@@ -10,6 +10,8 @@ RUN apt-get update && apt-get install -y git curl && rm -rf /var/lib/apt/lists/*
 # - transformer_lens: The key tool for "Steering Vectors" (Module 2)
 # - bitsandbytes: For 8-bit quantization (saves VRAM)
 # - accelerate: Optimizes inference on your single GPU
+# - tiktoken: Required for Qwen tokenizer
+# - transformers_stream_generator: Required for Qwen models
 RUN pip install --no-cache-dir --upgrade \
     "transformers>=4.39.0" \
     "accelerate>=0.28.0" \
@@ -21,7 +23,9 @@ RUN pip install --no-cache-dir --upgrade \
     pydantic \
     protobuf \
     sentencepiece \
-    einops
+    einops \
+    tiktoken \
+    transformers_stream_generator
 
 # Copy our application code
 COPY . .
