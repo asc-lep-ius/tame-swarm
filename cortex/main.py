@@ -1,15 +1,24 @@
-from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+import logging
+
 # --- CONFIGURATION ---
 # Qwen 1.5-1.8B is an excellent, smart, and tiny model that fits easily in 8GB VRAM
-MODEL_ID = "Qwen/Qwen1.5-1.8B-Chat" 
+MODEL_ID = "Qwen/Qwen1.5-1.8B-Chat"
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="TAME Cortex: Agential Swarm Node")
 
-print(f"Loading {MODEL_ID}... (Simulating 'Gestational' Phase)")
+logger.info(f"Loading {MODEL_ID}... (Simulating 'Gestational' Phase)")
 
 # Load Tokenizer
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
@@ -17,13 +26,13 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
 # Load Model with Low Memory Footprint (fp16)
 # We use float16 to ensure we have VRAM left over for the "Steering Vectors" later
 model = AutoModelForCausalLM.from_pretrained(
-    MODEL_ID, 
-    device_map="auto", 
-    torch_dtype=torch.float16, 
+    MODEL_ID,
+    device_map="auto",
+    torch_dtype=torch.float16,
     trust_remote_code=True
 )
 
-print("Cortex Online. Ready for Homeostatic Regulation.")
+logger.info("Cortex Online. Ready for Homeostatic Regulation.")
 
 class PromptRequest(BaseModel):
     prompt: str
@@ -70,5 +79,5 @@ async def generate(req: PromptRequest):
         }
 
     except Exception as e:
-        print(f"Error: {e}")
+        logger.error(f"Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
