@@ -25,15 +25,15 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
 
 # Load Model with Low Memory Footprint (fp16)
 # We use float16 to ensure we have VRAM left over for the "Steering Vectors" later
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_ID,
-    device_map="auto",
-    torch_dtype=torch.float16,
-    trust_remote_code=True
-)
+from pydantic import BaseModel, Field
 
-logger.info("Cortex Online. Ready for Homeostatic Regulation.")
-
+class PromptRequest(BaseModel):
+    prompt: str = Field(..., min_length=1, max_length=10000)
+    max_tokens: int = Field(default=200, ge=1, le=2048)
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+    # Future TAME inputs:
+    # steering_vector: list[float] = None
+    # active_inference_mode: bool = False
 class PromptRequest(BaseModel):
     prompt: str
     max_tokens: int = 200
