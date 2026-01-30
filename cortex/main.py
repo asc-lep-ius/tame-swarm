@@ -1,13 +1,8 @@
-from pydantic import BaseModel
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
-
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import logging
-
 # --- CONFIGURATION ---
 # Qwen 1.5-1.8B is an excellent, smart, and tiny model that fits easily in 8GB VRAM
 MODEL_ID = "Qwen/Qwen1.5-1.8B-Chat"
