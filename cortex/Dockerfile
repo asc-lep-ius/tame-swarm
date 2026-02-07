@@ -6,22 +6,23 @@ WORKDIR /app
 # Install system basics
 RUN apt-get update && apt-get install -y git curl && rm -rf /var/lib/apt/lists/*
 
-# Install transformer_lens first to avoid dependency conflicts
-RUN pip install --no-cache-dir transformer_lens
-
-# Install everything else - let pip resolve versions
-# Only constraint: transformers must be recent for Qwen3 support
+# Install ML dependencies
+# Using recent transformers for Mistral support
 RUN pip install --no-cache-dir --upgrade \
-    transformers \
+    "transformers>=4.36.0" \
     accelerate \
     bitsandbytes \
+    sentencepiece \
+    protobuf
+
+# Install API dependencies
+RUN pip install --no-cache-dir \
     fastapi \
     "uvicorn[standard]" \
     pydantic \
-    tiktoken \
-    einops
+    numpy
 
-# Copy our application code
+# Copy our TAME architecture code
 COPY . .
 
 # Launch the API
