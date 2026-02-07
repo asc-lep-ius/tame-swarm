@@ -471,7 +471,7 @@ async def generate_stream(req: GenerateRequest):
                 tokenizer, 
                 skip_prompt=True, 
                 skip_special_tokens=True,
-                timeout=600  # 10 minute timeout
+                timeout=2400  # 40 minute timeout
             )
             
             # Generation kwargs
