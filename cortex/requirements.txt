@@ -2,7 +2,7 @@
 # For local development and testing
 
 # Core ML
-torch>=2.0.0
+torch>=2.5.0
 transformers>=4.36.0
 accelerate>=0.25.0
 bitsandbytes>=0.41.0

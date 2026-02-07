@@ -1,5 +1,5 @@
-# PyTorch with CUDA 12.1 runtime
-FROM pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime
+# PyTorch with CUDA 12.4 runtime
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 
 WORKDIR /app
 
