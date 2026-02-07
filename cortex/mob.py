@@ -127,9 +127,9 @@ class LightweightExpert(nn.Module):
         # Initialize adapters (LoRA-style: A random, B zeros)
         for name, param in self.named_parameters():
             if '_A' in name:
-                nn.init.kaiming_uniform_(param.weight, a=5**0.5)
+                nn.init.kaiming_uniform_(param, a=5**0.5)
             else:  # '_B' layers
-                nn.init.zeros_(param.weight)
+                nn.init.zeros_(param)
     
     def forward(
         self, 
