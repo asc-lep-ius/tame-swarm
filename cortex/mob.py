@@ -34,6 +34,10 @@ class MoBConfig:
     wealth_decay: float = 0.99  # Wealth decay per step (prevents runaway accumulation)
     min_wealth: float = 1.0  # Minimum wealth (prevents bankruptcy death spiral)
     jitter_std: float = 0.01  # Gaussian noise for symmetry breaking
+    # Memory-efficient options
+    use_shared_base: bool = True  # Use shared base + adapters instead of full copies
+    adapter_rank: int = 64  # Rank of LoRA-style adapters when use_shared_base=True
+    adapter_alpha: float = 16.0  # Scaling factor for adapters
 
 
 class ConfidenceHead(nn.Module):
@@ -79,6 +83,83 @@ class Expert(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """SwiGLU FFN forward pass."""
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
+
+
+class LightweightExpert(nn.Module):
+    """
+    Memory-efficient expert using LoRA-style adapters on a shared base.
+    
+    Instead of duplicating the full FFN weights for each expert, we:
+    1. Keep one shared base FFN (not owned by this module)
+    2. Add small low-rank adapter matrices per expert
+    
+    This reduces memory from O(num_experts * FFN_size) to 
+    O(FFN_size + num_experts * adapter_size), where adapter_size << FFN_size.
+    
+    The expert's output becomes: base_output + adapter_output
+    Where adapter uses low-rank decomposition: x @ A @ B
+    """
+    
+    def __init__(
+        self, 
+        hidden_dim: int, 
+        intermediate_dim: int, 
+        rank: int = 64,
+        alpha: float = 16.0
+    ):
+        super().__init__()
+        self.rank = rank
+        self.scaling = alpha / rank
+        
+        # Low-rank adapters for each projection
+        # gate adapter: hidden -> rank -> intermediate
+        self.gate_adapter_A = nn.Linear(hidden_dim, rank, bias=False)
+        self.gate_adapter_B = nn.Linear(rank, intermediate_dim, bias=False)
+        
+        # up adapter: hidden -> rank -> intermediate
+        self.up_adapter_A = nn.Linear(hidden_dim, rank, bias=False)
+        self.up_adapter_B = nn.Linear(rank, intermediate_dim, bias=False)
+        
+        # down adapter: intermediate -> rank -> hidden
+        self.down_adapter_A = nn.Linear(intermediate_dim, rank, bias=False)
+        self.down_adapter_B = nn.Linear(rank, hidden_dim, bias=False)
+        
+        # Initialize adapters (LoRA-style: A random, B zeros)
+        for name, param in self.named_parameters():
+            if '_A' in name:
+                nn.init.kaiming_uniform_(param.weight, a=5**0.5)
+            else:  # '_B' layers
+                nn.init.zeros_(param.weight)
+    
+    def forward(
+        self, 
+        x: torch.Tensor, 
+        base_gate: nn.Linear,
+        base_up: nn.Linear,
+        base_down: nn.Linear
+    ) -> torch.Tensor:
+        """
+        Forward pass using shared base + expert-specific adapters.
+        
+        Args:
+            x: Input tensor
+            base_gate, base_up, base_down: Shared base FFN projections
+        """
+        # Base computation
+        gate_out = base_gate(x)
+        up_out = base_up(x)
+        
+        # Add adapter contributions (scaled)
+        gate_out = gate_out + self.gate_adapter_B(self.gate_adapter_A(x)) * self.scaling
+        up_out = up_out + self.up_adapter_B(self.up_adapter_A(x)) * self.scaling
+        
+        # SwiGLU activation
+        hidden = F.silu(gate_out) * up_out
+        
+        # Down projection with adapter
+        output = base_down(hidden) + self.down_adapter_B(self.down_adapter_A(hidden)) * self.scaling
+        
+        return output
 
 
 class VCGAuctioneer(nn.Module):
@@ -152,17 +233,40 @@ class MixtureOfBidders(nn.Module):
     
     This transforms static matrix multiplication into a dynamic
     competitive economy within the neural network.
+    
+    Supports two modes:
+    1. Full experts: Each expert has complete FFN weights (high memory)
+    2. Shared base + adapters: One shared FFN + lightweight adapters per expert (low memory)
     """
     
     def __init__(self, config: MoBConfig):
         super().__init__()
         self.config = config
+        self.use_shared_base = config.use_shared_base
         
-        # Create the expert pool
-        self.experts = nn.ModuleList([
-            Expert(config.hidden_dim, config.intermediate_dim)
-            for _ in range(config.num_experts)
-        ])
+        if self.use_shared_base:
+            # Memory-efficient mode: shared base + lightweight adapters
+            # Base FFN (shared across all experts)
+            self.base_gate_proj = nn.Linear(config.hidden_dim, config.intermediate_dim, bias=False)
+            self.base_up_proj = nn.Linear(config.hidden_dim, config.intermediate_dim, bias=False)
+            self.base_down_proj = nn.Linear(config.intermediate_dim, config.hidden_dim, bias=False)
+            
+            # Lightweight adapters per expert
+            self.experts = nn.ModuleList([
+                LightweightExpert(
+                    config.hidden_dim, 
+                    config.intermediate_dim,
+                    rank=config.adapter_rank,
+                    alpha=config.adapter_alpha
+                )
+                for _ in range(config.num_experts)
+            ])
+        else:
+            # Full expert mode (original, high memory)
+            self.experts = nn.ModuleList([
+                Expert(config.hidden_dim, config.intermediate_dim)
+                for _ in range(config.num_experts)
+            ])
         
         # Confidence head for each expert
         self.confidence_heads = nn.ModuleList([
@@ -232,7 +336,17 @@ class MixtureOfBidders(nn.Module):
                     
                 # Get tokens for this expert
                 expert_input = hidden_states[mask]  # (num_tokens, hidden_dim)
-                expert_output = self.experts[expert_idx](expert_input)
+                
+                # Different forward path for shared base vs full experts
+                if self.use_shared_base:
+                    expert_output = self.experts[expert_idx](
+                        expert_input,
+                        self.base_gate_proj,
+                        self.base_up_proj,
+                        self.base_down_proj
+                    )
+                else:
+                    expert_output = self.experts[expert_idx](expert_input)
                 
                 # Weight by routing weight and add to output
                 weight_vals = weights.squeeze(-1)[mask]  # (num_tokens,)
@@ -304,8 +418,15 @@ class MixtureOfBidders(nn.Module):
         Initialize MoB by "upcycling" from a pretrained FFN.
         
         This is the key efficiency gain: we don't train from scratch.
-        We duplicate the existing FFN weights across experts and add
-        small random noise to break symmetry.
+        
+        For shared base mode (memory-efficient):
+        - Copy the FFN weights to a single shared base
+        - Adapters start at zero (no initial change to behavior)
+        - Jitter applied to adapters only
+        
+        For full expert mode:
+        - Duplicate the existing FFN weights across experts
+        - Add small random noise to break symmetry
         
         Args:
             ffn_module: The original FFN module (e.g., from Mistral)
@@ -330,31 +451,60 @@ class MixtureOfBidders(nn.Module):
             if dtype is None:
                 dtype = ref_param.dtype
         
-        logger.info(f"Creating MoB on device={device}, dtype={dtype}")
+        mode_str = "shared-base" if config.use_shared_base else "full-expert"
+        logger.info(f"Creating MoB ({mode_str}) on device={device}, dtype={dtype}")
         
-        # Create MoB and move to correct device/dtype
+        # Create MoB on CPU first for memory efficiency, then move to device
         mob = cls(config)
+        
+        # Copy weights from original FFN
+        with torch.no_grad():
+            if config.use_shared_base:
+                # Shared base mode: copy weights to shared base only
+                if hasattr(ffn_module, 'gate_proj'):
+                    mob.base_gate_proj.weight.copy_(ffn_module.gate_proj.weight.cpu())
+                    mob.base_up_proj.weight.copy_(ffn_module.up_proj.weight.cpu())
+                    mob.base_down_proj.weight.copy_(ffn_module.down_proj.weight.cpu())
+                
+                # Adapters are already initialized (A: kaiming, B: zeros)
+                # Add small jitter to A matrices to break symmetry between experts
+                for i, expert in enumerate(mob.experts):
+                    expert.gate_adapter_A.weight.add_(
+                        torch.randn_like(expert.gate_adapter_A.weight) * config.jitter_std * (i + 1)
+                    )
+                    expert.up_adapter_A.weight.add_(
+                        torch.randn_like(expert.up_adapter_A.weight) * config.jitter_std * (i + 1)
+                    )
+                    expert.down_adapter_A.weight.add_(
+                        torch.randn_like(expert.down_adapter_A.weight) * config.jitter_std * (i + 1)
+                    )
+            else:
+                # Full expert mode: copy to each expert with jitter
+                for expert in mob.experts:
+                    if hasattr(ffn_module, 'gate_proj'):
+                        expert.gate_proj.weight.copy_(ffn_module.gate_proj.weight.cpu())
+                        expert.up_proj.weight.copy_(ffn_module.up_proj.weight.cpu())
+                        expert.down_proj.weight.copy_(ffn_module.down_proj.weight.cpu())
+                        
+                    # Add small noise for symmetry breaking
+                    expert.gate_proj.weight.add_(
+                        torch.randn_like(expert.gate_proj.weight) * config.jitter_std
+                    )
+                    expert.up_proj.weight.add_(
+                        torch.randn_like(expert.up_proj.weight) * config.jitter_std
+                    )
+                    expert.down_proj.weight.add_(
+                        torch.randn_like(expert.down_proj.weight) * config.jitter_std
+                    )
+        
+        # Move to target device/dtype
         mob = mob.to(device=device, dtype=dtype)
         
-        # Copy weights from original FFN to each expert
-        with torch.no_grad():
-            for expert in mob.experts:
-                # Copy gate, up, down projections
-                if hasattr(ffn_module, 'gate_proj'):
-                    expert.gate_proj.weight.copy_(ffn_module.gate_proj.weight)
-                    expert.up_proj.weight.copy_(ffn_module.up_proj.weight)
-                    expert.down_proj.weight.copy_(ffn_module.down_proj.weight)
-                    
-                # Add small noise for symmetry breaking
-                expert.gate_proj.weight.add_(
-                    torch.randn_like(expert.gate_proj.weight) * config.jitter_std
-                )
-                expert.up_proj.weight.add_(
-                    torch.randn_like(expert.up_proj.weight) * config.jitter_std
-                )
-                expert.down_proj.weight.add_(
-                    torch.randn_like(expert.down_proj.weight) * config.jitter_std
-                )
+        logger.info(
+            f"Upcycled FFN to MoB with {config.num_experts} experts, "
+            f"top-k={config.top_k}, mode={mode_str}"
+        )
+        return mob
         
         logger.info(
             f"Upcycled FFN to MoB with {config.num_experts} experts, "
