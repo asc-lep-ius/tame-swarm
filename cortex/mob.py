@@ -290,11 +290,14 @@ class MixtureOfBidders(nn.Module):
             torch.zeros(config.num_experts)
         )
         
+        # Last forward pass statistics (for monitoring)
+        self.last_stats = {}
+        
     def forward(
         self, 
         hidden_states: torch.Tensor,
         update_wealth: bool = True
-    ) -> Tuple[torch.Tensor, dict]:
+    ) -> torch.Tensor:
         """
         Forward pass through the MoB layer.
         
@@ -304,7 +307,9 @@ class MixtureOfBidders(nn.Module):
             
         Returns:
             output: Processed tensor (batch, seq_len, hidden_dim)
-            stats: Dictionary of routing statistics for monitoring
+            
+        Note:
+            Routing statistics are stored in self.last_stats for monitoring.
         """
         batch_size, seq_len, hidden_dim = hidden_states.shape
         
@@ -361,8 +366,8 @@ class MixtureOfBidders(nn.Module):
         if update_wealth and self.training:
             self._update_wealth(selected_experts, routing_weights, confidences)
         
-        # Collect statistics
-        stats = {
+        # Store statistics for monitoring (accessible via self.last_stats)
+        self.last_stats = {
             'confidences': confidences.detach(),
             'selected_experts': selected_experts.detach(),
             'routing_weights': routing_weights.detach(),
@@ -370,7 +375,7 @@ class MixtureOfBidders(nn.Module):
             'expert_usage': self.expert_usage_count.clone(),
         }
         
-        return output, stats
+        return output
     
     def _update_wealth(
         self,
