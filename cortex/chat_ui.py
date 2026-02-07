@@ -43,11 +43,15 @@ def get_swarm_status() -> str:
             wealth = data["expert_wealth"]
             usage = data["expert_usage"]
             
+            # Create list of (expert_id, wealth, usage) tuples and sort by usage descending
+            experts = [(i, w, u) for i, (w, u) in enumerate(zip(wealth, usage))]
+            experts.sort(key=lambda x: x[2], reverse=True)
+            
             lines = [f"**Expert Swarm Status** ({data['num_experts']} experts, {data['layers_modified']} layers)"]
             lines.append("| Expert | Wealth | Usage |")
             lines.append("|--------|--------|-------|")
-            for i, (w, u) in enumerate(zip(wealth, usage)):
-                lines.append(f"| {i} | {w:.2f} | {int(u)} |")
+            for expert_id, w, u in experts:
+                lines.append(f"| {expert_id} | {w:.2f} | {int(u)} |")
             return "\n".join(lines)
         return "Failed to get swarm status"
     except Exception as e:
