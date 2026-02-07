@@ -4,7 +4,7 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import logging
 # --- CONFIGURATION ---
-MODEL_ID = "Qwen/Qwen3-8B"
+MODEL_ID = "Qwen/Qwen3-4B"
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
