@@ -355,7 +355,14 @@ class MixtureOfBidders(nn.Module):
                 
                 # Weight by routing weight and add to output
                 weight_vals = weights.squeeze(-1)[mask]  # (num_tokens,)
-                output[mask] += expert_output * weight_vals.unsqueeze(-1)
+                weighted_expert_output = expert_output * weight_vals.unsqueeze(-1)
+                
+                # Use index_add_ instead of boolean masked in-place addition
+                # This avoids CUDA errors with boolean indexing
+                mask_indices = mask.nonzero(as_tuple=False)  # (num_tokens, 2)
+                flat_indices = mask_indices[:, 0] * seq_len + mask_indices[:, 1]
+                output_flat = output.view(-1, hidden_dim)
+                output_flat.index_add_(0, flat_indices, weighted_expert_output)
                 
                 # Update usage count
                 if update_wealth:
