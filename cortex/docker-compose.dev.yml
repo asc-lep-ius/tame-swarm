@@ -26,6 +26,27 @@ services:
               capabilities: [gpu]
     # Restart on crash during development
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  chat-ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.chat
+    volumes:
+      - ./chat_ui.py:/app/chat_ui.py
+    ports:
+      - "7860:7860"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - TAME_API_URL=http://cortex:8000
+    depends_on:
+      - cortex
+    restart: unless-stopped
 
 volumes:
   model_cache:

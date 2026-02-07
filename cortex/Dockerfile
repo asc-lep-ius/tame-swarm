@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y \
     python3-pip \
     git \
     curl \
+    wget \
     && rm -rf /var/lib/apt/lists/* \
     && ln -sf /usr/bin/python3.10 /usr/bin/python \
     && ln -sf /usr/bin/python3.10 /usr/bin/python3
@@ -33,6 +34,11 @@ RUN pip install --no-cache-dir \
     "uvicorn[standard]" \
     pydantic \
     numpy
+
+# Install Chat UI dependencies
+RUN pip install --no-cache-dir \
+    gradio \
+    requests
 
 # Copy our TAME architecture code
 COPY . .
