@@ -1,4 +1,4 @@
-# We use a PyTorch image with CUDA 12.1 support which matches your 4060 nicely
+# PyTorch with CUDA 12.1 runtime
 FROM pytorch/pytorch:2.2.0-cuda12.1-cudnn8-runtime
 
 WORKDIR /app

@@ -4,8 +4,7 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import logging
 # --- CONFIGURATION ---
-# Qwen3-1.7B is an excellent, smart, and tiny model that fits easily in 8GB VRAM
-MODEL_ID = "Qwen/Qwen3-1.7B"
+MODEL_ID = "Qwen/Qwen3-8B"
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -18,12 +17,10 @@ logger.info(f"Loading {MODEL_ID}... (Simulating 'Gestational' Phase)")
 # Load Tokenizer
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
 
-# Load Model with Low Memory Footprint (fp16)
-# We use float16 to ensure we have VRAM left over for the "Steering Vectors" later
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
     device_map="auto",
-    dtype=torch.float16,
+    torch_dtype=torch.bfloat16,
     trust_remote_code=True
 )
 
