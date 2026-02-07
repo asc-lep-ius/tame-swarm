@@ -12,8 +12,9 @@ Usage:
 
 import gradio as gr
 import requests
+import json
 import os
-from typing import List, Tuple
+from typing import List, Tuple, Generator
 
 # API Configuration - use env var for Docker, default to localhost for local dev
 API_BASE = os.getenv("TAME_API_URL", "http://localhost:8000")
@@ -82,6 +83,127 @@ def get_homeostasis_status() -> str:
         return f"Error: {e}"
 
 
+def stream_chat(
+    message: str,
+    history: List[dict],
+    temperature: float,
+    max_tokens: int,
+    steering_strength: float,
+    show_stats: bool
+):
+    """
+    Stream response from TAME server with real-time token feedback.
+    
+    Yields:
+        Tuple of (accumulated_response, status_text) for each token
+    """
+    if not message.strip():
+        yield "", ""
+        return
+    
+    try:
+        payload = {
+            "prompt": message,
+            "max_tokens": int(max_tokens),
+            "temperature": temperature,
+            "return_stats": show_stats
+        }
+        
+        if steering_strength >= 0:
+            payload["steering_strength"] = steering_strength
+        
+        # Use streaming endpoint with much longer timeout (10 minutes)
+        response = requests.post(
+            f"{API_BASE}/generate/stream",
+            json=payload,
+            stream=True,
+            timeout=600  # 10 minute timeout for long generations
+        )
+        
+        if not response.ok:
+            yield f"Error: {response.status_code} - {response.text}", ""
+            return
+        
+        accumulated_response = ""
+        status_text = "Generating..."
+        final_stats = {}
+        
+        # Process Server-Sent Events
+        for line in response.iter_lines():
+            if not line:
+                continue
+                
+            line = line.decode('utf-8')
+            if not line.startswith('data: '):
+                continue
+            
+            data_str = line[6:]  # Remove 'data: ' prefix
+            
+            if data_str == '[DONE]':
+                break
+            
+            try:
+                data = json.loads(data_str)
+                event_type = data.get('type', '')
+                
+                if event_type == 'token':
+                    # Append token to response
+                    accumulated_response += data.get('content', '')
+                    yield accumulated_response, status_text
+                    
+                elif event_type == 'status':
+                    status_text = f"⏳ {data.get('message', '')}"
+                    yield accumulated_response, status_text
+                    
+                elif event_type == 'progress':
+                    status_text = f"🔄 {data.get('message', '')} tokens"
+                    yield accumulated_response, status_text
+                    
+                elif event_type == 'complete':
+                    final_stats = data
+                    # Build final stats display
+                    stats_parts = []
+                    
+                    usage = data.get('usage', {})
+                    if usage:
+                        stats_parts.append(f"Tokens: {usage.get('input_tokens', '?')} → {usage.get('output_tokens', '?')}")
+                    
+                    homeostasis = data.get('homeostasis')
+                    if homeostasis:
+                        align = homeostasis.get('mean_alignment', 'N/A')
+                        if isinstance(align, float):
+                            align = f"{align:.3f}"
+                        stats_parts.append(f"Alignment: {align}")
+                    
+                    mob = data.get('mob_stats')
+                    if mob:
+                        wealth = mob.get('expert_wealth', [])
+                        if wealth:
+                            top_expert = wealth.index(max(wealth))
+                            stats_parts.append(f"Top Expert: {top_expert} ({max(wealth):.1f})")
+                    
+                    status_text = "✓ " + " | ".join(stats_parts) if stats_parts else "✓ Complete"
+                    yield accumulated_response, status_text
+                    
+                elif event_type == 'error':
+                    yield f"Error: {data.get('message', 'Unknown error')}", "❌ Error"
+                    return
+                    
+            except json.JSONDecodeError:
+                continue
+        
+        # Final yield
+        yield accumulated_response, status_text
+        
+    except requests.exceptions.ConnectionError:
+        yield "Error: Cannot connect to server. Is it running?", "❌ Connection Error"
+    except requests.exceptions.Timeout:
+        yield "Error: Request timed out (10 min limit)", "❌ Timeout"
+    except Exception as e:
+        yield f"Error: {e}", "❌ Error"
+
+
+# Keep non-streaming version as fallback
 def chat(
     message: str,
     history: List[dict],
@@ -90,7 +212,7 @@ def chat(
     steering_strength: float,
     show_stats: bool
 ) -> Tuple[str, str]:
-    """Send message to TAME server and get response."""
+    """Send message to TAME server and get response (non-streaming fallback)."""
     
     if not message.strip():
         return "", ""
@@ -110,7 +232,7 @@ def chat(
         resp = requests.post(
             f"{API_BASE}/generate",
             json=payload,
-            timeout=120
+            timeout=600  # Increased to 10 minutes
         )
         
         if not resp.ok:
@@ -238,23 +360,39 @@ def create_ui():
                 homeo_btn = gr.Button("View Homeostasis")
                 homeo_display = gr.Markdown("")
         
-        # Event handlers
-        def respond(message, history, temp, max_tok, steer, stats):
-            response, stats_text = chat(message, history, temp, max_tok, steer, stats)
-            history = history + [
-                {"role": "user", "content": message},
-                {"role": "assistant", "content": response}
-            ]
-            return "", history, stats_text
+        # Event handlers - streaming version
+        def respond_stream(message, history, temp, max_tok, steer, stats):
+            """Streaming response handler for Gradio."""
+            if not message.strip():
+                yield "", history, ""
+                return
+            
+            # Add user message to history immediately
+            history = history + [{"role": "user", "content": message}]
+            
+            # Stream the response
+            accumulated = ""
+            status = "Starting..."
+            
+            for response_text, stats_text in stream_chat(message, history, temp, max_tok, steer, stats):
+                accumulated = response_text
+                status = stats_text
+                # Update history with current accumulated response
+                current_history = history + [{"role": "assistant", "content": accumulated}]
+                yield "", current_history, status
+            
+            # Final yield with complete response
+            final_history = history + [{"role": "assistant", "content": accumulated}]
+            yield "", final_history, status
         
         msg_input.submit(
-            respond,
+            respond_stream,
             [msg_input, chatbot, temperature, max_tokens, steering_strength, show_stats],
             [msg_input, chatbot, stats_display]
         )
         
         send_btn.click(
-            respond,
+            respond_stream,
             [msg_input, chatbot, temperature, max_tokens, steering_strength, show_stats],
             [msg_input, chatbot, stats_display]
         )

@@ -12,11 +12,15 @@ Based on Michael Levin's TAME framework for biological cognition.
 """
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 from contextlib import asynccontextmanager
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+import json
+import asyncio
+from threading import Thread
+from transformers import AutoTokenizer, AutoModelForCausalLM, TextIteratorStreamer
 import logging
 
 from mob import MoBConfig, MixtureOfBidders, apply_mob_to_model
@@ -421,6 +425,158 @@ async def generate(req: GenerateRequest):
     except Exception as e:
         logger.error(f"Generation error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# =============================================================================
+# STREAMING GENERATION (with token-by-token feedback)
+# =============================================================================
+
+@app.post("/generate/stream")
+async def generate_stream(req: GenerateRequest):
+    """
+    Streaming generation endpoint.
+    
+    Returns Server-Sent Events (SSE) with:
+    - Token-by-token output
+    - Periodic status updates (expert routing, alignment)
+    - Final statistics
+    """
+    
+    async def event_generator():
+        try:
+            # Send initial status
+            yield f"data: {json.dumps({'type': 'status', 'message': 'Preparing generation...'})}\n\n"
+            
+            # Reset homeostatic tracking
+            if homeostat:
+                homeostat.reset()
+                if req.steering_strength is not None:
+                    homeostat.config.base_strength = req.steering_strength
+                    homeostat.config.adaptive = False
+            
+            # Tokenize
+            messages = [{"role": "user", "content": req.prompt}]
+            text = tokenizer.apply_chat_template(
+                messages, 
+                tokenize=False, 
+                add_generation_prompt=True
+            )
+            inputs = tokenizer(text, return_tensors="pt").to(model.device)
+            input_length = inputs.input_ids.shape[1]
+            
+            yield f"data: {json.dumps({'type': 'status', 'message': f'Processing {input_length} input tokens...'})}\n\n"
+            
+            # Create streamer using transformers' built-in TextIteratorStreamer
+            streamer = TextIteratorStreamer(
+                tokenizer, 
+                skip_prompt=True, 
+                skip_special_tokens=True,
+                timeout=600  # 10 minute timeout
+            )
+            
+            # Generation kwargs
+            generation_kwargs = dict(
+                **inputs,
+                max_new_tokens=req.max_tokens,
+                do_sample=req.temperature > 0,
+                temperature=req.temperature if req.temperature > 0 else 1.0,
+                top_k=50,
+                top_p=0.95,
+                pad_token_id=tokenizer.pad_token_id,
+                streamer=streamer
+            )
+            
+            # Run generation in background thread
+            def generate_in_thread():
+                try:
+                    with torch.inference_mode():
+                        model.generate(**generation_kwargs)
+                except Exception as e:
+                    logger.error(f"Generation thread error: {e}")
+            
+            thread = Thread(target=generate_in_thread)
+            thread.start()
+            
+            yield f"data: {json.dumps({'type': 'status', 'message': 'Generating response...'})}\n\n"
+            
+            # Stream tokens as they arrive
+            full_response = ""
+            token_count = 0
+            last_status_update = 0
+            
+            for token_text in streamer:
+                full_response += token_text
+                token_count += 1
+                
+                # Send token
+                yield f"data: {json.dumps({'type': 'token', 'content': token_text})}\n\n"
+                
+                # Every 10 tokens, send a status update with routing info
+                if token_count - last_status_update >= 10:
+                    last_status_update = token_count
+                    status_msg = f"Generated {token_count} tokens"
+                    
+                    # Add MoB info if available
+                    try:
+                        for layer in model.model.layers:
+                            if hasattr(layer, 'mlp') and hasattr(layer.mlp, 'last_stats'):
+                                stats = layer.mlp.last_stats
+                                if stats and 'expert_wealth' in stats:
+                                    wealth = stats['expert_wealth']
+                                    top_expert = wealth.argmax().item()
+                                    status_msg += f" | Expert {top_expert} leading"
+                                    break
+                    except:
+                        pass
+                    
+                    yield f"data: {json.dumps({'type': 'progress', 'message': status_msg, 'tokens': token_count})}\n\n"
+                
+                # Small delay to prevent overwhelming the client
+                await asyncio.sleep(0.01)
+            
+            # Wait for thread to complete
+            thread.join(timeout=10)
+            
+            # Send final stats
+            final_stats = {
+                'type': 'complete',
+                'usage': {
+                    'input_tokens': input_length,
+                    'output_tokens': token_count
+                }
+            }
+            
+            # Add homeostasis stats
+            if homeostat:
+                final_stats['homeostasis'] = homeostat.get_alignment_stats()
+            
+            # Add MoB stats
+            if req.return_stats:
+                try:
+                    swarm_status = get_swarm_status()
+                    final_stats['mob_stats'] = {
+                        'expert_wealth': swarm_status.expert_wealth,
+                        'expert_usage': swarm_status.expert_usage
+                    }
+                except:
+                    pass
+            
+            yield f"data: {json.dumps(final_stats)}\n\n"
+            yield "data: [DONE]\n\n"
+            
+        except Exception as e:
+            logger.error(f"Streaming error: {e}", exc_info=True)
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+    
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"  # Disable nginx buffering
+        }
+    )
 
 
 @app.post("/steering/update")
