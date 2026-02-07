@@ -11,7 +11,7 @@ services:
       # Cache model downloads between restarts
       - model_cache:/root/.cache/huggingface
     ports:
-      - "8000:8000"
+      - "8000"
     environment:
       - PYTHONUNBUFFERED=1
       - HF_HOME=/root/.cache/huggingface

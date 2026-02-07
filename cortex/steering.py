@@ -144,20 +144,38 @@ class SteeringVectorExtractor:
             # Collect activations for positive prompts
             positive_activations = {layer: [] for layer in self.layers}
             
+            # For device_map="auto", we need to find the input device
+            # The embedding layer is always on the first device
+            if hasattr(self.model, 'model') and hasattr(self.model.model, 'embed_tokens'):
+                input_device = self.model.model.embed_tokens.weight.device
+            elif hasattr(self.model, 'get_input_embeddings'):
+                input_device = self.model.get_input_embeddings().weight.device
+            else:
+                input_device = next(self.model.parameters()).device
+            
+            logger.info(f"Steering extraction: input device = {input_device}")
+            
+            # Get pad_token_id for generate calls
+            pad_token_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+            
             for prompt in positive_prompts:
                 inputs = self.tokenizer(
                     prompt, 
                     return_tensors="pt", 
                     max_length=max_length,
                     truncation=True
-                ).to(self.model.device)
+                ).to(input_device)
                 
                 with torch.no_grad():
-                    self.model(**inputs)
+                    # Forward pass - model handles internal device movement
+                    outputs = self.model(**inputs, output_hidden_states=False)
                     
                 for layer_idx in self.layers:
-                    # Use mean across sequence and batch
-                    activation = self.activations[layer_idx].mean(dim=(0, 1))
+                    if layer_idx not in self.activations:
+                        logger.warning(f"No activation captured for layer {layer_idx}")
+                        continue
+                    # Always move to CPU for consistent stacking
+                    activation = self.activations[layer_idx].float().cpu().mean(dim=(0, 1))
                     positive_activations[layer_idx].append(activation)
                     
             # Collect activations for negative prompts
@@ -169,13 +187,15 @@ class SteeringVectorExtractor:
                     return_tensors="pt",
                     max_length=max_length,
                     truncation=True
-                ).to(self.model.device)
+                ).to(input_device)
                 
                 with torch.no_grad():
-                    self.model(**inputs)
+                    outputs = self.model(**inputs, output_hidden_states=False)
                     
                 for layer_idx in self.layers:
-                    activation = self.activations[layer_idx].mean(dim=(0, 1))
+                    if layer_idx not in self.activations:
+                        continue
+                    activation = self.activations[layer_idx].float().cpu().mean(dim=(0, 1))
                     negative_activations[layer_idx].append(activation)
                     
             # Compute steering vectors (difference in means)

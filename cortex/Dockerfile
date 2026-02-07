@@ -1,19 +1,31 @@
-# PyTorch with CUDA 12.4 runtime
-FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+# CUDA base for Blackwell (RTX 50-series) support
+# Using 12.6 base image; PyTorch cu130 wheel bundles its own CUDA runtime
+FROM nvidia/cuda:12.6.3-cudnn-runtime-ubuntu22.04
 
 WORKDIR /app
 
-# Install system basics
-RUN apt-get update && apt-get install -y git curl && rm -rf /var/lib/apt/lists/*
+# Install Python 3.10 and system basics
+RUN apt-get update && apt-get install -y \
+    python3.10 \
+    python3.10-venv \
+    python3-pip \
+    git \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/python3.10 /usr/bin/python \
+    && ln -sf /usr/bin/python3.10 /usr/bin/python3
 
-# Install ML dependencies
-# Using recent transformers for Mistral support
-RUN pip install --no-cache-dir --upgrade \
-    "transformers>=4.36.0" \
+# Upgrade pip
+RUN python -m pip install --upgrade pip
+
+# Install PyTorch 2.10.0 stable with CUDA 13.0 (best Blackwell sm_120 support)
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu130
+
+# Install ML dependencies (only what's actually imported)
+RUN pip install --no-cache-dir \
+    "transformers>=4.44.0" \
     accelerate \
-    bitsandbytes \
-    sentencepiece \
-    protobuf
+    sentencepiece
 
 # Install API dependencies
 RUN pip install --no-cache-dir \

@@ -296,7 +296,9 @@ class MixtureOfBidders(nn.Module):
     def from_pretrained_ffn(
         cls,
         ffn_module: nn.Module,
-        config: MoBConfig
+        config: MoBConfig,
+        device: torch.device = None,
+        dtype: torch.dtype = None
     ) -> 'MixtureOfBidders':
         """
         Initialize MoB by "upcycling" from a pretrained FFN.
@@ -308,11 +310,31 @@ class MixtureOfBidders(nn.Module):
         Args:
             ffn_module: The original FFN module (e.g., from Mistral)
             config: MoB configuration
+            device: Target device (auto-detected from ffn_module if None)
+            dtype: Target dtype (auto-detected from ffn_module if None)
             
         Returns:
             Initialized MoB module with weights copied from FFN
         """
+        # Detect device and dtype from the original FFN
+        if device is None or dtype is None:
+            if hasattr(ffn_module, 'gate_proj'):
+                ref_param = ffn_module.gate_proj.weight
+            elif hasattr(ffn_module, 'up_proj'):
+                ref_param = ffn_module.up_proj.weight
+            else:
+                ref_param = next(ffn_module.parameters())
+            
+            if device is None:
+                device = ref_param.device
+            if dtype is None:
+                dtype = ref_param.dtype
+        
+        logger.info(f"Creating MoB on device={device}, dtype={dtype}")
+        
+        # Create MoB and move to correct device/dtype
         mob = cls(config)
+        mob = mob.to(device=device, dtype=dtype)
         
         # Copy weights from original FFN to each expert
         with torch.no_grad():

@@ -86,14 +86,21 @@ def initialize_tame_architecture():
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
+    # Use device_map="auto" for efficient memory usage across GPU/CPU
     model = AutoModelForCausalLM.from_pretrained(
         MODEL_ID,
         device_map="auto",
         torch_dtype=torch.bfloat16,
-        trust_remote_code=True
+        trust_remote_code=True,
+        low_cpu_mem_usage=True,
     )
     
-    logger.info(f"[GESTATIONAL] Base model loaded on {model.device}")
+    # Log device distribution
+    if hasattr(model, 'hf_device_map'):
+        devices_used = set(model.hf_device_map.values())
+        logger.info(f"[GESTATIONAL] Model distributed across devices: {devices_used}")
+    
+    logger.info("[GESTATIONAL] Base model loaded")
     
     # Phase 2: Morphogenesis - Transform to Agential Swarm (MoB)
     logger.info("[MORPHOGENESIS] Applying Mixture of Bidders transformation...")
