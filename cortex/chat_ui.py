@@ -84,7 +84,7 @@ def get_homeostasis_status() -> str:
 
 def chat(
     message: str,
-    history: List[Tuple[str, str]],
+    history: List[dict],
     temperature: float,
     max_tokens: int,
     steering_strength: float,
@@ -155,7 +155,7 @@ def chat(
 def create_ui():
     """Create the Gradio interface."""
     
-    with gr.Blocks(title="TAME Cortex Chat", theme=gr.themes.Soft()) as demo:
+    with gr.Blocks(title="TAME Cortex Chat") as demo:
         gr.Markdown("# 🧠 TAME Cortex Chat")
         gr.Markdown("Test the agential swarm with Mixture of Bidders and Cognitive Homeostasis")
         
@@ -176,8 +176,7 @@ def create_ui():
             with gr.Column(scale=3):
                 chatbot = gr.Chatbot(
                     label="Chat",
-                    height=400,
-                    show_copy_button=True
+                    height=400
                 )
                 
                 with gr.Row():
@@ -242,7 +241,10 @@ def create_ui():
         # Event handlers
         def respond(message, history, temp, max_tok, steer, stats):
             response, stats_text = chat(message, history, temp, max_tok, steer, stats)
-            history = history + [(message, response)]
+            history = history + [
+                {"role": "user", "content": message},
+                {"role": "assistant", "content": response}
+            ]
             return "", history, stats_text
         
         msg_input.submit(
@@ -259,6 +261,9 @@ def create_ui():
         
         clear_btn.click(lambda: ([], ""), outputs=[chatbot, stats_display])
         
+        # Initialize with empty list for messages format
+        demo.load(lambda: [], outputs=[chatbot])
+        
         swarm_btn.click(get_swarm_status, outputs=swarm_display)
         homeo_btn.click(get_homeostasis_status, outputs=homeo_display)
     
@@ -270,5 +275,6 @@ if __name__ == "__main__":
     demo.launch(
         server_name="0.0.0.0",
         server_port=7860,
-        share=False
+        share=False,
+        theme=gr.themes.Soft()
     )

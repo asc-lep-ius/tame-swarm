@@ -323,10 +323,10 @@ class SteeringHook:
             hidden_states = output
             rest = ()
             
-        # Move steering vector to correct device if needed
+        # Move steering vector to correct device and dtype if needed
         steer_vec = self.steering_vector.vector
-        if steer_vec.device != hidden_states.device:
-            steer_vec = steer_vec.to(hidden_states.device)
+        if steer_vec.device != hidden_states.device or steer_vec.dtype != hidden_states.dtype:
+            steer_vec = steer_vec.to(device=hidden_states.device, dtype=hidden_states.dtype)
             
         # Apply orthogonal projection if configured
         if self.config.orthogonal_projection and self.capability_subspace is not None:

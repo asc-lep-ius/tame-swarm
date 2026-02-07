@@ -45,7 +45,8 @@ services:
       - PYTHONUNBUFFERED=1
       - TAME_API_URL=http://cortex:8000
     depends_on:
-      - cortex
+      cortex:
+        condition: service_healthy
     restart: unless-stopped
 
 volumes:
