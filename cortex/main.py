@@ -4,8 +4,8 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 import logging
 # --- CONFIGURATION ---
-# Qwen 1.5-1.8B is an excellent, smart, and tiny model that fits easily in 8GB VRAM
-MODEL_ID = "Qwen/Qwen1.5-1.8B-Chat"
+# Qwen3-1.7B is an excellent, smart, and tiny model that fits easily in 8GB VRAM
+MODEL_ID = "Qwen/Qwen3-1.7B"
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)

@@ -6,26 +6,20 @@ WORKDIR /app
 # Install system basics
 RUN apt-get update && apt-get install -y git curl && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
-# - transformer_lens: The key tool for "Steering Vectors" (Module 2)
-# - bitsandbytes: For 8-bit quantization (saves VRAM)
-# - accelerate: Optimizes inference on your single GPU
-# - tiktoken: Required for Qwen tokenizer
-# - transformers_stream_generator: Required for Qwen models
+# Install transformer_lens first to avoid dependency conflicts
+RUN pip install --no-cache-dir transformer_lens
+
+# Install everything else - let pip resolve versions
+# Only constraint: transformers must be recent for Qwen3 support
 RUN pip install --no-cache-dir --upgrade \
-    "transformers>=4.39.0" \
-    "accelerate>=0.28.0" \
+    transformers \
     accelerate \
     bitsandbytes \
-    transformer_lens \
     fastapi \
-    uvicorn \
+    "uvicorn[standard]" \
     pydantic \
-    protobuf \
-    sentencepiece \
-    einops \
     tiktoken \
-    transformers_stream_generator
+    einops
 
 # Copy our application code
 COPY . .
