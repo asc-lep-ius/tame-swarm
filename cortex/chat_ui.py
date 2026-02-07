@@ -14,10 +14,174 @@ import gradio as gr
 import requests
 import json
 import os
-from typing import List, Tuple, Generator
+from typing import List, Tuple, Generator, Dict, Any
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # API Configuration - use env var for Docker, default to localhost for local dev
 API_BASE = os.getenv("TAME_API_URL", "http://localhost:8000")
+
+
+def create_wealth_distribution_plot(wealth_trace: Dict[str, Any]) -> go.Figure:
+    """
+    Create a plotly figure showing expert wealth distribution over tokens.
+    
+    Good Sign: Inequality - some experts should become rich (specialists),
+    others poor. Equal wealth means the auction isn't forcing specialization.
+    """
+    if not wealth_trace or not wealth_trace.get("expert_wealth"):
+        # Return empty figure with message
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No wealth trace data available yet.<br>Generate a response to see VCG auction dynamics.",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=14)
+        )
+        fig.update_layout(
+            title="VCG Auction: Expert Wealth Distribution",
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+            height=350
+        )
+        return fig
+    
+    expert_wealth = wealth_trace["expert_wealth"]
+    steps = wealth_trace.get("steps", list(range(len(expert_wealth))))
+    num_experts = wealth_trace.get("num_experts", len(expert_wealth[0]) if expert_wealth else 0)
+    
+    # Create traces for each expert
+    fig = go.Figure()
+    
+    colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD', '#98D8C8', '#F7DC6F']
+    
+    for expert_idx in range(num_experts):
+        wealth_values = [step[expert_idx] for step in expert_wealth]
+        fig.add_trace(go.Scatter(
+            x=steps,
+            y=wealth_values,
+            mode='lines',
+            name=f'Expert {expert_idx}',
+            line=dict(width=2, color=colors[expert_idx % len(colors)]),
+            hovertemplate=f'Expert {expert_idx}<br>Step: %{{x}}<br>Wealth: %{{y:.2f}}<extra></extra>'
+        ))
+    
+    # Calculate inequality metric (Gini coefficient approximation)
+    if expert_wealth:
+        final_wealth = expert_wealth[-1]
+        sorted_wealth = sorted(final_wealth)
+        n = len(sorted_wealth)
+        if n > 0 and sum(sorted_wealth) > 0:
+            cum_wealth = sum((i + 1) * w for i, w in enumerate(sorted_wealth))
+            total_wealth = sum(sorted_wealth)
+            gini = (2 * cum_wealth) / (n * total_wealth) - (n + 1) / n
+        else:
+            gini = 0
+        inequality_text = f"Gini: {gini:.3f} ({'Specializing!' if gini > 0.2 else 'Low inequality'})"
+    else:
+        inequality_text = ""
+    
+    fig.update_layout(
+        title=f"VCG Auction: Expert Wealth Over Tokens<br><sub>{inequality_text}</sub>",
+        xaxis_title="Forward Pass (≈ tokens)",
+        yaxis_title="Wealth (credits)",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        height=350,
+        margin=dict(l=50, r=20, t=80, b=50),
+        hovermode='x unified'
+    )
+    
+    return fig
+
+
+def create_steering_trace_plot(steering_trace: Dict[str, Any]) -> go.Figure:
+    """
+    Create a plotly figure showing steering strength (α_t) over time.
+    
+    Good Sign: Dynamic behavior - low when naturally aligned with goal,
+    spikes when the prompt tries to force the model off-course.
+    """
+    if not steering_trace or not steering_trace.get("strength_history"):
+        # Return empty figure with message
+        fig = go.Figure()
+        fig.add_annotation(
+            text="No steering trace data available yet.<br>Generate a response to see homeostatic dynamics.",
+            xref="paper", yref="paper",
+            x=0.5, y=0.5, showarrow=False,
+            font=dict(size=14)
+        )
+        fig.update_layout(
+            title="Homeostatic Trace: Steering Strength (α_t)",
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+            height=350
+        )
+        return fig
+    
+    strength_history = steering_trace["strength_history"]
+    alignment_history = steering_trace.get("alignment_history", [])
+    target_alignment = steering_trace.get("target_alignment", 0.7)
+    steps = list(range(len(strength_history)))
+    
+    # Create subplot with secondary y-axis
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    
+    # Steering strength trace
+    fig.add_trace(
+        go.Scatter(
+            x=steps,
+            y=strength_history,
+            mode='lines',
+            name='Steering Strength (α_t)',
+            line=dict(width=2.5, color='#FF6B6B'),
+            hovertemplate='Step: %{x}<br>Strength: %{y:.3f}<extra></extra>'
+        ),
+        secondary_y=False
+    )
+    
+    # Alignment trace (if available)
+    if alignment_history:
+        fig.add_trace(
+            go.Scatter(
+                x=list(range(len(alignment_history))),
+                y=alignment_history,
+                mode='lines',
+                name='Alignment',
+                line=dict(width=2, color='#4ECDC4', dash='dot'),
+                hovertemplate='Step: %{x}<br>Alignment: %{y:.3f}<extra></extra>'
+            ),
+            secondary_y=True
+        )
+        
+        # Target alignment line
+        fig.add_hline(
+            y=target_alignment,
+            line_dash="dash",
+            line_color="gray",
+            annotation_text=f"Target ({target_alignment})",
+            secondary_y=True
+        )
+    
+    # Analyze dynamics
+    if strength_history:
+        variance = sum((s - sum(strength_history)/len(strength_history))**2 for s in strength_history) / len(strength_history)
+        dynamics_text = f"Variance: {variance:.4f} ({'Dynamic!' if variance > 0.01 else 'Static - may need tuning'})"
+    else:
+        dynamics_text = ""
+    
+    fig.update_layout(
+        title=f"Homeostatic Trace: Injection Strength Over Time<br><sub>{dynamics_text}</sub>",
+        xaxis_title="Forward Pass",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        height=350,
+        margin=dict(l=50, r=50, t=80, b=50),
+        hovermode='x unified'
+    )
+    
+    fig.update_yaxes(title_text="Strength (α_t)", secondary_y=False)
+    fig.update_yaxes(title_text="Alignment (cosine sim)", secondary_y=True)
+    
+    return fig
 
 
 def check_server_health() -> str:
@@ -94,15 +258,15 @@ def stream_chat(
     max_tokens: int,
     steering_strength: float,
     show_stats: bool
-):
+) -> Generator[Tuple[str, str, Dict[str, Any], Dict[str, Any]], None, None]:
     """
     Stream response from TAME server with real-time token feedback.
     
     Yields:
-        Tuple of (accumulated_response, status_text) for each token
+        Tuple of (accumulated_response, status_text, wealth_trace, steering_trace) for each token
     """
     if not message.strip():
-        yield "", ""
+        yield "", "", {}, {}
         return
     
     try:
@@ -125,12 +289,13 @@ def stream_chat(
         )
         
         if not response.ok:
-            yield f"Error: {response.status_code} - {response.text}", ""
+            yield f"Error: {response.status_code} - {response.text}", "", {}, {}
             return
         
         accumulated_response = ""
         status_text = "Generating..."
-        final_stats = {}
+        wealth_trace = {}
+        steering_trace = {}
         
         # Process Server-Sent Events
         for line in response.iter_lines():
@@ -153,18 +318,21 @@ def stream_chat(
                 if event_type == 'token':
                     # Append token to response
                     accumulated_response += data.get('content', '')
-                    yield accumulated_response, status_text
+                    yield accumulated_response, status_text, wealth_trace, steering_trace
                     
                 elif event_type == 'status':
                     status_text = f"⏳ {data.get('message', '')}"
-                    yield accumulated_response, status_text
+                    yield accumulated_response, status_text, wealth_trace, steering_trace
                     
                 elif event_type == 'progress':
                     status_text = f"🔄 {data.get('message', '')} tokens"
-                    yield accumulated_response, status_text
+                    yield accumulated_response, status_text, wealth_trace, steering_trace
                     
                 elif event_type == 'complete':
-                    final_stats = data
+                    # Extract traces from final stats
+                    wealth_trace = data.get('wealth_trace', {})
+                    steering_trace = data.get('steering_trace', {})
+                    
                     # Build final stats display
                     stats_parts = []
                     
@@ -187,24 +355,24 @@ def stream_chat(
                             stats_parts.append(f"Top Expert: {top_expert} ({max(wealth):.1f})")
                     
                     status_text = "✓ " + " | ".join(stats_parts) if stats_parts else "✓ Complete"
-                    yield accumulated_response, status_text
+                    yield accumulated_response, status_text, wealth_trace, steering_trace
                     
                 elif event_type == 'error':
-                    yield f"Error: {data.get('message', 'Unknown error')}", "❌ Error"
+                    yield f"Error: {data.get('message', 'Unknown error')}", "❌ Error", {}, {}
                     return
                     
             except json.JSONDecodeError:
                 continue
         
         # Final yield
-        yield accumulated_response, status_text
+        yield accumulated_response, status_text, wealth_trace, steering_trace
         
     except requests.exceptions.ConnectionError:
-        yield "Error: Cannot connect to server. Is it running?", "❌ Connection Error"
+        yield "Error: Cannot connect to server. Is it running?", "❌ Connection Error", {}, {}
     except requests.exceptions.Timeout:
-        yield "Error: Request timed out (10 min limit)", "❌ Timeout"
+        yield "Error: Request timed out (10 min limit)", "❌ Timeout", {}, {}
     except Exception as e:
-        yield f"Error: {e}", "❌ Error"
+        yield f"Error: {e}", "❌ Error", {}, {}
 
 
 # Keep non-streaming version as fallback
@@ -302,7 +470,7 @@ def create_ui():
             with gr.Column(scale=3):
                 chatbot = gr.Chatbot(
                     label="Chat",
-                    height=400
+                    height=350
                 )
                 
                 with gr.Row():
@@ -364,11 +532,36 @@ def create_ui():
                 homeo_btn = gr.Button("View Homeostasis")
                 homeo_display = gr.Markdown("")
         
-        # Event handlers - streaming version
+        # TAME Visualization Section
+        gr.Markdown("---")
+        gr.Markdown("## 📊 TAME Architecture Insights")
+        gr.Markdown("""
+        **VCG Auction (MoB)**: Shows expert wealth distribution over tokens. 
+        *Good sign: Inequality - some experts should become rich specialists!*
+        
+        **Homeostatic Trace**: Shows steering strength (α_t) over time.
+        *Good sign: Dynamic - should spike when model drifts from goals!*
+        """)
+        
+        with gr.Row():
+            with gr.Column(scale=1):
+                wealth_plot = gr.Plot(
+                    label="VCG Auction: Expert Wealth Distribution",
+                    value=create_wealth_distribution_plot({})
+                )
+            with gr.Column(scale=1):
+                steering_plot = gr.Plot(
+                    label="Homeostatic Trace: Steering Strength",
+                    value=create_steering_trace_plot({})
+                )
+        
+        # Event handlers - streaming version with trace visualization
         def respond_stream(message, history, temp, max_tok, steer, stats):
-            """Streaming response handler for Gradio."""
+            """Streaming response handler for Gradio with trace visualization."""
             if not message.strip():
-                yield "", history, ""
+                empty_wealth_plot = create_wealth_distribution_plot({})
+                empty_steering_plot = create_steering_trace_plot({})
+                yield "", history, "", empty_wealth_plot, empty_steering_plot
                 return
             
             # Add user message to history immediately
@@ -377,31 +570,49 @@ def create_ui():
             # Stream the response
             accumulated = ""
             status = "Starting..."
+            wealth_trace = {}
+            steering_trace = {}
             
-            for response_text, stats_text in stream_chat(message, history, temp, max_tok, steer, stats):
+            for response_text, stats_text, w_trace, s_trace in stream_chat(message, history, temp, max_tok, steer, stats):
                 accumulated = response_text
                 status = stats_text
+                wealth_trace = w_trace if w_trace else wealth_trace
+                steering_trace = s_trace if s_trace else steering_trace
+                
                 # Update history with current accumulated response
                 current_history = history + [{"role": "assistant", "content": accumulated}]
-                yield "", current_history, status
+                
+                # Create plots (only update when we have data)
+                wealth_fig = create_wealth_distribution_plot(wealth_trace)
+                steering_fig = create_steering_trace_plot(steering_trace)
+                
+                yield "", current_history, status, wealth_fig, steering_fig
             
-            # Final yield with complete response
+            # Final yield with complete response and final plots
             final_history = history + [{"role": "assistant", "content": accumulated}]
-            yield "", final_history, status
+            wealth_fig = create_wealth_distribution_plot(wealth_trace)
+            steering_fig = create_steering_trace_plot(steering_trace)
+            yield "", final_history, status, wealth_fig, steering_fig
+        
+        def clear_all():
+            """Clear chat and reset plots."""
+            empty_wealth_plot = create_wealth_distribution_plot({})
+            empty_steering_plot = create_steering_trace_plot({})
+            return [], "", empty_wealth_plot, empty_steering_plot
         
         msg_input.submit(
             respond_stream,
             [msg_input, chatbot, temperature, max_tokens, steering_strength, show_stats],
-            [msg_input, chatbot, stats_display]
+            [msg_input, chatbot, stats_display, wealth_plot, steering_plot]
         )
         
         send_btn.click(
             respond_stream,
             [msg_input, chatbot, temperature, max_tokens, steering_strength, show_stats],
-            [msg_input, chatbot, stats_display]
+            [msg_input, chatbot, stats_display, wealth_plot, steering_plot]
         )
         
-        clear_btn.click(lambda: ([], ""), outputs=[chatbot, stats_display])
+        clear_btn.click(clear_all, outputs=[chatbot, stats_display, wealth_plot, steering_plot])
         
         # Initialize with empty list for messages format
         demo.load(lambda: [], outputs=[chatbot])

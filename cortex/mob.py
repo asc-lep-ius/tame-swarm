@@ -293,6 +293,11 @@ class MixtureOfBidders(nn.Module):
         # Last forward pass statistics (for monitoring)
         self.last_stats = {}
         
+        # Wealth history tracking for VCG auction analysis
+        # Stores wealth snapshots at each forward pass for visualization
+        self.wealth_history: List[List[float]] = []
+        self._track_wealth: bool = False  # Enable via start_tracking()
+        
     def forward(
         self, 
         hidden_states: torch.Tensor,
@@ -382,6 +387,10 @@ class MixtureOfBidders(nn.Module):
             'expert_usage': self.expert_usage_count.clone(),
         }
         
+        # Record wealth snapshot for history tracking
+        if self._track_wealth:
+            self.wealth_history.append(self.expert_wealth.cpu().tolist())
+        
         return output
     
     def _update_wealth(
@@ -417,6 +426,29 @@ class MixtureOfBidders(nn.Module):
             
             # Clamp to minimum wealth
             self.expert_wealth.clamp_(min=self.config.min_wealth)
+    
+    def start_tracking(self):
+        """Enable wealth history tracking for VCG auction analysis."""
+        self._track_wealth = True
+        self.wealth_history = []
+        
+    def stop_tracking(self):
+        """Disable wealth history tracking."""
+        self._track_wealth = False
+        
+    def get_wealth_history(self) -> List[List[float]]:
+        """
+        Get the wealth history.
+        
+        Returns:
+            List of wealth snapshots, each containing wealth values per expert.
+            Shape: [num_forward_passes, num_experts]
+        """
+        return self.wealth_history.copy()
+    
+    def reset_tracking(self):
+        """Reset the wealth history without disabling tracking."""
+        self.wealth_history = []
     
     @classmethod
     def from_pretrained_ffn(

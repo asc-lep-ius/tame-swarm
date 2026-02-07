@@ -117,6 +117,86 @@ homeostat = None
 mob_stats_history = []
 
 
+def start_mob_tracking():
+    """Enable wealth tracking on all MoB layers for VCG auction analysis."""
+    global model
+    if model is None:
+        return
+    for layer in model.model.layers:
+        if hasattr(layer, 'mlp') and isinstance(layer.mlp, MixtureOfBidders):
+            layer.mlp.start_tracking()
+
+
+def stop_mob_tracking():
+    """Disable wealth tracking on all MoB layers."""
+    global model
+    if model is None:
+        return
+    for layer in model.model.layers:
+        if hasattr(layer, 'mlp') and isinstance(layer.mlp, MixtureOfBidders):
+            layer.mlp.stop_tracking()
+
+
+def get_mob_wealth_traces() -> Dict[str, List[List[float]]]:
+    """
+    Collect wealth history from all MoB layers.
+    
+    Returns:
+        Dictionary mapping layer index to wealth history.
+        Each history is [num_forward_passes, num_experts].
+    """
+    global model
+    traces = {}
+    if model is None:
+        return traces
+    for idx, layer in enumerate(model.model.layers):
+        if hasattr(layer, 'mlp') and isinstance(layer.mlp, MixtureOfBidders):
+            history = layer.mlp.get_wealth_history()
+            if history:
+                traces[str(idx)] = history
+    return traces
+
+
+def get_aggregated_wealth_trace() -> Dict[str, Any]:
+    """
+    Get aggregated wealth trace across all MoB layers.
+    
+    Returns averaged wealth per step across all layers for simpler visualization.
+    """
+    traces = get_mob_wealth_traces()
+    if not traces:
+        return {"steps": [], "expert_wealth": []}
+    
+    # Find max length and number of experts
+    all_histories = list(traces.values())
+    if not all_histories:
+        return {"steps": [], "expert_wealth": []}
+    
+    num_experts = len(all_histories[0][0]) if all_histories[0] else 0
+    max_steps = max(len(h) for h in all_histories)
+    
+    # Aggregate wealth across layers
+    aggregated = []
+    for step in range(max_steps):
+        step_wealth = [0.0] * num_experts
+        count = 0
+        for history in all_histories:
+            if step < len(history):
+                for e in range(num_experts):
+                    step_wealth[e] += history[step][e]
+                count += 1
+        if count > 0:
+            step_wealth = [w / count for w in step_wealth]
+        aggregated.append(step_wealth)
+    
+    return {
+        "steps": list(range(max_steps)),
+        "expert_wealth": aggregated,
+        "num_experts": num_experts,
+        "num_layers": len(traces)
+    }
+
+
 def initialize_tame_architecture():
     """
     Initialize the full TAME architecture:
@@ -345,6 +425,42 @@ def get_homeostasis_status():
     }
 
 
+@app.get("/traces/wealth")
+def get_wealth_traces():
+    """
+    Get VCG auction wealth traces for visualization.
+    
+    Returns aggregated wealth distribution over forward passes.
+    Good for analyzing: Is the auction forcing specialization?
+    (Inequality = good, equal wealth = not specializing)
+    """
+    return get_aggregated_wealth_trace()
+
+
+@app.get("/traces/steering")
+def get_steering_traces():
+    """
+    Get homeostatic steering traces for visualization.
+    
+    Returns alignment and steering strength (α_t) history.
+    Good for analyzing: Is steering adaptive?
+    (Should spike when model drifts from goal)
+    """
+    if homeostat is None:
+        return {"status": "disabled", "alignment_history": [], "strength_history": []}
+    
+    stats = homeostat.get_alignment_stats()
+    return {
+        "status": "active",
+        "alignment_history": stats.get("alignment_history", []),
+        "strength_history": stats.get("strength_history", []),
+        "target_alignment": STEERING_CONFIG.target_alignment,
+        "base_strength": STEERING_CONFIG.base_strength,
+        "mean_alignment": stats.get("mean_alignment"),
+        "mean_strength": stats.get("mean_strength"),
+    }
+
+
 @app.post("/generate", response_model=GenerateResponse)
 async def generate(req: GenerateRequest):
     """
@@ -454,6 +570,9 @@ async def generate_stream(req: GenerateRequest):
                     homeostat.config.base_strength = req.steering_strength
                     homeostat.config.adaptive = False
             
+            # Enable MoB wealth tracking for VCG auction visualization
+            start_mob_tracking()
+            
             # Tokenize
             messages = [{"role": "user", "content": req.prompt}]
             text = tokenizer.apply_chat_template(
@@ -537,6 +656,9 @@ async def generate_stream(req: GenerateRequest):
             # Wait for thread to complete
             thread.join(timeout=10)
             
+            # Stop MoB tracking
+            stop_mob_tracking()
+            
             # Send final stats
             final_stats = {
                 'type': 'complete',
@@ -546,18 +668,31 @@ async def generate_stream(req: GenerateRequest):
                 }
             }
             
-            # Add homeostasis stats
+            # Add homeostasis stats with traces
             if homeostat:
-                final_stats['homeostasis'] = homeostat.get_alignment_stats()
+                homeo_stats = homeostat.get_alignment_stats()
+                final_stats['homeostasis'] = {
+                    'mean_alignment': homeo_stats.get('mean_alignment'),
+                    'current_strength': homeo_stats.get('current_strength'),
+                    'mean_strength': homeo_stats.get('mean_strength'),
+                }
+                # Include full traces for visualization
+                final_stats['steering_trace'] = {
+                    'alignment_history': homeo_stats.get('alignment_history', []),
+                    'strength_history': homeo_stats.get('strength_history', []),
+                    'target_alignment': STEERING_CONFIG.target_alignment,
+                }
             
-            # Add MoB stats
+            # Add MoB stats with wealth trace
             if req.return_stats:
                 try:
                     swarm_status = get_swarm_status()
+                    wealth_trace = get_aggregated_wealth_trace()
                     final_stats['mob_stats'] = {
                         'expert_wealth': swarm_status.expert_wealth,
                         'expert_usage': swarm_status.expert_usage
                     }
+                    final_stats['wealth_trace'] = wealth_trace
                 except:
                     pass
             
@@ -566,6 +701,7 @@ async def generate_stream(req: GenerateRequest):
             
         except Exception as e:
             logger.error(f"Streaming error: {e}", exc_info=True)
+            stop_mob_tracking()  # Ensure tracking is stopped on error
             yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
     
     return StreamingResponse(

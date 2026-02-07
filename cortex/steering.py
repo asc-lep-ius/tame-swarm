@@ -237,6 +237,7 @@ class AdaptiveHomeostat:
     def __init__(self, config: SteeringConfig):
         self.config = config
         self.alignment_history: List[float] = []
+        self.strength_history: List[float] = []  # Track α_t over time
         
     def compute_strength(
         self,
@@ -274,11 +275,15 @@ class AdaptiveHomeostat:
         # Clamp to valid range
         strength = max(self.config.min_strength, min(self.config.max_strength, strength))
         
+        # Record strength for homeostatic trace visualization
+        self.strength_history.append(strength)
+        
         return strength
         
     def reset(self):
-        """Reset alignment history."""
+        """Reset alignment and strength history."""
         self.alignment_history = []
+        self.strength_history = []
 
 
 class SteeringHook:
@@ -440,18 +445,29 @@ class CognitiveHomeostat(nn.Module):
         logger.info("Detached all steering hooks")
         
     def get_alignment_stats(self) -> Dict[str, float]:
-        """Get statistics about current alignment."""
+        """Get statistics about current alignment and steering strength."""
         if not self.homeostat.alignment_history:
             return {}
             
         history = self.homeostat.alignment_history
-        return {
+        strength_history = self.homeostat.strength_history
+        
+        stats = {
             'current_alignment': history[-1] if history else 0.0,
             'mean_alignment': np.mean(history),
             'min_alignment': min(history),
             'max_alignment': max(history),
-            'current_strength': list(self.hooks.values())[0]._last_strength if self.hooks else self.config.base_strength
+            'current_strength': list(self.hooks.values())[0]._last_strength if self.hooks else self.config.base_strength,
+            'alignment_history': history.copy(),
+            'strength_history': strength_history.copy(),
         }
+        
+        if strength_history:
+            stats['mean_strength'] = np.mean(strength_history)
+            stats['max_strength'] = max(strength_history)
+            stats['min_strength'] = min(strength_history)
+        
+        return stats
         
     def reset(self):
         """Reset alignment history."""
