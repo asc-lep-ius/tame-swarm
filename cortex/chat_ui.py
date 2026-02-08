@@ -544,12 +544,23 @@ def create_ui():
                 )
                 
                 max_tokens = gr.Slider(
-                    minimum=10,
-                    maximum=512,
-                    value=200,
-                    step=10,
+                    minimum=32,
+                    maximum=4096,
+                    value=512,
+                    step=32,
                     label="Max Tokens"
                 )
+                
+                gr.Markdown("**Token Presets:**")
+                with gr.Row():
+                    preset_quick = gr.Button("Quick (128)", size="sm")
+                    preset_brief = gr.Button("Brief (256)", size="sm")
+                with gr.Row():
+                    preset_standard = gr.Button("Standard (512)", size="sm")
+                    preset_detailed = gr.Button("Detailed (1024)", size="sm")
+                with gr.Row():
+                    preset_extended = gr.Button("Extended (2048)", size="sm")
+                    preset_max = gr.Button("Max (4096)", size="sm")
                 
                 steering_strength = gr.Slider(
                     minimum=-0.1,
@@ -673,6 +684,14 @@ def create_ui():
         )
         
         clear_btn.click(clear_all, outputs=[chatbot, stats_display, wealth_plot, steering_plot])
+        
+        # Token preset button handlers
+        preset_quick.click(lambda: 128, outputs=max_tokens)
+        preset_brief.click(lambda: 256, outputs=max_tokens)
+        preset_standard.click(lambda: 512, outputs=max_tokens)
+        preset_detailed.click(lambda: 1024, outputs=max_tokens)
+        preset_extended.click(lambda: 2048, outputs=max_tokens)
+        preset_max.click(lambda: 4096, outputs=max_tokens)
         
         # Initialize with empty list for messages format
         demo.load(lambda: [], outputs=[chatbot])

@@ -496,15 +496,23 @@ class MixtureOfBidders(nn.Module):
             self._cached_payments = payments.detach() if payments is not None else None
             self._loss_feedback_pending = True
         
-        # 5. Apply local quality signal if loss feedback not available
-        # This provides a fallback specialization signal
-        if update_wealth and self.training:
-            if self.config.use_local_quality:
-                # Compute local quality from output stability
+        # 5. Apply local quality signal for wealth updates
+        # During inference (use_loss_feedback=False): local quality is the PRIMARY mechanism
+        # During training (use_loss_feedback=True): loss feedback is primary, skip here to avoid double-updates
+        if update_wealth and self.config.use_local_quality and not self.config.use_loss_feedback:
+            # Inference mode: use local quality as the wealth update signal
+            # This enables the "VCG Auction" chart to show dynamic expert competition!
+            self._update_wealth_local_quality(
+                selected_experts, routing_weights, confidences, payments, output
+            )
+        elif update_wealth and self.training:
+            # Training mode with loss feedback: handled by update_wealth_from_loss() separately
+            # Only run local quality here if loss feedback is disabled in training
+            if self.config.use_local_quality and not self.config.use_loss_feedback:
                 self._update_wealth_local_quality(
                     selected_experts, routing_weights, confidences, payments, output
                 )
-            else:
+            elif not self.config.use_local_quality:
                 # Fallback to participation-only updates (less effective)
                 self._update_wealth_participation(
                     selected_experts, routing_weights, confidences, payments
