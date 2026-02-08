@@ -382,37 +382,130 @@ class TAMETrainer:
         """
         Reload pretrained weights after materializing from meta device.
         
-        This is needed because to_empty() creates uninitialized tensors.
-        We reload the original model weights while preserving MoB/LoRA structure.
+        Uses memory-efficient streaming from safetensors files (<500MB RAM)
+        instead of loading the full model (~14GB RAM).
         """
-        logger.info("Reloading pretrained weights for base model components...")
+        logger.info("Reloading pretrained weights (streaming from safetensors)...")
+        
+        try:
+            from huggingface_hub import hf_hub_download, list_repo_files
+            from safetensors import safe_open
+            
+            # Get list of safetensor files in the model repo
+            repo_files = list_repo_files(self.config.model_id)
+            safetensor_files = [f for f in repo_files if f.endswith('.safetensors')]
+            
+            if not safetensor_files:
+                logger.warning("No safetensors files found, falling back to bin files")
+                self._reload_pretrained_weights_legacy()
+                return
+            
+            # Build mapping of current model keys (handling PEFT prefix)
+            current_state_dict = self.model.state_dict()
+            
+            # PEFT wraps keys with "base_model.model." prefix
+            # Build reverse mapping: original_key -> peft_key
+            key_mapping = {}
+            for peft_key in current_state_dict.keys():
+                # Strip PEFT prefixes to get original key
+                original_key = peft_key
+                for prefix in ["base_model.model.", "base_model."]:
+                    if original_key.startswith(prefix):
+                        original_key = original_key[len(prefix):]
+                        break
+                key_mapping[original_key] = peft_key
+            
+            copied = 0
+            skipped = 0
+            
+            # Stream each safetensor file and copy matching weights
+            for sf_file in safetensor_files:
+                try:
+                    # Download file (uses cache if already downloaded)
+                    local_path = hf_hub_download(
+                        repo_id=self.config.model_id,
+                        filename=sf_file,
+                    )
+                    
+                    # Open safetensors file for memory-mapped reading
+                    with safe_open(local_path, framework="pt", device="cpu") as f:
+                        for tensor_name in f.keys():
+                            # Find matching key in current model
+                            peft_key = key_mapping.get(tensor_name)
+                            
+                            if peft_key and peft_key in current_state_dict:
+                                src_tensor = f.get_tensor(tensor_name)
+                                dst_tensor = current_state_dict[peft_key]
+                                
+                                if src_tensor.shape == dst_tensor.shape:
+                                    # Copy directly to device
+                                    with torch.no_grad():
+                                        dst_tensor.copy_(src_tensor.to(self.device))
+                                    copied += 1
+                                else:
+                                    skipped += 1
+                            else:
+                                skipped += 1
+                                
+                except Exception as e:
+                    logger.warning(f"Error loading {sf_file}: {e}")
+                    continue
+            
+            logger.info(f"Reloaded {copied} pretrained weight tensors (skipped {skipped} non-matching)")
+            
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+        except ImportError as e:
+            logger.warning(f"Missing dependency for streaming: {e}")
+            logger.warning("Install with: pip install safetensors huggingface_hub")
+            self._reload_pretrained_weights_legacy()
+        except Exception as e:
+            logger.warning(f"Streaming reload failed: {e}")
+            self._reload_pretrained_weights_legacy()
+    
+    def _reload_pretrained_weights_legacy(self):
+        """
+        Legacy fallback: reload weights by loading full model.
+        Warning: Uses ~14GB RAM for 7B models.
+        """
+        logger.warning("Using legacy weight reload (high RAM usage)")
         
         try:
             from transformers import AutoModelForCausalLM
             
-            # Load a fresh copy of weights (on CPU to save VRAM)
+            # Load a fresh copy of weights (on CPU)
             fresh_model = AutoModelForCausalLM.from_pretrained(
                 self.config.model_id,
                 torch_dtype=self.dtype,
                 device_map="cpu",
                 trust_remote_code=True,
+                low_cpu_mem_usage=True,  # At least try to reduce peak
             )
             fresh_state_dict = fresh_model.state_dict()
-            
-            # Get current model's state dict
             current_state_dict = self.model.state_dict()
             
-            # Copy weights that exist in both (original transformer layers)
+            # Build key mapping for PEFT
+            key_mapping = {}
+            for peft_key in current_state_dict.keys():
+                original_key = peft_key
+                for prefix in ["base_model.model.", "base_model."]:
+                    if original_key.startswith(prefix):
+                        original_key = original_key[len(prefix):]
+                        break
+                key_mapping[original_key] = peft_key
+            
             copied = 0
-            for name, param in fresh_state_dict.items():
-                if name in current_state_dict:
-                    if current_state_dict[name].shape == param.shape:
-                        current_state_dict[name].copy_(param.to(self.device))
+            for original_key, param in fresh_state_dict.items():
+                peft_key = key_mapping.get(original_key)
+                if peft_key and peft_key in current_state_dict:
+                    if current_state_dict[peft_key].shape == param.shape:
+                        with torch.no_grad():
+                            current_state_dict[peft_key].copy_(param.to(self.device))
                         copied += 1
             
             logger.info(f"Reloaded {copied} pretrained weight tensors")
             
-            # Clean up fresh model
             del fresh_model
             del fresh_state_dict
             if torch.cuda.is_available():
