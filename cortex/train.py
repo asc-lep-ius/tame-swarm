@@ -131,6 +131,8 @@ class TrainingConfig:
     # Hardware
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     dtype: str = "bfloat16"  # bfloat16, float16, or float32
+    # Gradient checkpointing saves memory but requires deterministic forward pass
+    # MoB layer now uses dense computation for checkpointing compatibility
     gradient_checkpointing: bool = True
     
     # Checkpointing

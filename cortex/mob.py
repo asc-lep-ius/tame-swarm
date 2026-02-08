@@ -393,48 +393,96 @@ class MixtureOfBidders(nn.Module):
         )
         
         # 3. Process tokens through selected experts
-        # This is the sparse computation - only top_k experts run per token
+        # Two modes:
+        # - TRAINING: Dense computation (all tokens through all experts, then mask)
+        #   Required for gradient checkpointing compatibility
+        # - INFERENCE: Sparse computation (only selected tokens through expert)
+        #   Much faster as we skip non-selected expert computations
+        
         output = torch.zeros_like(hidden_states)
         
-        for k in range(self.config.top_k):
-            expert_indices = selected_experts[:, :, k]  # (batch, seq_len)
-            weights = routing_weights[:, :, k:k+1]  # (batch, seq_len, 1)
+        if self.training:
+            # ========== TRAINING MODE: Dense computation ==========
+            # Process all tokens through each expert, mask by routing
+            # This ensures fixed tensor shapes for gradient checkpointing
+            flat_hidden = hidden_states.view(-1, hidden_dim)  # (batch * seq, hidden)
+            flat_output = output.view(-1, hidden_dim)
             
-            # Process through each expert (vectorized per expert)
-            for expert_idx in range(self.config.num_experts):
-                # Create mask for tokens assigned to this expert
-                mask = (expert_indices == expert_idx)
-                if not mask.any():
-                    continue
+            for k in range(self.config.top_k):
+                expert_indices = selected_experts[:, :, k]  # (batch, seq_len)
+                weights = routing_weights[:, :, k]  # (batch, seq_len)
+                flat_expert_indices = expert_indices.view(-1)  # (batch * seq,)
+                flat_weights = weights.view(-1)  # (batch * seq,)
+                
+                for expert_idx in range(self.config.num_experts):
+                    expert_mask = (flat_expert_indices == expert_idx).float()
                     
-                # Get tokens for this expert
-                expert_input = hidden_states[mask]  # (num_tokens, hidden_dim)
+                    if expert_mask.sum() == 0:
+                        # Maintain computation graph for unused experts
+                        if self.use_shared_base:
+                            dummy = self.experts[expert_idx](
+                                flat_hidden[:1], self.base_gate_proj,
+                                self.base_up_proj, self.base_down_proj
+                            )
+                        else:
+                            dummy = self.experts[expert_idx](flat_hidden[:1])
+                        flat_output = flat_output + 0.0 * dummy[:1].sum() * expert_mask[:1].unsqueeze(-1)
+                        continue
+                    
+                    # Dense: process ALL tokens
+                    if self.use_shared_base:
+                        all_expert_output = self.experts[expert_idx](
+                            flat_hidden, self.base_gate_proj,
+                            self.base_up_proj, self.base_down_proj
+                        )
+                    else:
+                        all_expert_output = self.experts[expert_idx](flat_hidden)
+                    
+                    combined_weight = expert_mask * flat_weights
+                    weighted_output = all_expert_output * combined_weight.unsqueeze(-1)
+                    flat_output = flat_output + weighted_output
+                    
+                    if update_wealth:
+                        self.expert_usage_count[expert_idx] += expert_mask.sum()
+            
+            output = flat_output.view(batch_size, seq_len, hidden_dim)
+        
+        else:
+            # ========== INFERENCE MODE: Sparse computation ==========
+            # Only process selected tokens through their assigned experts
+            # Much faster: O(top_k * tokens) vs O(num_experts * tokens)
+            for k in range(self.config.top_k):
+                expert_indices = selected_experts[:, :, k]  # (batch, seq_len)
+                weights = routing_weights[:, :, k:k+1]  # (batch, seq_len, 1)
                 
-                # Different forward path for shared base vs full experts
-                if self.use_shared_base:
-                    expert_output = self.experts[expert_idx](
-                        expert_input,
-                        self.base_gate_proj,
-                        self.base_up_proj,
-                        self.base_down_proj
-                    )
-                else:
-                    expert_output = self.experts[expert_idx](expert_input)
-                
-                # Weight by routing weight and add to output
-                weight_vals = weights.squeeze(-1)[mask]  # (num_tokens,)
-                weighted_expert_output = expert_output * weight_vals.unsqueeze(-1)
-                
-                # Use index_add_ instead of boolean masked in-place addition
-                # This avoids CUDA errors with boolean indexing
-                mask_indices = mask.nonzero(as_tuple=False)  # (num_tokens, 2)
-                flat_indices = mask_indices[:, 0] * seq_len + mask_indices[:, 1]
-                output_flat = output.view(-1, hidden_dim)
-                output_flat.index_add_(0, flat_indices, weighted_expert_output)
-                
-                # Update usage count
-                if update_wealth:
-                    self.expert_usage_count[expert_idx] += mask.sum().float()
+                for expert_idx in range(self.config.num_experts):
+                    mask = (expert_indices == expert_idx)
+                    if not mask.any():
+                        continue
+                    
+                    # Sparse: only selected tokens
+                    expert_input = hidden_states[mask]  # (num_tokens, hidden_dim)
+                    
+                    if self.use_shared_base:
+                        expert_output = self.experts[expert_idx](
+                            expert_input, self.base_gate_proj,
+                            self.base_up_proj, self.base_down_proj
+                        )
+                    else:
+                        expert_output = self.experts[expert_idx](expert_input)
+                    
+                    # Weight and scatter back
+                    weight_vals = weights.squeeze(-1)[mask]
+                    weighted_expert_output = expert_output * weight_vals.unsqueeze(-1)
+                    
+                    # Use index_add_ for safe in-place update
+                    mask_indices = mask.nonzero(as_tuple=False)
+                    flat_indices = mask_indices[:, 0] * seq_len + mask_indices[:, 1]
+                    output_flat = output.view(-1, hidden_dim)
+                    output_flat.index_add_(0, flat_indices, weighted_expert_output)
+                    
+                    if update_wealth:
+                        self.expert_usage_count[expert_idx] += mask.sum().float()
         
         # 4. Cache routing information for loss feedback
         # This enables update_wealth_from_loss() to be called after loss computation
