@@ -407,6 +407,7 @@ class MixtureOfBidders(nn.Module):
             # This ensures fixed tensor shapes for gradient checkpointing
             flat_hidden = hidden_states.view(-1, hidden_dim)  # (batch * seq, hidden)
             flat_output = output.view(-1, hidden_dim)
+            dtype = hidden_states.dtype  # Preserve model dtype (e.g., bfloat16)
             
             for k in range(self.config.top_k):
                 expert_indices = selected_experts[:, :, k]  # (batch, seq_len)
@@ -415,7 +416,7 @@ class MixtureOfBidders(nn.Module):
                 flat_weights = weights.view(-1)  # (batch * seq,)
                 
                 for expert_idx in range(self.config.num_experts):
-                    expert_mask = (flat_expert_indices == expert_idx).float()
+                    expert_mask = (flat_expert_indices == expert_idx).to(dtype)  # Match model dtype
                     
                     if expert_mask.sum() == 0:
                         # Maintain computation graph for unused experts
