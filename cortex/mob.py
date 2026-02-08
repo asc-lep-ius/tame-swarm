@@ -47,6 +47,11 @@ class MoBConfig:
     use_differentiable_routing: bool = True  # Straight-through estimator for confidence head gradients
     confidence_calibration_weight: float = 0.1  # Auxiliary loss weight for confidence calibration
     loss_ema_decay: float = 0.95  # EMA decay for baseline loss tracking
+    # Inference mode settings (only apply when use_loss_feedback=False)
+    # These create more dynamic wealth changes during user interaction
+    inference_wealth_decay: float = 0.99  # Faster decay during inference (vs 0.999 training)
+    inference_exploration_bonus: float = 0.02  # Bonus for underused experts (keeps competition alive)
+    inference_wealth_compression: float = 0.5  # Compress wealth toward mean on load (0=none, 1=full)
 
 
 class ConfidenceHead(nn.Module):
@@ -731,13 +736,21 @@ class MixtureOfBidders(nn.Module):
         - Experts with high variance in output norms are penalized
         
         This is less effective than loss feedback but works standalone.
+        
+        In inference mode (use_loss_feedback=False):
+        - Uses faster wealth_decay for more responsive dynamics
+        - Adds exploration bonus for underused experts to maintain competition
         """
         with torch.no_grad():
             batch_size, seq_len, hidden_dim = output.shape
             num_tokens = batch_size * seq_len
             
-            # 1. Mild decay
-            self.expert_wealth *= self.config.wealth_decay
+            # Determine if we're in inference mode
+            is_inference = not self.config.use_loss_feedback
+            
+            # 1. Decay: faster in inference mode for more dynamic wealth changes
+            decay_rate = self.config.inference_wealth_decay if is_inference else self.config.wealth_decay
+            self.expert_wealth *= decay_rate
             
             # 2. Compute output quality per expert
             expert_rewards = torch.zeros_like(self.expert_wealth)
@@ -794,7 +807,20 @@ class MixtureOfBidders(nn.Module):
                             payment_cost = mean_payment * 0.1 / (self.expert_wealth[expert_idx] + 1e-6)
                             expert_rewards[expert_idx] *= (1.0 - payment_cost.clamp(0, 0.5))
             
-            # 5. Apply rewards
+            # 5. Exploration bonus for underused experts (inference mode only)
+            # This prevents monopoly and keeps bidding competitive
+            if is_inference and self.config.inference_exploration_bonus > 0:
+                mean_usage = self.expert_usage_count.mean()
+                if mean_usage > 0:
+                    # Experts below average usage get a bonus proportional to how underused they are
+                    usage_ratio = self.expert_usage_count / (mean_usage + 1e-6)
+                    # Underused experts (ratio < 1) get bonus, overused get nothing
+                    exploration_bonus = (1.0 - usage_ratio).clamp(min=0) * self.config.inference_exploration_bonus
+                    # Scale by current wealth to make it meaningful but not overwhelming
+                    exploration_bonus = exploration_bonus * self.expert_wealth.mean()
+                    expert_rewards += exploration_bonus
+            
+            # 6. Apply rewards
             self.expert_wealth += expert_rewards
             self.expert_wealth.clamp_(min=self.config.min_wealth, max=self.config.max_wealth)
     
@@ -1253,7 +1279,8 @@ def get_mob_statistics(model: nn.Module) -> Dict[str, torch.Tensor]:
 def load_mob_state(
     model: nn.Module, 
     state_path: str,
-    strict: bool = False
+    strict: bool = False,
+    compress_wealth: float = 0.0
 ) -> int:
     """
     Load trained MoB state (wealth, performance EMA) into a model.
@@ -1265,6 +1292,11 @@ def load_mob_state(
         model: Model containing MoB layers
         state_path: Path to mob_state.pt file
         strict: If True, raise error on config mismatch
+        compress_wealth: Compression factor for inference mode (0.0-1.0).
+            0.0 = no compression (keep trained wealth as-is)
+            1.0 = full compression (all experts start at mean wealth)
+            0.5 = partial compression (move 50% toward mean)
+            This reduces initial wealth inequality to make inference more dynamic.
         
     Returns:
         Number of layers successfully loaded
@@ -1275,7 +1307,8 @@ def load_mob_state(
     Example:
         # In main.py after apply_mob_to_model():
         from mob import load_mob_state
-        loaded = load_mob_state(model, "./tame_inference/mob_state.pt")
+        # For inference: compress wealth for more dynamic bidding
+        loaded = load_mob_state(model, "./tame_inference/mob_state.pt", compress_wealth=0.5)
         print(f"Loaded MoB state for {loaded} layers")
     """
     import logging
@@ -1369,6 +1402,33 @@ def load_mob_state(
     
     if loaded > 0:
         logger.info(f"✓ Loaded MoB state for {loaded}/{len(mob_layers)} layers from {state_path}")
+        
+        # Apply wealth compression for inference mode
+        # This reduces initial inequality to make wealth dynamics more visible
+        if compress_wealth > 0:
+            compress_wealth = min(1.0, max(0.0, compress_wealth))  # Clamp to [0, 1]
+            logger.info(f"[INFERENCE] Applying wealth compression factor: {compress_wealth:.2f}")
+            
+            for mob in mob_layers:
+                mean_wealth = mob.expert_wealth.mean()
+                # Compress: move each expert's wealth toward the mean
+                # new_wealth = wealth * (1 - compress) + mean * compress
+                mob.expert_wealth.copy_(
+                    mob.expert_wealth * (1.0 - compress_wealth) + mean_wealth * compress_wealth
+                )
+            
+            # Log the result
+            if mob_layers:
+                sample_wealth = mob_layers[0].expert_wealth
+                logger.info(f"[INFERENCE] Post-compression wealth (layer 0): "
+                           f"min={sample_wealth.min():.1f}, max={sample_wealth.max():.1f}, "
+                           f"mean={sample_wealth.mean():.1f}")
+            
+            # Also reset usage counts to give underused experts a fair chance
+            for mob in mob_layers:
+                mob.expert_usage_count.zero_()
+            logger.info("[INFERENCE] Reset usage counts for fair exploration bonus")
+    
     if skipped > 0:
         logger.warning(f"Skipped {skipped} layers due to missing/mismatched state")
     

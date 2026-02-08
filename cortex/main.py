@@ -132,6 +132,10 @@ MOB_CONFIG = MoBConfig(
     use_loss_feedback=False,  # Disabled for inference (no training loop)
     use_local_quality=True,   # Use output quality signals for wealth updates
     use_differentiable_routing=False,  # Not needed for inference
+    # Inference dynamics: more responsive wealth changes for visible VCG auction
+    inference_wealth_decay=0.99,         # Faster decay (vs 0.999 training) - 1% per token
+    inference_exploration_bonus=0.02,    # 2% bonus for underused experts
+    inference_wealth_compression=0.5,    # Compress 50% toward mean on load
 )
 
 # Steering Configuration (Module 2: Cognitive Homeostasis)
@@ -315,17 +319,20 @@ def initialize_tame_architecture():
     
     # Phase 2b: Load trained MoB state if available
     # This restores expert specialization from training (wealth, performance EMA)
+    # We use compress_wealth to reduce inequality for more dynamic inference
     mob_state_paths = [
         "./tame_inference/mob_state.pt",  # Exported from training
         "./mob_state.pt",                  # Local file
     ]
     
     from mob import load_mob_state
+    # Use the inference_wealth_compression setting from config
+    compression = MOB_CONFIG.inference_wealth_compression
     for state_path in mob_state_paths:
         import os
         if os.path.exists(state_path):
             try:
-                loaded = load_mob_state(model, state_path)
+                loaded = load_mob_state(model, state_path, compress_wealth=compression)
                 if loaded > 0:
                     logger.info(f"[MORPHOGENESIS] Restored trained expert specialization from {state_path}")
                 break
