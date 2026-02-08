@@ -31,9 +31,12 @@ class MoBConfig:
     hidden_dim: int = 4096  # Model hidden dimension
     intermediate_dim: int = 14336  # FFN intermediate dimension (Mistral default)
     initial_wealth: float = 100.0  # Starting credits for each expert
-    wealth_decay: float = 0.99  # Wealth decay per step (prevents runaway accumulation)
-    min_wealth: float = 1.0  # Minimum wealth (prevents bankruptcy death spiral)
-    jitter_std: float = 0.01  # Gaussian noise for symmetry breaking
+    wealth_decay: float = 0.999  # Wealth decay per step (reduced from 0.99 - was too aggressive)
+    min_wealth: float = 10.0  # Minimum wealth (raised to prevent death spiral)
+    max_wealth: float = 500.0  # Maximum wealth (prevents runaway monopoly)
+    jitter_std: float = 0.05  # Gaussian noise for symmetry breaking (increased for differentiation)
+    reward_scale: float = 1.0  # Base reward multiplier
+    use_vcg_payments: bool = True  # Whether winners pay (wealth transfer mechanism)
     # Memory-efficient options
     use_shared_base: bool = True  # Use shared base + adapters instead of full copies
     adapter_rank: int = 64  # Rank of LoRA-style adapters when use_shared_base=True
@@ -48,12 +51,18 @@ class ConfidenceHead(nn.Module):
     Maps: hidden_dim -> 1 (scalar confidence score)
     """
     
-    def __init__(self, hidden_dim: int):
+    def __init__(self, hidden_dim: int, expert_id: int = 0, num_experts: int = 8):
         super().__init__()
         self.proj = nn.Linear(hidden_dim, 1, bias=True)
-        # Initialize to produce moderate confidence initially
+        self.expert_id = expert_id
+        
+        # Initialize with variation between experts to break symmetry
+        # Different experts start with different "preferences"
         nn.init.xavier_uniform_(self.proj.weight, gain=0.1)
-        nn.init.zeros_(self.proj.bias)
+        # Bias varies per expert to create initial confidence differences
+        # This is crucial for breaking the uniform equilibrium
+        bias_offset = (expert_id - num_experts / 2) * 0.1
+        nn.init.constant_(self.proj.bias, bias_offset)
         
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -268,10 +277,10 @@ class MixtureOfBidders(nn.Module):
                 for _ in range(config.num_experts)
             ])
         
-        # Confidence head for each expert
+        # Confidence head for each expert (with unique initialization for symmetry breaking)
         self.confidence_heads = nn.ModuleList([
-            ConfidenceHead(config.hidden_dim)
-            for _ in range(config.num_experts)
+            ConfidenceHead(config.hidden_dim, expert_id=i, num_experts=config.num_experts)
+            for i in range(config.num_experts)
         ])
         
         # The auctioneer
@@ -376,7 +385,7 @@ class MixtureOfBidders(nn.Module):
         # 4. Update wealth based on performance (simplified reward)
         # In full implementation, this would use actual loss reduction
         if update_wealth and self.training:
-            self._update_wealth(selected_experts, routing_weights, confidences)
+            self._update_wealth(selected_experts, routing_weights, confidences, payments)
         
         # Store statistics for monitoring (accessible via self.last_stats)
         self.last_stats = {
@@ -397,35 +406,79 @@ class MixtureOfBidders(nn.Module):
         self,
         selected_experts: torch.Tensor,
         routing_weights: torch.Tensor,
-        confidences: torch.Tensor
+        confidences: torch.Tensor,
+        payments: Optional[torch.Tensor] = None
     ):
         """
-        Update expert wealth based on their participation.
+        Update expert wealth based on their participation and performance.
         
-        In the full TAME architecture, this would incorporate:
-        - Actual loss reduction from each expert
-        - Long-term performance tracking
-        - Penalties for overconfidence
+        Economics redesigned for proper differentiation:
+        1. Decay is mild (0.999) - experts don't bleed out
+        2. Rewards are scaled to match or exceed decay for active experts
+        3. VCG payments create wealth transfer (not just accumulation)
+        4. Competitive rewards: better confidence relative to peers = more reward
         
-        For the prototype, we use a simplified reward:
-        - Experts gain wealth proportional to their confidence when selected
-        - All experts decay slightly to prevent runaway accumulation
+        The goal: Active, confident experts should grow wealth while
+        inactive or low-confidence experts slowly decay, creating specialization.
         """
         with torch.no_grad():
-            # Decay all wealth
+            batch_size, seq_len, _ = confidences.shape
+            num_tokens = batch_size * seq_len
+            
+            # 1. Mild decay to all experts (prevents permanent monopolies)
+            wealth_before_decay = self.expert_wealth.clone()
             self.expert_wealth *= self.config.wealth_decay
             
-            # Reward selected experts based on their confidence
+            # 2. Calculate participation-based rewards
+            # Key insight: rewards must be competitive, not absolute
+            # An expert that gets selected more AND has higher confidence earns more
+            
+            expert_rewards = torch.zeros_like(self.expert_wealth)
+            expert_selections = torch.zeros_like(self.expert_wealth)
+            
             for k in range(self.config.top_k):
                 for expert_idx in range(self.config.num_experts):
                     mask = (selected_experts[:, :, k] == expert_idx)
                     if mask.any():
-                        # Reward proportional to confidence when selected
-                        reward = confidences[:, :, expert_idx][mask].mean()
-                        self.expert_wealth[expert_idx] += reward * 0.1
+                        # Count selections
+                        selection_count = mask.sum().float()
+                        expert_selections[expert_idx] += selection_count
+                        
+                        # Reward = selection_fraction * mean_confidence * routing_weight
+                        # This creates differentiation: confident experts on important tokens win more
+                        selection_fraction = selection_count / num_tokens
+                        mean_confidence = confidences[:, :, expert_idx][mask].mean()
+                        mean_weight = routing_weights[:, :, k][mask].mean()
+                        
+                        # Scale reward to match potential decay
+                        # At equilibrium: reward ≈ decay for moderately active experts
+                        base_reward = selection_fraction * mean_confidence * mean_weight
+                        expert_rewards[expert_idx] += base_reward * self.config.reward_scale * 10.0
             
-            # Clamp to minimum wealth
-            self.expert_wealth.clamp_(min=self.config.min_wealth)
+            # 3. Competitive bonus: experts above average confidence get extra
+            mean_reward = expert_rewards.mean()
+            if mean_reward > 0:
+                competitive_bonus = (expert_rewards - mean_reward) * 0.5
+                expert_rewards += competitive_bonus.clamp(min=0)  # Only reward over-performers
+            
+            # 4. Apply VCG payments if enabled (wealth transfer mechanism)
+            if self.config.use_vcg_payments and payments is not None:
+                # Winners "pay" by losing some wealth proportional to their payment
+                # This prevents unchecked accumulation and creates circulation
+                for k in range(self.config.top_k):
+                    for expert_idx in range(self.config.num_experts):
+                        mask = (selected_experts[:, :, k] == expert_idx)
+                        if mask.any():
+                            mean_payment = payments[:, :, k][mask].mean()
+                            # Payment is a percentage of potential reward (creates cost for winning)
+                            payment_cost = mean_payment * 0.1 / (self.expert_wealth[expert_idx] + 1e-6)
+                            expert_rewards[expert_idx] *= (1.0 - payment_cost.clamp(0, 0.5))
+            
+            # 5. Apply rewards
+            self.expert_wealth += expert_rewards
+            
+            # 6. Clamp to valid range
+            self.expert_wealth.clamp_(min=self.config.min_wealth, max=self.config.max_wealth)
     
     def start_tracking(self):
         """Enable wealth history tracking for VCG auction analysis."""
