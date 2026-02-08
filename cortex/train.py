@@ -90,29 +90,64 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# =============================================================================
+# MODEL PROFILES - Change ACTIVE_MODEL to switch between models
+# =============================================================================
+# Keep synchronized with main.py!
+
+MODEL_PROFILES = {
+    "gemma-2-2b": {
+        "model_id": "google/gemma-2-2b-it",
+        "hidden_dim": 2304,
+        "intermediate_dim": 9216,
+        "num_layers": 26,
+        "mob_layers_start": 5,
+        "mob_layers_end": 18,
+    },
+    "llama-3.2-3b": {
+        "model_id": "meta-llama/Llama-3.2-3B-Instruct",
+        "hidden_dim": 3072,
+        "intermediate_dim": 8192,
+        "num_layers": 28,
+        "mob_layers_start": 6,
+        "mob_layers_end": 20,
+    },
+    "mistral-7b": {
+        "model_id": "mistralai/Mistral-7B-Instruct-v0.2",
+        "hidden_dim": 4096,
+        "intermediate_dim": 14336,
+        "num_layers": 32,
+        "mob_layers_start": 8,
+        "mob_layers_end": 24,
+    },
+}
+
+# =============================================================================
+# >>> CHANGE THIS TO SWITCH MODELS <<<
+# =============================================================================
+ACTIVE_MODEL = "gemma-2-2b"  # Options: "gemma-2-2b", "llama-3.2-3b", "mistral-7b"
+# =============================================================================
+
+_profile = MODEL_PROFILES[ACTIVE_MODEL]
+
+
 @dataclass
 class TrainingConfig:
     """
     Configuration for TAME training.
     
-    IMPORTANT: Keep MoB settings synchronized with main.py MOB_CONFIG!
-    If num_experts, top_k, or layer range differs between training and inference,
-    the trained mob_state.pt will not load correctly.
-    
-    Current defaults match main.py:
-      - num_experts=4, top_k=2
-      - layers 8-23 (mob_layers_start=8, mob_layers_end=24)
-      - adapter_rank=64
+    IMPORTANT: Keep ACTIVE_MODEL synchronized with main.py!
+    Defaults are auto-configured from the active model profile.
     """
-    # Model
-    model_id: str = "mistralai/Mistral-7B-Instruct-v0.2"
+    # Model (auto-configured from ACTIVE_MODEL)
+    model_id: str = _profile["model_id"]
     output_dir: str = "./tame_checkpoints"
     
-    # MoB settings
+    # MoB settings (auto-configured from ACTIVE_MODEL)
     num_experts: int = 4
     top_k: int = 2
-    mob_layers_start: int = 8  # First layer to apply MoB
-    mob_layers_end: int = 24   # Last layer to apply MoB (exclusive)
+    mob_layers_start: int = _profile["mob_layers_start"]
+    mob_layers_end: int = _profile["mob_layers_end"]
     adapter_rank: int = 64
     
     # Training hyperparameters
@@ -893,20 +928,20 @@ def main():
     """Main entry point."""
     parser = argparse.ArgumentParser(description="Train TAME architecture")
     
-    # Model arguments
-    parser.add_argument("--model_id", type=str, default="mistralai/Mistral-7B-Instruct-v0.2",
+    # Model arguments (defaults from ACTIVE_MODEL profile)
+    parser.add_argument("--model_id", type=str, default=_profile["model_id"],
                        help="HuggingFace model ID")
     parser.add_argument("--output_dir", type=str, default="./tame_checkpoints",
                        help="Output directory for checkpoints")
     
-    # MoB arguments
+    # MoB arguments (defaults from ACTIVE_MODEL profile)
     parser.add_argument("--num_experts", type=int, default=4,
                        help="Number of experts per MoB layer")
     parser.add_argument("--top_k", type=int, default=2,
                        help="Top-k experts to route to")
-    parser.add_argument("--mob_layers_start", type=int, default=8,
+    parser.add_argument("--mob_layers_start", type=int, default=_profile["mob_layers_start"],
                        help="First layer to apply MoB")
-    parser.add_argument("--mob_layers_end", type=int, default=24,
+    parser.add_argument("--mob_layers_end", type=int, default=_profile["mob_layers_end"],
                        help="Last layer to apply MoB (exclusive)")
     
     # Training arguments

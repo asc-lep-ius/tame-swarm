@@ -31,63 +31,92 @@ from steering import (
     SteeringVector
 )
 
-# --- CONFIGURATION ---
-# Using Mistral-7B-Instruct - well-supported and efficient
-MODEL_ID = "mistralai/Mistral-7B-Instruct-v0.2"
+# =============================================================================
+# MODEL PROFILES - Change ACTIVE_MODEL to switch between models
+# =============================================================================
+# 
+# To switch models, change ACTIVE_MODEL below. All dimensions and layer ranges
+# are automatically configured. Keep synchronized with train.py!
+#
+# Available profiles:
+# ┌───────────────┬─────────┬──────────────┬────────────┬───────────────────────────┐
+# │ Profile       │ Params  │ Train Speed  │ Quality    │ Access                    │
+# ├───────────────┼─────────┼──────────────┼────────────┼───────────────────────────┤
+# │ gemma-2-2b ✓  │ 2B      │ ~3.5x faster │ Medium     │ Open (no approval needed) │
+# │ llama-3.2-3b  │ 3B      │ ~2.5x faster │ Good       │ Requires Meta approval    │
+# │ mistral-7b    │ 7B      │ 1x (baseline)│ Best       │ Open                      │
+# └───────────────┴─────────┴──────────────┴────────────┴───────────────────────────┘
+
+MODEL_PROFILES = {
+    "gemma-2-2b": {
+        "model_id": "google/gemma-2-2b-it",
+        "hidden_dim": 2304,
+        "intermediate_dim": 9216,
+        "num_layers": 26,
+        "mob_layers_start": 5,   # Skip early syntax layers
+        "mob_layers_end": 18,    # Skip late output layers
+    },
+    "llama-3.2-3b": {
+        "model_id": "meta-llama/Llama-3.2-3B-Instruct",
+        "hidden_dim": 3072,
+        "intermediate_dim": 8192,
+        "num_layers": 28,
+        "mob_layers_start": 6,
+        "mob_layers_end": 20,
+    },
+    "mistral-7b": {
+        "model_id": "mistralai/Mistral-7B-Instruct-v0.2",
+        "hidden_dim": 4096,
+        "intermediate_dim": 14336,
+        "num_layers": 32,
+        "mob_layers_start": 8,
+        "mob_layers_end": 24,
+    },
+}
+
+# =============================================================================
+# >>> CHANGE THIS TO SWITCH MODELS <<<
+# =============================================================================
+ACTIVE_MODEL = "gemma-2-2b"  # Options: "gemma-2-2b", "llama-3.2-3b", "mistral-7b"
+# =============================================================================
+
+# Get active profile
+_profile = MODEL_PROFILES[ACTIVE_MODEL]
+MODEL_ID = _profile["model_id"]
 
 # =============================================================================
 # MoB Configuration (Module 1: Agential Swarm)
 # =============================================================================
 # 
-# IMPORTANT: Keep these settings synchronized with train.py TrainingConfig!
-# If you train with different num_experts/top_k/layers, the mob_state.pt
-# will not load correctly. The load_mob_state() function will warn on mismatch.
+# IMPORTANT: Keep ACTIVE_MODEL synchronized with train.py!
+# If you train with different model, the mob_state.pt will not load correctly.
 #
-# MEMORY-PERFORMANCE TRADEOFFS FOR MIXTURE OF BIDDERS
-# 
-# This configuration uses "Balanced" profile optimized for 16GB GPU:
-#   - 4 experts × 16 layers × rank 64 ≈ 14.5GB total
-#   - ~1.5GB headroom for activations during inference
+# TUNING GUIDE (applies to all models):
+# ┌───────────────┬─────────────────────────────────────┬───────────────────────────┐
+# │ Parameter     │ What it controls                    │ Tuning advice             │
+# ├───────────────┼─────────────────────────────────────┼───────────────────────────┤
+# │ num_experts   │ Specialization diversity            │ 4-8 optimal, >8 diminishes│
+# │ top_k         │ Experts per token (sparsity)        │ 2 is sweet spot           │
+# │ adapter_rank  │ Expert expressiveness (LoRA rank)   │ 32-64 sufficient          │
+# │ wealth_decay  │ How fast losers decay               │ 0.999=slow, 0.99=fast     │
+# │ min_wealth    │ Floor prevents expert death         │ 10.0 safe default         │
+# │ max_wealth    │ Cap prevents monopoly               │ 500.0 balanced            │
+# │ jitter_std    │ Symmetry breaking noise             │ 0.05 for differentiation  │
+# └───────────────┴─────────────────────────────────────┴───────────────────────────┘
 #
-# Parameter Impact Analysis:
-# ┌───────────────┬─────────────────────────────┬─────────────────┬───────────────────┐
-# │ Parameter     │ Impact on Performance       │ Memory Cost     │ Diminishing Returns│
-# ├───────────────┼─────────────────────────────┼─────────────────┼───────────────────┤
-# │ Experts       │ More specialization diversity│ ~7MB/expert/layer│ After 4-8 experts │
-# │ Layers        │ Depth of reasoning coverage │ ~28MB/layer     │ Early/late layers │
-# │ Adapter Rank  │ Expert expressiveness       │ ~0.1MB/rank/exp │ After rank 64-128 │
-# └───────────────┴─────────────────────────────┴─────────────────┴───────────────────┘
+# LAYER SELECTION (auto-configured per model):
+#   - Early layers (0-20%):  Tokenization, syntax → DON'T MODIFY
+#   - Middle layers (20-70%): Reasoning, knowledge → PRIORITY ZONE ✓
+#   - Late layers (70-100%): Output format → DON'T MODIFY
 #
-# Expert Count Rationale:
-#   - 4 experts with top_k=2 captures 80-90% benefit of 8 experts
-#   - VCG auction needs ≥3 experts for meaningful competition
-#   - (winner + runner-up + losers creates proper incentive dynamics)
-#
-# Layer Selection Rationale (Mistral-7B has 32 layers):
-#   - Layers 0-7:   Syntax, tokenization, basic features → DON'T MODIFY
-#   - Layers 8-23:  Abstract reasoning, knowledge retrieval → PRIORITY ZONE ✓
-#   - Layers 24-31: Output formatting, generation → DON'T MODIFY
-#
-# Adapter Rank Rationale:
-#   - LoRA research shows rank 64 captures most adaptation capacity
-#   - Rank 128+ is overkill for most tasks with minimal quality gain
-#
-# Alternative Profiles (adjust based on available GPU memory):
-# ┌──────────────┬─────────┬────────┬──────┬─────────┬─────────────┐
-# │ Profile      │ Experts │ Layers │ Rank │ Memory  │ Performance │
-# ├──────────────┼─────────┼────────┼──────┼─────────┼─────────────┤
-# │ Conservative │ 4       │ 12     │ 64   │ ~14.3GB │ Good        │
-# │ Balanced ✓   │ 4       │ 16     │ 64   │ ~14.5GB │ Better      │
-# │ Aggressive   │ 6       │ 20     │ 64   │ ~14.9GB │ Best        │
-# │ Max Headroom │ 4       │ 20     │ 32   │ ~14.3GB │ Good+       │
-# └──────────────┴─────────┴────────┴──────┴─────────┴─────────────┘
+# Memory estimate: ~3MB per expert per layer at rank 64
 #
 # =============================================================================
 MOB_CONFIG = MoBConfig(
     num_experts=4,          # 4 experts: minimum for meaningful VCG auction dynamics
     top_k=2,                # 2 experts per token (sparse routing)
-    hidden_dim=4096,        # Mistral hidden dimension
-    intermediate_dim=14336, # Mistral FFN intermediate
+    hidden_dim=_profile["hidden_dim"],
+    intermediate_dim=_profile["intermediate_dim"],
     initial_wealth=100.0,   # Starting credits for each expert
     wealth_decay=0.999,     # Mild decay for specialization (updated from 0.99)
     min_wealth=10.0,        # Minimum wealth (prevents death spiral)
@@ -106,8 +135,9 @@ MOB_CONFIG = MoBConfig(
 )
 
 # Steering Configuration (Module 2: Cognitive Homeostasis)
+# Steering layers align with MoB layers (reasoning core)
 STEERING_CONFIG = SteeringConfig(
-    steering_layers=list(range(10, 22)),  # Middle layers
+    steering_layers=list(range(_profile["mob_layers_start"], _profile["mob_layers_end"])),
     base_strength=0.3,
     adaptive=True,
     target_alignment=0.7,
@@ -248,10 +278,10 @@ def initialize_tame_architecture():
     # Phase 2: Morphogenesis - Transform to Agential Swarm (MoB)
     logger.info("[MORPHOGENESIS] Applying Mixture of Bidders transformation...")
     
-    # Apply MoB to the "reasoning core" layers (8-23)
-    # See MOB_CONFIG docstring for full rationale on layer selection
-    num_layers = len(model.model.layers)  # Mistral-7B has 32 layers
-    layers_to_modify = list(range(8, 24))  # Balanced: 16 layers in reasoning zone
+    # Apply MoB to the "reasoning core" layers
+    # Layer range is determined by the active model profile
+    num_layers = len(model.model.layers)
+    layers_to_modify = list(range(_profile["mob_layers_start"], _profile["mob_layers_end"]))
     
     logger.info(f"[MORPHOGENESIS] Targeting {len(layers_to_modify)} layers for MoB transformation")
     model = apply_mob_to_model(model, MOB_CONFIG, layers_to_modify)
