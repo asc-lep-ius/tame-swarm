@@ -126,7 +126,7 @@ MOB_CONFIG = MoBConfig(
     use_vcg_payments=True,  # Enable VCG payment mechanism
     # Memory-efficient mode: shared base FFN + lightweight LoRA-style adapters
     use_shared_base=True,   # Reduces memory from O(experts×FFN) to O(FFN + experts×adapters)
-    adapter_rank=64,        # Sweet spot: captures most adaptation capacity
+    adapter_rank=32,        # Reduced from 64 for 16GB GPUs (32 still effective)
     adapter_alpha=16.0,     # Adapter output scaling factor
     # Specialization mechanisms (inference mode)
     use_loss_feedback=False,  # Disabled for inference (no training loop)

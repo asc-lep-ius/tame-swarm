@@ -330,13 +330,16 @@ Examples:
                        default=_profile["model_id"],
                        help=f"HuggingFace model ID (default from ACTIVE_MODEL: {ACTIVE_MODEL})")
     
-    # Training
+    # Training (defaults optimized for 16GB VRAM - RTX 5070 Ti, RTX 4080, etc.)
     parser.add_argument("--steps", type=int, default=5000,
                        help="Number of training steps")
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=2,
+                       help="Batch size per step (default: 2 for 16GB GPU)")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=8,
+                       help="Gradient accumulation (default: 8, effective batch=16)")
     parser.add_argument("--learning_rate", type=float, default=2e-5)
-    parser.add_argument("--max_seq_length", type=int, default=1024)
+    parser.add_argument("--max_seq_length", type=int, default=512,
+                       help="Max sequence length (default: 512 for 16GB GPU)")
     
     # MoB - defaults from ACTIVE_MODEL profile
     parser.add_argument("--num_experts", type=int, default=4,

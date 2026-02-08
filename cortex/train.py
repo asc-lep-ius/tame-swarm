@@ -138,6 +138,10 @@ class TrainingConfig:
     
     IMPORTANT: Keep ACTIVE_MODEL synchronized with main.py!
     Defaults are auto-configured from the active model profile.
+    
+    Memory Profile (defaults optimized for 16GB VRAM - RTX 5070 Ti, RTX 4080, etc.):
+    - batch_size=2, seq_len=512, adapter_rank=32 → ~12GB peak usage
+    - Increase batch_size/seq_len if you have 24GB+ (A10G, RTX 4090, etc.)
     """
     # Model (auto-configured from ACTIVE_MODEL)
     model_id: str = _profile["model_id"]
@@ -148,16 +152,16 @@ class TrainingConfig:
     top_k: int = 2
     mob_layers_start: int = _profile["mob_layers_start"]
     mob_layers_end: int = _profile["mob_layers_end"]
-    adapter_rank: int = 64
+    adapter_rank: int = 32  # Reduced from 64 for 16GB GPUs (still effective)
     
-    # Training hyperparameters
-    batch_size: int = 4
-    gradient_accumulation_steps: int = 4
+    # Training hyperparameters (optimized for 16GB VRAM)
+    batch_size: int = 2  # Reduced from 4 for memory efficiency
+    gradient_accumulation_steps: int = 8  # Increased to maintain effective batch size of 16
     learning_rate: float = 2e-5
     weight_decay: float = 0.01
     max_steps: int = 10000
     warmup_steps: int = 500
-    max_seq_length: int = 1024
+    max_seq_length: int = 512  # Reduced from 1024 for 16GB GPUs
     
     # MoB-specific training
     calibration_loss_weight: float = 0.1  # Weight for confidence calibration loss
