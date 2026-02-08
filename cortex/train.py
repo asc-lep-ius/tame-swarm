@@ -41,6 +41,9 @@ from transformers import (
 
 try:
     from datasets import load_dataset
+    import datasets
+    # Option D: Disable dataset caching to reduce RAM usage
+    datasets.disable_caching()
     HAS_DATASETS = True
 except ImportError:
     HAS_DATASETS = False
@@ -581,11 +584,13 @@ class TAMETrainer:
         logger.info(f"Loading dataset: {self.config.dataset_name}")
         
         # Load dataset
+        # Option A: Use streaming=True to reduce RAM usage (~100MB vs ~2GB)
         if self.config.dataset_name == "wikitext":
             dataset = load_dataset(
                 self.config.dataset_name,
                 self.config.dataset_config,
-                split="train"
+                split="train",
+                streaming=True,  # Stream chunks instead of loading full dataset
             )
             text_column = "text"
         elif self.config.dataset_name == "c4":
@@ -597,7 +602,11 @@ class TAMETrainer:
             )
             text_column = "text"
         else:
-            dataset = load_dataset(self.config.dataset_name, split="train")
+            dataset = load_dataset(
+                self.config.dataset_name, 
+                split="train",
+                streaming=True,
+            )
             text_column = "text"
         
         # Tokenize
@@ -610,16 +619,21 @@ class TAMETrainer:
                 return_tensors="pt",
             )
         
-        # Process dataset
-        if hasattr(dataset, 'map'):
+        # Process dataset (streaming datasets don't have column_names attribute)
+        if hasattr(dataset, 'column_names') and dataset.column_names is not None:
+            # Non-streaming dataset
             tokenized_dataset = dataset.map(
                 tokenize_function,
                 batched=True,
                 remove_columns=dataset.column_names,
             )
         else:
-            # Streaming dataset
-            tokenized_dataset = dataset.map(tokenize_function, batched=True)
+            # Streaming dataset - columns are automatically handled
+            tokenized_dataset = dataset.map(
+                tokenize_function, 
+                batched=True,
+                remove_columns=[text_column],
+            )
         
         # Data collator
         data_collator = DataCollatorForLanguageModeling(
