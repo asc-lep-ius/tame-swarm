@@ -298,7 +298,7 @@ class TAMETrainer:
         """
         logger.info("Re-dispatching model after transformations...")
         
-        # First, materialize any parameters still on 'meta' device
+        # First, check for any parameters still on 'meta' device
         # This can happen with device_map="auto" lazy loading
         meta_params = []
         for name, param in self.model.named_parameters():
@@ -307,10 +307,35 @@ class TAMETrainer:
         
         if meta_params:
             logger.info(f"Found {len(meta_params)} parameters on meta device, materializing...")
-            # Move entire model to device first to materialize meta tensors
-            self.model = self.model.to(self.device)
-            logger.info("Model materialized on device")
-            return  # Skip re-dispatch since model is now fully on device
+            # Meta tensors require special handling - can't use .to() directly
+            # Use to_empty() to allocate memory, then initialize weights
+            self.model = self.model.to_empty(device=self.device)
+            
+            # Re-initialize any parameters that were on meta device
+            # For most cases these are MoB adapter weights which should start near-zero anyway
+            with torch.no_grad():
+                for name, param in self.model.named_parameters():
+                    if param.isnan().any() or param.isinf().any() or (param == 0).all():
+                        # Parameter needs initialization
+                        if 'weight' in name:
+                            if param.dim() >= 2:
+                                # Use kaiming for weight matrices
+                                nn.init.kaiming_uniform_(param, a=math.sqrt(5))
+                            else:
+                                # Small init for 1D weights
+                                nn.init.uniform_(param, -0.01, 0.01)
+                        elif 'bias' in name:
+                            nn.init.zeros_(param)
+                        else:
+                            # Default small random init
+                            nn.init.uniform_(param, -0.01, 0.01)
+            
+            logger.info("Model materialized and re-initialized on device")
+            
+            # Now reload pretrained weights for the base model components
+            # This preserves the original model weights while keeping new MoB/LoRA init
+            self._reload_pretrained_weights()
+            return
         
         try:
             # For PEFT models, we need to work with the underlying model
@@ -344,9 +369,58 @@ class TAMETrainer:
             logger.info("Model re-dispatched successfully")
             
         except Exception as e:
-            logger.warning(f"Re-dispatch failed ({type(e).__name__}: {e}), falling back to .to(device)")
-            # Fallback: move entire model to target device
-            self.model = self.model.to(self.device)
+            logger.warning(f"Re-dispatch failed ({type(e).__name__}: {e}), falling back to simple device move")
+            # Fallback: check if we have meta tensors before calling .to()
+            has_meta = any(p.device.type == 'meta' for p in self.model.parameters())
+            if has_meta:
+                self.model = self.model.to_empty(device=self.device)
+                self._reload_pretrained_weights()
+            else:
+                self.model = self.model.to(self.device)
+    
+    def _reload_pretrained_weights(self):
+        """
+        Reload pretrained weights after materializing from meta device.
+        
+        This is needed because to_empty() creates uninitialized tensors.
+        We reload the original model weights while preserving MoB/LoRA structure.
+        """
+        logger.info("Reloading pretrained weights for base model components...")
+        
+        try:
+            from transformers import AutoModelForCausalLM
+            
+            # Load a fresh copy of weights (on CPU to save VRAM)
+            fresh_model = AutoModelForCausalLM.from_pretrained(
+                self.config.model_id,
+                torch_dtype=self.dtype,
+                device_map="cpu",
+                trust_remote_code=True,
+            )
+            fresh_state_dict = fresh_model.state_dict()
+            
+            # Get current model's state dict
+            current_state_dict = self.model.state_dict()
+            
+            # Copy weights that exist in both (original transformer layers)
+            copied = 0
+            for name, param in fresh_state_dict.items():
+                if name in current_state_dict:
+                    if current_state_dict[name].shape == param.shape:
+                        current_state_dict[name].copy_(param.to(self.device))
+                        copied += 1
+            
+            logger.info(f"Reloaded {copied} pretrained weight tensors")
+            
+            # Clean up fresh model
+            del fresh_model
+            del fresh_state_dict
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                
+        except Exception as e:
+            logger.warning(f"Could not reload pretrained weights: {e}")
+            logger.warning("Model will use randomly initialized weights for some components")
     
     def _apply_lora(self):
         """Apply LoRA adapters for memory-efficient training."""
