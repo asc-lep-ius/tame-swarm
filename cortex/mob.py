@@ -520,6 +520,8 @@ class MixtureOfBidders(nn.Module):
         
         Args:
             per_token_loss: Loss per token, shape (batch, seq_len) or (batch * seq_len,)
+                           Note: For causal LM, this is typically (batch, input_seq_len - 1)
+                           due to next-token prediction shift.
             token_mask: Optional mask for valid tokens (1 = valid, 0 = padding)
         """
         if not self._loss_feedback_pending or self._cached_selected_experts is None:
@@ -532,16 +534,47 @@ class MixtureOfBidders(nn.Module):
             confidences = self._cached_confidences
             payments = self._cached_payments
             
-            batch_size, seq_len, _ = confidences.shape
+            batch_size, cached_seq_len, _ = confidences.shape
             
             # Reshape loss if needed
             if per_token_loss.dim() == 1:
-                per_token_loss = per_token_loss.view(batch_size, seq_len)
+                # Try to infer batch size from cached shape
+                loss_seq_len = per_token_loss.numel() // batch_size
+                per_token_loss = per_token_loss.view(batch_size, loss_seq_len)
+            
+            loss_seq_len = per_token_loss.size(1)
+            
+            # Handle sequence length mismatch (common in causal LM due to shift)
+            # Loss is computed on tokens [1:N], routing was done on [0:N]
+            # We align by taking the first loss_seq_len positions from routing
+            if loss_seq_len != cached_seq_len:
+                if loss_seq_len < cached_seq_len:
+                    # Slice routing tensors to match loss length
+                    # For causal LM: loss[i] corresponds to predicting token[i+1] from token[i]
+                    # So loss[i] should use routing decisions from position [i]
+                    selected_experts = selected_experts[:, :loss_seq_len, :]
+                    routing_weights = routing_weights[:, :loss_seq_len, :]
+                    confidences = confidences[:, :loss_seq_len, :]
+                    if payments is not None:
+                        payments = payments[:, :loss_seq_len, :]
+                else:
+                    logger.warning(f"Loss seq_len ({loss_seq_len}) > cached seq_len ({cached_seq_len}), skipping wealth update")
+                    self._loss_feedback_pending = False
+                    return
+            
+            seq_len = loss_seq_len  # Use the aligned sequence length
             
             # Apply token mask if provided
             if token_mask is not None:
                 if token_mask.dim() == 1:
-                    token_mask = token_mask.view(batch_size, seq_len)
+                    token_mask = token_mask.view(batch_size, -1)
+                # Align token_mask to loss sequence length
+                if token_mask.size(1) > seq_len:
+                    token_mask = token_mask[:, :seq_len]
+                elif token_mask.size(1) < seq_len:
+                    # Pad with zeros if mask is shorter (shouldn't happen)
+                    pad_size = seq_len - token_mask.size(1)
+                    token_mask = F.pad(token_mask, (0, pad_size), value=0)
                 per_token_loss = per_token_loss * token_mask
             
             # 1. Mild decay to all experts
