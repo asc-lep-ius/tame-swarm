@@ -39,6 +39,10 @@ MODEL_ID = "mistralai/Mistral-7B-Instruct-v0.2"
 # MoB Configuration (Module 1: Agential Swarm)
 # =============================================================================
 # 
+# IMPORTANT: Keep these settings synchronized with train.py TrainingConfig!
+# If you train with different num_experts/top_k/layers, the mob_state.pt
+# will not load correctly. The load_mob_state() function will warn on mismatch.
+#
 # MEMORY-PERFORMANCE TRADEOFFS FOR MIXTURE OF BIDDERS
 # 
 # This configuration uses "Balanced" profile optimized for 16GB GPU:
@@ -85,12 +89,20 @@ MOB_CONFIG = MoBConfig(
     hidden_dim=4096,        # Mistral hidden dimension
     intermediate_dim=14336, # Mistral FFN intermediate
     initial_wealth=100.0,   # Starting credits for each expert
-    wealth_decay=0.99,      # Prevents runaway wealth accumulation
-    jitter_std=0.01,        # Symmetry breaking noise
+    wealth_decay=0.999,     # Mild decay for specialization (updated from 0.99)
+    min_wealth=10.0,        # Minimum wealth (prevents death spiral)
+    max_wealth=500.0,       # Maximum wealth (prevents monopoly)
+    jitter_std=0.05,        # Symmetry breaking noise (increased for differentiation)
+    reward_scale=1.0,       # Base reward multiplier
+    use_vcg_payments=True,  # Enable VCG payment mechanism
     # Memory-efficient mode: shared base FFN + lightweight LoRA-style adapters
     use_shared_base=True,   # Reduces memory from O(experts×FFN) to O(FFN + experts×adapters)
     adapter_rank=64,        # Sweet spot: captures most adaptation capacity
-    adapter_alpha=16.0      # Adapter output scaling factor
+    adapter_alpha=16.0,     # Adapter output scaling factor
+    # Specialization mechanisms (inference mode)
+    use_loss_feedback=False,  # Disabled for inference (no training loop)
+    use_local_quality=True,   # Use output quality signals for wealth updates
+    use_differentiable_routing=False,  # Not needed for inference
 )
 
 # Steering Configuration (Module 2: Cognitive Homeostasis)
@@ -245,6 +257,27 @@ def initialize_tame_architecture():
     model = apply_mob_to_model(model, MOB_CONFIG, layers_to_modify)
     
     logger.info(f"[MORPHOGENESIS] MoB applied to layers {layers_to_modify[0]}-{layers_to_modify[-1]}")
+    
+    # Phase 2b: Load trained MoB state if available
+    # This restores expert specialization from training (wealth, performance EMA)
+    mob_state_paths = [
+        "./tame_inference/mob_state.pt",  # Exported from training
+        "./mob_state.pt",                  # Local file
+    ]
+    
+    from mob import load_mob_state
+    for state_path in mob_state_paths:
+        import os
+        if os.path.exists(state_path):
+            try:
+                loaded = load_mob_state(model, state_path)
+                if loaded > 0:
+                    logger.info(f"[MORPHOGENESIS] Restored trained expert specialization from {state_path}")
+                break
+            except Exception as e:
+                logger.warning(f"[MORPHOGENESIS] Failed to load mob_state from {state_path}: {e}")
+    else:
+        logger.info("[MORPHOGENESIS] No trained mob_state found - experts start with default wealth")
     
     # Phase 3: Homeostatic Calibration - Extract steering vectors
     logger.info("[HOMEOSTASIS] Extracting steering vectors for goal persistence...")

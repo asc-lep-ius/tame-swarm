@@ -1,0 +1,50 @@
+version: '3.8'
+
+# Docker Compose for TAME Training Workflow
+# Runs the setup_tame.py training script with GPU support and persistent volumes
+#
+# Usage:
+#   Quick test:    docker-compose -f docker-compose.train.yml run --rm train --mode test
+#   Full training: docker-compose -f docker-compose.train.yml run --rm train --mode full --steps 5000
+#   Export only:   docker-compose -f docker-compose.train.yml run --rm train --mode export
+
+services:
+  train:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    volumes:
+      # Mount source code for live editing
+      - .:/app
+      # Persistent HuggingFace model cache (shared with dev server)
+      - model_cache:/root/.cache/huggingface
+      # Persist training checkpoints
+      - ./tame_checkpoints:/app/tame_checkpoints
+      # Persist exported inference models
+      - ./tame_inference:/app/tame_inference
+    environment:
+      - PYTHONUNBUFFERED=1
+      - HF_HOME=/root/.cache/huggingface
+      # Optional: HuggingFace token for gated models
+      # - HF_TOKEN=${HF_TOKEN}
+    # Override entrypoint for training
+    entrypoint: ["python", "setup_tame.py"]
+    # Default: run quick test (override with docker-compose run args)
+    command: ["--mode", "test"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    # Allow stdin for interactive mode
+    stdin_open: true
+    tty: true
+    # Working directory
+    working_dir: /app
+
+volumes:
+  model_cache:
+    # Shared with docker-compose.dev.yml - models downloaded once
+    driver: local

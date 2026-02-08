@@ -198,6 +198,88 @@ curl http://localhost:8000/homeostasis/status
 | `Permission denied` on volume | Run `chmod -R 777 cortex/` (Linux) or check Docker settings (Windows) |
 | `--reload` not detecting changes | Ensure files are saved with LF line endings |
 
+## Training the MoB Experts
+
+The Mixture of Bidders (MoB) requires training to develop expert specialization. Without training, all experts remain undifferentiated (Gini ≈ 0).
+
+### Quick Test (Verify Setup)
+
+**Windows (PowerShell):**
+```powershell
+.\train.ps1 test
+# or
+docker-compose -f docker-compose.train.yml run --rm train --mode test
+```
+
+**Windows (CMD):**
+```cmd
+train.bat test
+```
+
+**Linux/macOS:**
+```bash
+docker-compose -f docker-compose.train.yml run --rm train --mode test
+```
+
+### Full Training Workflow
+
+```powershell
+# Full training (5000 steps, ~2-4 hours on A100)
+.\train.ps1 full
+
+# Or with custom steps
+.\train.ps1 train 10000
+
+# Memory-constrained? Use LoRA
+.\train.ps1 train -UseLora
+```
+
+### What Training Does
+
+| Phase | Description |
+|-------|-------------|
+| **Wealth Updates** | Experts who reduce loss gain wealth; poor performers lose it |
+| **Specialization** | Wealth differences cause VCG auction to route tokens differently |
+| **Calibration** | Confidence heads learn to predict actual routing quality |
+| **Persistence** | `mob_state.pt` saves wealth for inference server use |
+
+### Training Outputs
+
+```
+tame_checkpoints/
+├── checkpoint-1000/
+│   ├── model.safetensors    # Model weights
+│   ├── mob_state.pt         # Expert wealth & performance state
+│   └── training_state.pt    # Optimizer state
+└── checkpoint-5000/
+    └── ...
+
+tame_inference/                # Ready for inference server
+├── mob_state.pt
+├── inference_config.json
+└── loader_snippet.py
+```
+
+### Loading Trained State in Inference
+
+After training, the exported `mob_state.pt` is automatically loaded by the inference server if present in `./tame_inference/`.
+
+To manually load in `main.py`:
+```python
+from mob import load_mob_state
+load_mob_state(model, "./tame_inference/mob_state.pt")
+```
+
+### Training vs Inference Memory
+
+| Mode | VRAM | Notes |
+|------|------|-------|
+| **Inference** | ~16GB | bfloat16, forward pass only |
+| **Training (full)** | ~32GB+ | Gradients + optimizer states |
+| **Training (LoRA)** | ~20GB | Only adapter gradients |
+
+For GPUs with <24GB VRAM, use `--use_lora` flag.
+
 ## Configuration
 
 Key parameters in `main.py`:
@@ -228,6 +310,7 @@ STEERING_CONFIG = SteeringConfig(
 | Module | Status | Notes |
 |--------|--------|-------|
 | **Module 1: MoB** | ✅ Implemented | VCG auction, wealth tracking, upcycling |
+| **Module 1b: Training** | ✅ Implemented | Loss-based wealth updates, confidence calibration |
 | **Module 2: Steering** | ✅ Implemented | Adaptive control, contrastive extraction |
 | **Module 3: RMT Memory** | 🔲 Planned | Recurrent memory for bioelectric persistence |
 | **Module 4: Physicome** | 🔲 Planned | Physics engine integration |

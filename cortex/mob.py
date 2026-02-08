@@ -1136,3 +1136,169 @@ def get_mob_statistics(model: nn.Module) -> Dict[str, torch.Tensor]:
         'layer_wealth': [mob.expert_wealth.clone() for mob in mob_layers],
         'layer_performance': [mob.expert_performance_ema.clone() for mob in mob_layers],
     }
+
+
+def load_mob_state(
+    model: nn.Module, 
+    state_path: str,
+    strict: bool = False
+) -> int:
+    """
+    Load trained MoB state (wealth, performance EMA) into a model.
+    
+    Use this to restore expert specialization from a trained checkpoint
+    when starting the inference server.
+    
+    Args:
+        model: Model containing MoB layers
+        state_path: Path to mob_state.pt file
+        strict: If True, raise error on config mismatch
+        
+    Returns:
+        Number of layers successfully loaded
+        
+    Raises:
+        ValueError: If strict=True and config mismatch detected
+        
+    Example:
+        # In main.py after apply_mob_to_model():
+        from mob import load_mob_state
+        loaded = load_mob_state(model, "./tame_inference/mob_state.pt")
+        print(f"Loaded MoB state for {loaded} layers")
+    """
+    import logging
+    logger = logging.getLogger(__name__)
+    
+    mob_state = torch.load(state_path, map_location="cpu")
+    mob_layers = get_mob_layers(model)
+    
+    if not mob_layers:
+        logger.warning("No MoB layers found in model")
+        return 0
+    
+    # Validate config if present
+    saved_config = mob_state.get("_config", {})
+    if saved_config:
+        # Check num_experts
+        saved_experts = saved_config.get("num_experts")
+        if saved_experts and mob_layers:
+            model_experts = mob_layers[0].config.num_experts
+            if saved_experts != model_experts:
+                msg = (f"Expert count mismatch: trained with {saved_experts} experts, "
+                       f"but model has {model_experts} experts")
+                if strict:
+                    raise ValueError(msg)
+                logger.error(f"CONFIG MISMATCH: {msg}")
+                logger.error("Wealth state will NOT be loaded. "
+                            "Experts will start with default wealth.")
+                return 0
+        
+        # Check number of layers
+        saved_layers = saved_config.get("num_layers")
+        if saved_layers and saved_layers != len(mob_layers):
+            msg = (f"Layer count mismatch: trained {saved_layers} MoB layers, "
+                   f"but model has {len(mob_layers)} MoB layers")
+            if strict:
+                raise ValueError(msg)
+            logger.warning(f"CONFIG MISMATCH: {msg}")
+            logger.warning("Will load state for available layers only.")
+        
+        # Log training config for reference
+        logger.info(f"Loading state from: {state_path}")
+        logger.info(f"  Trained with: {saved_experts} experts, {saved_layers} layers")
+        if "top_k" in saved_config:
+            logger.info(f"  top_k: {saved_config['top_k']}")
+    else:
+        logger.warning("No config metadata in mob_state.pt - cannot validate compatibility")
+    
+    loaded = 0
+    skipped = 0
+    for idx, mob in enumerate(mob_layers):
+        key = f"layer_{idx}"
+        if key not in mob_state:
+            if strict:
+                raise ValueError(f"Missing state for {key}")
+            skipped += 1
+            continue
+        
+        state = mob_state[key]
+        device = mob.expert_wealth.device
+        
+        # Load wealth
+        if "wealth" in state:
+            wealth = torch.tensor(state["wealth"], device=device, dtype=mob.expert_wealth.dtype)
+            if wealth.shape == mob.expert_wealth.shape:
+                mob.expert_wealth.copy_(wealth)
+            else:
+                logger.warning(f"{key}: wealth shape mismatch "
+                              f"(saved: {wealth.shape}, model: {mob.expert_wealth.shape}), skipping")
+                skipped += 1
+                continue
+        
+        # Load performance EMA
+        if "performance_ema" in state:
+            perf = torch.tensor(state["performance_ema"], device=device, dtype=mob.expert_performance_ema.dtype)
+            if perf.shape == mob.expert_performance_ema.shape:
+                mob.expert_performance_ema.copy_(perf)
+        
+        # Load baseline loss
+        if "baseline_loss" in state:
+            baseline = torch.tensor(state["baseline_loss"], device=device, dtype=mob.expert_baseline_loss.dtype)
+            if baseline.shape == mob.expert_baseline_loss.shape:
+                mob.expert_baseline_loss.copy_(baseline)
+        
+        # Load usage count
+        if "usage_count" in state:
+            usage = torch.tensor(state["usage_count"], device=device, dtype=mob.expert_usage_count.dtype)
+            if usage.shape == mob.expert_usage_count.shape:
+                mob.expert_usage_count.copy_(usage)
+        
+        loaded += 1
+    
+    if loaded > 0:
+        logger.info(f"✓ Loaded MoB state for {loaded}/{len(mob_layers)} layers from {state_path}")
+    if skipped > 0:
+        logger.warning(f"Skipped {skipped} layers due to missing/mismatched state")
+    
+    return loaded
+
+
+def save_mob_state(model: nn.Module, save_path: str) -> bool:
+    """
+    Save MoB state (wealth, performance EMA) to file.
+    
+    Includes configuration metadata to validate compatibility on load.
+    
+    Args:
+        model: Model containing MoB layers
+        save_path: Path to save mob_state.pt
+        
+    Returns:
+        True if successful
+    """
+    mob_layers = get_mob_layers(model)
+    if not mob_layers:
+        return False
+    
+    # Save config metadata for validation on load
+    first_mob = mob_layers[0]
+    mob_state = {
+        "_config": {
+            "num_experts": first_mob.config.num_experts,
+            "top_k": first_mob.config.top_k,
+            "num_layers": len(mob_layers),
+            "hidden_dim": first_mob.config.hidden_dim,
+            "adapter_rank": first_mob.config.adapter_rank if first_mob.config.use_shared_base else None,
+        }
+    }
+    
+    for idx, mob in enumerate(mob_layers):
+        mob_state[f"layer_{idx}"] = {
+            "wealth": mob.expert_wealth.cpu().tolist(),
+            "performance_ema": mob.expert_performance_ema.cpu().tolist(),
+            "baseline_loss": mob.expert_baseline_loss.cpu().tolist(),
+            "usage_count": mob.expert_usage_count.cpu().tolist(),
+        }
+    
+    torch.save(mob_state, save_path)
+    return True

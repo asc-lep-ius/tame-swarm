@@ -28,6 +28,12 @@ RUN pip install --no-cache-dir \
     accelerate \
     sentencepiece
 
+# Install training dependencies (optional but included for full workflow)
+RUN pip install --no-cache-dir \
+    "datasets>=2.14.0" \
+    "peft>=0.7.0" \
+    "tqdm>=4.66.0"
+
 # Install API dependencies
 RUN pip install --no-cache-dir \
     fastapi \
