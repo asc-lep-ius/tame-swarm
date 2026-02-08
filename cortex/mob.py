@@ -405,6 +405,7 @@ class MixtureOfBidders(nn.Module):
             # ========== TRAINING MODE: Dense computation ==========
             # Process all tokens through each expert, mask by routing
             # This ensures fixed tensor shapes for gradient checkpointing
+            # CRITICAL: No branching based on routing - always same computation path
             flat_hidden = hidden_states.view(-1, hidden_dim)  # (batch * seq, hidden)
             flat_output = output.view(-1, hidden_dim)
             dtype = hidden_states.dtype  # Preserve model dtype (e.g., bfloat16)
@@ -418,19 +419,8 @@ class MixtureOfBidders(nn.Module):
                 for expert_idx in range(self.config.num_experts):
                     expert_mask = (flat_expert_indices == expert_idx).to(dtype)  # Match model dtype
                     
-                    if expert_mask.sum() == 0:
-                        # Maintain computation graph for unused experts
-                        if self.use_shared_base:
-                            dummy = self.experts[expert_idx](
-                                flat_hidden[:1], self.base_gate_proj,
-                                self.base_up_proj, self.base_down_proj
-                            )
-                        else:
-                            dummy = self.experts[expert_idx](flat_hidden[:1])
-                        flat_output = flat_output + 0.0 * dummy[:1].sum() * expert_mask[:1].unsqueeze(-1)
-                        continue
-                    
-                    # Dense: process ALL tokens
+                    # ALWAYS process all tokens - no branching!
+                    # The mask zeros out non-selected tokens, but tensor shapes stay fixed
                     if self.use_shared_base:
                         all_expert_output = self.experts[expert_idx](
                             flat_hidden, self.base_gate_proj,
@@ -439,6 +429,7 @@ class MixtureOfBidders(nn.Module):
                     else:
                         all_expert_output = self.experts[expert_idx](flat_hidden)
                     
+                    # Mask and weight: zeros out non-selected tokens
                     combined_weight = expert_mask * flat_weights
                     weighted_output = all_expert_output * combined_weight.unsqueeze(-1)
                     flat_output = flat_output + weighted_output
