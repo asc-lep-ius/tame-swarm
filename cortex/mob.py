@@ -372,6 +372,7 @@ class MixtureOfBidders(nn.Module):
         self._cached_payments: Optional[torch.Tensor] = None
         self._cached_expert_token_masks: Optional[List[torch.Tensor]] = None
         self._loss_feedback_pending: bool = False  # Flag to check if loss feedback was provided
+        self._cached_calibration_loss: Optional[torch.Tensor] = None  # Computed during wealth update
         
     def forward(
         self, 
@@ -541,38 +542,55 @@ class MixtureOfBidders(nn.Module):
     
     def get_confidence_calibration_loss(self) -> torch.Tensor:
         """
-        Compute auxiliary loss for confidence head calibration.
+        Return the cached calibration loss for confidence head training.
         
         This loss encourages confidence heads to be calibrated:
-        - High confidence should correlate with low loss (after loss feedback)
+        - High confidence should correlate with low loss
         - Overconfident experts get penalized
+        
+        The loss is computed inside update_wealth_from_loss() when all required
+        data (confidences + updated performance EMA) is available. This ensures
+        correct ordering and prevents stale data issues.
         
         Should be added to the main loss with weight config.confidence_calibration_weight.
         
         Returns:
-            Scalar calibration loss tensor (0 if no loss feedback available)
+            Scalar calibration loss tensor (0 if not yet computed this step)
         """
-        if not self._loss_feedback_pending or self._cached_confidences is None:
+        if self._cached_calibration_loss is None:
             return torch.tensor(0.0, device=self.expert_wealth.device)
+        return self._cached_calibration_loss
+    
+    def _compute_and_cache_calibration_loss(self, confidences: torch.Tensor):
+        """
+        Compute calibration loss and cache it for later retrieval.
         
+        Called internally by update_wealth_from_loss() after performance EMA is updated.
+        This ensures the target (based on performance EMA) reflects the current step.
+        
+        Args:
+            confidences: Cached confidence predictions from forward pass (batch, seq, num_experts)
+        """
         # Use performance EMA as target for confidence calibration
         # Experts should be confident when they typically perform well
         target_confidence = torch.sigmoid(self.expert_performance_ema * 5.0)  # Scale to [0, 1]
         
         # MSE between predicted confidence and performance-based target
-        mean_confidences = self._cached_confidences.mean(dim=(0, 1))  # (num_experts,)
+        mean_confidences = confidences.mean(dim=(0, 1))  # (num_experts,)
         
         # Guard against NaN in either tensor
         if torch.isnan(mean_confidences).any() or torch.isnan(target_confidence).any():
-            return torch.tensor(0.0, device=self.expert_wealth.device)
+            self._cached_calibration_loss = torch.tensor(0.0, device=self.expert_wealth.device)
+            return
         
         calibration_loss = F.mse_loss(mean_confidences, target_confidence.detach())
         
         # Final NaN guard
         if torch.isnan(calibration_loss):
-            return torch.tensor(0.0, device=self.expert_wealth.device)
+            self._cached_calibration_loss = torch.tensor(0.0, device=self.expert_wealth.device)
+            return
         
-        return calibration_loss * self.config.confidence_calibration_weight
+        self._cached_calibration_loss = calibration_loss * self.config.confidence_calibration_weight
     
     def update_wealth_from_loss(
         self, 
@@ -716,6 +734,10 @@ class MixtureOfBidders(nn.Module):
             # 5. Apply rewards and clamp
             self.expert_wealth += expert_rewards
             self.expert_wealth.clamp_(min=self.config.min_wealth, max=self.config.max_wealth)
+            
+            # 6. Compute and cache calibration loss while all data is available
+            # This ensures correct ordering: performance EMA is updated before computing loss
+            self._compute_and_cache_calibration_loss(confidences)
             
             # Clear cache
             self._loss_feedback_pending = False
