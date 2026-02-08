@@ -548,7 +548,16 @@ class MixtureOfBidders(nn.Module):
         
         # MSE between predicted confidence and performance-based target
         mean_confidences = self._cached_confidences.mean(dim=(0, 1))  # (num_experts,)
+        
+        # Guard against NaN in either tensor
+        if torch.isnan(mean_confidences).any() or torch.isnan(target_confidence).any():
+            return torch.tensor(0.0, device=self.expert_wealth.device)
+        
         calibration_loss = F.mse_loss(mean_confidences, target_confidence.detach())
+        
+        # Final NaN guard
+        if torch.isnan(calibration_loss):
+            return torch.tensor(0.0, device=self.expert_wealth.device)
         
         return calibration_loss * self.config.confidence_calibration_weight
     
@@ -674,7 +683,9 @@ class MixtureOfBidders(nn.Module):
             
             # 3. Competitive bonus for top performers
             if expert_rewards.abs().max() > 1e-6:
-                normalized_rewards = (expert_rewards - expert_rewards.mean()) / (expert_rewards.std() + 1e-6)
+                # Use correction=0 to avoid NaN when num_experts is small
+                reward_std = expert_rewards.std(correction=0) if expert_rewards.numel() >= 2 else torch.tensor(1e-6, device=expert_rewards.device)
+                normalized_rewards = (expert_rewards - expert_rewards.mean()) / (reward_std + 1e-6)
                 competitive_bonus = F.relu(normalized_rewards) * expert_rewards.abs().mean() * 0.5
                 expert_rewards += competitive_bonus
             
@@ -735,7 +746,11 @@ class MixtureOfBidders(nn.Module):
                     expert_output_norms = output_norms[mask]
                     
                     # Quality signal 1: consistency (low variance is good)
-                    norm_std = expert_output_norms.std()
+                    # Use correction=0 to avoid NaN with single element (default is Bessel's correction)
+                    if expert_output_norms.numel() >= 2:
+                        norm_std = expert_output_norms.std(correction=0)
+                    else:
+                        norm_std = torch.tensor(0.0, device=expert_output_norms.device)
                     consistency_reward = 1.0 / (1.0 + norm_std)
                     
                     # Quality signal 2: appropriate magnitude (close to global mean)

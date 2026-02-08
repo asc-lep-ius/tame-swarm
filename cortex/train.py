@@ -725,6 +725,16 @@ class TAMETrainer:
         # Total loss
         total_loss = main_loss + calibration_loss
         
+        # NaN guard: skip backprop if loss is NaN to prevent gradient corruption
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            logger.warning(f"Step {self.global_step}: NaN/Inf loss detected (main={main_loss.item()}, cal={calibration_loss.item() if isinstance(calibration_loss, torch.Tensor) else 0}), skipping backward")
+            return {
+                "loss": float('nan'),
+                "calibration_loss": 0.0,
+                "total_loss": float('nan'),
+                "perplexity": float('nan'),
+            }
+        
         # Scale for gradient accumulation
         scaled_loss = total_loss / self.config.gradient_accumulation_steps
         
