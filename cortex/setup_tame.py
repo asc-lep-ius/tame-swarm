@@ -73,6 +73,14 @@ def check_dependencies():
         print(f"✗ MoB module import failed: {e}")
         missing.append("mob (local)")
     
+    # Show active model profile
+    try:
+        from train import ACTIVE_MODEL, MODEL_PROFILES
+        profile = MODEL_PROFILES[ACTIVE_MODEL]
+        print(f"✓ Active model: {ACTIVE_MODEL} ({profile['model_id']})")
+    except ImportError as e:
+        print(f"⚠ Could not load model profile: {e}")
+    
     if missing:
         print(f"\n✗ Missing dependencies: {', '.join(missing)}")
         print("  Install with: pip install -r requirements.txt")
@@ -283,10 +291,17 @@ def run_test(args):
 
 
 def main():
+    # Import model profiles from train.py to use consistent defaults
+    from train import ACTIVE_MODEL, MODEL_PROFILES
+    _profile = MODEL_PROFILES[ACTIVE_MODEL]
+    
     parser = argparse.ArgumentParser(
         description="TAME Setup - Train and deploy MoB model",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog=f"""
+Active Model: {ACTIVE_MODEL} ({_profile['model_id']})
+(Change by editing ACTIVE_MODEL in train.py)
+
 Examples:
   # Quick test (verify setup)
   python setup_tame.py --mode test
@@ -310,10 +325,10 @@ Examples:
                        choices=["test", "train", "export", "full", "check"],
                        help="Operation mode")
     
-    # Model
+    # Model - default from ACTIVE_MODEL profile
     parser.add_argument("--model_id", type=str, 
-                       default="mistralai/Mistral-7B-Instruct-v0.2",
-                       help="HuggingFace model ID")
+                       default=_profile["model_id"],
+                       help=f"HuggingFace model ID (default from ACTIVE_MODEL: {ACTIVE_MODEL})")
     
     # Training
     parser.add_argument("--steps", type=int, default=5000,
@@ -323,15 +338,15 @@ Examples:
     parser.add_argument("--learning_rate", type=float, default=2e-5)
     parser.add_argument("--max_seq_length", type=int, default=1024)
     
-    # MoB (must match main.py MOB_CONFIG for inference compatibility)
+    # MoB - defaults from ACTIVE_MODEL profile
     parser.add_argument("--num_experts", type=int, default=4,
                        help="Number of experts (must match main.py)")
     parser.add_argument("--top_k", type=int, default=2,
                        help="Experts per token (must match main.py)")
-    parser.add_argument("--mob_layers_start", type=int, default=8,
-                       help="First MoB layer (must match main.py)")
-    parser.add_argument("--mob_layers_end", type=int, default=24,
-                       help="Last MoB layer exclusive (must match main.py)")
+    parser.add_argument("--mob_layers_start", type=int, default=_profile["mob_layers_start"],
+                       help="First MoB layer (auto-configured from ACTIVE_MODEL)")
+    parser.add_argument("--mob_layers_end", type=int, default=_profile["mob_layers_end"],
+                       help="Last MoB layer exclusive (auto-configured from ACTIVE_MODEL)")
     
     # Options
     parser.add_argument("--use_lora", action="store_true",
