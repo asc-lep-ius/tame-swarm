@@ -77,7 +77,10 @@ class ConfidenceHead(nn.Module):
         Returns:
             Confidence scores of shape (batch, seq_len, 1)
         """
-        return torch.sigmoid(self.proj(x))
+        # Clamp pre-sigmoid to avoid extreme values in bfloat16
+        logits = self.proj(x)
+        logits = torch.clamp(logits, min=-20.0, max=20.0)
+        return torch.sigmoid(logits)
 
 
 class Expert(nn.Module):
@@ -173,6 +176,10 @@ class LightweightExpert(nn.Module):
         
         # Down projection with adapter
         output = base_down(hidden) + self.down_adapter_B(self.down_adapter_A(hidden)) * self.scaling
+        
+        # Numerical stability for bfloat16: adapters can produce extreme values
+        if output.dtype == torch.bfloat16 or output.dtype == torch.float16:
+            output = torch.clamp(output, min=-65000.0, max=65000.0)
         
         return output
 
@@ -475,6 +482,10 @@ class MixtureOfBidders(nn.Module):
                     
                     if update_wealth:
                         self.expert_usage_count[expert_idx] += mask.sum().float()
+        
+        # Numerical stability for bfloat16: clamp extreme values, replace nan/inf
+        if output.dtype == torch.bfloat16 or output.dtype == torch.float16:
+            output = torch.nan_to_num(output, nan=0.0, posinf=65000.0, neginf=-65000.0)
         
         # 4. Cache routing information for loss feedback
         # This enables update_wealth_from_loss() to be called after loss computation

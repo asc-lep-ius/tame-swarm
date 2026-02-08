@@ -258,6 +258,31 @@ def initialize_tame_architecture():
     
     logger.info(f"[MORPHOGENESIS] MoB applied to layers {layers_to_modify[0]}-{layers_to_modify[-1]}")
     
+    # Set model to eval mode - critical for MoB to use inference path
+    model.eval()
+    
+    # Diagnostic: Verify MoB is producing valid output
+    logger.info("[DIAGNOSTIC] Testing MoB output validity...")
+    try:
+        test_input = tokenizer("Test", return_tensors="pt").to(model.device)
+        with torch.inference_mode():
+            test_output = model(**test_input, output_hidden_states=True)
+            # Check for NaN/Inf in hidden states
+            last_hidden = test_output.hidden_states[-1]
+            has_nan = torch.isnan(last_hidden).any().item()
+            has_inf = torch.isinf(last_hidden).any().item()
+            mean_val = last_hidden.abs().mean().item()
+            std_val = last_hidden.std().item()
+            logger.info(f"[DIAGNOSTIC] Hidden states: mean_abs={mean_val:.4f}, std={std_val:.4f}, has_nan={has_nan}, has_inf={has_inf}")
+            if has_nan or has_inf:
+                logger.error("[DIAGNOSTIC] WARNING: Model producing NaN/Inf! Check MoB configuration.")
+            elif mean_val < 0.01 or std_val < 0.01:
+                logger.warning("[DIAGNOSTIC] WARNING: Hidden states may be collapsed (very low variance)")
+            else:
+                logger.info("[DIAGNOSTIC] MoB output looks valid")
+    except Exception as e:
+        logger.warning(f"[DIAGNOSTIC] Test failed: {e}")
+    
     # Phase 2b: Load trained MoB state if available
     # This restores expert specialization from training (wealth, performance EMA)
     mob_state_paths = [
