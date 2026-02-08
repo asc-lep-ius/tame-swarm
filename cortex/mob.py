@@ -16,7 +16,7 @@ Key concepts:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict
 from dataclasses import dataclass
 import logging
 
@@ -41,6 +41,12 @@ class MoBConfig:
     use_shared_base: bool = True  # Use shared base + adapters instead of full copies
     adapter_rank: int = 64  # Rank of LoRA-style adapters when use_shared_base=True
     adapter_alpha: float = 16.0  # Scaling factor for adapters
+    # Specialization mechanisms
+    use_loss_feedback: bool = True  # Enable loss-based wealth updates (requires training loop integration)
+    use_local_quality: bool = True  # Use local quality signals when loss not available
+    use_differentiable_routing: bool = True  # Straight-through estimator for confidence head gradients
+    confidence_calibration_weight: float = 0.1  # Auxiliary loss weight for confidence calibration
+    loss_ema_decay: float = 0.95  # EMA decay for baseline loss tracking
 
 
 class ConfidenceHead(nn.Module):
@@ -182,12 +188,16 @@ class VCGAuctioneer(nn.Module):
     
     This creates emergent specialization as experts accumulate wealth
     by successfully processing tokens they're confident about.
+    
+    Supports differentiable routing via straight-through estimator for
+    gradient flow to confidence heads.
     """
     
-    def __init__(self, num_experts: int, top_k: int = 2):
+    def __init__(self, num_experts: int, top_k: int = 2, differentiable: bool = True):
         super().__init__()
         self.num_experts = num_experts
         self.top_k = top_k
+        self.differentiable = differentiable
         
     def forward(
         self, 
@@ -223,9 +233,28 @@ class VCGAuctioneer(nn.Module):
             payments = all_sorted[:, :, self.top_k:self.top_k+1].expand(-1, -1, self.top_k)
         else:
             payments = torch.zeros_like(top_bids)
+        
+        # Differentiable routing via straight-through estimator
+        # Forward: hard selection (top-k), Backward: soft gradients through all experts
+        if self.differentiable and self.training:
+            # Soft attention over ALL experts (for gradient flow)
+            soft_weights = F.softmax(bids, dim=-1)  # (batch, seq, num_experts)
             
-        # Normalize routing weights (softmax over selected experts' bids)
-        routing_weights = F.softmax(top_bids, dim=-1)
+            # Hard selection mask
+            hard_mask = torch.zeros_like(bids)
+            hard_mask.scatter_(-1, selected_experts, 1.0)
+            
+            # Straight-through: use hard mask in forward, soft gradients in backward
+            # The gradient flows through soft_weights but the value is hard_mask
+            differentiable_mask = hard_mask + (soft_weights - soft_weights.detach())
+            
+            # Gather routing weights for selected experts with gradient flow
+            routing_weights_full = differentiable_mask * F.softmax(bids, dim=-1)
+            routing_weights = torch.gather(routing_weights_full, -1, selected_experts)
+            routing_weights = routing_weights / (routing_weights.sum(dim=-1, keepdim=True) + 1e-8)
+        else:
+            # Standard routing (no gradient through selection)
+            routing_weights = F.softmax(top_bids, dim=-1)
         
         return selected_experts, routing_weights, payments
 
@@ -283,8 +312,12 @@ class MixtureOfBidders(nn.Module):
             for i in range(config.num_experts)
         ])
         
-        # The auctioneer
-        self.auctioneer = VCGAuctioneer(config.num_experts, config.top_k)
+        # The auctioneer (with differentiable routing for confidence head training)
+        self.auctioneer = VCGAuctioneer(
+            config.num_experts, 
+            config.top_k,
+            differentiable=config.use_differentiable_routing
+        )
         
         # Expert wealth (persistent state across forward passes)
         # This is the "economy" that drives specialization
@@ -299,6 +332,18 @@ class MixtureOfBidders(nn.Module):
             torch.zeros(config.num_experts)
         )
         
+        # EMA baseline loss for computing loss reduction (per expert)
+        self.register_buffer(
+            'expert_baseline_loss',
+            torch.ones(config.num_experts)  # Start at 1.0 as neutral baseline
+        )
+        
+        # Track expert performance (EMA of loss reduction)
+        self.register_buffer(
+            'expert_performance_ema',
+            torch.zeros(config.num_experts)
+        )
+        
         # Last forward pass statistics (for monitoring)
         self.last_stats = {}
         
@@ -306,6 +351,15 @@ class MixtureOfBidders(nn.Module):
         # Stores wealth snapshots at each forward pass for visualization
         self.wealth_history: List[List[float]] = []
         self._track_wealth: bool = False  # Enable via start_tracking()
+        
+        # Caching for loss feedback mechanism
+        # These are non-persistent and reset each forward pass
+        self._cached_selected_experts: Optional[torch.Tensor] = None
+        self._cached_routing_weights: Optional[torch.Tensor] = None
+        self._cached_confidences: Optional[torch.Tensor] = None
+        self._cached_payments: Optional[torch.Tensor] = None
+        self._cached_expert_token_masks: Optional[List[torch.Tensor]] = None
+        self._loss_feedback_pending: bool = False  # Flag to check if loss feedback was provided
         
     def forward(
         self, 
@@ -382,10 +436,28 @@ class MixtureOfBidders(nn.Module):
                 if update_wealth:
                     self.expert_usage_count[expert_idx] += mask.sum().float()
         
-        # 4. Update wealth based on performance (simplified reward)
-        # In full implementation, this would use actual loss reduction
+        # 4. Cache routing information for loss feedback
+        # This enables update_wealth_from_loss() to be called after loss computation
+        if self.training and self.config.use_loss_feedback:
+            self._cached_selected_experts = selected_experts.detach()
+            self._cached_routing_weights = routing_weights.detach()
+            self._cached_confidences = confidences.detach()
+            self._cached_payments = payments.detach() if payments is not None else None
+            self._loss_feedback_pending = True
+        
+        # 5. Apply local quality signal if loss feedback not available
+        # This provides a fallback specialization signal
         if update_wealth and self.training:
-            self._update_wealth(selected_experts, routing_weights, confidences, payments)
+            if self.config.use_local_quality:
+                # Compute local quality from output stability
+                self._update_wealth_local_quality(
+                    selected_experts, routing_weights, confidences, payments, output
+                )
+            else:
+                # Fallback to participation-only updates (less effective)
+                self._update_wealth_participation(
+                    selected_experts, routing_weights, confidences, payments
+                )
         
         # Store statistics for monitoring (accessible via self.last_stats)
         self.last_stats = {
@@ -394,6 +466,7 @@ class MixtureOfBidders(nn.Module):
             'routing_weights': routing_weights.detach(),
             'expert_wealth': self.expert_wealth.clone(),
             'expert_usage': self.expert_usage_count.clone(),
+            'expert_performance': self.expert_performance_ema.clone(),
         }
         
         # Record wealth snapshot for history tracking
@@ -402,7 +475,223 @@ class MixtureOfBidders(nn.Module):
         
         return output
     
-    def _update_wealth(
+    def get_confidence_calibration_loss(self) -> torch.Tensor:
+        """
+        Compute auxiliary loss for confidence head calibration.
+        
+        This loss encourages confidence heads to be calibrated:
+        - High confidence should correlate with low loss (after loss feedback)
+        - Overconfident experts get penalized
+        
+        Should be added to the main loss with weight config.confidence_calibration_weight.
+        
+        Returns:
+            Scalar calibration loss tensor (0 if no loss feedback available)
+        """
+        if not self._loss_feedback_pending or self._cached_confidences is None:
+            return torch.tensor(0.0, device=self.expert_wealth.device)
+        
+        # Use performance EMA as target for confidence calibration
+        # Experts should be confident when they typically perform well
+        target_confidence = torch.sigmoid(self.expert_performance_ema * 5.0)  # Scale to [0, 1]
+        
+        # MSE between predicted confidence and performance-based target
+        mean_confidences = self._cached_confidences.mean(dim=(0, 1))  # (num_experts,)
+        calibration_loss = F.mse_loss(mean_confidences, target_confidence.detach())
+        
+        return calibration_loss * self.config.confidence_calibration_weight
+    
+    def update_wealth_from_loss(
+        self, 
+        per_token_loss: torch.Tensor,
+        token_mask: Optional[torch.Tensor] = None
+    ):
+        """
+        Update expert wealth based on actual loss reduction.
+        
+        THIS IS THE KEY SPECIALIZATION MECHANISM.
+        
+        Called by the training loop after computing the loss:
+        ```
+        output = model(input_ids)
+        loss = criterion(output, labels)  # per-token loss
+        mob_layer.update_wealth_from_loss(loss)
+        ```
+        
+        Args:
+            per_token_loss: Loss per token, shape (batch, seq_len) or (batch * seq_len,)
+            token_mask: Optional mask for valid tokens (1 = valid, 0 = padding)
+        """
+        if not self._loss_feedback_pending or self._cached_selected_experts is None:
+            logger.warning("update_wealth_from_loss called without pending forward pass")
+            return
+        
+        with torch.no_grad():
+            selected_experts = self._cached_selected_experts
+            routing_weights = self._cached_routing_weights
+            confidences = self._cached_confidences
+            payments = self._cached_payments
+            
+            batch_size, seq_len, _ = confidences.shape
+            
+            # Reshape loss if needed
+            if per_token_loss.dim() == 1:
+                per_token_loss = per_token_loss.view(batch_size, seq_len)
+            
+            # Apply token mask if provided
+            if token_mask is not None:
+                if token_mask.dim() == 1:
+                    token_mask = token_mask.view(batch_size, seq_len)
+                per_token_loss = per_token_loss * token_mask
+            
+            # 1. Mild decay to all experts
+            self.expert_wealth *= self.config.wealth_decay
+            
+            # 2. Compute loss reduction per expert
+            expert_rewards = torch.zeros_like(self.expert_wealth)
+            expert_token_counts = torch.zeros_like(self.expert_wealth)
+            
+            for k in range(self.config.top_k):
+                for expert_idx in range(self.config.num_experts):
+                    mask = (selected_experts[:, :, k] == expert_idx)
+                    if not mask.any():
+                        continue
+                    
+                    # Get losses for tokens this expert processed
+                    expert_losses = per_token_loss[mask]
+                    mean_loss = expert_losses.mean()
+                    token_count = mask.sum().float()
+                    expert_token_counts[expert_idx] += token_count
+                    
+                    # Compare to baseline (EMA of past losses for this expert)
+                    baseline = self.expert_baseline_loss[expert_idx]
+                    
+                    # Loss reduction: positive = expert did better than baseline
+                    loss_reduction = baseline - mean_loss
+                    
+                    # Reward proportional to loss reduction and selection weight
+                    mean_weight = routing_weights[:, :, k][mask].mean()
+                    reward = loss_reduction * mean_weight * token_count / (batch_size * seq_len)
+                    
+                    # Scale reward
+                    expert_rewards[expert_idx] += reward * self.config.reward_scale * 50.0
+                    
+                    # Update baseline EMA
+                    self.expert_baseline_loss[expert_idx] = (
+                        self.config.loss_ema_decay * baseline + 
+                        (1 - self.config.loss_ema_decay) * mean_loss
+                    )
+                    
+                    # Update performance EMA (for confidence calibration)
+                    self.expert_performance_ema[expert_idx] = (
+                        self.config.loss_ema_decay * self.expert_performance_ema[expert_idx] +
+                        (1 - self.config.loss_ema_decay) * loss_reduction
+                    )
+            
+            # 3. Competitive bonus for top performers
+            if expert_rewards.abs().max() > 1e-6:
+                normalized_rewards = (expert_rewards - expert_rewards.mean()) / (expert_rewards.std() + 1e-6)
+                competitive_bonus = F.relu(normalized_rewards) * expert_rewards.abs().mean() * 0.5
+                expert_rewards += competitive_bonus
+            
+            # 4. Apply VCG payments (wealth transfer)
+            if self.config.use_vcg_payments and payments is not None:
+                for k in range(self.config.top_k):
+                    for expert_idx in range(self.config.num_experts):
+                        mask = (selected_experts[:, :, k] == expert_idx)
+                        if mask.any():
+                            mean_payment = payments[:, :, k][mask].mean()
+                            # Payment proportional to bid, reduces reward
+                            payment_fraction = mean_payment / (self.expert_wealth[expert_idx] + 1e-6)
+                            expert_rewards[expert_idx] *= (1.0 - payment_fraction.clamp(0, 0.3))
+            
+            # 5. Apply rewards and clamp
+            self.expert_wealth += expert_rewards
+            self.expert_wealth.clamp_(min=self.config.min_wealth, max=self.config.max_wealth)
+            
+            # Clear cache
+            self._loss_feedback_pending = False
+    
+    def _update_wealth_local_quality(
+        self,
+        selected_experts: torch.Tensor,
+        routing_weights: torch.Tensor,
+        confidences: torch.Tensor,
+        payments: Optional[torch.Tensor],
+        output: torch.Tensor
+    ):
+        """
+        Update wealth using local quality signals (when external loss unavailable).
+        
+        Uses output stability as a proxy for quality:
+        - Experts that produce consistent output magnitudes are rewarded
+        - Experts with high variance in output norms are penalized
+        
+        This is less effective than loss feedback but works standalone.
+        """
+        with torch.no_grad():
+            batch_size, seq_len, hidden_dim = output.shape
+            num_tokens = batch_size * seq_len
+            
+            # 1. Mild decay
+            self.expert_wealth *= self.config.wealth_decay
+            
+            # 2. Compute output quality per expert
+            expert_rewards = torch.zeros_like(self.expert_wealth)
+            output_norms = output.norm(dim=-1)  # (batch, seq_len)
+            global_mean_norm = output_norms.mean()
+            
+            for k in range(self.config.top_k):
+                for expert_idx in range(self.config.num_experts):
+                    mask = (selected_experts[:, :, k] == expert_idx)
+                    if not mask.any():
+                        continue
+                    
+                    # Get output norms for this expert's tokens
+                    expert_output_norms = output_norms[mask]
+                    
+                    # Quality signal 1: consistency (low variance is good)
+                    norm_std = expert_output_norms.std()
+                    consistency_reward = 1.0 / (1.0 + norm_std)
+                    
+                    # Quality signal 2: appropriate magnitude (close to global mean)
+                    norm_mean = expert_output_norms.mean()
+                    magnitude_diff = (norm_mean - global_mean_norm).abs()
+                    magnitude_reward = 1.0 / (1.0 + magnitude_diff)
+                    
+                    # Combined quality signal
+                    quality = (consistency_reward + magnitude_reward) / 2.0
+                    
+                    # Weight by confidence and selection fraction
+                    mean_confidence = confidences[:, :, expert_idx][mask].mean()
+                    mean_weight = routing_weights[:, :, k][mask].mean()
+                    selection_fraction = mask.sum().float() / num_tokens
+                    
+                    # Reward = quality * confidence * weight * fraction
+                    reward = quality * mean_confidence * mean_weight * selection_fraction
+                    expert_rewards[expert_idx] += reward * self.config.reward_scale * 5.0
+            
+            # 3. Competitive bonus
+            mean_reward = expert_rewards.mean()
+            if mean_reward > 0:
+                competitive_bonus = (expert_rewards - mean_reward) * 0.5
+                expert_rewards += competitive_bonus.clamp(min=0)
+            
+            # 4. VCG payments
+            if self.config.use_vcg_payments and payments is not None:
+                for k in range(self.config.top_k):
+                    for expert_idx in range(self.config.num_experts):
+                        mask = (selected_experts[:, :, k] == expert_idx)
+                        if mask.any():
+                            mean_payment = payments[:, :, k][mask].mean()
+                            payment_cost = mean_payment * 0.1 / (self.expert_wealth[expert_idx] + 1e-6)
+                            expert_rewards[expert_idx] *= (1.0 - payment_cost.clamp(0, 0.5))
+            
+            # 5. Apply rewards
+            self.expert_wealth += expert_rewards
+            self.expert_wealth.clamp_(min=self.config.min_wealth, max=self.config.max_wealth)
+    
+    def _update_wealth_participation(
         self,
         selected_experts: torch.Tensor,
         routing_weights: torch.Tensor,
@@ -602,12 +891,6 @@ class MixtureOfBidders(nn.Module):
             f"top-k={config.top_k}, mode={mode_str}"
         )
         return mob
-        
-        logger.info(
-            f"Upcycled FFN to MoB with {config.num_experts} experts, "
-            f"top-k={config.top_k}"
-        )
-        return mob
 
 
 class TAMETransformerLayer(nn.Module):
@@ -659,10 +942,21 @@ class TAMETransformerLayer(nn.Module):
         # Pre-norm + MoB (replaces standard FFN)
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states, mob_stats = self.mob(hidden_states)
+        hidden_states = self.mob(hidden_states)
         hidden_states = residual + hidden_states
         
+        # Get routing statistics from MoB
+        mob_stats = self.mob.last_stats
+        
         return hidden_states, mob_stats
+    
+    def get_calibration_loss(self) -> torch.Tensor:
+        """Get confidence calibration loss from MoB layer."""
+        return self.mob.get_confidence_calibration_loss()
+    
+    def update_from_loss(self, per_token_loss: torch.Tensor, token_mask: Optional[torch.Tensor] = None):
+        """Pass loss feedback to MoB layer for wealth updates."""
+        self.mob.update_wealth_from_loss(per_token_loss, token_mask)
 
 
 def apply_mob_to_model(
@@ -722,3 +1016,123 @@ def apply_mob_to_model(
         logger.info(f"Layer {layer_idx}: Replaced FFN with MoB")
     
     return model
+
+
+def get_mob_layers(model: nn.Module) -> List[MixtureOfBidders]:
+    """
+    Find all MoB layers in a model.
+    
+    Args:
+        model: Model that may contain MoB layers
+        
+    Returns:
+        List of MixtureOfBidders modules
+    """
+    mob_layers = []
+    for module in model.modules():
+        if isinstance(module, MixtureOfBidders):
+            mob_layers.append(module)
+    return mob_layers
+
+
+def update_all_mob_from_loss(
+    model: nn.Module,
+    per_token_loss: torch.Tensor,
+    token_mask: Optional[torch.Tensor] = None
+):
+    """
+    Update all MoB layers in a model with loss feedback.
+    
+    Call this after computing the loss in your training loop:
+    
+    ```python
+    # Forward pass
+    outputs = model(input_ids)
+    logits = outputs.logits
+    
+    # Compute per-token loss (don't reduce yet)
+    loss_fct = nn.CrossEntropyLoss(reduction='none')
+    per_token_loss = loss_fct(logits.view(-1, vocab_size), labels.view(-1))
+    per_token_loss = per_token_loss.view(batch_size, seq_len)
+    
+    # Update MoB wealth from loss feedback
+    update_all_mob_from_loss(model, per_token_loss, attention_mask)
+    
+    # Now reduce for backprop
+    loss = per_token_loss.mean()
+    loss.backward()
+    ```
+    
+    Args:
+        model: Model containing MoB layers
+        per_token_loss: Loss per token, shape (batch, seq_len)
+        token_mask: Optional mask for valid tokens
+    """
+    for mob in get_mob_layers(model):
+        mob.update_wealth_from_loss(per_token_loss, token_mask)
+
+
+def get_total_calibration_loss(model: nn.Module) -> torch.Tensor:
+    """
+    Sum calibration losses from all MoB layers.
+    
+    Add this to your main loss for confidence head training:
+    
+    ```python
+    main_loss = criterion(outputs, labels)
+    calibration_loss = get_total_calibration_loss(model)
+    total_loss = main_loss + calibration_loss
+    total_loss.backward()
+    ```
+    
+    Args:
+        model: Model containing MoB layers
+        
+    Returns:
+        Sum of calibration losses from all MoB layers
+    """
+    total_loss = torch.tensor(0.0)
+    for mob in get_mob_layers(model):
+        cal_loss = mob.get_confidence_calibration_loss()
+        if cal_loss.device != total_loss.device:
+            total_loss = total_loss.to(cal_loss.device)
+        total_loss = total_loss + cal_loss
+    return total_loss
+
+
+def get_mob_statistics(model: nn.Module) -> Dict[str, torch.Tensor]:
+    """
+    Aggregate statistics from all MoB layers for monitoring.
+    
+    Args:
+        model: Model containing MoB layers
+        
+    Returns:
+        Dictionary with aggregated statistics:
+        - 'mean_wealth': Mean wealth across all experts and layers
+        - 'wealth_gini': Gini coefficient of wealth distribution
+        - 'mean_performance': Mean performance EMA
+        - 'layer_wealth': List of per-layer wealth tensors
+    """
+    mob_layers = get_mob_layers(model)
+    if not mob_layers:
+        return {}
+    
+    all_wealth = torch.stack([mob.expert_wealth for mob in mob_layers])
+    all_performance = torch.stack([mob.expert_performance_ema for mob in mob_layers])
+    
+    # Compute Gini coefficient
+    flat_wealth = all_wealth.flatten()
+    sorted_wealth = torch.sort(flat_wealth)[0]
+    n = len(sorted_wealth)
+    cumsum = torch.cumsum(sorted_wealth, dim=0)
+    gini = (2 * torch.sum((torch.arange(1, n+1, device=flat_wealth.device) * sorted_wealth))) / (n * torch.sum(sorted_wealth)) - (n + 1) / n
+    
+    return {
+        'mean_wealth': all_wealth.mean(),
+        'wealth_std': all_wealth.std(),
+        'wealth_gini': gini.abs(),
+        'mean_performance': all_performance.mean(),
+        'layer_wealth': [mob.expert_wealth.clone() for mob in mob_layers],
+        'layer_performance': [mob.expert_performance_ema.clone() for mob in mob_layers],
+    }
