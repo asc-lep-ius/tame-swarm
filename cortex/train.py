@@ -61,6 +61,14 @@ except ImportError:
     def tqdm(iterable, **kwargs):
         return iterable
 
+try:
+    from accelerate import dispatch_model, infer_auto_device_map
+    from accelerate.utils import get_balanced_memory
+    HAS_ACCELERATE = True
+except ImportError:
+    HAS_ACCELERATE = False
+    print("Warning: 'accelerate' library not installed. Model re-dispatch disabled.")
+
 from mob import (
     MoBConfig, 
     MixtureOfBidders, 
@@ -213,12 +221,17 @@ class TAMETrainer:
         # Apply MoB transformation
         self._apply_mob()
         
-        # Apply LoRA if requested
+        # Apply LoRA if requested (before re-dispatch so all new modules are included)
         if self.config.use_lora:
             self._apply_lora()
         
-        # Move to device if not using device_map
-        if self.device.type != "cuda" or not hasattr(self.model, 'hf_device_map'):
+        # Option 4: Re-dispatch model after MoB + LoRA transformations to ensure consistent device placement
+        # This fixes the meta device gradient error when using device_map="auto"
+        # Must happen AFTER all model modifications (MoB and LoRA) are complete
+        if self.device.type == "cuda" and HAS_ACCELERATE:
+            self._redispatch_model()
+        elif self.device.type != "cuda":
+            # Move to device if not using CUDA
             self.model = self.model.to(self.device)
         
         # Setup optimizer
@@ -273,6 +286,67 @@ class TAMETrainer:
             mob_config,
             layers_to_modify=layers_to_modify
         )
+    
+    def _redispatch_model(self):
+        """
+        Re-dispatch model after MoB/LoRA transformations using Accelerate.
+        
+        This ensures all newly created modules (MoB, LoRA adapters) are properly placed 
+        on devices after modifying the model architecture. Without this, modules created 
+        during transformations may remain on 'meta' device causing gradient errors like:
+        "RuntimeError: expected device meta but got cuda:0"
+        """
+        logger.info("Re-dispatching model after transformations...")
+        
+        # First, materialize any parameters still on 'meta' device
+        # This can happen with device_map="auto" lazy loading
+        meta_params = []
+        for name, param in self.model.named_parameters():
+            if param.device.type == 'meta':
+                meta_params.append(name)
+        
+        if meta_params:
+            logger.info(f"Found {len(meta_params)} parameters on meta device, materializing...")
+            # Move entire model to device first to materialize meta tensors
+            self.model = self.model.to(self.device)
+            logger.info("Model materialized on device")
+            return  # Skip re-dispatch since model is now fully on device
+        
+        try:
+            # For PEFT models, we need to work with the underlying model
+            model_to_dispatch = self.model
+            is_peft = hasattr(self.model, 'base_model')
+            
+            if is_peft:
+                logger.info("Detected PEFT model, working with base model for dispatch")
+            
+            # Get balanced memory allocation
+            max_memory = get_balanced_memory(
+                model_to_dispatch,
+                max_memory=None,  # Use all available memory
+                no_split_module_classes=["MixtureOfBidders", "LoraLayer"],  # Don't split these modules
+            )
+            
+            device_map = infer_auto_device_map(
+                model_to_dispatch,
+                max_memory=max_memory,
+                no_split_module_classes=["MixtureOfBidders", "LoraLayer"],
+            )
+            
+            # Log device distribution
+            device_counts = {}
+            for module_name, device in device_map.items():
+                device_counts[str(device)] = device_counts.get(str(device), 0) + 1
+            logger.info(f"Device map: {device_counts}")
+            
+            # Dispatch the model with the new device map
+            self.model = dispatch_model(model_to_dispatch, device_map=device_map)
+            logger.info("Model re-dispatched successfully")
+            
+        except Exception as e:
+            logger.warning(f"Re-dispatch failed ({type(e).__name__}: {e}), falling back to .to(device)")
+            # Fallback: move entire model to target device
+            self.model = self.model.to(self.device)
     
     def _apply_lora(self):
         """Apply LoRA adapters for memory-efficient training."""

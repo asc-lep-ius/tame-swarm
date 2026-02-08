@@ -918,6 +918,11 @@ class MixtureOfBidders(nn.Module):
             
             if device is None:
                 device = ref_param.device
+                # Option 1: Force CUDA if device is 'meta' (lazy loading with device_map="auto")
+                # The meta device is a placeholder that causes gradient errors during backward pass
+                if device.type == 'meta':
+                    device = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
+                    logger.warning(f"Detected meta device from lazy loading, forcing device={device}")
             if dtype is None:
                 dtype = ref_param.dtype
         
