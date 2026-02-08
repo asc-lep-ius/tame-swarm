@@ -22,12 +22,16 @@ from plotly.subplots import make_subplots
 API_BASE = os.getenv("TAME_API_URL", "http://localhost:8000")
 
 
-def create_wealth_distribution_plot(wealth_trace: Dict[str, Any]) -> go.Figure:
+def create_wealth_distribution_plot(wealth_trace: Dict[str, Any], simplified: bool = False) -> go.Figure:
     """
     Create a plotly figure showing expert wealth distribution over tokens.
     
     Good Sign: Inequality - some experts should become rich (specialists),
     others poor. Equal wealth means the auction isn't forcing specialization.
+    
+    Args:
+        wealth_trace: Wealth trace data from API
+        simplified: If True, use faster rendering with fewer features
     """
     if not wealth_trace or not wealth_trace.get("expert_wealth"):
         # Return empty figure with message
@@ -47,8 +51,15 @@ def create_wealth_distribution_plot(wealth_trace: Dict[str, Any]) -> go.Figure:
         return fig
     
     expert_wealth = wealth_trace["expert_wealth"]
-    steps = wealth_trace.get("steps", list(range(len(expert_wealth))))
     num_experts = wealth_trace.get("num_experts", len(expert_wealth[0]) if expert_wealth else 0)
+    
+    # Downsample for performance if we have lots of data points
+    max_points = 100 if simplified else 500
+    if len(expert_wealth) > max_points:
+        step = len(expert_wealth) // max_points
+        expert_wealth = expert_wealth[::step]
+    
+    steps = list(range(len(expert_wealth)))
     
     # Create traces for each expert
     fig = go.Figure()
@@ -57,17 +68,18 @@ def create_wealth_distribution_plot(wealth_trace: Dict[str, Any]) -> go.Figure:
     
     for expert_idx in range(num_experts):
         wealth_values = [step[expert_idx] for step in expert_wealth]
-        fig.add_trace(go.Scatter(
+        fig.add_trace(go.Scattergl(  # Use WebGL for faster rendering
             x=steps,
             y=wealth_values,
             mode='lines',
             name=f'Expert {expert_idx}',
             line=dict(width=2, color=colors[expert_idx % len(colors)]),
-            hovertemplate=f'Expert {expert_idx}<br>Step: %{{x}}<br>Wealth: %{{y:.2f}}<extra></extra>'
+            hoverinfo='skip' if simplified else 'all',
         ))
     
-    # Calculate inequality metric (Gini coefficient approximation)
-    if expert_wealth:
+    # Calculate inequality metric only for final chart
+    inequality_text = ""
+    if not simplified and expert_wealth:
         final_wealth = expert_wealth[-1]
         sorted_wealth = sorted(final_wealth)
         n = len(sorted_wealth)
@@ -78,28 +90,34 @@ def create_wealth_distribution_plot(wealth_trace: Dict[str, Any]) -> go.Figure:
         else:
             gini = 0
         inequality_text = f"Gini: {gini:.3f} ({'Specializing!' if gini > 0.2 else 'Low inequality'})"
-    else:
-        inequality_text = ""
+    
+    title = "VCG Auction: Expert Wealth Over Tokens"
+    if inequality_text:
+        title += f"<br><sub>{inequality_text}</sub>"
     
     fig.update_layout(
-        title=f"VCG Auction: Expert Wealth Over Tokens<br><sub>{inequality_text}</sub>",
+        title=title,
         xaxis_title="Forward Pass (≈ tokens)",
         yaxis_title="Wealth (credits)",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         height=350,
         margin=dict(l=50, r=20, t=80, b=50),
-        hovermode='x unified'
+        hovermode='x unified' if not simplified else False,
     )
     
     return fig
 
 
-def create_steering_trace_plot(steering_trace: Dict[str, Any]) -> go.Figure:
+def create_steering_trace_plot(steering_trace: Dict[str, Any], simplified: bool = False) -> go.Figure:
     """
     Create a plotly figure showing steering strength (α_t) over time.
     
     Good Sign: Dynamic behavior - low when naturally aligned with goal,
     spikes when the prompt tries to force the model off-course.
+    
+    Args:
+        steering_trace: Steering trace data from API
+        simplified: If True, use faster rendering with fewer features
     """
     if not steering_trace or not steering_trace.get("strength_history"):
         # Return empty figure with message
@@ -121,20 +139,29 @@ def create_steering_trace_plot(steering_trace: Dict[str, Any]) -> go.Figure:
     strength_history = steering_trace["strength_history"]
     alignment_history = steering_trace.get("alignment_history", [])
     target_alignment = steering_trace.get("target_alignment", 0.7)
+    
+    # Downsample for performance
+    max_points = 100 if simplified else 500
+    if len(strength_history) > max_points:
+        step = len(strength_history) // max_points
+        strength_history = strength_history[::step]
+        if alignment_history:
+            alignment_history = alignment_history[::step]
+    
     steps = list(range(len(strength_history)))
     
     # Create subplot with secondary y-axis
     fig = make_subplots(specs=[[{"secondary_y": True}]])
     
-    # Steering strength trace
+    # Steering strength trace - use WebGL
     fig.add_trace(
-        go.Scatter(
+        go.Scattergl(
             x=steps,
             y=strength_history,
             mode='lines',
             name='Steering Strength (α_t)',
             line=dict(width=2.5, color='#FF6B6B'),
-            hovertemplate='Step: %{x}<br>Strength: %{y:.3f}<extra></extra>'
+            hoverinfo='skip' if simplified else 'all',
         ),
         secondary_y=False
     )
@@ -142,40 +169,45 @@ def create_steering_trace_plot(steering_trace: Dict[str, Any]) -> go.Figure:
     # Alignment trace (if available)
     if alignment_history:
         fig.add_trace(
-            go.Scatter(
+            go.Scattergl(
                 x=list(range(len(alignment_history))),
                 y=alignment_history,
                 mode='lines',
                 name='Alignment',
                 line=dict(width=2, color='#4ECDC4', dash='dot'),
-                hovertemplate='Step: %{x}<br>Alignment: %{y:.3f}<extra></extra>'
+                hoverinfo='skip' if simplified else 'all',
             ),
             secondary_y=True
         )
         
-        # Target alignment line
-        fig.add_hline(
-            y=target_alignment,
-            line_dash="dash",
-            line_color="gray",
-            annotation_text=f"Target ({target_alignment})",
-            secondary_y=True
-        )
+        # Target alignment line - skip during simplified mode
+        if not simplified:
+            fig.add_hline(
+                y=target_alignment,
+                line_dash="dash",
+                line_color="gray",
+                annotation_text=f"Target ({target_alignment})",
+                secondary_y=True
+            )
     
-    # Analyze dynamics
-    if strength_history:
-        variance = sum((s - sum(strength_history)/len(strength_history))**2 for s in strength_history) / len(strength_history)
+    # Analyze dynamics only for final chart
+    dynamics_text = ""
+    if not simplified and strength_history:
+        mean_strength = sum(strength_history) / len(strength_history)
+        variance = sum((s - mean_strength)**2 for s in strength_history) / len(strength_history)
         dynamics_text = f"Variance: {variance:.4f} ({'Dynamic!' if variance > 0.01 else 'Static - may need tuning'})"
-    else:
-        dynamics_text = ""
+    
+    title = "Homeostatic Trace: Injection Strength Over Time"
+    if dynamics_text:
+        title += f"<br><sub>{dynamics_text}</sub>"
     
     fig.update_layout(
-        title=f"Homeostatic Trace: Injection Strength Over Time<br><sub>{dynamics_text}</sub>",
+        title=title,
         xaxis_title="Forward Pass",
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         height=350,
         margin=dict(l=50, r=50, t=80, b=50),
-        hovermode='x unified'
+        hovermode='x unified' if not simplified else False,
     )
     
     fig.update_yaxes(title_text="Strength (α_t)", secondary_y=False)
@@ -326,6 +358,15 @@ def stream_chat(
                     
                 elif event_type == 'progress':
                     status_text = f"🔄 {data.get('message', '')} tokens"
+                    yield accumulated_response, status_text, wealth_trace, steering_trace
+                
+                elif event_type == 'trace_update':
+                    # Intermediate trace data for live chart updates
+                    if 'wealth_trace' in data:
+                        wealth_trace = data['wealth_trace']
+                    if 'steering_trace' in data:
+                        steering_trace = data['steering_trace']
+                    # Yield with updated traces
                     yield accumulated_response, status_text, wealth_trace, steering_trace
                     
                 elif event_type == 'complete':
@@ -572,21 +613,40 @@ def create_ui():
             status = "Starting..."
             wealth_trace = {}
             steering_trace = {}
+            last_wealth_len = 0
+            last_steering_len = 0
             
             for response_text, stats_text, w_trace, s_trace in stream_chat(message, history, temp, max_tok, steer, stats):
                 accumulated = response_text
                 status = stats_text
-                wealth_trace = w_trace if w_trace else wealth_trace
-                steering_trace = s_trace if s_trace else steering_trace
+                
+                # Track if traces have new data
+                new_wealth = w_trace if w_trace else wealth_trace
+                new_steering = s_trace if s_trace else steering_trace
+                
+                wealth_data_len = len(new_wealth.get('expert_wealth', []))
+                steering_data_len = len(new_steering.get('strength_history', []))
+                
+                # Check if we have new trace data (not just new tokens)
+                has_new_trace_data = (wealth_data_len > last_wealth_len) or (steering_data_len > last_steering_len)
+                
+                # Update stored traces
+                wealth_trace = new_wealth
+                steering_trace = new_steering
                 
                 # Update history with current accumulated response
                 current_history = history + [{"role": "assistant", "content": accumulated}]
                 
-                # Create plots (only update when we have data)
-                wealth_fig = create_wealth_distribution_plot(wealth_trace)
-                steering_fig = create_steering_trace_plot(steering_trace)
-                
-                yield "", current_history, status, wealth_fig, steering_fig
+                if has_new_trace_data:
+                    # New trace data arrived - update the charts
+                    last_wealth_len = wealth_data_len
+                    last_steering_len = steering_data_len
+                    wealth_fig = create_wealth_distribution_plot(wealth_trace)
+                    steering_fig = create_steering_trace_plot(steering_trace)
+                    yield "", current_history, status, wealth_fig, steering_fig
+                else:
+                    # No new trace data - skip plot updates for performance
+                    yield "", current_history, status, gr.update(), gr.update()
             
             # Final yield with complete response and final plots
             final_history = history + [{"role": "assistant", "content": accumulated}]

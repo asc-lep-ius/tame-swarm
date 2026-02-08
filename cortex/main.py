@@ -622,6 +622,7 @@ async def generate_stream(req: GenerateRequest):
             full_response = ""
             token_count = 0
             last_status_update = 0
+            last_trace_update = 0
             
             for token_text in streamer:
                 full_response += token_text
@@ -648,6 +649,51 @@ async def generate_stream(req: GenerateRequest):
                     except:
                         pass
                     
+                    yield f"data: {json.dumps({'type': 'progress', 'message': status_msg, 'tokens': token_count})}\n\n"
+                
+                # Every 25 tokens, send intermediate trace data for live chart updates
+                if token_count - last_trace_update >= 25:
+                    last_trace_update = token_count
+                    try:
+                        trace_update = {'type': 'trace_update', 'tokens': token_count}
+                        
+                        # Get current wealth trace (subsampled for performance)
+                        wealth_data = get_aggregated_wealth_trace()
+                        if wealth_data.get('expert_wealth'):
+                            # Subsample to max 100 points for performance
+                            expert_wealth = wealth_data['expert_wealth']
+                            if len(expert_wealth) > 100:
+                                step = len(expert_wealth) // 100
+                                expert_wealth = expert_wealth[::step]
+                            trace_update['wealth_trace'] = {
+                                'steps': list(range(len(expert_wealth))),
+                                'expert_wealth': expert_wealth,
+                                'num_experts': wealth_data.get('num_experts', 0),
+                                'num_layers': wealth_data.get('num_layers', 0)
+                            }
+                        
+                        # Get current steering trace (subsampled)
+                        if homeostat:
+                            homeo_stats = homeostat.get_alignment_stats()
+                            strength_history = homeo_stats.get('strength_history', [])
+                            alignment_history = homeo_stats.get('alignment_history', [])
+                            
+                            # Subsample to max 100 points
+                            if len(strength_history) > 100:
+                                step = len(strength_history) // 100
+                                strength_history = strength_history[::step]
+                                alignment_history = alignment_history[::step] if alignment_history else []
+                            
+                            if strength_history:
+                                trace_update['steering_trace'] = {
+                                    'strength_history': strength_history,
+                                    'alignment_history': alignment_history,
+                                    'target_alignment': STEERING_CONFIG.target_alignment,
+                                }
+                        
+                        yield f"data: {json.dumps(trace_update)}\n\n"
+                    except Exception as e:
+                        logger.warning(f"Error sending trace update: {e}")
                     yield f"data: {json.dumps({'type': 'progress', 'message': status_msg, 'tokens': token_count})}\n\n"
                 
                 # Small delay to prevent overwhelming the client
