@@ -1,5 +1,7 @@
 cortex/model_cache/
 cortex/__pycache__/
+cortex/tame_checkpoints/
+cortex/tame_inference/
 
 # Environment files with secrets
 .env
