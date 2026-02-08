@@ -25,8 +25,8 @@ services:
     environment:
       - PYTHONUNBUFFERED=1
       - HF_HOME=/root/.cache/huggingface
-      # Optional: HuggingFace token for gated models
-      # - HF_TOKEN=${HF_TOKEN}
+      # HuggingFace token for gated models (Gemma, Llama, etc.)
+      - HF_TOKEN=${HF_TOKEN}
     # Override entrypoint for training
     entrypoint: ["python", "setup_tame.py"]
     # Default: run quick test (override with docker-compose run args)

@@ -1,2 +1,6 @@
 cortex/model_cache/
 cortex/__pycache__/
+
+# Environment files with secrets
+.env
+cortex/.env
