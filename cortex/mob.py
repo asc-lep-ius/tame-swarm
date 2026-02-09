@@ -30,12 +30,12 @@ class MoBConfig:
     top_k: int = 2  # How many experts process each token
     hidden_dim: int = 4096  # Model hidden dimension
     intermediate_dim: int = 14336  # FFN intermediate dimension (Mistral default)
-    initial_wealth: float = 100.0  # Starting credits for each expert
-    wealth_decay: float = 0.999  # Wealth decay per step (reduced from 0.99 - was too aggressive)
-    min_wealth: float = 10.0  # Minimum wealth (raised to prevent death spiral)
-    max_wealth: float = 500.0  # Maximum wealth (prevents runaway monopoly)
-    jitter_std: float = 0.05  # Gaussian noise for symmetry breaking (increased for differentiation)
-    reward_scale: float = 1.0  # Base reward multiplier
+    initial_wealth: float = 75.0  # Starting credits (lower = more room to grow)
+    wealth_decay: float = 0.997  # Wealth decay per step (0.3%/step for stronger differentiation)
+    min_wealth: float = 15.0  # Minimum wealth (slightly higher floor)
+    max_wealth: float = 750.0  # Maximum wealth (higher ceiling to let winners dominate)
+    jitter_std: float = 0.08  # Gaussian noise for symmetry breaking (increased for differentiation)
+    reward_scale: float = 2.0  # Base reward multiplier (doubled for stronger specialization)
     use_vcg_payments: bool = True  # Whether winners pay (wealth transfer mechanism)
     # Memory-efficient options
     use_shared_base: bool = True  # Use shared base + adapters instead of full copies
@@ -45,13 +45,13 @@ class MoBConfig:
     use_loss_feedback: bool = True  # Enable loss-based wealth updates (requires training loop integration)
     use_local_quality: bool = True  # Use local quality signals when loss not available
     use_differentiable_routing: bool = True  # Straight-through estimator for confidence head gradients
-    confidence_calibration_weight: float = 0.1  # Auxiliary loss weight for confidence calibration
-    loss_ema_decay: float = 0.95  # EMA decay for baseline loss tracking
+    confidence_calibration_weight: float = 0.15  # Auxiliary loss weight for confidence calibration (increased)
+    loss_ema_decay: float = 0.92  # EMA decay for baseline loss tracking (faster adaptation)
     # Inference mode settings (only apply when use_loss_feedback=False)
     # These create more dynamic wealth changes during user interaction
-    inference_wealth_decay: float = 0.99  # Faster decay during inference (vs 0.999 training)
-    inference_exploration_bonus: float = 0.02  # Bonus for underused experts (keeps competition alive)
-    inference_wealth_compression: float = 0.5  # Compress wealth toward mean on load (0=none, 1=full)
+    inference_wealth_decay: float = 0.98  # Faster decay during inference (vs 0.997 training)
+    inference_exploration_bonus: float = 0.03  # Bonus for underused experts (keeps competition alive)
+    inference_wealth_compression: float = 0.4  # Compress wealth toward mean on load (0=none, 1=full)
 
 
 class ConfidenceHead(nn.Module):

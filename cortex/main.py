@@ -98,10 +98,10 @@ MODEL_ID = _profile["model_id"]
 # │ num_experts   │ Specialization diversity            │ 4-8 optimal, >8 diminishes│
 # │ top_k         │ Experts per token (sparsity)        │ 2 is sweet spot           │
 # │ adapter_rank  │ Expert expressiveness (LoRA rank)   │ 32-64 sufficient          │
-# │ wealth_decay  │ How fast losers decay               │ 0.999=slow, 0.99=fast     │
-# │ min_wealth    │ Floor prevents expert death         │ 10.0 safe default         │
-# │ max_wealth    │ Cap prevents monopoly               │ 500.0 balanced            │
-# │ jitter_std    │ Symmetry breaking noise             │ 0.05 for differentiation  │
+# │ wealth_decay  │ How fast losers decay               │ 0.997=aggressive, 0.999=slow│
+# │ min_wealth    │ Floor prevents expert death         │ 15.0 safe default         │
+# │ max_wealth    │ Cap prevents monopoly               │ 750.0 balanced            │
+# │ jitter_std    │ Symmetry breaking noise             │ 0.08 for differentiation  │
 # └───────────────┴─────────────────────────────────────┴───────────────────────────┘
 #
 # LAYER SELECTION (auto-configured per model):
@@ -117,12 +117,12 @@ MOB_CONFIG = MoBConfig(
     top_k=2,                # 2 experts per token (sparse routing)
     hidden_dim=_profile["hidden_dim"],
     intermediate_dim=_profile["intermediate_dim"],
-    initial_wealth=100.0,   # Starting credits for each expert
-    wealth_decay=0.999,     # Mild decay for specialization (updated from 0.99)
-    min_wealth=10.0,        # Minimum wealth (prevents death spiral)
-    max_wealth=500.0,       # Maximum wealth (prevents monopoly)
-    jitter_std=0.05,        # Symmetry breaking noise (increased for differentiation)
-    reward_scale=1.0,       # Base reward multiplier
+    initial_wealth=75.0,    # Starting credits (lower = more room to grow)
+    wealth_decay=0.997,     # Faster decay for differentiation (0.3%/step vs 0.1%)
+    min_wealth=15.0,        # Minimum wealth (slightly higher floor)
+    max_wealth=750.0,       # Maximum wealth (higher ceiling to let winners dominate)
+    jitter_std=0.08,        # Symmetry breaking noise (increased for differentiation)
+    reward_scale=2.0,       # Base reward multiplier (doubled for stronger specialization)
     use_vcg_payments=True,  # Enable VCG payment mechanism
     # Memory-efficient mode: shared base FFN + lightweight LoRA-style adapters
     use_shared_base=True,   # Reduces memory from O(experts×FFN) to O(FFN + experts×adapters)
@@ -133,9 +133,9 @@ MOB_CONFIG = MoBConfig(
     use_local_quality=True,   # Use output quality signals for wealth updates
     use_differentiable_routing=False,  # Not needed for inference
     # Inference dynamics: more responsive wealth changes for visible VCG auction
-    inference_wealth_decay=0.99,         # Faster decay (vs 0.999 training) - 1% per token
-    inference_exploration_bonus=0.02,    # 2% bonus for underused experts
-    inference_wealth_compression=0.5,    # Compress 50% toward mean on load
+    inference_wealth_decay=0.98,         # Faster decay (vs 0.997 training) - 2% per token
+    inference_exploration_bonus=0.03,    # 3% bonus for underused experts
+    inference_wealth_compression=0.4,    # Compress 40% toward mean on load
 )
 
 # Steering Configuration (Module 2: Cognitive Homeostasis)

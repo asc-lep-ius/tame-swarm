@@ -164,7 +164,7 @@ class TrainingConfig:
     max_seq_length: int = 512  # Reduced from 1024 for 16GB GPUs
     
     # MoB-specific training
-    calibration_loss_weight: float = 0.1  # Weight for confidence calibration loss
+    calibration_loss_weight: float = 0.15  # Weight for confidence calibration loss (increased for stronger training)
     wealth_update_frequency: int = 1  # How often to update wealth (every N steps)
     log_wealth_frequency: int = 100  # How often to log wealth statistics
     
