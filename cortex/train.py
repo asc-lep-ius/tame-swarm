@@ -166,7 +166,7 @@ class TrainingConfig:
     # MoB-specific training
     calibration_loss_weight: float = 0.15  # Weight for confidence calibration loss (increased for stronger training)
     wealth_update_frequency: int = 1  # How often to update wealth (every N steps)
-    log_wealth_frequency: int = 100  # How often to log wealth statistics
+    log_frequency: int = 10  # How often to log comprehensive training statistics (every N steps)
     
     # LoRA (optional)
     use_lora: bool = False
@@ -226,6 +226,7 @@ class TAMETrainer:
         # Training state
         self.global_step = 0
         self.best_loss = float('inf')
+        self._last_avg_metrics = {"loss": 0.0, "calibration_loss": 0.0, "perplexity": 0.0}
         
         # Wealth history for analysis
         self.wealth_history: List[Dict[str, Any]] = []
@@ -790,6 +791,9 @@ class TAMETrainer:
     def train(self):
         """Main training loop."""
         logger.info("Starting training...")
+        logger.info("="*100)
+        logger.info(f"{'Step':>6} | {'Prog':>5} | {'Loss':>7} | {'PPL':>10} | {'Cal':>6} | {'Mean Wealth':>12} | {'Std Dev':>8} | {'Gini':>6} | {'Perf EMA':>9}")
+        logger.info("-"*100)
         
         # Start wealth tracking for analysis
         for mob in get_mob_layers(self.model):
@@ -832,60 +836,92 @@ class TAMETrainer:
                 self.scheduler.step()
                 self.optimizer.zero_grad()
                 
-                # Log metrics
-                avg_metrics = {k: v / self.config.gradient_accumulation_steps 
-                              for k, v in accumulated_metrics.items()}
-                
-                if HAS_TQDM:
-                    progress_bar.set_postfix({
-                        "loss": f"{avg_metrics['loss']:.4f}",
-                        "ppl": f"{avg_metrics['perplexity']:.2f}",
-                        "cal": f"{avg_metrics['calibration_loss']:.4f}",
-                    })
+                # Compute averaged metrics for this accumulation window (stored for next log)
+                self._last_avg_metrics = {k: v / self.config.gradient_accumulation_steps 
+                                          for k, v in accumulated_metrics.items()}
                 
                 # Reset accumulated metrics
                 accumulated_metrics = {k: 0.0 for k in accumulated_metrics}
             
-            # Log wealth statistics
-            if step > 0 and step % self.config.log_wealth_frequency == 0:
-                self._log_wealth_statistics()
+            # Log comprehensive training statistics
+            if step > 0 and step % self.config.log_frequency == 0:
+                self._log_training_step(step)
             
             # Save checkpoint
             if step > 0 and step % self.config.save_steps == 0:
                 self._save_checkpoint(step)
         
-        # Final save
+        # Final save and log
+        self._log_training_step(self.config.max_steps)
         self._save_checkpoint(self.config.max_steps, final=True)
         
+        logger.info("="*100)
         logger.info("Training complete!")
     
-    def _log_wealth_statistics(self):
-        """Log MoB wealth distribution statistics."""
+    def _log_training_step(self, step: int):
+        """
+        Log comprehensive training statistics for fine-tuning analysis.
+        
+        Outputs: Step, Progress%, Loss, Perplexity, Calibration Loss,
+                 Mean Wealth, Std Dev, Gini Coefficient, Performance EMA
+        """
+        # Get MoB wealth statistics
         stats = get_mob_statistics(self.model)
         
-        if not stats:
-            return
+        # Calculate progress percentage
+        progress = (step / self.config.max_steps) * 100
         
-        # Store for analysis
-        self.wealth_history.append({
-            "step": self.global_step,
-            **{k: v.item() if isinstance(v, torch.Tensor) else v 
-               for k, v in stats.items() if k not in ['layer_wealth', 'layer_performance']}
-        })
+        # Use averaged metrics from gradient accumulation window
+        metrics = self._last_avg_metrics
+        loss = metrics.get('loss', float('nan'))
+        ppl = metrics.get('perplexity', float('nan'))
+        cal = metrics.get('calibration_loss', 0.0)
         
-        # Log
-        logger.info(
-            f"Step {self.global_step} | Wealth: mean={stats['mean_wealth']:.2f}, "
-            f"std={stats['wealth_std']:.2f}, gini={stats['wealth_gini']:.4f} | "
-            f"Performance EMA: {stats['mean_performance']:.4f}"
-        )
-        
-        # Check for healthy specialization
-        gini = stats['wealth_gini'].item() if isinstance(stats['wealth_gini'], torch.Tensor) else stats['wealth_gini']
-        if gini < 0.05:
-            logger.warning("Low Gini coefficient - experts may not be specializing. Check loss feedback.")
-        elif gini > 0.7:
-            logger.warning("Very high Gini - potential wealth monopoly. Consider increasing min_wealth.")
+        if stats:
+            mean_wealth = stats['mean_wealth'].item() if isinstance(stats['mean_wealth'], torch.Tensor) else stats['mean_wealth']
+            std_wealth = stats['wealth_std'].item() if isinstance(stats['wealth_std'], torch.Tensor) else stats['wealth_std']
+            gini = stats['wealth_gini'].item() if isinstance(stats['wealth_gini'], torch.Tensor) else stats['wealth_gini']
+            perf_ema = stats['mean_performance'].item() if isinstance(stats['mean_performance'], torch.Tensor) else stats['mean_performance']
+            
+            # Store for analysis
+            self.wealth_history.append({
+                "step": step,
+                "progress": progress,
+                "loss": loss,
+                "perplexity": ppl,
+                "calibration_loss": cal,
+                "mean_wealth": mean_wealth,
+                "wealth_std": std_wealth,
+                "wealth_gini": gini,
+                "mean_performance": perf_ema,
+            })
+            
+            # Format performance EMA with sign
+            perf_sign = "+" if perf_ema >= 0 else ""
+            
+            # Log comprehensive line
+            logger.info(
+                f"{step:>6} | {progress:>4.0f}% | {loss:>7.4f} | {ppl:>10.2f} | {cal:>6.4f} | "
+                f"{mean_wealth:>12.2f} | {std_wealth:>8.2f} | {gini:>6.4f} | {perf_sign}{perf_ema:>8.4f}"
+            )
+            
+            # Warnings for unhealthy dynamics
+            if gini < 0.10:
+                logger.warning(f"  ⚠ Low Gini ({gini:.4f}) - experts converging, not specializing. Consider: ↑reward_scale, ↓wealth_decay")
+            elif gini > 0.60:
+                logger.warning(f"  ⚠ High Gini ({gini:.4f}) - wealth monopoly risk. Consider: ↑min_wealth, ↓max_wealth")
+            
+            if mean_wealth > 0.9 * 750:  # 90% of max_wealth (Option A default)
+                logger.warning(f"  ⚠ Wealth near ceiling ({mean_wealth:.0f}/750) - consider ↑max_wealth")
+            
+            if perf_ema < -0.3:
+                logger.warning(f"  ⚠ Negative performance EMA ({perf_ema:.4f}) - experts underperforming vs baseline")
+        else:
+            # No MoB stats available
+            logger.info(
+                f"{step:>6} | {progress:>4.0f}% | {loss:>7.4f} | {ppl:>10.2f} | {cal:>6.4f} | "
+                f"{'N/A':>12} | {'N/A':>8} | {'N/A':>6} | {'N/A':>9}"
+            )
     
     def _save_checkpoint(self, step: int, final: bool = False):
         """Save model checkpoint and wealth state."""
