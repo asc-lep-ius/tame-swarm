@@ -80,9 +80,6 @@ Returns model status, MoB configuration, steering status, and device info.
 | `goal` | string | `"truthful"` | Steering goal (`truthful`, `reasoning`, `safe`) |
 | `steering_strength` | float | null | Override adaptive steering (0.0–1.5) |
 | `return_stats` | bool | false | Include MoB routing statistics in response |
-- `steering_strength`: Override adaptive steering (optional)
-- `goal`: Behavioral goal (truthful/reasoning/safe)
-- `return_stats`: Include MoB routing statistics
 
 ### `GET /swarm/status`
 

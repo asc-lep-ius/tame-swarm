@@ -338,18 +338,18 @@ The response includes MoB routing statistics showing which experts were activate
 This project implements ideas from the following research areas:
 
 - **TAME Framework** — Michael Levin's theory that intelligence is an emergent property of competent sub-agents cooperating under homeostatic pressure, not a monolithic central process.
-- **Active Inference / Free Energy Principle** — The agent minimises "surprise" (divergence between sensed and expected states), providing intrinsic motivation.
+- **Active Inference / Free Energy Principle** — Steering vectors approximate active inference by maintaining a "preferred state" in activation space; the adaptive controller minimises drift from this setpoint.
 - **Activation Engineering** — Steering vectors discovered via contrastive activation analysis provide zero-cost behavioural control in latent space.
 - **Sparse Mixture of Experts** — Token-level routing enables efficient scaling; TAME-Swarm extends this with decentralised economic allocation.
 
 ### From Biology to Code
 
-| Biological Principle | TAME-Swarm Implementation |
-|---------------------|---------------------------|
-| Multicellular tissue with specialised organs | Expert pool with VCG auction routing |
-| Gap junctions synchronising bioelectric state | Shared base weights + wealth economy |
-| Homeostatic setpoints (temperature, pH) | Steering vectors as target directions in activation space |
-| Morphogenetic adaptation under physical constraint | Planned: physics-engine grounding (WorldCoder) |
+| Biological Principle | TAME-Swarm Implementation | Status |
+|---------------------|---------------------------|--------|
+| Multicellular tissue with specialised organs | Expert pool with VCG auction routing | Implemented |
+| Homeostatic setpoints (temperature, pH) | Steering vectors as target directions in activation space | Implemented |
+| Gap junctions synchronising bioelectric state | Recurrent Memory Transformer (RMT) for persistent internal state | Planned |
+| Morphogenetic adaptation under physical constraint | Physics-engine grounding (WorldCoder) | Planned |
 
 ---
 
