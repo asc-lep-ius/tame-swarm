@@ -23,7 +23,6 @@ Contemporary LLMs are **monolithic next-token predictors** — sophisticated but
 |---------|-------------------|
 | No internal modularity — improving one skill degrades another | Organs specialise; the liver doesn't interfere with the brain |
 | No persistent goals — behaviour drifts with context length | Homeostasis keeps body temperature at 37 °C regardless of weather |
-| No grounding — "hallucinations" about the physical world are unchecked | Organisms are embodied; physics constrains morphogenesis |
 
 TAME-Swarm addresses the first two by re-architecting an LLM's internals using two bio-inspired modules that run **today** on consumer GPUs.
 
@@ -83,7 +82,6 @@ $$\alpha(t) = k_p \cdot (\text{target\\_alignment} - \cos(h_t,\; v_{\text{steer}
 | Module | Purpose | Status |
 |--------|---------|--------|
 | **Recurrent Memory (RMT)** | Persistent "bioelectric" state across segments — infinite context | Planned |
-| **Physicome (WorldCoder)** | Physics-engine grounding to eliminate physical hallucinations | Planned |
 
 ---
 
@@ -349,7 +347,6 @@ This project implements ideas from the following research areas:
 | Multicellular tissue with specialised organs | Expert pool with VCG auction routing | Implemented |
 | Homeostatic setpoints (temperature, pH) | Steering vectors as target directions in activation space | Implemented |
 | Gap junctions synchronising bioelectric state | Recurrent Memory Transformer (RMT) for persistent internal state | Planned |
-| Morphogenetic adaptation under physical constraint | Physics-engine grounding (WorldCoder) | Planned |
 
 ---
 
@@ -361,9 +358,8 @@ This project implements ideas from the following research areas:
 - [x] Chat UI with live auction visualisation
 - [x] Multi-model support (Gemma 2B, Llama 3B, Mistral 7B)
 - [ ] Recurrent Memory Transformer (bioelectric persistence)
-- [ ] Neuro-symbolic physics grounding (WorldCoder)
 - [ ] Contrastive steering vector extraction tooling
-- [ ] Benchmark suite (Machiavelli, Needle-in-Haystack, PhyQA)
+- [ ] Benchmark suite (Machiavelli, Needle-in-Haystack)
 
 ---
 
