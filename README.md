@@ -72,7 +72,7 @@ Standard Mixture-of-Experts uses a learned router — a centralised command econ
 
 Activation **Steering Vectors** encode goals (truthfulness, safety, reasoning) as linear directions in the model's hidden space. A proportional controller injects these vectors at every layer, dynamically adjusting strength based on how far the model's activations have drifted from the target:
 
-$$\alpha(t) = k_p \cdot (\text{target\_alignment} - \cos(h_t,\; v_{\text{steer}}))$$
+$$\alpha(t) = k_p \cdot (\text{target\\_alignment} - \cos(h_t,\; v_{\text{steer}}))$$
 
 - Zero context-window cost (no system-prompt tokens consumed)
 - Resilient to jailbreaks — operates on the *latent space*, not text
