@@ -1,0 +1,26 @@
+# TAME Swarm Dependencies
+# For local development and testing
+
+# Core ML
+torch>=2.0.0
+transformers>=4.44.0
+accelerate>=0.25.0
+sentencepiece
+
+# Training
+datasets>=2.14.0
+peft>=0.7.0
+tqdm>=4.66.0
+
+# API Server
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+
+# Chat UI
+gradio>=4.0.0
+requests>=2.31.0
+plotly>=5.18.0
+
+# Utilities
+numpy>=1.24.0

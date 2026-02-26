@@ -1,8 +1,52 @@
-cortex/model_cache/
-cortex/__pycache__/
-cortex/tame_checkpoints/
-cortex/tame_inference/
+# =============================================================================
+# TAME-Swarm .gitignore
+# =============================================================================
 
-# Environment files with secrets
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+*.so
+
+# ── Virtual Environments ────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── Model Artifacts (large binaries) ────────────────────────────────────────
+tame/model_cache/
+tame/tame_checkpoints/
+tame/tame_inference/
+*.safetensors
+*.bin
+*.pt
+*.onnx
+*.gguf
+
+# ── IDE / Editor ────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ── Environment / Secrets ───────────────────────────────────────────────────
 .env
-cortex/.env
+.env.*
+
+# ── Docker ──────────────────────────────────────────────────────────────────
+docker-compose.override.yml
+
+# ── Research / Private ──────────────────────────────────────────────────────
+Implementing_Multi-Scale_Competency_in_Large_Language_Models-A_Bio-Inspired_Architecture_for_Agential_Homeostasis.md
+
+# ── Misc ────────────────────────────────────────────────────────────────────
+*.log
+*.tmp
+*.bak
