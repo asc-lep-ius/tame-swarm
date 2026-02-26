@@ -6,5 +6,4 @@ __pycache__/
 .env
 *.log
 docker-compose.dev.yml
-dev.bat
 README.md

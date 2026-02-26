@@ -97,6 +97,8 @@ $$\alpha(t) = k_p \cdot (\text{target\\_alignment} - \cos(h_t,\; v_{\text{steer}
 
 ### Option A — Docker (Recommended)
 
+Docker commands are the same on all platforms:
+
 ```bash
 cd tame
 docker build -t tame-swarm .
@@ -105,16 +107,32 @@ docker run --gpus all -p 8000:8000 tame-swarm
 
 ### Option B — Local
 
+**Linux / macOS:**
+
 ```bash
 cd tame
 python -m venv .venv
-
-# Linux / macOS
 source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn main:app --host 0.0.0.0 --port 8000
+```
 
-# Windows (PowerShell)
+**Windows (PowerShell):**
+
+```powershell
+cd tame
+python -m venv .venv
 .\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+uvicorn main:app --host 0.0.0.0 --port 8000
+```
 
+**Windows (CMD):**
+
+```cmd
+cd tame
+python -m venv .venv
+.venv\Scripts\activate.bat
 pip install -r requirements.txt
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
@@ -122,6 +140,8 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 The first run downloads the base model (~5 GB for Gemma-2-2B). Subsequent runs use the local cache.
 
 ### Verify
+
+**Linux / macOS:**
 
 ```bash
 # Health check
@@ -131,6 +151,21 @@ curl http://localhost:8000/health
 curl -X POST http://localhost:8000/generate \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Explain quantum entanglement", "max_tokens": 200}'
+
+# Inspect swarm economy
+curl http://localhost:8000/swarm/status
+```
+
+**Windows (PowerShell):**
+
+```powershell
+# Health check
+curl http://localhost:8000/health
+
+# Generate with homeostatic steering
+Invoke-RestMethod -Method Post -Uri http://localhost:8000/generate `
+  -ContentType "application/json" `
+  -Body '{"prompt": "Explain quantum entanglement", "max_tokens": 200}'
 
 # Inspect swarm economy
 curl http://localhost:8000/swarm/status
@@ -156,29 +191,44 @@ Switch models by changing `ACTIVE_MODEL` in both [tame/main.py](tame/main.py) an
 
 ### Quick Test (verify setup)
 
-```powershell
-# PowerShell
+```bash
 cd tame
-.\train.ps1 test
-
-# CMD
-train.bat test
-
-# Direct
 python setup_tame.py --mode test --steps 100
+```
+
+Or via Docker:
+
+```bash
+cd tame
+docker-compose -f docker-compose.train.yml run --rm train --mode test
 ```
 
 ### Full Training
 
-```powershell
+```bash
+cd tame
+
 # 5 000 steps (~2-4 h on A100, ~6-8 h on RTX 4090)
-.\train.ps1 train
+python setup_tame.py --mode train --steps 5000
 
 # Custom step count
-.\train.ps1 train 10000
+python setup_tame.py --mode train --steps 10000
 
 # Memory-constrained (< 24 GB VRAM) — add LoRA
-.\train.ps1 train -UseLora
+python setup_tame.py --mode train --steps 5000 --use_lora
+
+# Full pipeline: train + export in one step
+python setup_tame.py --mode full --steps 5000
+```
+
+Or via Docker:
+
+```bash
+cd tame
+docker-compose -f docker-compose.train.yml run --rm train --mode train --steps 5000
+
+# With LoRA
+docker-compose -f docker-compose.train.yml run --rm train --mode train --steps 5000 --use_lora
 ```
 
 ### What Happens During Training
@@ -236,8 +286,8 @@ tame-swarm/
     ├── requirements.txt    ← Python dependencies
     ├── Dockerfile          ← Production container (CUDA 12.6)
     ├── Dockerfile.chat     ← Lightweight chat UI container
-    ├── dev.ps1 / dev.bat   ← One-click dev server (hot-reload)
-    └── train.ps1 / train.bat ← One-click training scripts
+    ├── docker-compose.dev.yml   ← Dev server with hot-reload
+    └── docker-compose.train.yml ← Containerised training
 ```
 
 ### Dev Server (Hot Reload)
@@ -249,19 +299,21 @@ cd tame
 uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-Or with Docker:
+Or via Docker (mounts local directory, auto-reloads on save):
 
-```powershell
+```bash
 cd tame
-.\dev.ps1
+docker-compose -f docker-compose.dev.yml up --build
 ```
 
 ### Chat UI
 
-A Gradio interface ships with live VCG auction visualisations — watch expert wealth diverge in real time:
+A Gradio interface ships with live VCG auction visualisations — watch expert wealth diverge in real time.
+Start the API server first (see above), then in a separate terminal:
+
+**Any platform:**
 
 ```bash
-# Start the API server first, then:
 cd tame
 python chat_ui.py
 # Open http://localhost:7860

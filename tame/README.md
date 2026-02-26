@@ -144,6 +144,8 @@ Switch by setting `ACTIVE_MODEL` at the top of each file.
 
 ### Production
 
+Docker commands are the same on all platforms:
+
 ```bash
 docker build -t tame-swarm .
 docker run --gpus all -p 8000:8000 tame-swarm
@@ -158,9 +160,8 @@ docker run -p 7860:7860 -e TAME_API_URL=http://host.docker.internal:8000 tame-ch
 
 ### Dev Mode (hot reload)
 
-```powershell
-.\dev.ps1          # PowerShell
-dev.bat            # CMD
+```bash
+docker-compose -f docker-compose.dev.yml up --build
 ```
 
 Mounts the local directory into the container and runs uvicorn with `--reload`.
@@ -172,7 +173,7 @@ Mounts the local directory into the container and runs uvicorn with `--reload`.
 | Symptom | Fix |
 |---------|-----|
 | `CUDA out of memory` | Use `--use_lora` for training; reduce `num_experts` or `adapter_rank` |
-| `Model download timeout` | `export HF_HUB_DOWNLOAD_TIMEOUT=3600` |
+| `Model download timeout` | Set the timeout environment variable: Linux/macOS: `export HF_HUB_DOWNLOAD_TIMEOUT=3600`; PowerShell: `$env:HF_HUB_DOWNLOAD_TIMEOUT = 3600` |
 | Wealth stays flat (Gini ≈ 0) | Train for more steps; increase `jitter_std` or `reward_scale` |
 | Steering degrades output quality | Lower `base_strength`; enable `orthogonal_projection` |
 | `--reload` not detecting changes | Ensure files are saved with LF line endings (not CRLF) |
