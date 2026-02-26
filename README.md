@@ -24,7 +24,7 @@ Contemporary LLMs are **monolithic next-token predictors** — sophisticated but
 | No internal modularity — improving one skill degrades another | Organs specialise; the liver doesn't interfere with the brain |
 | No persistent goals — behaviour drifts with context length | Homeostasis keeps body temperature at 37 °C regardless of weather |
 
-TAME-Swarm addresses the first two by re-architecting an LLM's internals using two bio-inspired modules that run **today** on consumer GPUs.
+TAME-Swarm addresses this by re-architecting an LLM's internals using two bio-inspired modules that run **today** on consumer GPUs.
 
 ---
 
