@@ -17,14 +17,17 @@
 
 ## Why This Exists
 
-Contemporary LLMs are **monolithic next-token predictors** — sophisticated but fundamentally passive. They lack:
+"There is no truly monadic, indivisible agent: all minds reside in physical systems made of components of various complexity. The Self is a dynamical construct—a multiscale holobiont where the activities of competent, lower-level agents give rise to something truly more than the sum of its parts."
+— Michael Levin, Technological Approach to Mind Everywhere (TAME)
 
-| Problem | Biological Analogue |
-|---------|-------------------|
-| No internal modularity — improving one skill degrades another | Organs specialise; the liver doesn't interfere with the brain |
-| No persistent goals — behaviour drifts with context length | Homeostasis keeps body temperature at 37 °C regardless of weather |
+From Monolith to Holobiont
+In the TAME framework, intelligence isn't a "thing" you have; it's a collective competency across scales. Traditional LLMs are like a single, giant, frozen cell. TAME-Swarm unfeltters this architecture by treating the model as a tissue of sub-agents:
 
-TAME-Swarm addresses this by re-architecting an LLM's internals using two bio-inspired modules that run **today** on consumer GPUs.
+The Mixture of Bidders (MoB) represents the Evolutionary Economy. It recognizes that "competence without comprehension" is the engine of life. By forcing experts to compete and profit, we replicate the bio-economic pressure that drives cellular specialization.
+
+Cognitive Homeostasis represents the Bioelectric Target Pattern. Just as an embryo "knows" to build a face even if the cells are scrambled, our PID-controlled steering vectors act as a "moral and logical pH balance," pulling the swarm back to its goal-state whenever the stochasticity of the auction drifts too far.
+
+In this architecture "alignment" is a homeostatic state the system is physically incapable of leaving for long.
 
 ---
 
@@ -82,6 +85,11 @@ $$\alpha(t) = k_p \cdot (\text{target\\_alignment} - \cos(h_t,\; v_{\text{steer}
 | Module | Purpose | Status |
 |--------|---------|--------|
 | **Recurrent Memory (RMT)** | Persistent "bioelectric" state across segments — infinite context | Planned |
+
+While MoB provides the body and Steering provides the goal, the system is currently "staccato"—it lives only in the immediate present of its context window. In Michael Levin’s TAME framework, true scaling of cognition requires Gap Junctions: physical links that allow sub-agents to share their internal states, effectively merging several small "selves" into one larger "Self."
+
+The Implementation:
+I want to implement a Recurrent Memory Transformer (RMT) architecture to act as these virtual gap junctions. This should allow the "bioelectric state" (hidden activations) of the swarm to persist across segments, expanding the system's Cognitive Light Cone.
 
 ---
 
