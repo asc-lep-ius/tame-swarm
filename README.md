@@ -9,7 +9,7 @@
     grounded in Michael Levin's <em>Technological Approach to Mind Everywhere</em> (TAME) framework
   </p>
   <p align="center">
-    <a href="#architecture">Architecture</a> · <a href="#quickstart">Quickstart</a> · <a href="#training">Training</a> · <a href="#development">Development</a> · <a href="#api-reference">API</a>
+    <a href="#architecture">Architecture</a> · <a href="#quickstart">Quickstart</a> · <a href="#training">Training</a> · <a href="#development">Development</a> · <a href="#api-reference">API</a> · <a href="#roadmap">Roadmap</a>
   </p>
 </p>
 
@@ -84,14 +84,18 @@ $$\alpha(t) = k_p \cdot (\text{target\\_alignment} - \cos(h_t,\; v_{\text{steer}
 
 ### Planned Modules
 
-| Module | Purpose | Status |
-|--------|---------|--------|
-| **Recurrent Memory (RMT)** | Persistent "bioelectric" state across segments — infinite context | Planned |
+| Module | Purpose | Phase | Status |
+|--------|---------|-------|--------|
+| **Steering–Economy Coupling** | Goal state shapes expert routing, not just post-hoc correction | [Phase 1](#phase-1--steering-economy-coupling) | Planned |
+| **Economy Stabilisation** | Unified wealth dynamics with formal stability guarantees | [Phase 2](#phase-2--economy-stabilisation) | Planned |
+| **Concept-Level Agency** | Chunk-level routing + per-expert memory within forward pass | [Phase 3](#phase-3--concept-level-agency) | Planned |
+| **Multi-Scale Hierarchy** | Inter-layer wealth coupling + hierarchical VCG auction | [Phase 4](#phase-4--multi-scale-hierarchy) | Planned |
+| **Recurrent Memory (RMT)** | Persistent "bioelectric" state across segments — infinite context | [Phase 5](#phase-5--persistent-memory-gap-junctions) | Planned |
+| **Allostasis** | Meta-controller that adapts homeostatic setpoints under sustained pressure | [Phase 5](#phase-5--persistent-memory-gap-junctions) | Planned |
 
-While MoB provides the body and Steering provides the goal, the system is currently "staccato"—it lives only in the immediate present of its context window. In Michael Levin’s TAME framework, true scaling of cognition requires Gap Junctions: physical links that allow sub-agents to share their internal states, effectively merging several small "selves" into one larger "Self."
+The system currently has two decoupled modules (MoB body, Steering mind) operating at token granularity within a single context window. The [full roadmap](#roadmap) lays out the path from this foundation to the complete TAME vision: coupled body–mind dynamics, stable economy, concept-level agency, multi-scale hierarchy, and persistent memory with allostatic stress response.
 
-The Implementation:
-I want to implement a Recurrent Memory Transformer (RMT) architecture to act as these virtual gap junctions. This should allow the "bioelectric state" (hidden activations) of the swarm to persist across segments, expanding the system's Cognitive Light Cone.
+See the [Roadmap](#roadmap) for the dependency graph and implementation order.
 
 ---
 
@@ -408,20 +412,150 @@ This project implements ideas from the following research areas:
 |---------------------|---------------------------|--------|
 | Multicellular tissue with specialised organs | Expert pool with VCG auction routing | Implemented |
 | Homeostatic setpoints (temperature, pH) | Steering vectors as target directions in activation space | Implemented |
-| Gap junctions synchronising bioelectric state | Recurrent Memory Transformer (RMT) for persistent internal state | Planned |
+| Morphogenetic field shaping cell behaviour | Steering signal coupled into expert confidence & routing | Phase 1 |
+| Metabolic homeostasis (energy regulation) | Unified wealth economy with formal stability analysis | Phase 2 |
+| Organ-level agency (not single-cell reflexes) | Chunk-level VCG routing with per-expert working memory | Phase 3 |
+| Multi-scale nested agents (cells → tissues → organs) | Inter-layer wealth coupling + hierarchical auction | Phase 4 |
+| Gap junctions synchronising bioelectric state | Recurrent Memory Transformer (RMT) for persistent internal state | Phase 5 |
+| HPA axis / stress response (allostasis) | Meta-controller adapting steering setpoints under pressure | Phase 5 |
 
 ---
 
 ## Roadmap
 
-- [x] Mixture of Bidders (VCG auction routing)
-- [x] Cognitive Homeostasis (adaptive steering vectors)
-- [x] Training pipeline with wealth-based specialisation
-- [x] Chat UI with live auction visualisation
-- [x] Multi-model support (Gemma 2B, Llama 3B, Mistral 7B)
-- [ ] Recurrent Memory Transformer (bioelectric persistence)
-- [ ] Contrastive steering vector extraction tooling
-- [ ] Benchmark suite (Machiavelli, Needle-in-Haystack)
+<a name="roadmap"></a>
+
+Improvements are ordered by **dependency** — each phase unlocks multiplicative returns for later phases.
+
+```
+Phase 0: Config + Split + Tests
+    │
+    ▼
+Phase 1: Steering ↔ Economy Coupling → Better Contrastive Data → PID Controller
+    │
+    ▼
+Phase 2: Stability Analysis → Unified Wealth Updater
+    │
+    ▼
+Phase 3: Chunk-Level Routing → Expert Memory
+    │
+    ▼
+Phase 4: Inter-Layer Coupling → Hierarchical Auction
+    │
+    ▼
+Phase 5: RMT Gap Junctions → Allostasis
+```
+
+### Completed
+
+- [x] Mixture of Bidders — VCG auction routing with LoRA-adapter experts
+- [x] Cognitive Homeostasis — adaptive steering vectors with P-controller
+- [x] Training pipeline — loss-based wealth updates, confidence calibration, checkpointing
+- [x] Chat UI — Gradio interface with live VCG auction & steering visualisation
+- [x] Multi-model support — Gemma 2B, Llama 3B, Mistral 7B
+
+---
+
+### Phase 0 — Foundation (Engineering Hygiene)
+
+*"You can't study emergent dynamics in a system you can't reliably test."*
+
+| Task | Description | Status |
+|------|-------------|--------|
+| **0a. Shared config module** | Extract `MODEL_PROFILES` and `ACTIVE_MODEL` into a single `config.py`, eliminating sync bugs between `main.py` and `train.py` | Not started |
+| **0b. Split `mob.py`** | Decompose the 1,500-line module into `auction.py`, `experts.py`, `economy.py`, `serialization.py` | Not started |
+| **0c. Test suite** | Numerical stability (NaN/Inf under bfloat16), checkpoint round-trips, wealth convergence smoke tests, steering extraction determinism | Not started |
+| **0d. Request-scoped state** | Replace global `model`/`homeostat` with FastAPI dependency injection; eliminate race conditions under concurrent requests | Not started |
+
+---
+
+<a name="phase-1--steering-economy-coupling"></a>
+
+### Phase 1 — Steering–Economy Coupling
+
+*"The mind must influence the body, not just observe it."*
+
+This is the **single highest-impact architectural change**. Currently MoB and Steering are parallel systems — MoB routes tokens, Steering corrects the output afterward. In TAME, the morphogenetic goal doesn't just *fix* deviations — it *shapes which cells activate in the first place*.
+
+| Task | Description | Status |
+|------|-------------|--------|
+| **1a. Inject steering into confidence** | Modify `ConfidenceHead` so steering alignment modulates expert bids: $\text{bid}_i = c_i \times W_i \times (1 + \beta \cdot \cos(E_i(h),\, v_{\text{steer}}))$ — experts that move the representation *toward* the goal bid higher | Not started |
+| **1b. Enrich contrastive data** | Expand `STEERING_TEMPLATES` from 4 to 50–200 diverse contrastive pairs per goal, producing genuine latent-trait directions instead of prompt-surface features | Not started |
+| **1c. PID controller** | Upgrade P-only controller to full PID with anti-windup — integral term eliminates steady-state error, derivative term dampens oscillation under stochastic sampling | Not started |
+
+**Why first:** Creates a feedback loop between goal and routing. Without it, improvements to steering and routing are additive. With it, they're multiplicative — better goals → better routing → better representations → easier steering.
+
+---
+
+<a name="phase-2--economy-stabilisation"></a>
+
+### Phase 2 — Economy Stabilisation
+
+*"An economy with hand-tuned magic numbers is a planned economy; planned economies collapse."*
+
+| Task | Description | Status |
+|------|-------------|--------|
+| **2a. Formal stability analysis** | Fixed-point analysis on decay × reward equilibrium, eigenvalue analysis for oscillation conditions, empirical Gini-stability mapping | Not started |
+| **2b. Unified wealth updater** | Merge the three wealth-update paths (`update_wealth_from_loss`, `_update_wealth_local_quality`, `_update_wealth_participation`) into a single `WealthUpdater` class with a pluggable reward signal | Not started |
+
+**Why after Phase 1:** Steering–economy coupling changes the wealth dynamics. Stabilising before coupling would require re-doing the analysis.
+
+---
+
+<a name="phase-3--concept-level-agency"></a>
+
+### Phase 3 — Concept-Level Agency
+
+*"Cells don't decide one amino acid at a time."*
+
+TAME posits agents operating at the *concept* level. Token-level routing limits experts to single-hidden-state decisions with no memory of what they bid on previously.
+
+| Task | Description | Status |
+|------|-------------|--------|
+| **3a. Chunk-level routing** | Group tokens into 16–32 token spans (or attention-derived semantic chunks) and have experts bid on entire spans — enables specialisation on reasoning chains, code blocks, factual claims; reduces auction overhead by 16–32× | Not started |
+| **3b. Expert memory (intra-forward)** | Lightweight per-expert recurrent state (EMA of past hidden states within current generation) — turns experts from reflexes into simple agents with short-term context | Not started |
+
+**Why after Phase 2:** Chunk-level routing changes the reward signal granularity (one reward per chunk, not per token). Stable economy dynamics are needed before changing this shape.
+
+---
+
+<a name="phase-4--multi-scale-hierarchy"></a>
+
+### Phase 4 — Multi-Scale Hierarchy
+
+*"The whole point of TAME: from cells to tissues to organs."*
+
+Currently the architecture is single-scale: individual experts competing flat within each layer. There's no mechanism for experts across layers to form coalitions or exhibit higher-order agency.
+
+| Task | Description | Status |
+|------|-------------|--------|
+| **4a. Inter-layer wealth coupling** | "Tissue" abstraction: groups of 2–3 adjacent MoB layers share a pooled wealth component, enabling vertical specialisation (e.g., layers 8–10 form a "reasoning pathway" that co-evolves) | Not started |
+| **4b. Hierarchical VCG auction** | Two-level auction: experts bid within their layer (inner), then layer-groups bid against each other for output influence (outer) — the computational analogue of Levin's nested agents | Not started |
+
+**Why after Phase 3:** Multi-scale hierarchy only produces emergent structure when individual agents are meaningful. Phase 3 gives experts concept-level scope and memory; hierarchically organising token-level reflexes produces nothing.
+
+---
+
+<a name="phase-5--persistent-memory-gap-junctions"></a>
+
+### Phase 5 — Persistent Memory (Gap Junctions)
+
+*"Expanding the Cognitive Light Cone."*
+
+While MoB provides the body and Steering provides the goal, the system currently lives only in the immediate present of its context window. In TAME, true scaling of cognition requires Gap Junctions: physical links that allow sub-agents to share their internal states, merging several small "selves" into one larger "Self."
+
+| Task | Description | Status |
+|------|-------------|--------|
+| **5a. Recurrent Memory Transformer** | Memory tokens that persist across context window segments, acting as virtual gap junctions — the "bioelectric state" of the swarm survives beyond the context boundary, expanding the system's Cognitive Light Cone | Not started |
+| **5b. Allostasis / stress response** | Meta-controller monitoring system-level statistics (mean alignment, Gini, loss trend) and adapting control setpoints — tightens steering under sustained adversarial pressure, relaxes when stable; the computational analogue of the HPA axis | Not started |
+
+**Why last:** RMT and allostasis amplify whatever dynamics exist. If the economy is unstable (pre-Phase 2), persistent memory would propagate instability across segments. If steering is decoupled from routing (pre-Phase 1), persistent memory just remembers the wrong things.
+
+---
+
+### Future Directions
+
+- [ ] Benchmark suite (Machiavelli alignment benchmark, Needle-in-Haystack for RMT)
 
 ---
 
