@@ -19,7 +19,7 @@
 
 > "There is no truly monadic, indivisible agent: all minds reside in physical systems made of components of various complexity. The Self is a dynamical construct—a multiscale holobiont where the activities of competent, lower-level agents give rise to something truly more than the sum of its parts."
 >
-> — Michael Levin, *Technological Approach to Mind Everywhere* (TAME)
+> — Michael Levin, [*Technological Approach to Mind Everywhere (TAME)*](https://arxiv.org/abs/2201.10346) 
 
 ### From Monolith to Holobiont
 
