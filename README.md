@@ -17,17 +17,19 @@
 
 ## Why This Exists
 
-"There is no truly monadic, indivisible agent: all minds reside in physical systems made of components of various complexity. The Self is a dynamical construct—a multiscale holobiont where the activities of competent, lower-level agents give rise to something truly more than the sum of its parts."
-— Michael Levin, Technological Approach to Mind Everywhere (TAME)
+> "There is no truly monadic, indivisible agent: all minds reside in physical systems made of components of various complexity. The Self is a dynamical construct—a multiscale holobiont where the activities of competent, lower-level agents give rise to something truly more than the sum of its parts."
+>
+> — Michael Levin, *Technological Approach to Mind Everywhere* (TAME)
 
-From Monolith to Holobiont
-In the TAME framework, intelligence isn't a "thing" you have; it's a collective competency across scales. Traditional LLMs are like a single, giant, frozen cell. TAME-Swarm unfeltters this architecture by treating the model as a tissue of sub-agents:
+### From Monolith to Holobiont
 
-The Mixture of Bidders (MoB) represents the Evolutionary Economy. It recognizes that "competence without comprehension" is the engine of life. By forcing experts to compete and profit, we replicate the bio-economic pressure that drives cellular specialization.
+In the TAME framework, intelligence isn't a "thing" you have; it's a collective competency across scales. Traditional LLMs are like a single, giant, frozen cell. TAME-Swarm unfetters this architecture by treating the model as a tissue of sub-agents:
 
-Cognitive Homeostasis represents the Bioelectric Target Pattern. Just as an embryo "knows" to build a face even if the cells are scrambled, our PID-controlled steering vectors act as a "moral and logical pH balance," pulling the swarm back to its goal-state whenever the stochasticity of the auction drifts too far.
+**Mixture of Bidders (MoB)** represents the Evolutionary Economy. It recognizes that "competence without comprehension" is the engine of life. By forcing experts to compete and profit, we replicate the bio-economic pressure that drives cellular specialization.
 
-In this architecture "alignment" is a homeostatic state the system is physically incapable of leaving for long.
+**Cognitive Homeostasis** represents the Bioelectric Target Pattern. Just as an embryo "knows" to build a face even if the cells are scrambled, our PID-controlled steering vectors act as a "moral and logical pH balance," pulling the swarm back to its goal-state whenever the stochasticity of the auction drifts too far.
+
+> In this architecture, "alignment" is a homeostatic state the system is physically incapable of leaving for long.
 
 ---
 
