@@ -53,7 +53,7 @@ Token hidden state h
 - Gaussian jitter on adapter init (`jitter_std=0.08`) breaks symmetry so experts can diverge. Jitter scales with expert index (`jitter_std * (i + 1)`) to create asymmetric starting points.
 - **Two forward-pass modes:**
   - **Training:** Dense computation — all tokens through all experts, masked by routing. Fixed tensor shapes required for gradient checkpointing compatibility.
-  - **Inference:** Sparse computation — only selected tokens through assigned experts. Much faster: $O(\text{top\_k} \times \text{tokens})$ vs $O(\text{experts} \times \text{tokens})$.
+  - **Inference:** Sparse computation — only selected tokens through assigned experts. Much faster: $O(\text{top\\_k} \times \text{tokens})$ vs $O(\text{experts} \times \text{tokens})$.
 - **Differentiable routing** (training only): Straight-through estimator on the VCG selection. Forward pass uses hard top-k selection, backward pass flows gradients through softmax over all experts. This enables confidence heads to learn from the loss signal.
 
 **Wealth economy — three update paths:**
@@ -205,7 +205,9 @@ This writes the production-ready state to `tame_inference/`, which `main.py` loa
 
 Trained models develop significant wealth inequality (high Gini). Directly loading this into inference mode produces static routing — the rich expert always wins. Wealth compression addresses this:
 
-$$W_i' = W_i \times (1 - c) + \bar{W} \times c$$
+```math
+W_i' = W_i \times (1 - c) + \bar{W} \times c
+```
 
 where $c$ is the compression factor (0.0 = keep as-is, 1.0 = full equalisation). The default is 0.4, which preserves the *ranking* of experts while narrowing the gap enough for meaningful competition.
 
@@ -225,7 +227,9 @@ Switch by setting `ACTIVE_MODEL` at the top of each file.
 
 **Memory estimate per profile** (MoB overhead only, at 4 experts, rank 32):
 
-$$\text{MoB overhead} = \text{num\_layers} \times \text{num\_experts} \times 6 \times \text{rank} \times \text{dim} \times 2\text{ bytes}$$
+```math
+\text{MoB overhead} = \text{num\_layers} \times \text{num\_experts} \times 6 \times \text{rank} \times \text{dim} \times 2\text{ bytes}
+```
 
 | Profile | MoB Overhead |
 |---------|--------------|
