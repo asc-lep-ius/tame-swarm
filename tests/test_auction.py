@@ -85,3 +85,50 @@ def test_vcg_differentiable_mode():
     loss.backward()
     assert confidences.grad is not None
     assert (confidences.grad.abs() > 0).any()
+
+
+def test_vcg_externality_equals_replacement_bid():
+    auctioneer = _make_auction(num_experts=4, top_k=2)
+    auctioneer.eval()
+
+    confidences = torch.tensor([[[0.1, 0.9, 0.5, 0.3]]])
+    wealth = torch.tensor([1.0, 1.0, 1.0, 1.0])
+
+    selected, _, payments = auctioneer(confidences, wealth)
+    bids = confidences * wealth.unsqueeze(0).unsqueeze(0)
+
+    for j in range(2):
+        winner_idx = selected[0, 0, j].item()
+        remaining_bids = [bids[0, 0, e].item() for e in range(4) if e != winner_idx]
+        remaining_bids.sort(reverse=True)
+        welfare_without_j = sum(remaining_bids[:1])
+        other_winner_bid = bids[0, 0, selected[0, 0, 1 - j].item()].item()
+        expected_payment = max(0.0, welfare_without_j - other_winner_bid)
+        assert abs(payments[0, 0, j].item() - expected_payment) < 1e-5
+
+
+def test_vcg_payments_with_nonuniform_wealth():
+    auctioneer = _make_auction(num_experts=4, top_k=2)
+    auctioneer.eval()
+
+    confidences = torch.tensor([[[0.5, 0.4, 0.3, 0.2]]])
+    wealth = torch.tensor([1.0, 2.0, 3.0, 0.5])
+    bids = confidences * wealth.unsqueeze(0).unsqueeze(0)
+
+    selected, _, payments = auctioneer(confidences, wealth)
+    sorted_bids, _ = torch.sort(bids[0, 0], descending=True)
+
+    for j in range(2):
+        assert payments[0, 0, j].item() >= 0
+        assert payments[0, 0, j].item() <= sorted_bids[0].item()
+
+
+def test_vcg_top_k_equals_num_experts_zero_payments():
+    auctioneer = _make_auction(num_experts=3, top_k=3)
+    auctioneer.eval()
+
+    confidences = torch.tensor([[[0.5, 0.3, 0.8]]])
+    wealth = torch.ones(3)
+
+    _, _, payments = auctioneer(confidences, wealth)
+    assert (payments == 0).all()
