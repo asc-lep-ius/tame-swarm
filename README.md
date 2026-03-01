@@ -133,8 +133,7 @@ Docker commands are the same on all platforms:
 
 ```bash
 cd tame
-docker build -t tame-swarm .
-docker run --gpus all -p 8000:8000 tame-swarm
+docker compose -f docker-compose.dev.yml up --build
 ```
 
 ### Option B — Local
