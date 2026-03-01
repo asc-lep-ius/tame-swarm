@@ -80,6 +80,7 @@ from mob import (
     update_all_mob_from_loss,
     get_total_calibration_loss,
     get_mob_statistics,
+    save_mob_state,
 )
 from config import MODEL_PROFILES, ACTIVE_MODEL, get_active_profile
 
@@ -898,17 +899,7 @@ class TAMETrainer:
         
         self.tokenizer.save_pretrained(checkpoint_dir)
         
-        # Save MoB state (wealth, performance EMA)
-        mob_state = {}
-        for idx, mob in enumerate(get_mob_layers(self.model)):
-            mob_state[f"layer_{idx}"] = {
-                "wealth": mob.expert_wealth.cpu().tolist(),
-                "performance_ema": mob.expert_performance_ema.cpu().tolist(),
-                "baseline_loss": mob.expert_baseline_loss.cpu().tolist(),
-                "usage_count": mob.expert_usage_count.cpu().tolist(),
-            }
-        
-        torch.save(mob_state, checkpoint_dir / "mob_state.pt")
+        save_mob_state(self.model, str(checkpoint_dir / "mob_state.pt"))
         
         # Save wealth history
         if self.wealth_history:
@@ -947,12 +938,12 @@ def main():
                        help="Last layer to apply MoB (exclusive)")
     
     # Training arguments
-    parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=2)
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=8)
     parser.add_argument("--learning_rate", type=float, default=2e-5)
     parser.add_argument("--max_steps", type=int, default=10000)
     parser.add_argument("--warmup_steps", type=int, default=500)
-    parser.add_argument("--max_seq_length", type=int, default=1024)
+    parser.add_argument("--max_seq_length", type=int, default=512)
     
     # LoRA
     parser.add_argument("--use_lora", action="store_true",
