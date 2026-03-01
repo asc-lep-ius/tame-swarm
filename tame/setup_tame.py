@@ -202,7 +202,7 @@ def export_for_inference(checkpoint_path: str, export_dir: str = "./tame_inferen
         print("  ✓ Copied mob_state.pt")
         
         # Print wealth summary
-        mob_state = torch.load(mob_state_path, map_location="cpu", weights_only=False)
+        mob_state = torch.load(mob_state_path, map_location="cpu", weights_only=True)
         print("\n  MoB Wealth Summary:")
         for layer_key, state in mob_state.items():
             wealth = state.get("wealth", [])
@@ -240,7 +240,7 @@ def load_mob_state(model, mob_state_path="{export_dir}/mob_state.pt"):
     import torch
     from mob import get_mob_layers
     
-    mob_state = torch.load(mob_state_path, map_location="cpu", weights_only=False)
+    mob_state = torch.load(mob_state_path, map_location="cpu", weights_only=True)
     mob_layers = get_mob_layers(model)
     
     for idx, mob in enumerate(mob_layers):

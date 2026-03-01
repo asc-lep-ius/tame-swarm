@@ -119,7 +119,7 @@ def load_mob_state(
     Raises:
         ValueError: If strict=True and config mismatch detected
     """
-    mob_state = torch.load(state_path, map_location="cpu", weights_only=False)
+    mob_state = torch.load(state_path, map_location="cpu", weights_only=True)
     mob_layers = get_mob_layers(model)
 
     if not mob_layers:

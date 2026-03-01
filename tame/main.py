@@ -584,7 +584,7 @@ async def generate(req: GenerateRequest):
 
     except Exception as e:
         logger.error(f"Generation error: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Generation failed")
 
 
 # =============================================================================
@@ -792,7 +792,7 @@ async def generate_stream(req: GenerateRequest):
         except Exception as e:
             logger.error(f"Streaming error: {e}", exc_info=True)
             stop_mob_tracking()  # Ensure tracking is stopped on error
-            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
+            yield f"data: {json.dumps({'type': 'error', 'message': 'Streaming generation failed'})}\n\n"
     
     return StreamingResponse(
         event_generator(),
@@ -847,4 +847,4 @@ async def update_steering(goal: str = "truthful", strength: float = 0.3):
         
     except Exception as e:
         logger.error(f"Steering update error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail="Steering update failed")
