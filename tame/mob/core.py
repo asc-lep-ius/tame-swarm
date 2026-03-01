@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-from typing import Optional, List
 import logging
 
 from .mob_config import MoBConfig
@@ -12,7 +11,6 @@ logger = logging.getLogger(__name__)
 
 
 class MixtureOfBidders(WealthUpdateMixin, nn.Module):
-    """Complete Mixture of Bidders layer that replaces a standard FFN."""
 
     def __init__(self, config: MoBConfig):
         super().__init__()
@@ -72,16 +70,16 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
 
         self.last_stats: dict = {}
 
-        self.wealth_history: List[List[float]] = []
+        self.wealth_history: list[list[float]] = []
         self._track_wealth: bool = False
 
-        self._cached_selected_experts: Optional[torch.Tensor] = None
-        self._cached_routing_weights: Optional[torch.Tensor] = None
-        self._cached_confidences: Optional[torch.Tensor] = None
-        self._cached_payments: Optional[torch.Tensor] = None
-        self._cached_expert_token_masks: Optional[List[torch.Tensor]] = None
+        self._cached_selected_experts: torch.Tensor | None = None
+        self._cached_routing_weights: torch.Tensor | None = None
+        self._cached_confidences: torch.Tensor | None = None
+        self._cached_payments: torch.Tensor | None = None
+        self._cached_expert_token_masks: list[torch.Tensor] | None = None
         self._loss_feedback_pending: bool = False
-        self._cached_calibration_loss: Optional[torch.Tensor] = None
+        self._cached_calibration_loss: torch.Tensor | None = None
 
     def forward(
         self,
@@ -157,39 +155,39 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         routing_weights: torch.Tensor,
         update_wealth: bool,
     ) -> torch.Tensor:
-        """Dense computation path for training mode."""
         hidden_dim = hidden_states.shape[-1]
-        dtype = hidden_states.dtype
-        flat_hidden = hidden_states.view(-1, hidden_dim)
-        flat_output = output.view(-1, hidden_dim)
+        flat_hidden = hidden_states.reshape(-1, hidden_dim)
+        flat_output = output.reshape(-1, hidden_dim)
 
         for k in range(self.config.top_k):
-            expert_indices = selected_experts[:, :, k]
-            weights = routing_weights[:, :, k]
-            flat_expert_indices = expert_indices.view(-1)
-            flat_weights = weights.view(-1)
+            flat_expert_indices = selected_experts[:, :, k].reshape(-1)
+            flat_weights = routing_weights[:, :, k].reshape(-1)
 
             for expert_idx in range(self.config.num_experts):
-                expert_mask = (flat_expert_indices == expert_idx).to(dtype)
+                mask = flat_expert_indices == expert_idx
+                if not mask.any():
+                    continue
+
+                expert_input = flat_hidden[mask]
 
                 if self.use_shared_base:
-                    all_expert_output = self.experts[expert_idx](
-                        flat_hidden,
+                    expert_output = self.experts[expert_idx](
+                        expert_input,
                         self.base_gate_proj,
                         self.base_up_proj,
                         self.base_down_proj,
                     )
                 else:
-                    all_expert_output = self.experts[expert_idx](flat_hidden)
+                    expert_output = self.experts[expert_idx](expert_input)
 
-                combined_weight = expert_mask * flat_weights
-                weighted_output = all_expert_output * combined_weight.unsqueeze(-1)
-                flat_output = flat_output + weighted_output
+                weighted = expert_output * flat_weights[mask].unsqueeze(-1)
+                token_indices = mask.nonzero(as_tuple=False).squeeze(-1)
+                flat_output.index_add_(0, token_indices, weighted)
 
                 if update_wealth:
-                    self.expert_usage_count[expert_idx] += expert_mask.sum()
+                    self.expert_usage_count[expert_idx] += mask.sum().float()
 
-        return flat_output.view_as(hidden_states)
+        return flat_output.reshape_as(hidden_states)
 
     def _forward_inference(
         self,
@@ -199,7 +197,6 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         routing_weights: torch.Tensor,
         update_wealth: bool,
     ) -> torch.Tensor:
-        """Sparse computation path for inference mode."""
         seq_len = hidden_states.shape[1]
         hidden_dim = hidden_states.shape[2]
 
@@ -238,21 +235,13 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         return output
 
     def start_tracking(self):
-        """Enable wealth history tracking for VCG auction analysis."""
         self._track_wealth = True
         self.wealth_history = []
 
     def stop_tracking(self):
-        """Disable wealth history tracking."""
         self._track_wealth = False
 
-    def get_wealth_history(self) -> List[List[float]]:
-        """
-        Get the wealth history.
-
-        Returns:
-            List of wealth snapshots, each containing wealth values per expert.
-        """
+    def get_wealth_history(self) -> list[list[float]]:
         return self.wealth_history.copy()
 
     def reset_tracking(self):
@@ -346,19 +335,8 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
 def apply_mob_to_model(
     model: nn.Module,
     mob_config: MoBConfig,
-    layers_to_modify: Optional[List[int]] = None,
+    layers_to_modify: list[int] | None = None,
 ) -> nn.Module:
-    """
-    Apply MoB transformation to an existing pretrained model.
-
-    Args:
-        model: Pretrained HuggingFace model (Mistral, Llama, etc.)
-        mob_config: Configuration for MoB modules
-        layers_to_modify: Which layers to convert (None = all)
-
-    Returns:
-        Modified model with MoB layers
-    """
     if hasattr(model, "model") and hasattr(model.model, "layers"):
         layers = model.model.layers
     elif hasattr(model, "layers"):

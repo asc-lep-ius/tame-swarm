@@ -98,6 +98,29 @@ def test_tracking_records_history(mob_layer, random_hidden_states):
     mob_layer.stop_tracking()
 
 
+def test_training_and_eval_produce_same_output(tiny_config):
+    mob = MixtureOfBidders(tiny_config)
+    hidden = torch.randn(1, 4, tiny_config.hidden_dim)
+
+    mob.train()
+    train_out = mob(hidden, update_wealth=False)
+
+    mob.eval()
+    eval_out = mob(hidden, update_wealth=False)
+
+    assert torch.allclose(train_out, eval_out, atol=1e-5)
+
+
+def test_sparse_forward_skips_unselected_experts(tiny_config):
+    mob = MixtureOfBidders(tiny_config)
+    mob.eval()
+    mob.expert_usage_count.zero_()
+    hidden = torch.randn(1, 1, tiny_config.hidden_dim)
+    mob(hidden, update_wealth=True)
+    nonzero_experts = (mob.expert_usage_count > 0).sum().item()
+    assert nonzero_experts == tiny_config.top_k
+
+
 def test_apply_mob_replaces_mlp(tiny_config):
     class FakeFFN(nn.Module):
         def __init__(self, hidden_dim, intermediate_dim):
