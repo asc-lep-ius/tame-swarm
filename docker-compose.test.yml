@@ -1,0 +1,20 @@
+services:
+  test:
+    build:
+      context: tame
+      dockerfile: Dockerfile
+    volumes:
+      - .:/project
+    working_dir: /project
+    environment:
+      - PYTHONPATH=/project/tame
+      - PYTHONDONTWRITEBYTECODE=1
+    entrypoint: ["sh", "-c"]
+    command: ["pip install -q pytest && python -m pytest tests/ -v --tb=short"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
