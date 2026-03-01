@@ -1,5 +1,3 @@
-version: '3.8'
-
 # Docker Compose for TAME Training Workflow
 # Runs the setup_tame.py training script with GPU support and persistent volumes
 #

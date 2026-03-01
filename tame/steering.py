@@ -24,6 +24,8 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+MAX_HISTORY_LENGTH = 10_000
+
 
 @dataclass
 class SteeringConfig:
@@ -267,6 +269,8 @@ class AdaptiveHomeostat:
         ).item()
         
         self.alignment_history.append(alignment)
+        if len(self.alignment_history) > MAX_HISTORY_LENGTH:
+            self.alignment_history = self.alignment_history[-MAX_HISTORY_LENGTH:]
         
         # P-controller: strength increases when alignment drops
         error = self.config.target_alignment - alignment
@@ -277,6 +281,8 @@ class AdaptiveHomeostat:
         
         # Record strength for homeostatic trace visualization
         self.strength_history.append(strength)
+        if len(self.strength_history) > MAX_HISTORY_LENGTH:
+            self.strength_history = self.strength_history[-MAX_HISTORY_LENGTH:]
         
         return strength
         

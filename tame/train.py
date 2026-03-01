@@ -81,6 +81,7 @@ from mob import (
     get_total_calibration_loss,
     get_mob_statistics,
 )
+from config import MODEL_PROFILES, ACTIVE_MODEL, get_active_profile
 
 # Configure logging
 logging.basicConfig(
@@ -90,45 +91,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# =============================================================================
-# MODEL PROFILES - Change ACTIVE_MODEL to switch between models
-# =============================================================================
-# Keep synchronized with main.py!
-
-MODEL_PROFILES = {
-    "gemma-2-2b": {
-        "model_id": "google/gemma-2-2b-it",
-        "hidden_dim": 2304,
-        "intermediate_dim": 9216,
-        "num_layers": 26,
-        "mob_layers_start": 5,
-        "mob_layers_end": 18,
-    },
-    "llama-3.2-3b": {
-        "model_id": "meta-llama/Llama-3.2-3B-Instruct",
-        "hidden_dim": 3072,
-        "intermediate_dim": 8192,
-        "num_layers": 28,
-        "mob_layers_start": 6,
-        "mob_layers_end": 20,
-    },
-    "mistral-7b": {
-        "model_id": "mistralai/Mistral-7B-Instruct-v0.2",
-        "hidden_dim": 4096,
-        "intermediate_dim": 14336,
-        "num_layers": 32,
-        "mob_layers_start": 8,
-        "mob_layers_end": 24,
-    },
-}
-
-# =============================================================================
-# >>> CHANGE THIS TO SWITCH MODELS <<<
-# =============================================================================
-ACTIVE_MODEL = "gemma-2-2b"  # Options: "gemma-2-2b", "llama-3.2-3b", "mistral-7b"
-# =============================================================================
-
-_profile = MODEL_PROFILES[ACTIVE_MODEL]
+_profile = get_active_profile()
 
 
 @dataclass
@@ -136,8 +99,7 @@ class TrainingConfig:
     """
     Configuration for TAME training.
     
-    IMPORTANT: Keep ACTIVE_MODEL synchronized with main.py!
-    Defaults are auto-configured from the active model profile.
+    Defaults are auto-configured from the active model profile in config.py.
     
     Memory Profile (defaults optimized for 16GB VRAM - RTX 5070 Ti, RTX 4080, etc.):
     - batch_size=2, seq_len=512, adapter_rank=32 → ~12GB peak usage

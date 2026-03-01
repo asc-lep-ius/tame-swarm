@@ -75,7 +75,7 @@ def check_dependencies():
     
     # Show active model profile
     try:
-        from train import ACTIVE_MODEL, MODEL_PROFILES
+        from config import ACTIVE_MODEL, MODEL_PROFILES
         profile = MODEL_PROFILES[ACTIVE_MODEL]
         print(f"✓ Active model: {ACTIVE_MODEL} ({profile['model_id']})")
     except ImportError as e:
@@ -114,7 +114,7 @@ def run_training(args):
         dataset_name=args.dataset,
         dtype=args.dtype,
         save_steps=max(args.steps // 5, 100),
-        log_wealth_frequency=max(args.steps // 50, 10),
+        log_frequency=max(args.steps // 50, 10),
     )
     
     print(f"\nConfiguration:")
@@ -202,7 +202,7 @@ def export_for_inference(checkpoint_path: str, export_dir: str = "./tame_inferen
         print("  ✓ Copied mob_state.pt")
         
         # Print wealth summary
-        mob_state = torch.load(mob_state_path, map_location="cpu")
+        mob_state = torch.load(mob_state_path, map_location="cpu", weights_only=False)
         print("\n  MoB Wealth Summary:")
         for layer_key, state in mob_state.items():
             wealth = state.get("wealth", [])
@@ -240,7 +240,7 @@ def load_mob_state(model, mob_state_path="{export_dir}/mob_state.pt"):
     import torch
     from mob import get_mob_layers
     
-    mob_state = torch.load(mob_state_path, map_location="cpu")
+    mob_state = torch.load(mob_state_path, map_location="cpu", weights_only=False)
     mob_layers = get_mob_layers(model)
     
     for idx, mob in enumerate(mob_layers):
@@ -292,8 +292,8 @@ def run_test(args):
 
 def main():
     # Import model profiles from train.py to use consistent defaults
-    from train import ACTIVE_MODEL, MODEL_PROFILES
-    _profile = MODEL_PROFILES[ACTIVE_MODEL]
+    from config import ACTIVE_MODEL, MODEL_PROFILES, get_active_profile
+    _profile = get_active_profile()
     
     parser = argparse.ArgumentParser(
         description="TAME Setup - Train and deploy MoB model",

@@ -30,66 +30,16 @@ from steering import (
     create_default_steering_vectors,
     SteeringVector
 )
+from config import MODEL_PROFILES, ACTIVE_MODEL, get_active_profile
 
-# =============================================================================
-# MODEL PROFILES - Change ACTIVE_MODEL to switch between models
-# =============================================================================
-# 
-# To switch models, change ACTIVE_MODEL below. All dimensions and layer ranges
-# are automatically configured. Keep synchronized with train.py!
-#
-# Available profiles:
-# ┌───────────────┬─────────┬──────────────┬────────────┬───────────────────────────┐
-# │ Profile       │ Params  │ Train Speed  │ Quality    │ Access                    │
-# ├───────────────┼─────────┼──────────────┼────────────┼───────────────────────────┤
-# │ gemma-2-2b ✓  │ 2B      │ ~3.5x faster │ Medium     │ Open (no approval needed) │
-# │ llama-3.2-3b  │ 3B      │ ~2.5x faster │ Good       │ Requires Meta approval    │
-# │ mistral-7b    │ 7B      │ 1x (baseline)│ Best       │ Open                      │
-# └───────────────┴─────────┴──────────────┴────────────┴───────────────────────────┘
-
-MODEL_PROFILES = {
-    "gemma-2-2b": {
-        "model_id": "google/gemma-2-2b-it",
-        "hidden_dim": 2304,
-        "intermediate_dim": 9216,
-        "num_layers": 26,
-        "mob_layers_start": 5,   # Skip early syntax layers
-        "mob_layers_end": 18,    # Skip late output layers
-    },
-    "llama-3.2-3b": {
-        "model_id": "meta-llama/Llama-3.2-3B-Instruct",
-        "hidden_dim": 3072,
-        "intermediate_dim": 8192,
-        "num_layers": 28,
-        "mob_layers_start": 6,
-        "mob_layers_end": 20,
-    },
-    "mistral-7b": {
-        "model_id": "mistralai/Mistral-7B-Instruct-v0.2",
-        "hidden_dim": 4096,
-        "intermediate_dim": 14336,
-        "num_layers": 32,
-        "mob_layers_start": 8,
-        "mob_layers_end": 24,
-    },
-}
-
-# =============================================================================
-# >>> CHANGE THIS TO SWITCH MODELS <<<
-# =============================================================================
-ACTIVE_MODEL = "gemma-2-2b"  # Options: "gemma-2-2b", "llama-3.2-3b", "mistral-7b"
-# =============================================================================
-
-# Get active profile
-_profile = MODEL_PROFILES[ACTIVE_MODEL]
+_profile = get_active_profile()
 MODEL_ID = _profile["model_id"]
 
 # =============================================================================
 # MoB Configuration (Module 1: Agential Swarm)
 # =============================================================================
-# 
-# IMPORTANT: Keep ACTIVE_MODEL synchronized with train.py!
-# If you train with different model, the mob_state.pt will not load correctly.
+#
+# Model profile is loaded from config.py (single source of truth).
 #
 # TUNING GUIDE (applies to all models):
 # ┌───────────────┬─────────────────────────────────────┬───────────────────────────┐
@@ -160,7 +110,6 @@ logger = logging.getLogger(__name__)
 model = None
 tokenizer = None
 homeostat = None
-mob_stats_history = []
 
 
 def start_mob_tracking():
@@ -449,7 +398,7 @@ def health_check():
     """
     try:
         gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
-    except:
+    except Exception:
         gpu_name = "Unknown"
         
     return HealthResponse(
@@ -741,7 +690,7 @@ async def generate_stream(req: GenerateRequest):
                                     top_expert = wealth.argmax().item()
                                     status_msg += f" | Expert {top_expert} leading"
                                     break
-                    except:
+                    except Exception:
                         pass
                     
                     yield f"data: {json.dumps({'type': 'progress', 'message': status_msg, 'tokens': token_count})}\n\n"
@@ -834,7 +783,7 @@ async def generate_stream(req: GenerateRequest):
                         'expert_usage': swarm_status.expert_usage
                     }
                     final_stats['wealth_trace'] = wealth_trace
-                except:
+                except Exception:
                     pass
             
             yield f"data: {json.dumps(final_stats)}\n\n"

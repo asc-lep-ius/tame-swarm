@@ -1053,72 +1053,6 @@ class MixtureOfBidders(nn.Module):
         return mob
 
 
-class TAMETransformerLayer(nn.Module):
-    """
-    A complete Transformer layer with MoB replacing the standard FFN.
-    
-    This wraps the attention mechanism and adds the MoB layer,
-    creating a single "organ" in the agential swarm.
-    """
-    
-    def __init__(
-        self,
-        attention_module: nn.Module,
-        mob_config: MoBConfig,
-        layer_norm_eps: float = 1e-5,
-        hidden_dim: int = 4096
-    ):
-        super().__init__()
-        self.attention = attention_module
-        self.mob = MixtureOfBidders(mob_config)
-        
-        # Layer norms (standard Transformer architecture)
-        self.input_layernorm = nn.LayerNorm(hidden_dim, eps=layer_norm_eps)
-        self.post_attention_layernorm = nn.LayerNorm(hidden_dim, eps=layer_norm_eps)
-        
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.Tensor] = None,
-        **kwargs
-    ) -> Tuple[torch.Tensor, dict]:
-        """
-        Forward pass through the TAME layer.
-        
-        Returns both the hidden states and MoB routing statistics.
-        """
-        # Pre-norm + Attention
-        residual = hidden_states
-        hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.attention(
-            hidden_states,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            **kwargs
-        )[0]
-        hidden_states = residual + hidden_states
-        
-        # Pre-norm + MoB (replaces standard FFN)
-        residual = hidden_states
-        hidden_states = self.post_attention_layernorm(hidden_states)
-        hidden_states = self.mob(hidden_states)
-        hidden_states = residual + hidden_states
-        
-        # Get routing statistics from MoB
-        mob_stats = self.mob.last_stats
-        
-        return hidden_states, mob_stats
-    
-    def get_calibration_loss(self) -> torch.Tensor:
-        """Get confidence calibration loss from MoB layer."""
-        return self.mob.get_confidence_calibration_loss()
-    
-    def update_from_loss(self, per_token_loss: torch.Tensor, token_mask: Optional[torch.Tensor] = None):
-        """Pass loss feedback to MoB layer for wealth updates."""
-        self.mob.update_wealth_from_loss(per_token_loss, token_mask)
-
-
 def apply_mob_to_model(
     model: nn.Module,
     mob_config: MoBConfig,
@@ -1336,7 +1270,7 @@ def load_mob_state(
     import logging
     logger = logging.getLogger(__name__)
     
-    mob_state = torch.load(state_path, map_location="cpu")
+    mob_state = torch.load(state_path, map_location="cpu", weights_only=False)
     mob_layers = get_mob_layers(model)
     
     if not mob_layers:
