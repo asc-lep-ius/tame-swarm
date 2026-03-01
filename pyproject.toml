@@ -3,7 +3,7 @@ name = "tame-swarm"
 version = "0.1.0"
 description = "Technological Approach to Mind Everywhere — agential swarm architecture for LLMs"
 readme = "README.md"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 
 dependencies = [
