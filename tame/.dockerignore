@@ -1,6 +1,13 @@
 model_cache/
+tame_checkpoints/
+tame_inference/
 __pycache__/
 *.pyc
+*.pt
+*.safetensors
+*.bin
+*.onnx
+*.gguf
 .git/
 .venv/
 .env
