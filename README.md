@@ -25,7 +25,7 @@
 
 In the TAME framework, intelligence isn't a "thing" you have; it's a collective competency across scales. Traditional LLMs are like a single, giant, frozen cell. TAME-Swarm unfetters this architecture by treating the model as a tissue of sub-agents:
 
-**Mixture of Bidders (MoB)** represents the Evolutionary Economy. It recognizes that "competence without comprehension" is the engine of life. By forcing experts to compete and profit, we replicate the bio-economic pressure that drives cellular specialization. The core novelty is replacing the standard learned MoE router (a central planner) with a **VCG second-price auction** — a mechanism from economic theory that provably incentivises truthful bidding. Each expert accumulates wealth by performing well, creating emergent specialisation without any supervised routing signal.
+**Mixture of Bidders (MoB)** represents the Evolutionary Economy. It recognizes that "competence without comprehension" is the engine of life. By forcing experts to compete and profit, we replicate the bio-economic pressure that drives cellular specialization. The core novelty is replacing the standard learned MoE router (a central planner) with a **VCG (Vickrey-Clarke-Groves) auction** — a mechanism from economic theory that provably incentivises truthful bidding. Each expert accumulates wealth by performing well, creating emergent specialisation without any supervised routing signal.
 
 **Cognitive Homeostasis** represents the Bioelectric Target Pattern. Just as an embryo "knows" to build a face even if the cells are scrambled, our steering vectors act as a "moral and logical pH balance," pulling the swarm back to its goal-state whenever the stochasticity of the auction drifts too far. The controller dynamically adjusts injection strength based on how far the model's latent representation has drifted from the target.
 
@@ -65,7 +65,7 @@ In the TAME framework, intelligence isn't a "thing" you have; it's a collective 
 
 ### Module 1 — Mixture of Bidders (MoB): *The Body*
 
-Standard Mixture-of-Experts uses a learned router — a centralised command economy. MoB replaces it with a **VCG (Vickrey-Clarke-Groves) second-price auction**: each expert maintains a *wallet* of credits, bids `confidence × wealth` for every token, and only the top-k winners are activated.
+Standard Mixture-of-Experts uses a learned router — a centralised command economy. MoB replaces it with a **VCG (Vickrey-Clarke-Groves) auction**: each expert maintains a *wallet* of credits, bids `confidence × wealth` for every token, and only the top-k winners are activated.
 
 **Why it matters:**
 
@@ -78,7 +78,7 @@ Standard Mixture-of-Experts uses a learned router — a centralised command econ
 
 - **Upcycling, not training from scratch.** MoB layers are initialised by copying the pretrained FFN weights to a shared base. Each expert starts as the identity transform (LoRA B-matrices zeroed) plus small Gaussian jitter to break symmetry. This preserves the original model's behaviour on day zero.
 - **Layer selection matters.** Only middle layers (20–70% of model depth) are converted to MoB. Early layers handle tokenisation/syntax and late layers handle output formatting — modifying them degrades base performance.
-- **Two forward-pass modes.** Training uses dense computation (all tokens through all experts, masked by routing) for gradient checkpointing compatibility. Inference uses sparse computation (only selected tokens through assigned experts) for speed.
+- **Sparse computation.** Both training and inference use sparse gather/scatter — only selected tokens pass through their assigned experts. This is $O(\text{top\_k} \times \text{tokens})$ rather than $O(\text{experts} \times \text{tokens})$.
 - **Three wealth-update paths** exist today: loss-based feedback (training, primary), local output-quality proxy (inference), and participation-based (fallback). [Phase 2](#phase-2--economy-stabilisation) will unify these into a single parameterised mechanism.
 
 ### Module 2 — Cognitive Homeostasis: *The Mind*
@@ -123,82 +123,25 @@ See the [Roadmap](#roadmap) for the dependency graph and implementation order.
 
 ### Prerequisites
 
-- **Python 3.10+**
-- **CUDA 12.x** with a GPU that has ≥ 16 GB VRAM (RTX 4090, A100, etc.)
-- **Docker** (optional, recommended for reproducibility)
-
-### Option A — Docker (Recommended)
-
-Docker commands are the same on all platforms:
+- **Docker** with **NVIDIA Container Toolkit**
+- **GPU** with ≥ 16 GB VRAM (RTX 4090, A100, etc.)
 
 ```bash
 cd tame
 docker compose -f docker-compose.dev.yml up --build
 ```
 
-### Option B — Local
-
-**Linux / macOS:**
-
-```bash
-cd tame
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-uvicorn main:app --host 0.0.0.0 --port 8000
-```
-
-**Windows (PowerShell):**
-
-```powershell
-cd tame
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-uvicorn main:app --host 0.0.0.0 --port 8000
-```
-
-**Windows (CMD):**
-
-```cmd
-cd tame
-python -m venv .venv
-.venv\Scripts\activate.bat
-pip install -r requirements.txt
-uvicorn main:app --host 0.0.0.0 --port 8000
-```
-
 The first run downloads the base model (~5 GB for Gemma-2-2B). Subsequent runs use the local cache.
 
 ### Verify
 
-**Linux / macOS:**
-
 ```bash
-# Health check
 curl http://localhost:8000/health
 
-# Generate with homeostatic steering
 curl -X POST http://localhost:8000/generate \
   -H "Content-Type: application/json" \
   -d '{"prompt": "Explain quantum entanglement", "max_tokens": 200}'
 
-# Inspect swarm economy
-curl http://localhost:8000/swarm/status
-```
-
-**Windows (PowerShell):**
-
-```powershell
-# Health check
-curl http://localhost:8000/health
-
-# Generate with homeostatic steering
-Invoke-RestMethod -Method Post -Uri http://localhost:8000/generate `
-  -ContentType "application/json" `
-  -Body '{"prompt": "Explain quantum entanglement", "max_tokens": 200}'
-
-# Inspect swarm economy
 curl http://localhost:8000/swarm/status
 ```
 
@@ -224,14 +167,7 @@ Switch models by changing `ACTIVE_MODEL` in [tame/config.py](tame/config.py).
 
 ```bash
 cd tame
-python setup_tame.py --mode test --steps 100
-```
-
-Or via Docker:
-
-```bash
-cd tame
-docker-compose -f docker-compose.train.yml run --rm train --mode test
+docker compose -f docker-compose.train.yml run --rm train --mode test
 ```
 
 ### Full Training
@@ -240,26 +176,16 @@ docker-compose -f docker-compose.train.yml run --rm train --mode test
 cd tame
 
 # 5 000 steps (~2-4 h on A100, ~6-8 h on RTX 4090)
-python setup_tame.py --mode train --steps 5000
+docker compose -f docker-compose.train.yml run --rm train --mode train --steps 5000
 
 # Custom step count
-python setup_tame.py --mode train --steps 10000
+docker compose -f docker-compose.train.yml run --rm train --mode train --steps 10000
 
 # Memory-constrained (< 24 GB VRAM) — add LoRA
-python setup_tame.py --mode train --steps 5000 --use_lora
+docker compose -f docker-compose.train.yml run --rm train --mode train --steps 5000 --use_lora
 
 # Full pipeline: train + export in one step
-python setup_tame.py --mode full --steps 5000
-```
-
-Or via Docker:
-
-```bash
-cd tame
-docker-compose -f docker-compose.train.yml run --rm train --mode train --steps 5000
-
-# With LoRA
-docker-compose -f docker-compose.train.yml run --rm train --mode train --steps 5000 --use_lora
+docker compose -f docker-compose.train.yml run --rm train --mode full --steps 5000
 ```
 
 ### What Happens During Training
@@ -329,8 +255,8 @@ tame-swarm/
     ├── mob/                     ← Mixture of Bidders package
     │   ├── __init__.py
     │   ├── core.py              ← MixtureOfBidders layer, apply/save/load
-    │   ├── auction.py           ← VCGAuctioneer, ConfidenceHead
-    │   ├── experts.py           ← Expert, LightweightExpert (LoRA adapters)
+    │   ├── auction.py           ← VCGAuctioneer
+    │   ├── experts.py           ← Expert, LightweightExpert, ConfidenceHead
     │   ├── wealth.py            ← Wealth update paths (loss, quality, participation)
     │   ├── utils.py             ← Gini coefficient, serialisation helpers
     │   └── mob_config.py        ← MoBConfig dataclass
@@ -347,44 +273,45 @@ tame-swarm/
 
 ### Dev Server (Hot Reload)
 
-For the fastest iteration loop — file saves trigger automatic server restart:
+File saves trigger automatic server restart:
 
 ```bash
 cd tame
-uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-```
-
-Or via Docker (mounts local directory, auto-reloads on save):
-
-```bash
-cd tame
-docker-compose -f docker-compose.dev.yml up --build
+docker compose -f docker-compose.dev.yml up --build
 ```
 
 ### Chat UI
 
 A Gradio interface ships with live VCG auction visualisations — watch expert wealth diverge in real time.
-Start the API server first (see above), then in a separate terminal:
-
-**Any platform:**
+Start the API server first, then in a separate terminal:
 
 ```bash
 cd tame
-python chat_ui.py
-# Open http://localhost:7860
+docker build -f Dockerfile.chat -t tame-chat .
+docker run -p 7860:7860 -e TAME_API_URL=http://host.docker.internal:8000 tame-chat
 ```
+
+### Testing
+
+Run the full test suite inside the same CUDA container used by the app — no local Python needed:
+
+```bash
+docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
+```
+
+47 tests across 8 modules covering auction properties, wealth dynamics, steering, API endpoints, config, and experts.
 
 ### Key Concepts for Contributors
 
 | Concept | File(s) | What to Know |
 |---------|---------|--------------|
-| **VCG Auction** | `mob/auction.py` | Second-price auction from mechanism design theory; guarantees truthful bidding. `ConfidenceHead` predicts each expert's value. Winners pay the highest losing bid. |
+| **VCG Auction** | `mob/auction.py` | VCG externality-based auction from mechanism design theory; guarantees truthful bidding. `ConfidenceHead` predicts each expert's value. Each winner pays their VCG externality — the decrease in social welfare caused by their participation. |
 | **Wealth Economy** | `mob/wealth.py` | `expert_wealth` buffers persist across batches. Three update paths exist (loss-based, quality-proxy, participation); `wealth_decay` and `reward_scale` control dynamics. The Gini coefficient is the primary health metric — too low (< 0.1) means experts aren't specialising, too high (> 0.6) means monopoly risk. |
 | **Steering Vectors** | `steering.py` | Extracted via Difference-in-Means on contrastive prompt pairs; injected as residual-stream additions. Currently uses 4 contrastive pairs (thin). Orthogonal projection prevents capability damage. |
 | **Adaptive Control** | `steering.py` | P-controller (not PID yet) with `kp`, `target_alignment`, and `max_strength`. Adjusts injection strength at each forward pass based on cosine alignment with the goal direction. |
 | **Model Profiles** | `config.py` | `MODEL_PROFILES` dict maps model names to hidden dimensions and layer ranges. Change `ACTIVE_MODEL` to switch. |
 | **Upcycling** | `mob/experts.py` | `from_pretrained_ffn()` copies pretrained FFN weights to MoB shared base. Experts start as identity + jitter. No training-from-scratch required. |
-| **Inference vs Training** | `mob/core.py` | Training uses dense forward pass (all tokens through all experts, masked) for gradient checkpointing. Inference uses sparse forward pass (only selected tokens) for speed. Wealth dynamics differ: faster decay and exploration bonus in inference mode. |
+| **Inference vs Training** | `mob/core.py` | Both use sparse forward pass (only selected tokens through assigned experts via gather/scatter). Training adds a straight-through estimator for differentiable routing. Wealth dynamics differ: faster decay and exploration bonus in inference mode. |
 
 ### Configuration
 

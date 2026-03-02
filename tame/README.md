@@ -16,8 +16,8 @@ This directory contains the full implementation of the TAME multi-scale competen
 | [`config.py`](config.py) | Shared model profiles and active model selection | `MODEL_PROFILES`, `ACTIVE_MODEL`, `get_active_profile()` |
 | [`mob/`](mob/) | **Mixture of Bidders** package | |
 | [`mob/core.py`](mob/core.py) | MoB layer, apply/save/load orchestration | `MixtureOfBidders`, `apply_mob_to_model()` |
-| [`mob/auction.py`](mob/auction.py) | VCG auction and confidence heads | `VCGAuctioneer`, `ConfidenceHead` |
-| [`mob/experts.py`](mob/experts.py) | Expert and LoRA-adapter implementations | `Expert`, `LightweightExpert` |
+| [`mob/auction.py`](mob/auction.py) | VCG externality-based auction mechanism | `VCGAuctioneer` |
+| [`mob/experts.py`](mob/experts.py) | Expert, LightweightExpert (LoRA), and ConfidenceHead implementations | `Expert`, `LightweightExpert`, `ConfidenceHead` |
 | [`mob/wealth.py`](mob/wealth.py) | Wealth update paths (loss, quality, participation) | `update_wealth_from_loss()` |
 | [`mob/utils.py`](mob/utils.py) | Gini coefficient, serialisation helpers | `compute_gini()` |
 | [`mob/mob_config.py`](mob/mob_config.py) | MoBConfig dataclass | `MoBConfig` |
@@ -43,7 +43,7 @@ Token hidden state h
   │                                                  │
   │  VCG Auction:                                    │
   │    winners = top_k(bids)                         │
-  │    price  = highest_losing_bid  (truthful)       │
+  │    payment = per-winner externality (truthful)    │
   │                                                  │
   │  Sparse Forward:                                 │
   │    output = Σ (winner_weight × Expert_FFN(h))    │
@@ -60,9 +60,7 @@ Token hidden state h
 - Experts use **shared base weights + LoRA adapters** (not full FFN copies) — ~3 MB per expert per layer at rank 32. This reduces memory from $O(\text{experts} \times \text{FFN})$ to $O(\text{FFN} + \text{experts} \times \text{adapter})$.
 - Only **middle layers** (20–70% of depth) are converted; early tokenisation and late output layers remain untouched. Modifying them degrades base performance.
 - Gaussian jitter on adapter init (`jitter_std=0.08`) breaks symmetry so experts can diverge. Jitter scales with expert index (`jitter_std * (i + 1)`) to create asymmetric starting points.
-- **Two forward-pass modes:**
-  - **Training:** Dense computation — all tokens through all experts, masked by routing. Fixed tensor shapes required for gradient checkpointing compatibility.
-  - **Inference:** Sparse computation — only selected tokens through assigned experts. Much faster: $O(\text{top\\_k} \times \text{tokens})$ vs $O(\text{experts} \times \text{tokens})$.
+- **Sparse computation.** Both training and inference use sparse gather/scatter — only selected tokens pass through their assigned experts. $O(\text{top\_k} \times \text{tokens})$ rather than $O(\text{experts} \times \text{tokens})$.
 - **Differentiable routing** (training only): Straight-through estimator on the VCG selection. Forward pass uses hard top-k selection, backward pass flows gradients through softmax over all experts. This enables confidence heads to learn from the loss signal.
 
 **Wealth economy — three update paths:**
@@ -75,7 +73,7 @@ Token hidden state h
 
 All three paths share the same structure: decay → compute reward → competitive bonus → VCG payment → clamp. [Phase 2](../README.md#phase-2--economy-stabilisation) will unify them into a single `WealthUpdater` class.
 
-**Current limitation:** The wealth dynamics have multiple hand-tuned multipliers (5.0, 50.0, 0.5 etc.) without formal stability analysis. The system can oscillate between undertrained and monopoly states depending on hyperparameters. See the [tuning guide](../README.md#tuning-guide--diagnostics) for diagnostic interpretation.
+**Current limitation:** The wealth dynamics use named constants (`LOSS_REWARD_MULTIPLIER`, `COMPETITIVE_BONUS_FACTOR`, etc.) that are still hand-tuned without formal stability analysis. The system can oscillate between undertrained and monopoly states depending on hyperparameters. See the [tuning guide](../README.md#tuning-guide--diagnostics) for diagnostic interpretation.
 
 ### Steering Controller
 
@@ -174,14 +172,14 @@ During training, the MoB economy learns from the *actual* loss signal. This is t
 
 1. Each batch computes **per-token cross-entropy loss** (unreduced, not averaged).
 2. For each MoB layer, **loss reduction vs expert baseline EMA** is computed for every expert.
-3. Experts that improve loss receive wealth proportional to `reward_scale × 50.0`.
+3. Experts that improve loss receive wealth proportional to `reward_scale × LOSS_REWARD_MULTIPLIER`.
 4. A **competitive bonus** normalises rewards across experts — above-average performers get extra.
 5. **VCG payments** reduce rewards proportionally to the winning bid, creating wealth circulation.
 6. A `confidence_calibration_weight` auxiliary loss trains confidence heads to predict routing quality (target: sigmoid of performance EMA).
 
 ### Gradient Handling
 
-- **Gradient checkpointing** is enabled by default for memory efficiency. MoB layers use dense (not sparse) computation during training to ensure fixed tensor shapes compatible with checkpointing.
+- **Gradient checkpointing** is enabled by default for memory efficiency.
 - **Gradient accumulation** (default: 8 steps) maintains an effective batch size of 16 on 16GB GPUs where physical batch size is limited to 2.
 - **Gradient clipping** at norm 1.0 prevents explosion from the auction dynamics.
 - **NaN guard:** If total loss is NaN/Inf, the backward pass is skipped entirely to prevent gradient corruption.
@@ -205,7 +203,7 @@ Checkpoints save three files:
 ### Export for Inference
 
 ```bash
-python setup_tame.py --mode export --checkpoint ./tame_checkpoints/checkpoint-5000
+docker compose -f docker-compose.train.yml run --rm train --mode export --checkpoint ./tame_checkpoints/checkpoint-5000
 ```
 
 This writes the production-ready state to `tame_inference/`, which `main.py` loads automatically on startup. On load, **wealth compression** is applied (default 40%): each expert's wealth is moved toward the mean to reduce initial inequality and make inference-time wealth dynamics more visible and responsive.
