@@ -8,14 +8,23 @@ This directory contains the full implementation of the TAME multi-scale competen
 
 | File | Role | Key Classes/Functions |
 |------|------|----------------------|
-| [`main.py`](main.py) | FastAPI inference server — model loading, API endpoints, streaming generation | `initialize_tame_architecture()`, `generate()`, `generate_stream()` |
-| [`mob.py`](mob.py) | **Mixture of Bidders** — VCG auction, expert wallets, confidence heads, wealth economy | `MixtureOfBidders`, `VCGAuctioneer`, `ConfidenceHead`, `LightweightExpert` |
+| [`main.py`](main.py) | Uvicorn entrypoint — imports `create_app` from `app.py` | `app` |
+| [`app.py`](app.py) | FastAPI app factory, `TAMEApplication` lifecycle, lifespan management | `create_app()`, `TAMEApplication` |
+| [`routes.py`](routes.py) | API route handlers — generation, streaming, steering, traces | `generate()`, `generate_stream()` |
+| [`models.py`](models.py) | Pydantic request/response models | `GenerateRequest`, `SteeringUpdateRequest` |
+| [`dependencies.py`](dependencies.py) | FastAPI dependency injection for `TAMEApplication` | `get_tame_app()` |
+| [`config.py`](config.py) | Shared model profiles and active model selection | `MODEL_PROFILES`, `ACTIVE_MODEL`, `get_active_profile()` |
+| [`mob/`](mob/) | **Mixture of Bidders** package | |
+| [`mob/core.py`](mob/core.py) | MoB layer, apply/save/load orchestration | `MixtureOfBidders`, `apply_mob_to_model()` |
+| [`mob/auction.py`](mob/auction.py) | VCG auction and confidence heads | `VCGAuctioneer`, `ConfidenceHead` |
+| [`mob/experts.py`](mob/experts.py) | Expert and LoRA-adapter implementations | `Expert`, `LightweightExpert` |
+| [`mob/wealth.py`](mob/wealth.py) | Wealth update paths (loss, quality, participation) | `update_wealth_from_loss()` |
+| [`mob/utils.py`](mob/utils.py) | Gini coefficient, serialisation helpers | `compute_gini()` |
+| [`mob/mob_config.py`](mob/mob_config.py) | MoBConfig dataclass | `MoBConfig` |
 | [`steering.py`](steering.py) | **Cognitive Homeostasis** — steering vector extraction, P-controller, orthogonal projection | `CognitiveHomeostat`, `SteeringVectorExtractor`, `AdaptiveHomeostat` |
 | [`train.py`](train.py) | Training loop — loss-based wealth updates, confidence calibration, checkpointing | `TAMETrainer`, `TrainingConfig` |
 | [`setup_tame.py`](setup_tame.py) | End-to-end workflow orchestrator (check → train → export) | `run_training()`, `export_for_inference()` |
 | [`chat_ui.py`](chat_ui.py) | Gradio interface with live VCG auction & steering trace visualisation | `create_wealth_distribution_plot()`, `create_steering_trace_plot()` |
-
-> **Note on file sizes:** `mob.py` (~1,500 lines) and `train.py` (~1,000 lines) are larger than ideal. [Phase 0b](../README.md#phase-0--foundation-engineering-hygiene) will decompose `mob.py` into `auction.py`, `experts.py`, `economy.py`, and `serialization.py`.
 
 ---
 
@@ -215,7 +224,7 @@ where $c$ is the compression factor (0.0 = keep as-is, 1.0 = full equalisation).
 
 ## Model Profiles
 
-Profiles are defined in both `main.py` and `train.py` — **keep them in sync**. If you train with one profile and serve with another, `mob_state.pt` will fail to load due to dimension mismatches. [Phase 0a](../README.md#phase-0--foundation-engineering-hygiene) will extract these into a shared `config.py`.
+Profiles are defined in [`config.py`](config.py). Change `ACTIVE_MODEL` to switch.
 
 | Profile | `hidden_dim` | `intermediate_dim` | MoB Layers | Adapter Rank | ~VRAM (inference) | Notes |
 |---------|-------------|--------------------:|:----------:|:------------:|:-----------------:|-------|
@@ -223,7 +232,7 @@ Profiles are defined in both `main.py` and `train.py` — **keep them in sync**.
 | `llama-3.2-3b` | 3072 | 8192 | 6–20 (14 layers) | 32 | ~10 GB | Requires Meta access |
 | `mistral-7b` | 4096 | 14336 | 8–24 (16 layers) | 32 | ~16 GB | Best quality; most VRAM |
 
-Switch by setting `ACTIVE_MODEL` at the top of each file.
+Switch by setting `ACTIVE_MODEL` in `config.py`.
 
 **Memory estimate per profile** (MoB overhead only, at 4 experts, rank 32):
 
@@ -288,13 +297,9 @@ Mounts the local directory into the container and runs uvicorn with `--reload`.
 
 ## Architecture Notes
 
-### Global State (known limitation)
-
-The inference server (`main.py`) uses module-level globals for `model`, `tokenizer`, and `homeostat`. This prevents concurrent model instances and creates race conditions under concurrent requests — wealth traces and homeostat history will cross-contaminate. [Phase 0d](../README.md#phase-0--foundation-engineering-hygiene) addresses this with FastAPI dependency injection and request-scoped state.
-
 ### Streaming Thread Safety
 
-The `/generate/stream` endpoint spawns a raw `Thread` for generation while the async event loop reads tokens. `start_mob_tracking()` / `stop_mob_tracking()` flip a boolean on the model’s MoB layers globally. Two concurrent streaming requests would corrupt each other’s traces. Single-user deployment only until Phase 0d.
+The `/generate/stream` endpoint spawns a raw `Thread` for generation while the async event loop reads tokens. `start_mob_tracking()` / `stop_mob_tracking()` flip a boolean on the model's MoB layers globally. Two concurrent streaming requests would corrupt each other's traces. Single-user deployment only until per-request isolation is added.
 
 ### Numerical Stability
 

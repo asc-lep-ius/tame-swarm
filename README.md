@@ -218,9 +218,7 @@ Training develops expert specialisation within the MoB layers. Without it, all e
 | `llama-3.2-3b` | 3 B | ~2.5× faster | Good | Requires Meta approval |
 | `mistral-7b` | 7 B | 1× (baseline) | Best | Open |
 
-Switch models by changing `ACTIVE_MODEL` in both [tame/main.py](tame/main.py) and [tame/train.py](tame/train.py).
-
-> **Known limitation:** `MODEL_PROFILES` is duplicated between `main.py` and `train.py` and must be kept in sync manually. If you train with one model profile and serve with another, `mob_state.pt` will fail to load due to dimension mismatches. [Phase 0a](#phase-0--foundation-engineering-hygiene) extracts these into a shared `config.py`.
+Switch models by changing `ACTIVE_MODEL` in [tame/config.py](tame/config.py).
 
 ### Quick Test (verify setup)
 
@@ -308,17 +306,41 @@ tame_inference/               # Automatically exported for the API server
 
 ```
 tame-swarm/
-├── README.md               ← You are here
-└── tame/                   ← Core implementation
-    ├── main.py             ← FastAPI inference server + API endpoints
-    ├── mob.py              ← Mixture of Bidders: VCG auction, experts, wealth
-    ├── steering.py         ← Cognitive Homeostasis: steering vectors, PID control
-    ├── train.py            ← Training loop with MoB economic dynamics
-    ├── setup_tame.py       ← End-to-end train → export workflow
-    ├── chat_ui.py          ← Gradio chat interface with live wealth visualisation
-    ├── requirements.txt    ← Python dependencies
-    ├── Dockerfile          ← Production container (CUDA 12.6)
-    ├── Dockerfile.chat     ← Lightweight chat UI container
+├── README.md                    ← You are here
+├── docker-compose.test.yml      ← Containerised test runner
+├── pyproject.toml
+├── tests/                       ← Test suite (pytest)
+│   ├── conftest.py
+│   ├── test_auction.py
+│   ├── test_config.py
+│   ├── test_experts.py
+│   ├── test_mixture.py
+│   ├── test_mob_config.py
+│   ├── test_steering.py
+│   ├── test_wealth_updates.py
+│   └── test_api.py
+└── tame/                        ← Core implementation
+    ├── main.py                  ← Uvicorn entrypoint (imports create_app)
+    ├── app.py                   ← FastAPI app factory + TAMEApplication lifecycle
+    ├── routes.py                ← API route handlers
+    ├── models.py                ← Pydantic request/response models
+    ├── dependencies.py          ← FastAPI dependency injection
+    ├── config.py                ← Shared model profiles + active model selection
+    ├── mob/                     ← Mixture of Bidders package
+    │   ├── __init__.py
+    │   ├── core.py              ← MixtureOfBidders layer, apply/save/load
+    │   ├── auction.py           ← VCGAuctioneer, ConfidenceHead
+    │   ├── experts.py           ← Expert, LightweightExpert (LoRA adapters)
+    │   ├── wealth.py            ← Wealth update paths (loss, quality, participation)
+    │   ├── utils.py             ← Gini coefficient, serialisation helpers
+    │   └── mob_config.py        ← MoBConfig dataclass
+    ├── steering.py              ← Cognitive Homeostasis: steering vectors, P-controller
+    ├── train.py                 ← Training loop with MoB economic dynamics
+    ├── setup_tame.py            ← End-to-end train → export workflow
+    ├── chat_ui.py               ← Gradio chat interface with live wealth visualisation
+    ├── requirements.txt
+    ├── Dockerfile               ← Production container (CUDA 12.6)
+    ├── Dockerfile.chat          ← Lightweight chat UI container
     ├── docker-compose.dev.yml   ← Dev server with hot-reload
     └── docker-compose.train.yml ← Containerised training
 ```
@@ -354,22 +376,22 @@ python chat_ui.py
 
 ### Key Concepts for Contributors
 
-| Concept | File | What to Know |
-|---------|------|--------------|
-| **VCG Auction** | `mob.py` | Second-price auction from mechanism design theory; guarantees truthful bidding. `ConfidenceHead` predicts each expert's value. Winners pay the highest losing bid. |
-| **Wealth Economy** | `mob.py` | `expert_wealth` buffers persist across batches. Three update paths exist (loss-based, quality-proxy, participation); `wealth_decay` and `reward_scale` control dynamics. The Gini coefficient is the primary health metric — too low (< 0.1) means experts aren't specialising, too high (> 0.6) means monopoly risk. |
+| Concept | File(s) | What to Know |
+|---------|---------|--------------|
+| **VCG Auction** | `mob/auction.py` | Second-price auction from mechanism design theory; guarantees truthful bidding. `ConfidenceHead` predicts each expert's value. Winners pay the highest losing bid. |
+| **Wealth Economy** | `mob/wealth.py` | `expert_wealth` buffers persist across batches. Three update paths exist (loss-based, quality-proxy, participation); `wealth_decay` and `reward_scale` control dynamics. The Gini coefficient is the primary health metric — too low (< 0.1) means experts aren't specialising, too high (> 0.6) means monopoly risk. |
 | **Steering Vectors** | `steering.py` | Extracted via Difference-in-Means on contrastive prompt pairs; injected as residual-stream additions. Currently uses 4 contrastive pairs (thin). Orthogonal projection prevents capability damage. |
 | **Adaptive Control** | `steering.py` | P-controller (not PID yet) with `kp`, `target_alignment`, and `max_strength`. Adjusts injection strength at each forward pass based on cosine alignment with the goal direction. |
-| **Model Profiles** | `main.py`, `train.py` | `MODEL_PROFILES` dict maps model names to hidden dimensions and layer ranges. Duplicated across files (see Phase 0a). Change `ACTIVE_MODEL` to switch. |
-| **Upcycling** | `mob.py` | `from_pretrained_ffn()` copies pretrained FFN weights to MoB shared base. Experts start as identity + jitter. No training-from-scratch required. |
-| **Inference vs Training** | `mob.py` | Training uses dense forward pass (all tokens through all experts, masked) for gradient checkpointing. Inference uses sparse forward pass (only selected tokens) for speed. Wealth dynamics differ: faster decay and exploration bonus in inference mode. |
+| **Model Profiles** | `config.py` | `MODEL_PROFILES` dict maps model names to hidden dimensions and layer ranges. Change `ACTIVE_MODEL` to switch. |
+| **Upcycling** | `mob/experts.py` | `from_pretrained_ffn()` copies pretrained FFN weights to MoB shared base. Experts start as identity + jitter. No training-from-scratch required. |
+| **Inference vs Training** | `mob/core.py` | Training uses dense forward pass (all tokens through all experts, masked) for gradient checkpointing. Inference uses sparse forward pass (only selected tokens) for speed. Wealth dynamics differ: faster decay and exploration bonus in inference mode. |
 
 ### Configuration
 
 All tuneable parameters are documented in-line. The most impactful knobs:
 
 ```python
-# tame/main.py
+# tame/config.py / tame/app.py
 
 MOB_CONFIG = MoBConfig(
     num_experts=4,           # 4–8 for meaningful auction dynamics
@@ -495,7 +517,7 @@ This project implements ideas from the following research areas:
 Improvements are ordered by **dependency** — each phase unlocks multiplicative returns for later phases.
 
 ```
-Phase 0: Config + Split + Tests
+Phase 0: Config + Split + Tests                           ✔ DONE
     │
     ▼
 Phase 1: Steering ↔ Economy Coupling → Better Contrastive Data → PID Controller
@@ -520,19 +542,22 @@ Phase 5: RMT Gap Junctions → Allostasis
 - [x] Training pipeline — loss-based wealth updates, confidence calibration, checkpointing
 - [x] Chat UI — Gradio interface with live VCG auction & steering visualisation
 - [x] Multi-model support — Gemma 2B, Llama 3B, Mistral 7B
+- [x] Phase 0 — shared `config.py`, `mob/` package split, `main.py` split (app/routes/models/dependencies), test suite, security hardening, code quality cleanup
 
 ---
 
-### Phase 0 — Foundation (Engineering Hygiene)
+### Phase 0 — Foundation (Engineering Hygiene) ✔️
 
 *"You can't study emergent dynamics in a system you can't reliably test."*
 
 | Task | Description | Status |
 |------|-------------|--------|
-| **0a. Shared config module** | Extract `MODEL_PROFILES` and `ACTIVE_MODEL` into a single `config.py`, eliminating sync bugs between `main.py` and `train.py` | Not started |
-| **0b. Split `mob.py`** | Decompose the 1,500-line module into `auction.py`, `experts.py`, `economy.py`, `serialization.py` | Not started |
-| **0c. Test suite** | Numerical stability (NaN/Inf under bfloat16), checkpoint round-trips, wealth convergence smoke tests, steering extraction determinism | Not started |
-| **0d. Request-scoped state** | Replace global `model`/`homeostat` with FastAPI dependency injection; eliminate race conditions under concurrent requests | Not started |
+| **0a. Shared config module** | Extract `MODEL_PROFILES` and `ACTIVE_MODEL` into `config.py` | Done |
+| **0b. Split `mob.py`** | Decompose into `mob/` package: `core.py`, `auction.py`, `experts.py`, `wealth.py`, `utils.py`, `mob_config.py` | Done |
+| **0c. Test suite** | VCG auction properties, numerical stability, checkpoint round-trips, wealth convergence, steering, API endpoints (8 test files) | Done |
+| **0d. Split `main.py`** | Extract into `app.py` (factory + lifecycle), `routes.py`, `models.py`, `dependencies.py` with DI via `TAMEApplication` | Done |
+| **0e. Security hardening** | Stop leaking `str(e)` to clients, add input validation on `/steering/update`, make `trust_remote_code` configurable | Done |
+| **0f. Code quality** | `print()` → structured logging, `deque` for steering history, named constants for magic numbers, modern typing | Done |
 
 ---
 
