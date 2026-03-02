@@ -1,27 +1,7 @@
 #!/usr/bin/env python3
-"""
-TAME Setup Script - Training & Deployment Workflow
-
-This script handles the complete workflow:
-1. Train the MoB model to develop expert specialization
-2. Save the trained checkpoint with wealth state
-3. Prepare for inference server deployment
-
-Usage:
-    # Full training workflow (recommended first run)
-    python setup_tame.py --mode train --steps 5000
-    
-    # Quick test (verify everything works)
-    python setup_tame.py --mode test --steps 100
-    
-    # Export trained model for inference server
-    python setup_tame.py --mode export --checkpoint ./tame_checkpoints/checkpoint-5000
-    
-    # Full pipeline: train + export
-    python setup_tame.py --mode full --steps 5000
-"""
 
 import argparse
+import logging
 import os
 import sys
 import json
@@ -29,73 +9,73 @@ import shutil
 from pathlib import Path
 from datetime import datetime
 
-# Ensure we can import local modules
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 
 def check_dependencies():
-    """Check all required dependencies are installed."""
     missing = []
     
     try:
         import torch
-        print(f"✓ PyTorch {torch.__version__}")
+        logger.info("PyTorch %s", torch.__version__)
         if torch.cuda.is_available():
-            print(f"  └─ CUDA available: {torch.cuda.get_device_name(0)}")
-            print(f"  └─ VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+            logger.info("CUDA available: %s", torch.cuda.get_device_name(0))
+            logger.info("VRAM: %.1f GB", torch.cuda.get_device_properties(0).total_memory / 1e9)
         else:
-            print("  └─ CUDA not available, will use CPU (slow!)")
+            logger.info("CUDA not available, will use CPU (slow)")
     except ImportError:
         missing.append("torch")
     
     try:
         import transformers
-        print(f"✓ Transformers {transformers.__version__}")
+        logger.info("Transformers %s", transformers.__version__)
     except ImportError:
         missing.append("transformers")
     
     try:
         import datasets
-        print(f"✓ Datasets {datasets.__version__}")
+        logger.info("Datasets %s", datasets.__version__)
     except ImportError:
         missing.append("datasets")
     
     try:
         import peft
-        print(f"✓ PEFT {peft.__version__}")
+        logger.info("PEFT %s", peft.__version__)
     except ImportError:
-        print("⚠ PEFT not installed (LoRA disabled)")
+        logger.warning("PEFT not installed (LoRA disabled)")
     
     try:
         from mob import MoBConfig, MixtureOfBidders
-        print("✓ MoB module")
+        logger.info("MoB module loaded")
     except ImportError as e:
-        print(f"✗ MoB module import failed: {e}")
+        logger.error("MoB module import failed: %s", e)
         missing.append("mob (local)")
     
-    # Show active model profile
     try:
         from config import ACTIVE_MODEL, MODEL_PROFILES
         profile = MODEL_PROFILES[ACTIVE_MODEL]
-        print(f"✓ Active model: {ACTIVE_MODEL} ({profile['model_id']})")
+        logger.info("Active model: %s (%s)", ACTIVE_MODEL, profile['model_id'])
     except ImportError as e:
-        print(f"⚠ Could not load model profile: {e}")
+        logger.warning("Could not load model profile: %s", e)
     
     if missing:
-        print(f"\n✗ Missing dependencies: {', '.join(missing)}")
-        print("  Install with: pip install -r requirements.txt")
+        logger.error("Missing dependencies: %s", ', '.join(missing))
+        logger.error("Install with: pip install -r requirements.txt")
         return False
     
     return True
 
 
 def run_training(args):
-    """Run the training loop."""
     from train import TrainingConfig, TAMETrainer
     
-    print("\n" + "="*60)
-    print("TAME TRAINING")
-    print("="*60)
+    logger.info("TAME TRAINING")
     
     config = TrainingConfig(
         model_id=args.model_id,
@@ -117,60 +97,51 @@ def run_training(args):
         log_frequency=max(args.steps // 50, 10),
     )
     
-    print(f"\nConfiguration:")
-    print(f"  Model: {config.model_id}")
-    print(f"  Dataset: {config.dataset_name}")
-    print(f"  Steps: {config.max_steps}")
-    print(f"  Batch size: {config.batch_size} x {config.gradient_accumulation_steps} accumulation")
-    print(f"  MoB: {config.num_experts} experts, top-{config.top_k}, layers {config.mob_layers_start}-{config.mob_layers_end}")
-    print(f"  LoRA: {'enabled' if config.use_lora else 'disabled'}")
-    print(f"  Output: {config.output_dir}")
+    logger.info(
+        "Configuration: model=%s dataset=%s steps=%d batch=%dx%d "
+        "mob=%d experts top-%d layers %d-%d lora=%s output=%s",
+        config.model_id, config.dataset_name, config.max_steps,
+        config.batch_size, config.gradient_accumulation_steps,
+        config.num_experts, config.top_k,
+        config.mob_layers_start, config.mob_layers_end,
+        "enabled" if config.use_lora else "disabled",
+        config.output_dir,
+    )
     
     trainer = TAMETrainer(config)
     
-    print("\nInitializing model...")
+    logger.info("Initializing model...")
     trainer.setup()
     
-    print("\nStarting training...")
+    logger.info("Starting training...")
     trainer.train()
     
     # Find latest checkpoint
     checkpoints = sorted(Path(config.output_dir).glob("checkpoint-*"))
     if checkpoints:
         latest = checkpoints[-1]
-        print(f"\n✓ Training complete! Latest checkpoint: {latest}")
+        logger.info("Training complete. Latest checkpoint: %s", latest)
         return str(latest)
     
     return None
 
 
 def export_for_inference(checkpoint_path: str, export_dir: str = "./tame_inference"):
-    """
-    Export trained checkpoint for use with inference server (main.py).
-    
-    Creates a deployment-ready package with:
-    - Model weights (or LoRA adapters)
-    - MoB state (wealth, performance EMA)
-    - Config for main.py
-    """
     import torch
     
     checkpoint_path = Path(checkpoint_path)
     export_dir = Path(export_dir)
     
-    print("\n" + "="*60)
-    print("EXPORTING FOR INFERENCE")
-    print("="*60)
+    logger.info("EXPORTING FOR INFERENCE")
     
     if not checkpoint_path.exists():
-        print(f"✗ Checkpoint not found: {checkpoint_path}")
+        logger.error("Checkpoint not found: %s", checkpoint_path)
         return False
     
     # Create export directory
     export_dir.mkdir(parents=True, exist_ok=True)
     
-    # Copy model files
-    print(f"\nCopying model from {checkpoint_path}...")
+    logger.info("Copying model from %s...", checkpoint_path)
     model_files = [
         "config.json",
         "generation_config.json", 
@@ -193,30 +164,31 @@ def export_for_inference(checkpoint_path: str, export_dir: str = "./tame_inferen
             shutil.copy2(src, export_dir / fname)
             copied += 1
     
-    print(f"  Copied {copied} model files")
+    logger.info("Copied %d model files", copied)
     
     # Copy MoB state
     mob_state_path = checkpoint_path / "mob_state.pt"
     if mob_state_path.exists():
         shutil.copy2(mob_state_path, export_dir / "mob_state.pt")
-        print("  ✓ Copied mob_state.pt")
+        logger.info("Copied mob_state.pt")
         
-        # Print wealth summary
         mob_state = torch.load(mob_state_path, map_location="cpu", weights_only=True)
-        print("\n  MoB Wealth Summary:")
+        logger.info("MoB Wealth Summary:")
         for layer_key, state in mob_state.items():
             wealth = state.get("wealth", [])
             if wealth:
-                print(f"    {layer_key}: min={min(wealth):.1f}, max={max(wealth):.1f}, "
-                      f"spread={max(wealth)-min(wealth):.1f}")
+                logger.info(
+                    "%s: min=%.1f, max=%.1f, spread=%.1f",
+                    layer_key, min(wealth), max(wealth), max(wealth) - min(wealth),
+                )
     else:
-        print("  ⚠ No mob_state.pt found (wealth will start fresh)")
+        logger.warning("No mob_state.pt found (wealth will start fresh)")
     
     # Copy training state for reference
     training_state_path = checkpoint_path / "training_state.pt"
     if training_state_path.exists():
         shutil.copy2(training_state_path, export_dir / "training_state.pt")
-        print("  ✓ Copied training_state.pt")
+        logger.info("Copied training_state.pt")
     
     # Create inference config
     inference_config = {
@@ -228,8 +200,8 @@ def export_for_inference(checkpoint_path: str, export_dir: str = "./tame_inferen
     with open(export_dir / "inference_config.json", "w") as f:
         json.dump(inference_config, f, indent=2)
     
-    print(f"\n✓ Export complete: {export_dir}")
-    print(f"\nTo use in main.py, update MODEL_PATH to: {export_dir.absolute()}")
+    logger.info("Export complete: %s", export_dir)
+    logger.info("To use in main.py, update MODEL_PATH to: %s", export_dir.absolute())
     
     # Generate loader code snippet
     loader_code = f'''
@@ -257,16 +229,13 @@ def load_mob_state(model, mob_state_path="{export_dir}/mob_state.pt"):
     with open(export_dir / "loader_snippet.py", "w") as f:
         f.write(loader_code)
     
-    print(f"\nLoader code saved to: {export_dir}/loader_snippet.py")
+    logger.info("Loader code saved to: %s/loader_snippet.py", export_dir)
     
     return True
 
 
 def run_test(args):
-    """Quick test to verify everything works."""
-    print("\n" + "="*60)
-    print("QUICK TEST (100 steps)")
-    print("="*60)
+    logger.info("QUICK TEST (100 steps)")
     
     args.steps = 100
     args.batch_size = 2
@@ -276,15 +245,14 @@ def run_test(args):
     checkpoint = run_training(args)
     
     if checkpoint:
-        print("\n✓ Test completed successfully!")
-        print(f"  Checkpoint: {checkpoint}")
+        logger.info("Test completed successfully")
+        logger.info("Checkpoint: %s", checkpoint)
         
-        # Cleanup test files
         if args.cleanup:
             shutil.rmtree(args.output_dir, ignore_errors=True)
-            print("  Cleaned up test files")
+            logger.info("Cleaned up test files")
     else:
-        print("\n✗ Test failed")
+        logger.error("Test failed")
         return False
     
     return True
@@ -369,18 +337,15 @@ Examples:
     
     args = parser.parse_args()
     
-    print("="*60)
-    print("TAME SETUP - Multi-Scale Competency Architecture")
-    print("="*60)
+    logger.info("TAME SETUP - Multi-Scale Competency Architecture")
     
-    # Check dependencies
     if not check_dependencies():
         if args.mode != "check":
             sys.exit(1)
         return
     
     if args.mode == "check":
-        print("\n✓ All dependencies OK")
+        logger.info("All dependencies OK")
         return
     
     # Execute mode
@@ -392,9 +357,8 @@ Examples:
         checkpoint = run_training(args)
         if not checkpoint:
             sys.exit(1)
-        print(f"\n✓ Training complete!")
-        print(f"\nNext step: Export for inference:")
-        print(f"  python setup_tame.py --mode export --checkpoint {checkpoint}")
+        logger.info("Training complete")
+        logger.info("Next step: python setup_tame.py --mode export --checkpoint %s", checkpoint)
     
     elif args.mode == "export":
         if not args.checkpoint:
@@ -402,10 +366,10 @@ Examples:
             checkpoints = sorted(Path(args.output_dir).glob("checkpoint-*"))
             if checkpoints:
                 args.checkpoint = str(checkpoints[-1])
-                print(f"Using latest checkpoint: {args.checkpoint}")
+                logger.info("Using latest checkpoint: %s", args.checkpoint)
             else:
-                print("✗ No checkpoint specified and none found")
-                print("  Run training first or specify --checkpoint")
+                logger.error("No checkpoint specified and none found")
+                logger.error("Run training first or specify --checkpoint")
                 sys.exit(1)
         
         success = export_for_inference(args.checkpoint, args.export_dir)
@@ -420,13 +384,11 @@ Examples:
         success = export_for_inference(checkpoint, args.export_dir)
         
         if success:
-            print("\n" + "="*60)
-            print("SETUP COMPLETE")
-            print("="*60)
-            print(f"\nTrained model ready at: {args.export_dir}")
-            print(f"\nTo start inference server:")
-            print(f"  1. Update MODEL_PATH in main.py to: {Path(args.export_dir).absolute()}")
-            print(f"  2. Run: python main.py")
+            logger.info("SETUP COMPLETE")
+            logger.info("Trained model ready at: %s", args.export_dir)
+            logger.info("To start inference server:")
+            logger.info("1. Update MODEL_PATH in main.py to: %s", Path(args.export_dir).absolute())
+            logger.info("2. Run: python main.py")
         
         sys.exit(0 if success else 1)
 

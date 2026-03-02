@@ -1,23 +1,8 @@
-"""
-Cognitive Homeostasis via Activation Steering
-
-This module implements the Active Inference approximation using
-Activation Steering Vectors as described in the TAME architecture.
-
-Key concepts:
-- Steering vectors encode goals as directions in activation space
-- Injecting vectors provides constant "homeostatic force"
-- Adaptive control adjusts steering strength based on drift
-- Orthogonal projection prevents capability damage
-
-This transforms the LLM from a passive predictor into an agent
-with persistent goal-directed behavior that resists drift.
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, List, Dict, Callable, Tuple
+from collections.abc import Callable
+from collections import deque
 from dataclasses import dataclass, field
 import logging
 import numpy as np
@@ -29,8 +14,7 @@ MAX_HISTORY_LENGTH = 10_000
 
 @dataclass
 class SteeringConfig:
-    """Configuration for activation steering."""
-    steering_layers: List[int] = field(default_factory=lambda: list(range(10, 20)))
+    steering_layers: list[int] = field(default_factory=lambda: list(range(10, 20)))
     base_strength: float = 0.3  # Base steering coefficient (alpha)
     adaptive: bool = True  # Whether to use adaptive control
     target_alignment: float = 0.7  # Target cosine similarity
@@ -41,13 +25,6 @@ class SteeringConfig:
     
 
 class SteeringVector:
-    """
-    Represents a single steering vector extracted from contrastive data.
-    
-    A steering vector encodes a behavioral direction (e.g., "truthfulness",
-    "safety", "reasoning") as a linear direction in the model's activation space.
-    """
-    
     def __init__(
         self,
         name: str,
@@ -61,7 +38,6 @@ class SteeringVector:
         self.description = description
         
     def to(self, device: torch.device) -> 'SteeringVector':
-        """Move vector to device."""
         self.vector = self.vector.to(device)
         return self
         
@@ -70,20 +46,11 @@ class SteeringVector:
 
 
 class SteeringVectorExtractor:
-    """
-    Extracts steering vectors from contrastive prompt pairs.
-    
-    This implements the "Difference-in-Means" method:
-    v_steer = mean(activations_positive) - mean(activations_negative)
-    
-    The resulting vector points in the direction of the desired behavior.
-    """
-    
     def __init__(
         self,
         model: nn.Module,
         tokenizer,
-        layers: List[int]
+        layers: list[int]
     ):
         self.model = model
         self.tokenizer = tokenizer
@@ -92,7 +59,6 @@ class SteeringVectorExtractor:
         self._hooks = []
         
     def _get_activation_hook(self, layer_idx: int) -> Callable:
-        """Create hook to capture activations at a specific layer."""
         def hook(module, input, output):
             if isinstance(output, tuple):
                 hidden = output[0]
@@ -102,8 +68,6 @@ class SteeringVectorExtractor:
         return hook
         
     def _register_hooks(self):
-        """Register forward hooks on target layers."""
-        # Find transformer layers
         if hasattr(self.model, 'model') and hasattr(self.model.model, 'layers'):
             layers = self.model.model.layers
         elif hasattr(self.model, 'layers'):
@@ -118,28 +82,16 @@ class SteeringVectorExtractor:
             self._hooks.append(hook)
             
     def _remove_hooks(self):
-        """Remove all registered hooks."""
         for hook in self._hooks:
             hook.remove()
         self._hooks = []
         
     def extract(
         self,
-        positive_prompts: List[str],
-        negative_prompts: List[str],
+        positive_prompts: list[str],
+        negative_prompts: list[str],
         max_length: int = 128
-    ) -> Dict[int, SteeringVector]:
-        """
-        Extract steering vectors from contrastive prompt pairs.
-        
-        Args:
-            positive_prompts: Prompts eliciting desired behavior
-            negative_prompts: Prompts eliciting undesired behavior
-            max_length: Maximum token length for prompts
-            
-        Returns:
-            Dictionary mapping layer index to SteeringVector
-        """
+    ) -> dict[int, SteeringVector]:
         self._register_hooks()
         
         try:
@@ -224,38 +176,16 @@ class SteeringVectorExtractor:
 
 
 class AdaptiveHomeostat:
-    """
-    Implements adaptive steering control (P-controller).
-    
-    Monitors the model's alignment with the steering direction
-    and dynamically adjusts steering strength:
-    - Low alignment (drifting) → increase strength
-    - High alignment (on target) → decrease strength
-    
-    This mimics biological homeostasis where control effort
-    increases when the system deviates from its setpoint.
-    """
-    
     def __init__(self, config: SteeringConfig):
         self.config = config
-        self.alignment_history: List[float] = []
-        self.strength_history: List[float] = []  # Track α_t over time
+        self.alignment_history: deque[float] = deque(maxlen=MAX_HISTORY_LENGTH)
+        self.strength_history: deque[float] = deque(maxlen=MAX_HISTORY_LENGTH)
         
     def compute_strength(
         self,
         hidden_states: torch.Tensor,
         steering_vector: torch.Tensor
     ) -> float:
-        """
-        Compute adaptive steering strength based on current alignment.
-        
-        Args:
-            hidden_states: Current activation state (batch, seq, hidden)
-            steering_vector: Target steering direction (hidden,)
-            
-        Returns:
-            Steering strength coefficient
-        """
         if not self.config.adaptive:
             return self.config.base_strength
             
@@ -269,47 +199,29 @@ class AdaptiveHomeostat:
         ).item()
         
         self.alignment_history.append(alignment)
-        if len(self.alignment_history) > MAX_HISTORY_LENGTH:
-            self.alignment_history = self.alignment_history[-MAX_HISTORY_LENGTH:]
         
-        # P-controller: strength increases when alignment drops
         error = self.config.target_alignment - alignment
         strength = self.config.base_strength + self.config.kp * error
         
         # Clamp to valid range
         strength = max(self.config.min_strength, min(self.config.max_strength, strength))
         
-        # Record strength for homeostatic trace visualization
         self.strength_history.append(strength)
-        if len(self.strength_history) > MAX_HISTORY_LENGTH:
-            self.strength_history = self.strength_history[-MAX_HISTORY_LENGTH:]
         
         return strength
         
     def reset(self):
-        """Reset alignment and strength history."""
-        self.alignment_history = []
-        self.strength_history = []
+        self.alignment_history = deque(maxlen=MAX_HISTORY_LENGTH)
+        self.strength_history = deque(maxlen=MAX_HISTORY_LENGTH)
 
 
 class SteeringHook:
-    """
-    Forward hook that injects steering vectors into the model.
-    
-    This is attached to transformer layers and modifies the hidden
-    states during inference to push the model toward the goal state.
-    
-    h' = h + alpha * v_steer
-    
-    Where alpha may be adaptive based on current alignment.
-    """
-    
     def __init__(
         self,
         steering_vector: SteeringVector,
         config: SteeringConfig,
-        homeostat: Optional[AdaptiveHomeostat] = None,
-        capability_subspace: Optional[torch.Tensor] = None
+        homeostat: AdaptiveHomeostat | None = None,
+        capability_subspace: torch.Tensor | None = None
     ):
         self.steering_vector = steering_vector
         self.config = config
@@ -320,13 +232,9 @@ class SteeringHook:
     def __call__(
         self,
         module: nn.Module,
-        input: Tuple[torch.Tensor, ...],
-        output: Tuple[torch.Tensor, ...]
-    ) -> Tuple[torch.Tensor, ...]:
-        """
-        Hook function called after layer forward pass.
-        Modifies the output to include steering injection.
-        """
+        input: tuple[torch.Tensor, ...],
+        output: tuple[torch.Tensor, ...]
+    ) -> tuple[torch.Tensor, ...]:
         if isinstance(output, tuple):
             hidden_states = output[0]
             rest = output[1:]
@@ -334,21 +242,16 @@ class SteeringHook:
             hidden_states = output
             rest = ()
             
-        # Move steering vector to correct device and dtype if needed
         steer_vec = self.steering_vector.vector
         if steer_vec.device != hidden_states.device or steer_vec.dtype != hidden_states.dtype:
             steer_vec = steer_vec.to(device=hidden_states.device, dtype=hidden_states.dtype)
             
-        # Apply orthogonal projection if configured
         if self.config.orthogonal_projection and self.capability_subspace is not None:
             steer_vec = self._project_orthogonal(steer_vec, self.capability_subspace)
-            
-        # Compute adaptive strength
+
         strength = self.homeostat.compute_strength(hidden_states, steer_vec)
         self._last_strength = strength
         
-        # Inject steering vector
-        # h' = h + alpha * v_steer
         modified = hidden_states + strength * steer_vec.unsqueeze(0).unsqueeze(0)
         
         if rest:
@@ -360,14 +263,6 @@ class SteeringHook:
         vector: torch.Tensor,
         subspace: torch.Tensor
     ) -> torch.Tensor:
-        """
-        Project steering vector to be orthogonal to capability subspace.
-        
-        This prevents steering from degrading general capabilities
-        (the "lobotomy" problem).
-        """
-        # subspace: (num_components, hidden_dim)
-        # Project out each component
         result = vector.clone()
         for component in subspace:
             component = component / component.norm()
@@ -377,22 +272,12 @@ class SteeringHook:
 
 
 class CognitiveHomeostat(nn.Module):
-    """
-    Main interface for cognitive homeostasis system.
-    
-    Manages steering vectors, hooks, and adaptive control
-    to maintain goal-directed behavior in the model.
-    
-    This is the "Mind" that regulates the "Body" (MoB swarm),
-    providing persistent purpose that resists drift.
-    """
-    
     def __init__(self, config: SteeringConfig):
         super().__init__()
         self.config = config
-        self.steering_vectors: Dict[int, SteeringVector] = {}
-        self.hooks: Dict[int, SteeringHook] = {}
-        self._registered_hooks: List = []
+        self.steering_vectors: dict[int, SteeringVector] = {}
+        self.hooks: dict[int, SteeringHook] = {}
+        self._registered_hooks: list = []
         self.homeostat = AdaptiveHomeostat(config)
         
     def add_steering_vector(
@@ -400,23 +285,17 @@ class CognitiveHomeostat(nn.Module):
         layer: int,
         vector: SteeringVector
     ):
-        """Add a steering vector for a specific layer."""
         self.steering_vectors[layer] = vector
         logger.info(f"Added steering vector '{vector.name}' to layer {layer}")
         
     def add_steering_vectors(
         self,
-        vectors: Dict[int, SteeringVector]
+        vectors: dict[int, SteeringVector]
     ):
-        """Add multiple steering vectors."""
         for layer, vector in vectors.items():
             self.add_steering_vector(layer, vector)
             
     def attach_to_model(self, model: nn.Module):
-        """
-        Attach steering hooks to the model's transformer layers.
-        """
-        # Find transformer layers
         if hasattr(model, 'model') and hasattr(model.model, 'layers'):
             layers = model.model.layers
         elif hasattr(model, 'layers'):
@@ -443,15 +322,13 @@ class CognitiveHomeostat(nn.Module):
         logger.info(f"Attached {len(self._registered_hooks)} steering hooks to model")
         
     def detach_from_model(self):
-        """Remove all steering hooks from the model."""
         for handle in self._registered_hooks:
             handle.remove()
         self._registered_hooks = []
         self.hooks = {}
         logger.info("Detached all steering hooks")
         
-    def get_alignment_stats(self) -> Dict[str, float]:
-        """Get statistics about current alignment and steering strength."""
+    def get_alignment_stats(self) -> dict[str, float]:
         if not self.homeostat.alignment_history:
             return {}
             
@@ -460,23 +337,22 @@ class CognitiveHomeostat(nn.Module):
         
         stats = {
             'current_alignment': history[-1] if history else 0.0,
-            'mean_alignment': np.mean(history),
+            'mean_alignment': np.mean(list(history)),
             'min_alignment': min(history),
             'max_alignment': max(history),
             'current_strength': list(self.hooks.values())[0]._last_strength if self.hooks else self.config.base_strength,
-            'alignment_history': history.copy(),
-            'strength_history': strength_history.copy(),
+            'alignment_history': list(history),
+            'strength_history': list(strength_history),
         }
         
         if strength_history:
-            stats['mean_strength'] = np.mean(strength_history)
+            stats['mean_strength'] = np.mean(list(strength_history))
             stats['max_strength'] = max(strength_history)
             stats['min_strength'] = min(strength_history)
         
         return stats
         
     def reset(self):
-        """Reset alignment history."""
         self.homeostat.reset()
 
 
@@ -531,25 +407,12 @@ def create_default_steering_vectors(
     model: nn.Module,
     tokenizer,
     goal: str = "truthful",
-    layers: Optional[List[int]] = None
-) -> Dict[int, SteeringVector]:
-    """
-    Create steering vectors using predefined templates.
-    
-    Args:
-        model: The transformer model
-        tokenizer: Model tokenizer
-        goal: One of "truthful", "reasoning", "safe"
-        layers: Which layers to create vectors for
-        
-    Returns:
-        Dictionary of steering vectors by layer
-    """
+    layers: list[int] | None = None
+) -> dict[int, SteeringVector]:
     if goal not in STEERING_TEMPLATES:
         raise ValueError(f"Unknown goal: {goal}. Available: {list(STEERING_TEMPLATES.keys())}")
         
     if layers is None:
-        # Default to middle layers (where reasoning happens)
         num_layers = len(model.model.layers) if hasattr(model, 'model') else len(model.layers)
         layers = list(range(num_layers // 3, 2 * num_layers // 3))
         

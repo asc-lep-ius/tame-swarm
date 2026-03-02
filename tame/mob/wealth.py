@@ -1,37 +1,29 @@
 import torch
 import torch.nn.functional as F
-from typing import Optional
 import logging
 
 logger = logging.getLogger(__name__)
 
+CONFIDENCE_SIGMOID_SCALE = 5.0
+LOSS_REWARD_MULTIPLIER = 50.0
+LOCAL_REWARD_MULTIPLIER = 5.0
+PARTICIPATION_REWARD_MULTIPLIER = 10.0
+COMPETITIVE_BONUS_FACTOR = 0.5
+PAYMENT_COST_FACTOR = 0.1
+WEALTH_EPSILON = 1e-6
+LOSS_PAYMENT_CLAMP_MAX = 0.3
+LOCAL_PAYMENT_CLAMP_MAX = 0.5
+
 
 class WealthUpdateMixin:
-    """Mixin providing wealth update methods for MixtureOfBidders."""
 
     def get_confidence_calibration_loss(self) -> torch.Tensor:
-        """
-        Return the cached calibration loss for confidence head training.
-
-        Should be added to the main loss with weight config.confidence_calibration_weight.
-
-        Returns:
-            Scalar calibration loss tensor (0 if not yet computed this step)
-        """
         if self._cached_calibration_loss is None:
             return torch.tensor(0.0, device=self.expert_wealth.device)
         return self._cached_calibration_loss
 
     def _compute_and_cache_calibration_loss(self, confidences: torch.Tensor):
-        """
-        Compute calibration loss and cache it for later retrieval.
-
-        Called internally by update_wealth_from_loss() after performance EMA is updated.
-
-        Args:
-            confidences: Cached confidence predictions from forward pass (batch, seq, num_experts)
-        """
-        target_confidence = torch.sigmoid(self.expert_performance_ema * 5.0)
+        target_confidence = torch.sigmoid(self.expert_performance_ema * CONFIDENCE_SIGMOID_SCALE)
 
         mean_confidences = confidences.mean(dim=(0, 1))
 
@@ -50,17 +42,8 @@ class WealthUpdateMixin:
     def update_wealth_from_loss(
         self,
         per_token_loss: torch.Tensor,
-        token_mask: Optional[torch.Tensor] = None,
+        token_mask: torch.Tensor | None = None,
     ):
-        """
-        Update expert wealth based on actual loss reduction.
-
-        Called by the training loop after computing the loss.
-
-        Args:
-            per_token_loss: Loss per token, shape (batch, seq_len) or (batch * seq_len,)
-            token_mask: Optional mask for valid tokens (1 = valid, 0 = padding)
-        """
         if not self._loss_feedback_pending or self._cached_selected_experts is None:
             logger.warning("update_wealth_from_loss called without pending forward pass")
             return
@@ -129,7 +112,7 @@ class WealthUpdateMixin:
                     mean_weight = routing_weights[:, :, k][mask].mean()
                     reward = loss_reduction * mean_weight * token_count / (batch_size * seq_len)
 
-                    expert_rewards[expert_idx] += reward * self.config.reward_scale * 50.0
+                    expert_rewards[expert_idx] += reward * self.config.reward_scale * LOSS_REWARD_MULTIPLIER
 
                     self.expert_baseline_loss[expert_idx] = (
                         self.config.loss_ema_decay * baseline
@@ -141,14 +124,14 @@ class WealthUpdateMixin:
                         + (1 - self.config.loss_ema_decay) * loss_reduction
                     )
 
-            if expert_rewards.abs().max() > 1e-6:
+            if expert_rewards.abs().max() > WEALTH_EPSILON:
                 reward_std = (
                     expert_rewards.std(correction=0)
                     if expert_rewards.numel() >= 2
-                    else torch.tensor(1e-6, device=expert_rewards.device)
+                    else torch.tensor(WEALTH_EPSILON, device=expert_rewards.device)
                 )
-                normalized_rewards = (expert_rewards - expert_rewards.mean()) / (reward_std + 1e-6)
-                competitive_bonus = F.relu(normalized_rewards) * expert_rewards.abs().mean() * 0.5
+                normalized_rewards = (expert_rewards - expert_rewards.mean()) / (reward_std + WEALTH_EPSILON)
+                competitive_bonus = F.relu(normalized_rewards) * expert_rewards.abs().mean() * COMPETITIVE_BONUS_FACTOR
                 expert_rewards += competitive_bonus
 
             if self.config.use_vcg_payments and payments is not None:
@@ -157,8 +140,8 @@ class WealthUpdateMixin:
                         mask = (selected_experts[:, :, k] == expert_idx)
                         if mask.any():
                             mean_payment = payments[:, :, k][mask].mean()
-                            payment_fraction = mean_payment / (self.expert_wealth[expert_idx] + 1e-6)
-                            expert_rewards[expert_idx] *= 1.0 - payment_fraction.clamp(0, 0.3)
+                            payment_fraction = mean_payment / (self.expert_wealth[expert_idx] + WEALTH_EPSILON)
+                            expert_rewards[expert_idx] *= 1.0 - payment_fraction.clamp(0, LOSS_PAYMENT_CLAMP_MAX)
 
             self.expert_wealth += expert_rewards
             self.expert_wealth.clamp_(min=self.config.min_wealth, max=self.config.max_wealth)
@@ -172,14 +155,9 @@ class WealthUpdateMixin:
         selected_experts: torch.Tensor,
         routing_weights: torch.Tensor,
         confidences: torch.Tensor,
-        payments: Optional[torch.Tensor],
+        payments: torch.Tensor | None,
         output: torch.Tensor,
     ):
-        """
-        Update wealth using local quality signals (when external loss unavailable).
-
-        Uses output stability as a proxy for quality.
-        """
         with torch.no_grad():
             batch_size, seq_len, hidden_dim = output.shape
             num_tokens = batch_size * seq_len
@@ -218,11 +196,11 @@ class WealthUpdateMixin:
                     selection_fraction = mask.sum().float() / num_tokens
 
                     reward = quality * mean_confidence * mean_weight * selection_fraction
-                    expert_rewards[expert_idx] += reward * self.config.reward_scale * 5.0
+                    expert_rewards[expert_idx] += reward * self.config.reward_scale * LOCAL_REWARD_MULTIPLIER
 
             mean_reward = expert_rewards.mean()
             if mean_reward > 0:
-                competitive_bonus = (expert_rewards - mean_reward) * 0.5
+                competitive_bonus = (expert_rewards - mean_reward) * COMPETITIVE_BONUS_FACTOR
                 expert_rewards += competitive_bonus.clamp(min=0)
 
             if self.config.use_vcg_payments and payments is not None:
@@ -231,13 +209,13 @@ class WealthUpdateMixin:
                         mask = (selected_experts[:, :, k] == expert_idx)
                         if mask.any():
                             mean_payment = payments[:, :, k][mask].mean()
-                            payment_cost = mean_payment * 0.1 / (self.expert_wealth[expert_idx] + 1e-6)
-                            expert_rewards[expert_idx] *= 1.0 - payment_cost.clamp(0, 0.5)
+                            payment_cost = mean_payment * PAYMENT_COST_FACTOR / (self.expert_wealth[expert_idx] + WEALTH_EPSILON)
+                            expert_rewards[expert_idx] *= 1.0 - payment_cost.clamp(0, LOCAL_PAYMENT_CLAMP_MAX)
 
             if is_inference and self.config.inference_exploration_bonus > 0:
                 mean_usage = self.expert_usage_count.mean()
                 if mean_usage > 0:
-                    usage_ratio = self.expert_usage_count / (mean_usage + 1e-6)
+                    usage_ratio = self.expert_usage_count / (mean_usage + WEALTH_EPSILON)
                     exploration_bonus = (1.0 - usage_ratio).clamp(min=0) * self.config.inference_exploration_bonus
                     exploration_bonus = exploration_bonus * self.expert_wealth.mean()
                     expert_rewards += exploration_bonus
@@ -250,9 +228,8 @@ class WealthUpdateMixin:
         selected_experts: torch.Tensor,
         routing_weights: torch.Tensor,
         confidences: torch.Tensor,
-        payments: Optional[torch.Tensor] = None,
+        payments: torch.Tensor | None = None,
     ):
-        """Update expert wealth based on participation and performance."""
         with torch.no_grad():
             batch_size, seq_len, _ = confidences.shape
             num_tokens = batch_size * seq_len
@@ -274,11 +251,11 @@ class WealthUpdateMixin:
                         mean_weight = routing_weights[:, :, k][mask].mean()
 
                         base_reward = selection_fraction * mean_confidence * mean_weight
-                        expert_rewards[expert_idx] += base_reward * self.config.reward_scale * 10.0
+                        expert_rewards[expert_idx] += base_reward * self.config.reward_scale * PARTICIPATION_REWARD_MULTIPLIER
 
             mean_reward = expert_rewards.mean()
             if mean_reward > 0:
-                competitive_bonus = (expert_rewards - mean_reward) * 0.5
+                competitive_bonus = (expert_rewards - mean_reward) * COMPETITIVE_BONUS_FACTOR
                 expert_rewards += competitive_bonus.clamp(min=0)
 
             if self.config.use_vcg_payments and payments is not None:
@@ -287,8 +264,8 @@ class WealthUpdateMixin:
                         mask = (selected_experts[:, :, k] == expert_idx)
                         if mask.any():
                             mean_payment = payments[:, :, k][mask].mean()
-                            payment_cost = mean_payment * 0.1 / (self.expert_wealth[expert_idx] + 1e-6)
-                            expert_rewards[expert_idx] *= 1.0 - payment_cost.clamp(0, 0.5)
+                            payment_cost = mean_payment * PAYMENT_COST_FACTOR / (self.expert_wealth[expert_idx] + WEALTH_EPSILON)
+                            expert_rewards[expert_idx] *= 1.0 - payment_cost.clamp(0, LOCAL_PAYMENT_CLAMP_MAX)
 
             self.expert_wealth += expert_rewards
 

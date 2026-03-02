@@ -22,8 +22,14 @@ import os
 import sys
 import math
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, List
+from typing import Any
 from pathlib import Path
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 import torch
 import torch.nn as nn
@@ -47,14 +53,14 @@ try:
     HAS_DATASETS = True
 except ImportError:
     HAS_DATASETS = False
-    print("Warning: 'datasets' library not installed. Install with: pip install datasets")
+    logger.warning("'datasets' library not installed. Install with: pip install datasets")
 
 try:
     from peft import LoraConfig, get_peft_model, TaskType
     HAS_PEFT = True
 except ImportError:
     HAS_PEFT = False
-    print("Warning: 'peft' library not installed. LoRA support disabled. Install with: pip install peft")
+    logger.warning("'peft' library not installed. LoRA support disabled. Install with: pip install peft")
 
 try:
     from tqdm import tqdm
@@ -70,7 +76,7 @@ try:
     HAS_ACCELERATE = True
 except ImportError:
     HAS_ACCELERATE = False
-    print("Warning: 'accelerate' library not installed. Model re-dispatch disabled.")
+    logger.warning("'accelerate' library not installed. Model re-dispatch disabled.")
 
 from mob import (
     MoBConfig, 
@@ -83,13 +89,6 @@ from mob import (
     save_mob_state,
 )
 from config import MODEL_PROFILES, ACTIVE_MODEL, get_active_profile
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
 
 
 _profile = get_active_profile()
@@ -192,7 +191,7 @@ class TAMETrainer:
         self._last_avg_metrics = {"loss": 0.0, "calibration_loss": 0.0, "perplexity": 0.0}
         
         # Wealth history for analysis
-        self.wealth_history: List[Dict[str, Any]] = []
+        self.wealth_history: list[dict[str, Any]] = []
         
         # Set seed
         torch.manual_seed(config.seed)
@@ -654,7 +653,7 @@ class TAMETrainer:
             pin_memory=True if self.device.type == "cuda" else False,
         )
     
-    def train_step(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
+    def train_step(self, batch: dict[str, torch.Tensor]) -> dict[str, float]:
         """
         Single training step with MoB wealth updates.
         
