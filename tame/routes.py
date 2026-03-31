@@ -2,8 +2,10 @@ import asyncio
 import json
 import logging
 from threading import Thread
+from typing import cast
 
 import torch
+import torch.nn as nn
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from transformers import TextIteratorStreamer
@@ -43,7 +45,7 @@ def get_swarm_status(tame: TAMEApplication = Depends(get_tame_app)):
     total_usage = torch.zeros(tame.mob_config.num_experts)
     num_mob_layers = 0
 
-    for layer in tame.model.model.layers:
+    for layer in tame.model.model.layers:  # pyright: ignore[reportAttributeAccessIssue] # HuggingFace Auto* stubs lack runtime model internals
         if hasattr(layer, "mlp") and isinstance(layer.mlp, MixtureOfBidders):
             mob = layer.mlp
             total_wealth += mob.expert_wealth.cpu()
@@ -117,26 +119,26 @@ async def generate(req: GenerateRequest, tame: TAMEApplication = Depends(get_tam
                 tame.homeostat.config.adaptive = False
 
         messages = [{"role": "user", "content": req.prompt}]
-        text = tame.tokenizer.apply_chat_template(
+        text = tame.tokenizer.apply_chat_template(  # pyright: ignore[reportAttributeAccessIssue] # AutoTokenizer stubs lack runtime attributes
             messages,
             tokenize=False,
             add_generation_prompt=True,
         )
-        inputs = tame.tokenizer(text, return_tensors="pt").to(tame.model.device)
+        inputs = tame.tokenizer(text, return_tensors="pt").to(tame.model.device)  # pyright: ignore[reportCallIssue, reportAttributeAccessIssue]
 
         with torch.inference_mode():
-            outputs = tame.model.generate(
+            outputs = tame.model.generate(  # pyright: ignore[reportAttributeAccessIssue] # AutoModelForCausalLM stubs lack .generate
                 **inputs,
                 max_new_tokens=req.max_tokens,
                 do_sample=req.temperature > 0,
                 temperature=req.temperature if req.temperature > 0 else 1.0,
                 top_k=50,
                 top_p=0.95,
-                pad_token_id=tame.tokenizer.pad_token_id,
+                pad_token_id=tame.tokenizer.pad_token_id,  # pyright: ignore[reportAttributeAccessIssue]
             )
 
         generated_ids = outputs[0][inputs.input_ids.shape[1] :]
-        response_text = tame.tokenizer.decode(generated_ids, skip_special_tokens=True)
+        response_text = tame.tokenizer.decode(generated_ids, skip_special_tokens=True)  # pyright: ignore[reportAttributeAccessIssue]
 
         usage = {
             "input_tokens": inputs.input_ids.shape[1],
@@ -169,7 +171,8 @@ async def generate(req: GenerateRequest, tame: TAMEApplication = Depends(get_tam
     finally:
         if tame.homeostat and original_strength is not None:
             tame.homeostat.config.base_strength = original_strength
-            tame.homeostat.config.adaptive = original_adaptive
+            if original_adaptive is not None:
+                tame.homeostat.config.adaptive = original_adaptive
 
 
 @router.post("/generate/stream")
@@ -191,12 +194,12 @@ async def generate_stream(req: GenerateRequest, tame: TAMEApplication = Depends(
             tame.start_mob_tracking()
 
             messages = [{"role": "user", "content": req.prompt}]
-            text = tame.tokenizer.apply_chat_template(
+            text = tame.tokenizer.apply_chat_template(  # pyright: ignore[reportAttributeAccessIssue] # AutoTokenizer stubs lack runtime attributes
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,
             )
-            inputs = tame.tokenizer(text, return_tensors="pt").to(tame.model.device)
+            inputs = tame.tokenizer(text, return_tensors="pt").to(tame.model.device)  # pyright: ignore[reportCallIssue, reportAttributeAccessIssue]
             input_length = inputs.input_ids.shape[1]
 
             status_payload = json.dumps(
@@ -218,14 +221,14 @@ async def generate_stream(req: GenerateRequest, tame: TAMEApplication = Depends(
                 "temperature": req.temperature if req.temperature > 0 else 1.0,
                 "top_k": 50,
                 "top_p": 0.95,
-                "pad_token_id": tame.tokenizer.pad_token_id,
+                "pad_token_id": tame.tokenizer.pad_token_id,  # pyright: ignore[reportAttributeAccessIssue]
                 "streamer": streamer,
             }
 
             def generate_in_thread():
                 try:
                     with torch.inference_mode():
-                        tame.model.generate(**generation_kwargs)
+                        tame.model.generate(**generation_kwargs)  # pyright: ignore[reportAttributeAccessIssue] # AutoModelForCausalLM stubs lack .generate
                 except Exception as e:
                     logger.error("Generation thread error: %s", e)
 
@@ -250,7 +253,7 @@ async def generate_stream(req: GenerateRequest, tame: TAMEApplication = Depends(
                     status_msg = f"Generated {token_count} tokens"
 
                     try:
-                        for layer in tame.model.model.layers:
+                        for layer in tame.model.model.layers:  # pyright: ignore[reportAttributeAccessIssue] # HuggingFace Auto* stubs lack runtime model internals
                             if hasattr(layer, "mlp") and hasattr(layer.mlp, "last_stats"):
                                 stats = layer.mlp.last_stats
                                 if stats and "expert_wealth" in stats:
@@ -362,7 +365,8 @@ async def generate_stream(req: GenerateRequest, tame: TAMEApplication = Depends(
         finally:
             if tame.homeostat and original_strength is not None:
                 tame.homeostat.config.base_strength = original_strength
-                tame.homeostat.config.adaptive = original_adaptive
+                if original_adaptive is not None:
+                    tame.homeostat.config.adaptive = original_adaptive
 
     return StreamingResponse(
         event_generator(),
@@ -388,7 +392,7 @@ async def update_steering(
         tame.homeostat.detach_from_model()
 
         steering_vectors = create_default_steering_vectors(
-            tame.model,
+            cast(nn.Module, tame.model),
             tame.tokenizer,
             goal=goal,
             layers=tame.steering_config.steering_layers,
@@ -397,7 +401,7 @@ async def update_steering(
         tame.homeostat.config.base_strength = strength
 
         tame.homeostat.add_steering_vectors(steering_vectors)
-        tame.homeostat.attach_to_model(tame.model)
+        tame.homeostat.attach_to_model(cast(nn.Module, tame.model))
 
         return {
             "status": "updated",

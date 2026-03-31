@@ -1,7 +1,13 @@
+from __future__ import annotations
+
 import logging
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
+
+if TYPE_CHECKING:
+    from .mob_config import MoBConfig
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +23,20 @@ LOCAL_PAYMENT_CLAMP_MAX = 0.5
 
 
 class WealthUpdateMixin:
+    # Declared for type checking — provided by MixtureOfBidders.__init__()
+    config: MoBConfig
+    expert_wealth: torch.Tensor
+    expert_usage_count: torch.Tensor
+    expert_baseline_loss: torch.Tensor
+    expert_performance_ema: torch.Tensor
+    _cached_selected_experts: torch.Tensor | None
+    _cached_routing_weights: torch.Tensor | None
+    _cached_confidences: torch.Tensor | None
+    _cached_payments: torch.Tensor | None
+    _cached_expert_token_masks: list[torch.Tensor] | None
+    _loss_feedback_pending: bool
+    _cached_calibration_loss: torch.Tensor | None
+
     def get_confidence_calibration_loss(self) -> torch.Tensor:
         if self._cached_calibration_loss is None:
             return torch.tensor(0.0, device=self.expert_wealth.device)
@@ -53,6 +73,9 @@ class WealthUpdateMixin:
             routing_weights = self._cached_routing_weights
             confidences = self._cached_confidences
             payments = self._cached_payments
+
+            assert routing_weights is not None
+            assert confidences is not None
 
             batch_size, cached_seq_len, _ = confidences.shape
 

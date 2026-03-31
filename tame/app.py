@@ -88,7 +88,7 @@ class TAMEApplication:
         )
 
         if hasattr(model, "hf_device_map"):
-            devices_used = set(model.hf_device_map.values())
+            devices_used = set(model.hf_device_map.values())  # pyright: ignore[reportCallIssue] # hf_device_map is a dict at runtime, stubs see Tensor
             logger.info("[GESTATIONAL] Model distributed across devices: %s", devices_used)
 
         logger.info("[GESTATIONAL] Base model loaded")
@@ -112,7 +112,7 @@ class TAMEApplication:
 
         logger.info("[DIAGNOSTIC] Testing MoB output validity...")
         try:
-            test_input = tokenizer("Test", return_tensors="pt").to(model.device)
+            test_input = tokenizer("Test", return_tensors="pt").to(model.device)  # pyright: ignore[reportCallIssue] # AutoTokenizer stubs lack __call__
             with torch.inference_mode():
                 test_output = model(**test_input, output_hidden_states=True)
                 last_hidden = test_output.hidden_states[-1]
@@ -191,7 +191,7 @@ class TAMEApplication:
         logger.info("=" * 60)
 
         return cls(
-            model=model,
+            model=model,  # pyright: ignore[reportArgumentType] # apply_mob_to_model returns Module but is still AutoModelForCausalLM at runtime
             tokenizer=tokenizer,
             homeostat=homeostat,
             mob_config=mob_config,
@@ -200,18 +200,18 @@ class TAMEApplication:
         )
 
     def start_mob_tracking(self) -> None:
-        for layer in self.model.model.layers:
+        for layer in self.model.model.layers:  # pyright: ignore[reportAttributeAccessIssue] # HuggingFace Auto* stubs lack runtime model internals
             if hasattr(layer, "mlp") and isinstance(layer.mlp, MixtureOfBidders):
                 layer.mlp.start_tracking()
 
     def stop_mob_tracking(self) -> None:
-        for layer in self.model.model.layers:
+        for layer in self.model.model.layers:  # pyright: ignore[reportAttributeAccessIssue] # HuggingFace Auto* stubs lack runtime model internals
             if hasattr(layer, "mlp") and isinstance(layer.mlp, MixtureOfBidders):
                 layer.mlp.stop_tracking()
 
     def get_mob_wealth_traces(self) -> dict[str, list[list[float]]]:
         traces: dict[str, list[list[float]]] = {}
-        for idx, layer in enumerate(self.model.model.layers):
+        for idx, layer in enumerate(self.model.model.layers):  # pyright: ignore[reportAttributeAccessIssue] # HuggingFace Auto* stubs lack runtime model internals
             if hasattr(layer, "mlp") and isinstance(layer.mlp, MixtureOfBidders):
                 history = layer.mlp.get_wealth_history()
                 if history:

@@ -31,6 +31,13 @@ lint:
     - uv run ruff check .
     - uv run ruff format --check .
 
+pyright:
+  extends: .python-job
+  stage: check
+  script:
+    - uv run pyright
+  allow_failure: false
+
 test:
   extends: .python-job
   stage: check

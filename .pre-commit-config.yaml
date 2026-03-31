@@ -5,9 +5,14 @@ repos:
       - id: ruff
       - id: ruff-format
 
-  # pyright is run in CI (allow_failure) instead of pre-commit.
-  # 235 pre-existing errors from torch/transformers untyped APIs
-  # make a blocking pre-commit hook impractical without stub packages.
+  - repo: local
+    hooks:
+      - id: pyright
+        name: pyright
+        entry: uv run pyright
+        language: system
+        types: [python]
+        pass_filenames: false
 
   - repo: https://github.com/compilerla/conventional-pre-commit
     rev: v4.1.0

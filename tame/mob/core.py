@@ -1,4 +1,5 @@
 import logging
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -258,8 +259,8 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         cls,
         ffn_module: nn.Module,
         config: MoBConfig,
-        device: torch.device = None,
-        dtype: torch.dtype = None,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
     ) -> "MixtureOfBidders":
         """
         Initialize MoB by upcycling from a pretrained FFN.
@@ -275,9 +276,9 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         """
         if device is None or dtype is None:
             if hasattr(ffn_module, "gate_proj"):
-                ref_param = ffn_module.gate_proj.weight
+                ref_param = cast(nn.Linear, ffn_module.gate_proj).weight
             elif hasattr(ffn_module, "up_proj"):
-                ref_param = ffn_module.up_proj.weight
+                ref_param = cast(nn.Linear, ffn_module.up_proj).weight
             else:
                 ref_param = next(ffn_module.parameters())
 
@@ -301,35 +302,48 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         with torch.no_grad():
             if config.use_shared_base:
                 if hasattr(ffn_module, "gate_proj"):
-                    mob.base_gate_proj.weight.copy_(ffn_module.gate_proj.weight.cpu())
-                    mob.base_up_proj.weight.copy_(ffn_module.up_proj.weight.cpu())
-                    mob.base_down_proj.weight.copy_(ffn_module.down_proj.weight.cpu())
+                    ffn_gate = cast(nn.Linear, ffn_module.gate_proj)
+                    ffn_up = cast(nn.Linear, ffn_module.up_proj)
+                    ffn_down = cast(nn.Linear, ffn_module.down_proj)
+                    mob.base_gate_proj.weight.copy_(ffn_gate.weight.cpu())
+                    mob.base_up_proj.weight.copy_(ffn_up.weight.cpu())
+                    mob.base_down_proj.weight.copy_(ffn_down.weight.cpu())
 
-                for i, expert in enumerate(mob.experts):
-                    expert.gate_adapter_A.weight.add_(
-                        torch.randn_like(expert.gate_adapter_A.weight) * config.jitter_std * (i + 1)
+                for i, expert_mod in enumerate(mob.experts):
+                    lw = cast(LightweightExpert, expert_mod)
+                    lw.gate_adapter_A.weight.add_(
+                        torch.randn_like(lw.gate_adapter_A.weight) * config.jitter_std * (i + 1)
                     )
-                    expert.up_adapter_A.weight.add_(
-                        torch.randn_like(expert.up_adapter_A.weight) * config.jitter_std * (i + 1)
+                    lw.up_adapter_A.weight.add_(
+                        torch.randn_like(lw.up_adapter_A.weight) * config.jitter_std * (i + 1)
                     )
-                    expert.down_adapter_A.weight.add_(
-                        torch.randn_like(expert.down_adapter_A.weight) * config.jitter_std * (i + 1)
+                    lw.down_adapter_A.weight.add_(
+                        torch.randn_like(lw.down_adapter_A.weight) * config.jitter_std * (i + 1)
                     )
             else:
-                for expert in mob.experts:
-                    if hasattr(ffn_module, "gate_proj"):
-                        expert.gate_proj.weight.copy_(ffn_module.gate_proj.weight.cpu())
-                        expert.up_proj.weight.copy_(ffn_module.up_proj.weight.cpu())
-                        expert.down_proj.weight.copy_(ffn_module.down_proj.weight.cpu())
+                ffn_gate_w: torch.Tensor | None = None
+                ffn_up_w: torch.Tensor | None = None
+                ffn_down_w: torch.Tensor | None = None
+                if hasattr(ffn_module, "gate_proj"):
+                    ffn_gate_w = cast(nn.Linear, ffn_module.gate_proj).weight.cpu()
+                    ffn_up_w = cast(nn.Linear, ffn_module.up_proj).weight.cpu()
+                    ffn_down_w = cast(nn.Linear, ffn_module.down_proj).weight.cpu()
 
-                    expert.gate_proj.weight.add_(
-                        torch.randn_like(expert.gate_proj.weight) * config.jitter_std
+                for expert_mod in mob.experts:
+                    exp = cast(Expert, expert_mod)
+                    if ffn_gate_w is not None and ffn_up_w is not None and ffn_down_w is not None:
+                        exp.gate_proj.weight.copy_(ffn_gate_w)
+                        exp.up_proj.weight.copy_(ffn_up_w)
+                        exp.down_proj.weight.copy_(ffn_down_w)
+
+                    exp.gate_proj.weight.add_(
+                        torch.randn_like(exp.gate_proj.weight) * config.jitter_std
                     )
-                    expert.up_proj.weight.add_(
-                        torch.randn_like(expert.up_proj.weight) * config.jitter_std
+                    exp.up_proj.weight.add_(
+                        torch.randn_like(exp.up_proj.weight) * config.jitter_std
                     )
-                    expert.down_proj.weight.add_(
-                        torch.randn_like(expert.down_proj.weight) * config.jitter_std
+                    exp.down_proj.weight.add_(
+                        torch.randn_like(exp.down_proj.weight) * config.jitter_std
                     )
 
         mob = mob.to(device=device, dtype=dtype)
@@ -346,11 +360,14 @@ def apply_mob_to_model(
     mob_config: MoBConfig,
     layers_to_modify: list[int] | None = None,
 ) -> nn.Module:
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        layers = model.model.layers
-    elif hasattr(model, "layers"):
-        layers = model.layers
-    else:
+    layers: nn.ModuleList | None = None
+    if hasattr(model, "model"):
+        model_inner = cast(nn.Module, model.model)
+        if hasattr(model_inner, "layers"):
+            layers = cast(nn.ModuleList, model_inner.layers)
+    if layers is None and hasattr(model, "layers"):
+        layers = cast(nn.ModuleList, model.layers)
+    if layers is None:
         raise ValueError("Cannot find transformer layers in model")
 
     num_layers = len(layers)
@@ -360,20 +377,18 @@ def apply_mob_to_model(
     for layer_idx in layers_to_modify:
         layer = layers[layer_idx]
 
+        ffn_attr: str | None = None
         if hasattr(layer, "mlp"):
-            ffn = layer.mlp
+            ffn_attr = "mlp"
         elif hasattr(layer, "feed_forward"):
-            ffn = layer.feed_forward
+            ffn_attr = "feed_forward"
         else:
             logger.warning(f"Layer {layer_idx}: Cannot find FFN module, skipping")
             continue
 
+        ffn = cast(nn.Module, getattr(layer, ffn_attr))
         mob = MixtureOfBidders.from_pretrained_ffn(ffn, mob_config)
-
-        if hasattr(layer, "mlp"):
-            layer.mlp = mob
-        else:
-            layer.feed_forward = mob
+        setattr(layer, ffn_attr, mob)
 
         logger.info(f"Layer {layer_idx}: Replaced FFN with MoB")
 

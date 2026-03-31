@@ -135,11 +135,11 @@ def run_training(args):
     return None
 
 
-def export_for_inference(checkpoint_path: str, export_dir: str = "./tame_inference"):
+def export_for_inference(checkpoint_path_str: str, export_dir_str: str = "./tame_inference"):
     import torch
 
-    checkpoint_path = Path(checkpoint_path)
-    export_dir = Path(export_dir)
+    checkpoint_path: Path = Path(checkpoint_path_str)
+    export_dir: Path = Path(export_dir_str)
 
     logger.info("EXPORTING FOR INFERENCE")
 

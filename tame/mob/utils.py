@@ -57,7 +57,7 @@ def get_total_calibration_loss(model: nn.Module) -> torch.Tensor:
     return total_loss
 
 
-def get_mob_statistics(model: nn.Module) -> dict[str, torch.Tensor]:
+def get_mob_statistics(model: nn.Module) -> dict[str, torch.Tensor | list[torch.Tensor]]:
     """
     Aggregate statistics from all MoB layers for monitoring.
 

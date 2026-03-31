@@ -22,7 +22,7 @@ import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -38,6 +38,7 @@ from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     DataCollatorForLanguageModeling,
+    PreTrainedModel,
     get_linear_schedule_with_warmup,
 )
 
@@ -243,7 +244,7 @@ class TAMETrainer:
             self._redispatch_model()
         elif self.device.type != "cuda":
             # Move to device if not using CUDA
-            self.model = self.model.to(self.device)
+            self.model = self.model.to(self.device)  # pyright: ignore[reportArgumentType]
 
         # Setup optimizer
         self._setup_optimizer()
@@ -271,6 +272,7 @@ class TAMETrainer:
 
     def _apply_mob(self):
         """Apply Mixture of Bidders transformation to model."""
+        assert self.model is not None
         logger.info("Applying MoB transformation...")
 
         # Determine hidden dimensions from model config
@@ -305,6 +307,7 @@ class TAMETrainer:
         during transformations may remain on 'meta' device causing gradient errors like:
         "RuntimeError: expected device meta but got cuda:0"
         """
+        assert self.model is not None
         logger.info("Re-dispatching model after transformations...")
 
         # First, check for any parameters still on 'meta' device
@@ -390,7 +393,7 @@ class TAMETrainer:
                 self.model = self.model.to_empty(device=self.device)
                 self._reload_pretrained_weights()
             else:
-                self.model = self.model.to(self.device)
+                self.model = self.model.to(self.device)  # pyright: ignore[reportArgumentType]
 
     def _reload_pretrained_weights(self):
         """
@@ -399,6 +402,7 @@ class TAMETrainer:
         Uses memory-efficient streaming from safetensors files (<500MB RAM)
         instead of loading the full model (~14GB RAM).
         """
+        assert self.model is not None
         logger.info("Reloading pretrained weights (streaming from safetensors)...")
 
         try:
@@ -485,6 +489,7 @@ class TAMETrainer:
         Legacy fallback: reload weights by loading full model.
         Warning: Uses ~14GB RAM for 7B models.
         """
+        assert self.model is not None
         logger.warning("Using legacy weight reload (high RAM usage)")
 
         try:
@@ -551,11 +556,13 @@ class TAMETrainer:
             bias="none",
         )
 
-        self.model = get_peft_model(self.model, lora_config)
+        assert self.model is not None
+        self.model = get_peft_model(cast(PreTrainedModel, self.model), lora_config)
         self.model.print_trainable_parameters()
 
     def _setup_optimizer(self):
         """Setup AdamW optimizer with weight decay."""
+        assert self.model is not None
         # Separate parameters for weight decay
         decay_params = []
         no_decay_params = []
@@ -593,6 +600,7 @@ class TAMETrainer:
 
     def _setup_data(self):
         """Setup training data loader."""
+        assert self.tokenizer is not None
         if not HAS_DATASETS:
             logger.error("datasets library required for training")
             raise ImportError("Install datasets: pip install datasets")
@@ -620,9 +628,11 @@ class TAMETrainer:
             )
             text_column = "text"
 
-        # Tokenize
+        # Tokenize — capture tokenizer locally for pyright closure narrowing
+        tokenizer = self.tokenizer
+
         def tokenize_function(examples):
-            return self.tokenizer(
+            return tokenizer(
                 examples[text_column],
                 truncation=True,
                 max_length=self.config.max_seq_length,
@@ -654,7 +664,7 @@ class TAMETrainer:
 
         # Create dataloader
         self.train_dataloader = DataLoader(
-            tokenized_dataset,
+            tokenized_dataset,  # pyright: ignore[reportArgumentType]
             batch_size=self.config.batch_size,
             shuffle=hasattr(tokenized_dataset, "__len__"),
             collate_fn=data_collator,
@@ -673,6 +683,7 @@ class TAMETrainer:
         4. Add calibration loss (trains confidence heads)
         5. Backward pass
         """
+        assert self.model is not None
         self.model.train()
 
         # Move batch to device
@@ -683,7 +694,7 @@ class TAMETrainer:
         batch_size, seq_len = input_ids.shape
 
         # Forward pass
-        outputs = self.model(
+        outputs = self.model(  # pyright: ignore[reportCallIssue]
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=None,  # We'll compute loss manually for per-token access
@@ -776,6 +787,11 @@ class TAMETrainer:
         )
         logger.info("-" * 100)
 
+        assert self.model is not None
+        assert self.train_dataloader is not None
+        assert self.optimizer is not None
+        assert self.scheduler is not None
+
         # Start wealth tracking for analysis
         for mob in get_mob_layers(self.model):
             mob.start_tracking()
@@ -851,6 +867,7 @@ class TAMETrainer:
         Outputs: Step, Progress%, Loss, Perplexity, Calibration Loss,
                  Mean Wealth, Std Dev, Gini Coefficient, Performance EMA
         """
+        assert self.model is not None
         # Get MoB wealth statistics
         stats = get_mob_statistics(self.model)
 
@@ -864,26 +881,21 @@ class TAMETrainer:
         cal = metrics.get("calibration_loss", 0.0)
 
         if stats:
-            mean_wealth = (
-                stats["mean_wealth"].item()
-                if isinstance(stats["mean_wealth"], torch.Tensor)
-                else stats["mean_wealth"]
-            )
-            std_wealth = (
-                stats["wealth_std"].item()
-                if isinstance(stats["wealth_std"], torch.Tensor)
-                else stats["wealth_std"]
-            )
-            gini = (
-                stats["wealth_gini"].item()
-                if isinstance(stats["wealth_gini"], torch.Tensor)
-                else stats["wealth_gini"]
-            )
-            perf_ema = (
-                stats["mean_performance"].item()
-                if isinstance(stats["mean_performance"], torch.Tensor)
-                else stats["mean_performance"]
-            )
+            _mw = stats["mean_wealth"]
+            assert isinstance(_mw, torch.Tensor)
+            mean_wealth = float(_mw.item())
+
+            _sw = stats["wealth_std"]
+            assert isinstance(_sw, torch.Tensor)
+            std_wealth = float(_sw.item())
+
+            _gi = stats["wealth_gini"]
+            assert isinstance(_gi, torch.Tensor)
+            gini = float(_gi.item())
+
+            _pe = stats["mean_performance"]
+            assert isinstance(_pe, torch.Tensor)
+            perf_ema = float(_pe.item())
 
             # Store for analysis
             self.wealth_history.append(
@@ -942,18 +954,24 @@ class TAMETrainer:
 
     def _save_checkpoint(self, step: int, final: bool = False):
         """Save model checkpoint and wealth state."""
+        assert self.model is not None
+        assert self.tokenizer is not None
+        assert self.optimizer is not None
+        assert self.scheduler is not None
+
         checkpoint_dir = Path(self.config.output_dir) / f"checkpoint-{step}"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
         # Save model
+        checkpoint_str = str(checkpoint_dir)
         if self.config.use_lora and HAS_PEFT:
-            self.model.save_pretrained(checkpoint_dir)
+            self.model.save_pretrained(checkpoint_str)  # pyright: ignore[reportCallIssue]
         else:
-            self.model.save_pretrained(checkpoint_dir)
+            self.model.save_pretrained(checkpoint_str)  # pyright: ignore[reportCallIssue]
 
-        self.tokenizer.save_pretrained(checkpoint_dir)
+        self.tokenizer.save_pretrained(checkpoint_str)
 
-        save_mob_state(self.model, str(checkpoint_dir / "mob_state.pt"))
+        save_mob_state(cast(nn.Module, self.model), str(checkpoint_dir / "mob_state.pt"))
 
         # Save wealth history
         if self.wealth_history:

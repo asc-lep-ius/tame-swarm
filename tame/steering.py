@@ -2,6 +2,7 @@ import logging
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from typing import Any, cast
 
 import numpy as np
 import torch
@@ -59,9 +60,9 @@ class SteeringVectorExtractor:
 
     def _register_hooks(self):
         if hasattr(self.model, "model") and hasattr(self.model.model, "layers"):
-            layers = self.model.model.layers
+            layers = cast(nn.ModuleList, getattr(self.model.model, "layers"))  # noqa: B009
         elif hasattr(self.model, "layers"):
-            layers = self.model.layers
+            layers = cast(nn.ModuleList, getattr(self.model, "layers"))  # noqa: B009
         else:
             raise ValueError("Cannot find transformer layers")
 
@@ -86,9 +87,14 @@ class SteeringVectorExtractor:
             # For device_map="auto", we need to find the input device
             # The embedding layer is always on the first device
             if hasattr(self.model, "model") and hasattr(self.model.model, "embed_tokens"):
-                input_device = self.model.model.embed_tokens.weight.device
+                # HuggingFace model internals: embed_tokens is an nn.Embedding
+                embed_tokens = getattr(self.model.model, "embed_tokens")  # noqa: B009
+                input_device = embed_tokens.weight.device
             elif hasattr(self.model, "get_input_embeddings"):
-                input_device = self.model.get_input_embeddings().weight.device
+                # HuggingFace PreTrainedModel method, not on nn.Module stubs
+                get_embeddings = getattr(self.model, "get_input_embeddings")  # noqa: B009
+                embed_layer = get_embeddings()
+                input_device = embed_layer.weight.device
             else:
                 input_device = next(self.model.parameters()).device
 
@@ -203,7 +209,7 @@ class SteeringHook:
 
     def __call__(
         self, module: nn.Module, input: tuple[torch.Tensor, ...], output: tuple[torch.Tensor, ...]
-    ) -> tuple[torch.Tensor, ...]:
+    ) -> tuple[torch.Tensor, ...] | torch.Tensor:
         if isinstance(output, tuple):
             hidden_states = output[0]
             rest = output[1:]
@@ -255,9 +261,9 @@ class CognitiveHomeostat(nn.Module):
 
     def attach_to_model(self, model: nn.Module):
         if hasattr(model, "model") and hasattr(model.model, "layers"):
-            layers = model.model.layers
+            layers = cast(nn.ModuleList, getattr(model.model, "layers"))  # noqa: B009
         elif hasattr(model, "layers"):
-            layers = model.layers
+            layers = cast(nn.ModuleList, getattr(model, "layers"))  # noqa: B009
         else:
             raise ValueError("Cannot find transformer layers")
 
@@ -284,7 +290,7 @@ class CognitiveHomeostat(nn.Module):
         self.hooks = {}
         logger.info("Detached all steering hooks")
 
-    def get_alignment_stats(self) -> dict[str, float]:
+    def get_alignment_stats(self) -> dict[str, Any]:
         if not self.homeostat.alignment_history:
             return {}
 
@@ -368,7 +374,12 @@ def create_default_steering_vectors(
         raise ValueError(f"Unknown goal: {goal}. Available: {list(STEERING_TEMPLATES.keys())}")
 
     if layers is None:
-        num_layers = len(model.model.layers) if hasattr(model, "model") else len(model.layers)
+        # HuggingFace models store layers in model.model.layers (ModuleList)
+        if hasattr(model, "model"):
+            model_layers = cast(nn.ModuleList, getattr(model.model, "layers"))  # noqa: B009
+        else:
+            model_layers = cast(nn.ModuleList, getattr(model, "layers"))  # noqa: B009
+        num_layers = len(model_layers)
         layers = list(range(num_layers // 3, 2 * num_layers // 3))
 
     template = STEERING_TEMPLATES[goal]
