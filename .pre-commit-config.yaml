@@ -1,0 +1,27 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.11.4
+    hooks:
+      - id: ruff
+      - id: ruff-format
+
+  # pyright is run in CI (allow_failure) instead of pre-commit.
+  # 235 pre-existing errors from torch/transformers untyped APIs
+  # make a blocking pre-commit hook impractical without stub packages.
+
+  - repo: https://github.com/compilerla/conventional-pre-commit
+    rev: v4.1.0
+    hooks:
+      - id: conventional-pre-commit
+        stages: [commit-msg]
+        args:
+          - feat
+          - fix
+          - refactor
+          - docs
+          - test
+          - chore
+          - style
+          - perf
+          - build
+          - ci

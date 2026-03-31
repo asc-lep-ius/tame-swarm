@@ -179,7 +179,8 @@ async def generate_stream(req: GenerateRequest, tame: TAMEApplication = Depends(
 
     async def event_generator():
         try:
-            yield f"data: {json.dumps({'type': 'status', 'message': 'Preparing generation...'})}\n\n"
+            status_payload = json.dumps({"type": "status", "message": "Preparing generation..."})
+            yield f"data: {status_payload}\n\n"
 
             if tame.homeostat:
                 tame.homeostat.reset()
@@ -198,7 +199,10 @@ async def generate_stream(req: GenerateRequest, tame: TAMEApplication = Depends(
             inputs = tame.tokenizer(text, return_tensors="pt").to(tame.model.device)
             input_length = inputs.input_ids.shape[1]
 
-            yield f"data: {json.dumps({'type': 'status', 'message': f'Processing {input_length} input tokens...'})}\n\n"
+            status_payload = json.dumps(
+                {"type": "status", "message": f"Processing {input_length} input tokens..."}
+            )
+            yield f"data: {status_payload}\n\n"
 
             streamer = TextIteratorStreamer(
                 tame.tokenizer,
@@ -257,7 +261,10 @@ async def generate_stream(req: GenerateRequest, tame: TAMEApplication = Depends(
                     except Exception:
                         pass
 
-                    yield f"data: {json.dumps({'type': 'progress', 'message': status_msg, 'tokens': token_count})}\n\n"
+                    progress_payload = json.dumps(
+                        {"type": "progress", "message": status_msg, "tokens": token_count}
+                    )
+                    yield f"data: {progress_payload}\n\n"
 
                 if token_count - last_trace_update >= 25:
                     last_trace_update = token_count
@@ -299,7 +306,10 @@ async def generate_stream(req: GenerateRequest, tame: TAMEApplication = Depends(
                         yield f"data: {json.dumps(trace_update)}\n\n"
                     except Exception as e:
                         logger.warning("Error sending trace update: %s", e)
-                    yield f"data: {json.dumps({'type': 'progress', 'message': status_msg, 'tokens': token_count})}\n\n"
+                    progress_payload = json.dumps(
+                        {"type": "progress", "message": status_msg, "tokens": token_count}
+                    )
+                    yield f"data: {progress_payload}\n\n"
 
                 await asyncio.sleep(0.01)
 
@@ -346,7 +356,8 @@ async def generate_stream(req: GenerateRequest, tame: TAMEApplication = Depends(
         except Exception as e:
             logger.error("Streaming error: %s", e, exc_info=True)
             tame.stop_mob_tracking()
-            yield f"data: {json.dumps({'type': 'error', 'message': 'Streaming generation failed'})}\n\n"
+            error_payload = json.dumps({"type": "error", "message": "Streaming generation failed"})
+            yield f"data: {error_payload}\n\n"
 
         finally:
             if tame.homeostat and original_strength is not None:

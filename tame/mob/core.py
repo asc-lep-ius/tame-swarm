@@ -1,17 +1,17 @@
-import torch
-import torch.nn as nn
 import logging
 
-from .mob_config import MoBConfig
-from .experts import ConfidenceHead, Expert, LightweightExpert
+import torch
+import torch.nn as nn
+
 from .auction import VCGAuctioneer
+from .experts import ConfidenceHead, Expert, LightweightExpert
+from .mob_config import MoBConfig
 from .wealth import WealthUpdateMixin
 
 logger = logging.getLogger(__name__)
 
 
 class MixtureOfBidders(WealthUpdateMixin, nn.Module):
-
     def __init__(self, config: MoBConfig):
         super().__init__()
         self.config = config
@@ -22,25 +22,31 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
             self.base_up_proj = nn.Linear(config.hidden_dim, config.intermediate_dim, bias=False)
             self.base_down_proj = nn.Linear(config.intermediate_dim, config.hidden_dim, bias=False)
 
-            self.experts = nn.ModuleList([
-                LightweightExpert(
-                    config.hidden_dim,
-                    config.intermediate_dim,
-                    rank=config.adapter_rank,
-                    alpha=config.adapter_alpha,
-                )
-                for _ in range(config.num_experts)
-            ])
+            self.experts = nn.ModuleList(
+                [
+                    LightweightExpert(
+                        config.hidden_dim,
+                        config.intermediate_dim,
+                        rank=config.adapter_rank,
+                        alpha=config.adapter_alpha,
+                    )
+                    for _ in range(config.num_experts)
+                ]
+            )
         else:
-            self.experts = nn.ModuleList([
-                Expert(config.hidden_dim, config.intermediate_dim)
-                for _ in range(config.num_experts)
-            ])
+            self.experts = nn.ModuleList(
+                [
+                    Expert(config.hidden_dim, config.intermediate_dim)
+                    for _ in range(config.num_experts)
+                ]
+            )
 
-        self.confidence_heads = nn.ModuleList([
-            ConfidenceHead(config.hidden_dim, expert_id=i, num_experts=config.num_experts)
-            for i in range(config.num_experts)
-        ])
+        self.confidence_heads = nn.ModuleList(
+            [
+                ConfidenceHead(config.hidden_dim, expert_id=i, num_experts=config.num_experts)
+                for i in range(config.num_experts)
+            ]
+        )
 
         self.auctioneer = VCGAuctioneer(
             config.num_experts,
@@ -89,10 +95,9 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         """Forward pass through the MoB layer."""
         batch_size, seq_len, hidden_dim = hidden_states.shape
 
-        confidences = torch.stack([
-            head(hidden_states).squeeze(-1)
-            for head in self.confidence_heads
-        ], dim=-1)
+        confidences = torch.stack(
+            [head(hidden_states).squeeze(-1) for head in self.confidence_heads], dim=-1
+        )
 
         selected_experts, routing_weights, payments = self.auctioneer(
             confidences, self.expert_wealth
@@ -279,8 +284,12 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
             if device is None:
                 device = ref_param.device
                 if device.type == "meta":
-                    device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
-                    logger.warning(f"Detected meta device from lazy loading, forcing device={device}")
+                    device = (
+                        torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
+                    )
+                    logger.warning(
+                        f"Detected meta device from lazy loading, forcing device={device}"
+                    )
             if dtype is None:
                 dtype = ref_param.dtype
 

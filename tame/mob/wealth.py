@@ -1,6 +1,7 @@
+import logging
+
 import torch
 import torch.nn.functional as F
-import logging
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +17,6 @@ LOCAL_PAYMENT_CLAMP_MAX = 0.5
 
 
 class WealthUpdateMixin:
-
     def get_confidence_calibration_loss(self) -> torch.Tensor:
         if self._cached_calibration_loss is None:
             return torch.tensor(0.0, device=self.expert_wealth.device)
@@ -96,7 +96,7 @@ class WealthUpdateMixin:
 
             for k in range(self.config.top_k):
                 for expert_idx in range(self.config.num_experts):
-                    mask = (selected_experts[:, :, k] == expert_idx)
+                    mask = selected_experts[:, :, k] == expert_idx
                     if not mask.any():
                         continue
 
@@ -112,7 +112,9 @@ class WealthUpdateMixin:
                     mean_weight = routing_weights[:, :, k][mask].mean()
                     reward = loss_reduction * mean_weight * token_count / (batch_size * seq_len)
 
-                    expert_rewards[expert_idx] += reward * self.config.reward_scale * LOSS_REWARD_MULTIPLIER
+                    expert_rewards[expert_idx] += (
+                        reward * self.config.reward_scale * LOSS_REWARD_MULTIPLIER
+                    )
 
                     self.expert_baseline_loss[expert_idx] = (
                         self.config.loss_ema_decay * baseline
@@ -130,18 +132,28 @@ class WealthUpdateMixin:
                     if expert_rewards.numel() >= 2
                     else torch.tensor(WEALTH_EPSILON, device=expert_rewards.device)
                 )
-                normalized_rewards = (expert_rewards - expert_rewards.mean()) / (reward_std + WEALTH_EPSILON)
-                competitive_bonus = F.relu(normalized_rewards) * expert_rewards.abs().mean() * COMPETITIVE_BONUS_FACTOR
+                normalized_rewards = (expert_rewards - expert_rewards.mean()) / (
+                    reward_std + WEALTH_EPSILON
+                )
+                competitive_bonus = (
+                    F.relu(normalized_rewards)
+                    * expert_rewards.abs().mean()
+                    * COMPETITIVE_BONUS_FACTOR
+                )
                 expert_rewards += competitive_bonus
 
             if self.config.use_vcg_payments and payments is not None:
                 for k in range(self.config.top_k):
                     for expert_idx in range(self.config.num_experts):
-                        mask = (selected_experts[:, :, k] == expert_idx)
+                        mask = selected_experts[:, :, k] == expert_idx
                         if mask.any():
                             mean_payment = payments[:, :, k][mask].mean()
-                            payment_fraction = mean_payment / (self.expert_wealth[expert_idx] + WEALTH_EPSILON)
-                            expert_rewards[expert_idx] *= 1.0 - payment_fraction.clamp(0, LOSS_PAYMENT_CLAMP_MAX)
+                            payment_fraction = mean_payment / (
+                                self.expert_wealth[expert_idx] + WEALTH_EPSILON
+                            )
+                            expert_rewards[expert_idx] *= 1.0 - payment_fraction.clamp(
+                                0, LOSS_PAYMENT_CLAMP_MAX
+                            )
 
             self.expert_wealth += expert_rewards
             self.expert_wealth.clamp_(min=self.config.min_wealth, max=self.config.max_wealth)
@@ -164,7 +176,9 @@ class WealthUpdateMixin:
 
             is_inference = not self.config.use_loss_feedback
 
-            decay_rate = self.config.inference_wealth_decay if is_inference else self.config.wealth_decay
+            decay_rate = (
+                self.config.inference_wealth_decay if is_inference else self.config.wealth_decay
+            )
             self.expert_wealth *= decay_rate
 
             expert_rewards = torch.zeros_like(self.expert_wealth)
@@ -173,7 +187,7 @@ class WealthUpdateMixin:
 
             for k in range(self.config.top_k):
                 for expert_idx in range(self.config.num_experts):
-                    mask = (selected_experts[:, :, k] == expert_idx)
+                    mask = selected_experts[:, :, k] == expert_idx
                     if not mask.any():
                         continue
 
@@ -196,7 +210,9 @@ class WealthUpdateMixin:
                     selection_fraction = mask.sum().float() / num_tokens
 
                     reward = quality * mean_confidence * mean_weight * selection_fraction
-                    expert_rewards[expert_idx] += reward * self.config.reward_scale * LOCAL_REWARD_MULTIPLIER
+                    expert_rewards[expert_idx] += (
+                        reward * self.config.reward_scale * LOCAL_REWARD_MULTIPLIER
+                    )
 
             mean_reward = expert_rewards.mean()
             if mean_reward > 0:
@@ -206,17 +222,25 @@ class WealthUpdateMixin:
             if self.config.use_vcg_payments and payments is not None:
                 for k in range(self.config.top_k):
                     for expert_idx in range(self.config.num_experts):
-                        mask = (selected_experts[:, :, k] == expert_idx)
+                        mask = selected_experts[:, :, k] == expert_idx
                         if mask.any():
                             mean_payment = payments[:, :, k][mask].mean()
-                            payment_cost = mean_payment * PAYMENT_COST_FACTOR / (self.expert_wealth[expert_idx] + WEALTH_EPSILON)
-                            expert_rewards[expert_idx] *= 1.0 - payment_cost.clamp(0, LOCAL_PAYMENT_CLAMP_MAX)
+                            payment_cost = (
+                                mean_payment
+                                * PAYMENT_COST_FACTOR
+                                / (self.expert_wealth[expert_idx] + WEALTH_EPSILON)
+                            )
+                            expert_rewards[expert_idx] *= 1.0 - payment_cost.clamp(
+                                0, LOCAL_PAYMENT_CLAMP_MAX
+                            )
 
             if is_inference and self.config.inference_exploration_bonus > 0:
                 mean_usage = self.expert_usage_count.mean()
                 if mean_usage > 0:
                     usage_ratio = self.expert_usage_count / (mean_usage + WEALTH_EPSILON)
-                    exploration_bonus = (1.0 - usage_ratio).clamp(min=0) * self.config.inference_exploration_bonus
+                    exploration_bonus = (1.0 - usage_ratio).clamp(
+                        min=0
+                    ) * self.config.inference_exploration_bonus
                     exploration_bonus = exploration_bonus * self.expert_wealth.mean()
                     expert_rewards += exploration_bonus
 
@@ -241,7 +265,7 @@ class WealthUpdateMixin:
 
             for k in range(self.config.top_k):
                 for expert_idx in range(self.config.num_experts):
-                    mask = (selected_experts[:, :, k] == expert_idx)
+                    mask = selected_experts[:, :, k] == expert_idx
                     if mask.any():
                         selection_count = mask.sum().float()
                         expert_selections[expert_idx] += selection_count
@@ -251,7 +275,9 @@ class WealthUpdateMixin:
                         mean_weight = routing_weights[:, :, k][mask].mean()
 
                         base_reward = selection_fraction * mean_confidence * mean_weight
-                        expert_rewards[expert_idx] += base_reward * self.config.reward_scale * PARTICIPATION_REWARD_MULTIPLIER
+                        expert_rewards[expert_idx] += (
+                            base_reward * self.config.reward_scale * PARTICIPATION_REWARD_MULTIPLIER
+                        )
 
             mean_reward = expert_rewards.mean()
             if mean_reward > 0:
@@ -261,11 +287,17 @@ class WealthUpdateMixin:
             if self.config.use_vcg_payments and payments is not None:
                 for k in range(self.config.top_k):
                     for expert_idx in range(self.config.num_experts):
-                        mask = (selected_experts[:, :, k] == expert_idx)
+                        mask = selected_experts[:, :, k] == expert_idx
                         if mask.any():
                             mean_payment = payments[:, :, k][mask].mean()
-                            payment_cost = mean_payment * PAYMENT_COST_FACTOR / (self.expert_wealth[expert_idx] + WEALTH_EPSILON)
-                            expert_rewards[expert_idx] *= 1.0 - payment_cost.clamp(0, LOCAL_PAYMENT_CLAMP_MAX)
+                            payment_cost = (
+                                mean_payment
+                                * PAYMENT_COST_FACTOR
+                                / (self.expert_wealth[expert_idx] + WEALTH_EPSILON)
+                            )
+                            expert_rewards[expert_idx] *= 1.0 - payment_cost.clamp(
+                                0, LOCAL_PAYMENT_CLAMP_MAX
+                            )
 
             self.expert_wealth += expert_rewards
 

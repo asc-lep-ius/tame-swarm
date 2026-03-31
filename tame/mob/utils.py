@@ -1,15 +1,14 @@
+import logging
+
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from typing import Optional, List, Dict
-import logging
 
 from .core import MixtureOfBidders
 
 logger = logging.getLogger(__name__)
 
 
-def get_mob_layers(model: nn.Module) -> List[MixtureOfBidders]:
+def get_mob_layers(model: nn.Module) -> list[MixtureOfBidders]:
     """
     Find all MoB layers in a model.
 
@@ -19,17 +18,13 @@ def get_mob_layers(model: nn.Module) -> List[MixtureOfBidders]:
     Returns:
         List of MixtureOfBidders modules
     """
-    return [
-        module
-        for module in model.modules()
-        if isinstance(module, MixtureOfBidders)
-    ]
+    return [module for module in model.modules() if isinstance(module, MixtureOfBidders)]
 
 
 def update_all_mob_from_loss(
     model: nn.Module,
     per_token_loss: torch.Tensor,
-    token_mask: Optional[torch.Tensor] = None,
+    token_mask: torch.Tensor | None = None,
 ):
     """
     Update all MoB layers in a model with loss feedback.
@@ -62,7 +57,7 @@ def get_total_calibration_loss(model: nn.Module) -> torch.Tensor:
     return total_loss
 
 
-def get_mob_statistics(model: nn.Module) -> Dict[str, torch.Tensor]:
+def get_mob_statistics(model: nn.Module) -> dict[str, torch.Tensor]:
     """
     Aggregate statistics from all MoB layers for monitoring.
 
@@ -82,11 +77,9 @@ def get_mob_statistics(model: nn.Module) -> Dict[str, torch.Tensor]:
     flat_wealth = all_wealth.flatten()
     sorted_wealth = torch.sort(flat_wealth)[0]
     n = len(sorted_wealth)
-    gini = (
-        (2 * torch.sum((torch.arange(1, n + 1, device=flat_wealth.device) * sorted_wealth)))
-        / (n * torch.sum(sorted_wealth))
-        - (n + 1) / n
-    )
+    gini = (2 * torch.sum(torch.arange(1, n + 1, device=flat_wealth.device) * sorted_wealth)) / (
+        n * torch.sum(sorted_wealth)
+    ) - (n + 1) / n
 
     return {
         "mean_wealth": all_wealth.mean(),
@@ -263,7 +256,9 @@ def save_mob_state(model: nn.Module, save_path: str) -> bool:
             "top_k": first_mob.config.top_k,
             "num_layers": len(mob_layers),
             "hidden_dim": first_mob.config.hidden_dim,
-            "adapter_rank": first_mob.config.adapter_rank if first_mob.config.use_shared_base else None,
+            "adapter_rank": first_mob.config.adapter_rank
+            if first_mob.config.use_shared_base
+            else None,
         }
     }
 

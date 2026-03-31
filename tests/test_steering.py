@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from steering import SteeringConfig, SteeringVector, AdaptiveHomeostat, CognitiveHomeostat
+from steering import AdaptiveHomeostat, CognitiveHomeostat, SteeringConfig, SteeringVector
 
 
 def test_steering_config_defaults():

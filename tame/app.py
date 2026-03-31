@@ -97,7 +97,9 @@ class TAMEApplication:
 
         layers_to_modify = list(range(profile["mob_layers_start"], profile["mob_layers_end"]))
 
-        logger.info("[MORPHOGENESIS] Targeting %d layers for MoB transformation", len(layers_to_modify))
+        logger.info(
+            "[MORPHOGENESIS] Targeting %d layers for MoB transformation", len(layers_to_modify)
+        )
         model = apply_mob_to_model(model, mob_config, layers_to_modify)
 
         logger.info(
@@ -126,9 +128,13 @@ class TAMEApplication:
                     has_inf,
                 )
                 if has_nan or has_inf:
-                    logger.error("[DIAGNOSTIC] WARNING: Model producing NaN/Inf! Check MoB configuration.")
+                    logger.error(
+                        "[DIAGNOSTIC] WARNING: Model producing NaN/Inf! Check MoB configuration."
+                    )
                 elif mean_val < 0.01 or std_val < 0.01:
-                    logger.warning("[DIAGNOSTIC] WARNING: Hidden states may be collapsed (very low variance)")
+                    logger.warning(
+                        "[DIAGNOSTIC] WARNING: Hidden states may be collapsed (very low variance)"
+                    )
                 else:
                     logger.info("[DIAGNOSTIC] MoB output looks valid")
         except Exception as e:
@@ -151,9 +157,13 @@ class TAMEApplication:
                         )
                     break
                 except Exception as e:
-                    logger.warning("[MORPHOGENESIS] Failed to load mob_state from %s: %s", state_path, e)
+                    logger.warning(
+                        "[MORPHOGENESIS] Failed to load mob_state from %s: %s", state_path, e
+                    )
         else:
-            logger.info("[MORPHOGENESIS] No trained mob_state found - experts start with default wealth")
+            logger.info(
+                "[MORPHOGENESIS] No trained mob_state found - experts start with default wealth"
+            )
 
         logger.info("[HOMEOSTASIS] Extracting steering vectors for goal persistence...")
 
