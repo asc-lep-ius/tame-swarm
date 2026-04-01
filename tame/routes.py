@@ -124,7 +124,7 @@ async def generate(req: GenerateRequest, tame: TAMEApplication = Depends(get_tam
             tokenize=False,
             add_generation_prompt=True,
         )
-        inputs = tame.tokenizer(text, return_tensors="pt").to(tame.model.device)  # pyright: ignore[reportCallIssue, reportAttributeAccessIssue]
+        inputs = tame.tokenizer(text, return_tensors="pt").to(tame.model.device)  # pyright: ignore[reportCallIssue, reportAttributeAccessIssue] # AutoTokenizer stubs lack __call__ and .device
 
         with torch.inference_mode():
             outputs = tame.model.generate(  # pyright: ignore[reportAttributeAccessIssue] # AutoModelForCausalLM stubs lack .generate
@@ -134,11 +134,11 @@ async def generate(req: GenerateRequest, tame: TAMEApplication = Depends(get_tam
                 temperature=req.temperature if req.temperature > 0 else 1.0,
                 top_k=50,
                 top_p=0.95,
-                pad_token_id=tame.tokenizer.pad_token_id,  # pyright: ignore[reportAttributeAccessIssue]
+                pad_token_id=tame.tokenizer.pad_token_id,  # pyright: ignore[reportAttributeAccessIssue] # AutoTokenizer stubs lack .pad_token_id
             )
 
         generated_ids = outputs[0][inputs.input_ids.shape[1] :]
-        response_text = tame.tokenizer.decode(generated_ids, skip_special_tokens=True)  # pyright: ignore[reportAttributeAccessIssue]
+        response_text = tame.tokenizer.decode(generated_ids, skip_special_tokens=True)  # pyright: ignore[reportAttributeAccessIssue] # AutoTokenizer stubs lack .decode
 
         usage = {
             "input_tokens": inputs.input_ids.shape[1],
@@ -199,7 +199,7 @@ async def generate_stream(req: GenerateRequest, tame: TAMEApplication = Depends(
                 tokenize=False,
                 add_generation_prompt=True,
             )
-            inputs = tame.tokenizer(text, return_tensors="pt").to(tame.model.device)  # pyright: ignore[reportCallIssue, reportAttributeAccessIssue]
+            inputs = tame.tokenizer(text, return_tensors="pt").to(tame.model.device)  # pyright: ignore[reportCallIssue, reportAttributeAccessIssue] # AutoTokenizer stubs lack __call__ and .device
             input_length = inputs.input_ids.shape[1]
 
             status_payload = json.dumps(
@@ -221,7 +221,7 @@ async def generate_stream(req: GenerateRequest, tame: TAMEApplication = Depends(
                 "temperature": req.temperature if req.temperature > 0 else 1.0,
                 "top_k": 50,
                 "top_p": 0.95,
-                "pad_token_id": tame.tokenizer.pad_token_id,  # pyright: ignore[reportAttributeAccessIssue]
+                "pad_token_id": tame.tokenizer.pad_token_id,  # pyright: ignore[reportAttributeAccessIssue] # AutoTokenizer stubs lack .pad_token_id
                 "streamer": streamer,
             }
 

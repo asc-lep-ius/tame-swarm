@@ -244,7 +244,7 @@ class TAMETrainer:
             self._redispatch_model()
         elif self.device.type != "cuda":
             # Move to device if not using CUDA
-            self.model = self.model.to(self.device)  # pyright: ignore[reportArgumentType]
+            self.model = self.model.to(self.device)  # pyright: ignore[reportArgumentType] # .to() overload expects Device, not torch.device
 
         # Setup optimizer
         self._setup_optimizer()
@@ -393,7 +393,7 @@ class TAMETrainer:
                 self.model = self.model.to_empty(device=self.device)
                 self._reload_pretrained_weights()
             else:
-                self.model = self.model.to(self.device)  # pyright: ignore[reportArgumentType]
+                self.model = self.model.to(self.device)  # pyright: ignore[reportArgumentType] # .to() overload expects Device, not torch.device
 
     def _reload_pretrained_weights(self):
         """
@@ -664,7 +664,7 @@ class TAMETrainer:
 
         # Create dataloader
         self.train_dataloader = DataLoader(
-            tokenized_dataset,  # pyright: ignore[reportArgumentType]
+            tokenized_dataset,  # pyright: ignore[reportArgumentType] # DataLoader stubs don't accept IterableDataset
             batch_size=self.config.batch_size,
             shuffle=hasattr(tokenized_dataset, "__len__"),
             collate_fn=data_collator,
@@ -694,7 +694,7 @@ class TAMETrainer:
         batch_size, seq_len = input_ids.shape
 
         # Forward pass
-        outputs = self.model(  # pyright: ignore[reportCallIssue]
+        outputs = self.model(  # pyright: ignore[reportCallIssue] # model forward call signature varies by runtime model type
             input_ids=input_ids,
             attention_mask=attention_mask,
             labels=None,  # We'll compute loss manually for per-token access
@@ -965,9 +965,9 @@ class TAMETrainer:
         # Save model
         checkpoint_str = str(checkpoint_dir)
         if self.config.use_lora and HAS_PEFT:
-            self.model.save_pretrained(checkpoint_str)  # pyright: ignore[reportCallIssue]
+            self.model.save_pretrained(checkpoint_str)  # pyright: ignore[reportCallIssue] # PeftModel.save_pretrained stubs incomplete
         else:
-            self.model.save_pretrained(checkpoint_str)  # pyright: ignore[reportCallIssue]
+            self.model.save_pretrained(checkpoint_str)  # pyright: ignore[reportCallIssue] # PreTrainedModel.save_pretrained stubs incomplete
 
         self.tokenizer.save_pretrained(checkpoint_str)
 
