@@ -1,59 +1,104 @@
 variables:
-  PYTHON_VERSION: "3.12"
-  UV_CACHE_DIR: .uv-cache
+  CI_CPU_IMAGE: $CI_REGISTRY_IMAGE/ci-cpu:v1.0.0
+  CI_GPU_IMAGE: $CI_REGISTRY_IMAGE/ci-gpu:v1.0.0
 
 stages:
+  - rebuild-ci
   - check
   - build
 
-# ── Base job ────────────────────────────────────────────────────────────────
+# ── CI image rebuild (only when deps change) ───────────────────────────────
 
-.python-job:
-  image: python:${PYTHON_VERSION}-slim
+.rebuild-ci:
+  stage: rebuild-ci
+  image: docker:27
+  tags: [ubuntu-desktop-1]
+  variables:
+    DOCKER_HOST: unix:///var/run/docker.sock
+
+rebuild-ci-cpu:
+  extends: .rebuild-ci
+  script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    - docker build -t "$CI_CPU_IMAGE" -f ci/Dockerfile.cpu .
+    - docker push "$CI_CPU_IMAGE"
+  rules:
+    - changes:
+        - pyproject.toml
+        - uv.lock
+        - ci/Dockerfile.cpu
+
+rebuild-ci-gpu:
+  extends: .rebuild-ci
+  allow_failure: true
+  script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    - docker build -t "$CI_GPU_IMAGE" -f ci/Dockerfile.gpu .
+    - docker push "$CI_GPU_IMAGE"
+  rules:
+    - changes:
+        - pyproject.toml
+        - uv.lock
+        - ci/Dockerfile.gpu
+
+# ── Base jobs ───────────────────────────────────────────────────────────────
+
+.cpu-job:
+  image: $CI_CPU_IMAGE
   tags: [ubuntu-desktop-1]
   before_script:
-    - pip install uv
-    - uv sync --extra dev
-  cache:
-    key:
-      prefix: uv-${PYTHON_VERSION}
-      files:
-        - uv.lock
-    paths:
-      - .uv-cache/
+    - ln -s /app/.venv .venv
+
+.gpu-job:
+  image: $CI_GPU_IMAGE
+  tags: [ubuntu-desktop-1]
+  before_script:
+    - ln -s /app/.venv .venv
 
 # ── Check stage ─────────────────────────────────────────────────────────────
 
 lint:
-  extends: .python-job
+  extends: .cpu-job
   stage: check
+  needs:
+    - job: rebuild-ci-cpu
+      optional: true
   script:
-    - uv run ruff check .
-    - uv run ruff format --check .
+    - uv run --no-sync ruff check .
+    - uv run --no-sync ruff format --check .
 
 pyright:
-  extends: .python-job
+  extends: .cpu-job
   stage: check
+  needs:
+    - job: rebuild-ci-cpu
+      optional: true
   script:
-    - uv run pyright
-  allow_failure: false
+    - uv run --no-sync pyright
 
 test:
-  extends: .python-job
+  extends: .cpu-job
   stage: check
+  needs:
+    - job: rebuild-ci-cpu
+      optional: true
+  before_script:
+    - ln -s /app/.venv .venv
+    - uv pip install --python .venv/bin/python -e . --no-deps
   script:
-    - uv run pytest --tb=short -q
+    - uv run --no-sync pytest --tb=short -q
 
 test-gpu:
-  extends: .python-job
+  extends: .gpu-job
   stage: check
-  image: nvidia/cuda:12.6.3-cudnn-runtime-ubuntu22.04
+  needs:
+    - job: rebuild-ci-gpu
+      optional: true
   before_script:
-    - apt-get update && apt-get install -y python3 python3-pip python3-venv
-    - pip install uv
-    - uv sync --extra dev
+    - ln -s /app/.venv .venv
+    - uv pip install --python .venv/bin/python -e . --no-deps
   script:
-    - uv run pytest --tb=short -q -m gpu
+    - uv run --no-sync pytest --tb=short -q -m gpu
   allow_failure: true
 
 # ── Build stage ─────────────────────────────────────────────────────────────
@@ -62,16 +107,14 @@ docker-build:
   stage: build
   tags: [ubuntu-desktop-1]
   image: docker:27
-  services: []
   variables:
     DOCKER_HOST: unix:///var/run/docker.sock
-  only:
-    refs:
-      - main
-    changes:
-      - tame/Dockerfile
-      - pyproject.toml
-      - uv.lock
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+    - changes:
+        - tame/Dockerfile
+        - pyproject.toml
+        - uv.lock
   script:
     - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
     - docker build -t "$CI_REGISTRY_IMAGE:latest" -f tame/Dockerfile .
