@@ -580,7 +580,7 @@ While MoB provides the body and Steering provides the goal, the system currently
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE).
+All Rights Reserved — see [LICENSE](LICENSE).
 
 ---
 
