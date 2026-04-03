@@ -1,13 +1,24 @@
-variables:
-  CI_CPU_IMAGE: $CI_REGISTRY_IMAGE/ci-cpu:v1.0.0
-  CI_GPU_IMAGE: $CI_REGISTRY_IMAGE/ci-gpu:v1.0.0
-
 stages:
   - rebuild-ci
   - check
   - build
 
-# ── CI image rebuild (only when deps change) ───────────────────────────────
+# ── Helpers ─────────────────────────────────────────────────────────────────
+
+.docker-push-with-retry: &docker-push-with-retry |
+  push_with_retry() {
+    local image="$1" attempt=0 max_attempts=3 delay=5
+    while [ "$attempt" -lt "$max_attempts" ]; do
+      attempt=$((attempt + 1))
+      echo "[push] attempt $attempt/$max_attempts — $image"
+      if docker push "$image"; then return 0; fi
+      [ "$attempt" -lt "$max_attempts" ] && sleep "$delay"
+    done
+    echo "[push] FAILED after $max_attempts attempts" >&2
+    return 1
+  }
+
+# ── CI image rebuild (pull-or-build) ───────────────────────────────────────
 
 .rebuild-ci:
   stage: rebuild-ci
@@ -15,31 +26,56 @@ stages:
   tags: [ubuntu-desktop-1]
   variables:
     DOCKER_HOST: unix:///var/run/docker.sock
+  artifacts:
+    reports:
+      dotenv: build.env
 
 rebuild-ci-cpu:
   extends: .rebuild-ci
   script:
-    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
-    - docker build -t "$CI_CPU_IMAGE" -f ci/Dockerfile.cpu .
-    - docker push "$CI_CPU_IMAGE"
-  rules:
-    - changes:
-        - pyproject.toml
-        - uv.lock
-        - ci/Dockerfile.cpu
+    - *docker-push-with-retry
+    - TAG=$(cat ci/Dockerfile.cpu pyproject.toml uv.lock | sha256sum | cut -c1-16)
+    - IMAGE="$CI_REGISTRY_IMAGE/ci-cpu:${TAG}"
+    - echo "CI_CPU_IMAGE=${IMAGE}" > build.env
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - |
+      if docker pull "$IMAGE" 2>/dev/null; then
+        echo "Image $IMAGE already exists — skipping build"
+      else
+        echo "Image not found — building $IMAGE"
+        docker pull "$CI_REGISTRY_IMAGE/ci-cpu:latest" 2>/dev/null || true
+        docker build \
+          --cache-from "$CI_REGISTRY_IMAGE/ci-cpu:latest" \
+          -t "$IMAGE" \
+          -t "$CI_REGISTRY_IMAGE/ci-cpu:latest" \
+          -f ci/Dockerfile.cpu .
+        push_with_retry "$IMAGE"
+        push_with_retry "$CI_REGISTRY_IMAGE/ci-cpu:latest"
+      fi
 
 rebuild-ci-gpu:
   extends: .rebuild-ci
   allow_failure: true
   script:
-    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
-    - docker build -t "$CI_GPU_IMAGE" -f ci/Dockerfile.gpu .
-    - docker push "$CI_GPU_IMAGE"
-  rules:
-    - changes:
-        - pyproject.toml
-        - uv.lock
-        - ci/Dockerfile.gpu
+    - *docker-push-with-retry
+    - TAG=$(cat ci/Dockerfile.gpu pyproject.toml uv.lock | sha256sum | cut -c1-16)
+    - IMAGE="$CI_REGISTRY_IMAGE/ci-gpu:${TAG}"
+    - echo "CI_GPU_IMAGE=${IMAGE}" > build.env
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - |
+      if docker pull "$IMAGE" 2>/dev/null; then
+        echo "Image $IMAGE already exists — skipping build"
+      else
+        echo "Image not found — building $IMAGE"
+        docker pull "$CI_REGISTRY_IMAGE/ci-gpu:latest" 2>/dev/null || true
+        docker build \
+          --cache-from "$CI_REGISTRY_IMAGE/ci-gpu:latest" \
+          -t "$IMAGE" \
+          -t "$CI_REGISTRY_IMAGE/ci-gpu:latest" \
+          -f ci/Dockerfile.gpu .
+        push_with_retry "$IMAGE"
+        push_with_retry "$CI_REGISTRY_IMAGE/ci-gpu:latest"
+      fi
 
 # ── Base jobs ───────────────────────────────────────────────────────────────
 
@@ -62,7 +98,7 @@ lint:
   stage: check
   needs:
     - job: rebuild-ci-cpu
-      optional: true
+      artifacts: true
   script:
     - uv run --no-sync ruff check .
     - uv run --no-sync ruff format --check .
@@ -72,7 +108,7 @@ pyright:
   stage: check
   needs:
     - job: rebuild-ci-cpu
-      optional: true
+      artifacts: true
   script:
     - uv run --no-sync pyright
 
@@ -81,7 +117,7 @@ test:
   stage: check
   needs:
     - job: rebuild-ci-cpu
-      optional: true
+      artifacts: true
   before_script:
     - ln -s /app/.venv .venv
     - uv pip install --python .venv/bin/python -e . --no-deps
@@ -93,7 +129,7 @@ test-gpu:
   stage: check
   needs:
     - job: rebuild-ci-gpu
-      optional: true
+      artifacts: true
   before_script:
     - ln -s /app/.venv .venv
     - uv pip install --python .venv/bin/python -e . --no-deps
@@ -112,10 +148,13 @@ docker-build:
   rules:
     - if: $CI_COMMIT_BRANCH == "main"
     - changes:
-        - tame/Dockerfile
-        - pyproject.toml
-        - uv.lock
+        compare_to: refs/heads/main
+        paths:
+          - tame/Dockerfile
+          - pyproject.toml
+          - uv.lock
   script:
-    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    - *docker-push-with-retry
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
     - docker build -t "$CI_REGISTRY_IMAGE:latest" -f tame/Dockerfile .
-    - docker push "$CI_REGISTRY_IMAGE:latest"
+    - push_with_retry "$CI_REGISTRY_IMAGE:latest"
