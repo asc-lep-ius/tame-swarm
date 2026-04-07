@@ -1,14 +1,8 @@
 # tame-swarm CI — local GitLab runners + registry
-# Replace .gitlab-ci.yml in the tame-swarm repo after migration
 #
-# Changes from gitlab.com version:
-#   - Registry: gitlab.hephaestus:5050 (local, fast push)
-#   - Tags: hephaestus (build/test), workstation (training)
-#   - Removed push_with_retry
-#   - GPU test now mandatory (not allow_failure)
-#   - Added training smoke test and performance regression
-#   - All CUDA images pinned to 13.0+ (RTX 5070 Ti / Blackwell)
-#   - Kaniko OOM fix: --compressed-caching=false --use-new-run
+# Docker builds use BuildKit (docker buildx) via DinD on the privileged runner.
+# Registry: gitlab.hephaestus:5050 (HTTP, insecure).
+# Tags: hephaestus (check/build), workstation (training).
 
 variables:
   LOCAL_REGISTRY: "gitlab.hephaestus:5050/mipkovich/tame-swarm"
@@ -19,46 +13,57 @@ stages:
   - build
   - train
 
+# --- Docker build template (BuildKit + DinD) ---
+.docker-build:
+  image: docker:27-cli
+  services:
+    - name: docker:27-dind
+      command: ["--insecure-registry=gitlab.hephaestus:5050"]
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    - |
+      cat > /tmp/buildkitd.toml << EOF
+      [registry."gitlab.hephaestus:5050"]
+        http = true
+      EOF
+    - docker buildx create --use --name ci-builder
+        --driver docker-container
+        --driver-opt network=host
+        --config /tmp/buildkitd.toml
+    - docker buildx inspect --bootstrap
+  after_script:
+    - docker buildx rm ci-builder 2>/dev/null || true
+  tags: [hephaestus, build]
+
 # --- CI image rebuild ---
 rebuild-ci-cpu:
   stage: rebuild-ci
-  tags: [hephaestus, build]
-  image:
-    name: gcr.io/kaniko-project/executor:v1.23.2-debug
-    entrypoint: [""]
+  extends: .docker-build
   script:
     - CPU_HASH=$(cat ci/Dockerfile.cpu pyproject.toml uv.lock | sha256sum | cut -c1-16)
-    - /kaniko/executor
-        --context "${CI_PROJECT_DIR}"
-        --dockerfile "${CI_PROJECT_DIR}/ci/Dockerfile.cpu"
-        --destination "${LOCAL_REGISTRY}/ci-cpu:${CPU_HASH}"
-        --cache=true
-        --cache-repo="${LOCAL_REGISTRY}/ci-cpu-cache"
-        --insecure-registry=gitlab.hephaestus:5050
-        --snapshot-mode=redo
-        --compressed-caching=false
-        --use-new-run
+    - docker buildx build
+        --file ci/Dockerfile.cpu
+        --cache-from type=registry,ref=${LOCAL_REGISTRY}/ci-cpu-cache
+        --cache-to type=registry,ref=${LOCAL_REGISTRY}/ci-cpu-cache,mode=max
+        --tag ${LOCAL_REGISTRY}/ci-cpu:${CPU_HASH}
+        --push .
   rules:
     - changes: [ci/Dockerfile.cpu, pyproject.toml, uv.lock]
 
 rebuild-ci-gpu:
   stage: rebuild-ci
-  tags: [hephaestus, build]
-  image:
-    name: gcr.io/kaniko-project/executor:v1.23.2-debug
-    entrypoint: [""]
+  extends: .docker-build
   script:
     - GPU_HASH=$(cat ci/Dockerfile.gpu pyproject.toml uv.lock | sha256sum | cut -c1-16)
-    - /kaniko/executor
-        --context "${CI_PROJECT_DIR}"
-        --dockerfile "${CI_PROJECT_DIR}/ci/Dockerfile.gpu"
-        --destination "${LOCAL_REGISTRY}/ci-gpu:${GPU_HASH}"
-        --cache=true
-        --cache-repo="${LOCAL_REGISTRY}/ci-gpu-cache"
-        --insecure-registry=gitlab.hephaestus:5050
-        --snapshot-mode=redo
-        --compressed-caching=false
-        --use-new-run
+    - docker buildx build
+        --file ci/Dockerfile.gpu
+        --cache-from type=registry,ref=${LOCAL_REGISTRY}/ci-gpu-cache
+        --cache-to type=registry,ref=${LOCAL_REGISTRY}/ci-gpu-cache,mode=max
+        --tag ${LOCAL_REGISTRY}/ci-gpu:${GPU_HASH}
+        --push .
   rules:
     - changes: [ci/Dockerfile.gpu, pyproject.toml, uv.lock]
 
@@ -89,21 +94,16 @@ test-gpu:
 # --- Build stage ---
 docker-build:
   stage: build
-  tags: [hephaestus, build]
-  image:
-    name: gcr.io/kaniko-project/executor:v1.23.2-debug
-    entrypoint: [""]
+  extends: .docker-build
   script:
-    - /kaniko/executor
-        --context "${CI_PROJECT_DIR}/tame"
-        --dockerfile "${CI_PROJECT_DIR}/tame/Dockerfile"
-        --destination "${LOCAL_REGISTRY}:${CI_COMMIT_SHORT_SHA}"
-        --destination "${LOCAL_REGISTRY}:latest"
-        --cache=true
-        --insecure-registry=gitlab.hephaestus:5050
-        --snapshot-mode=redo
-        --compressed-caching=false
-        --use-new-run
+    - docker buildx build
+        --file tame/Dockerfile
+        --cache-from type=registry,ref=${LOCAL_REGISTRY}/build-cache
+        --cache-to type=registry,ref=${LOCAL_REGISTRY}/build-cache,mode=max
+        --tag ${LOCAL_REGISTRY}:${CI_COMMIT_SHORT_SHA}
+        --tag ${LOCAL_REGISTRY}:latest
+        --push
+        tame/
   rules:
     - changes: [tame/Dockerfile, tame/pyproject.toml, tame/**/*.py]
 
