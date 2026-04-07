@@ -8,6 +8,7 @@
 #   - GPU test now mandatory (not allow_failure)
 #   - Added training smoke test and performance regression
 #   - All CUDA images pinned to 13.0+ (RTX 5070 Ti / Blackwell)
+#   - Kaniko OOM fix: --compressed-caching=false --use-new-run
 
 variables:
   LOCAL_REGISTRY: "gitlab.hephaestus:5050/mipkovich/tame-swarm"
@@ -33,6 +34,10 @@ rebuild-ci-cpu:
         --destination "${LOCAL_REGISTRY}/ci-cpu:${CPU_HASH}"
         --cache=true
         --cache-repo="${LOCAL_REGISTRY}/ci-cpu-cache"
+        --insecure-registry=gitlab.hephaestus:5050
+        --snapshot-mode=redo
+        --compressed-caching=false
+        --use-new-run
   rules:
     - changes: [ci/Dockerfile.cpu, pyproject.toml, uv.lock]
 
@@ -50,6 +55,10 @@ rebuild-ci-gpu:
         --destination "${LOCAL_REGISTRY}/ci-gpu:${GPU_HASH}"
         --cache=true
         --cache-repo="${LOCAL_REGISTRY}/ci-gpu-cache"
+        --insecure-registry=gitlab.hephaestus:5050
+        --snapshot-mode=redo
+        --compressed-caching=false
+        --use-new-run
   rules:
     - changes: [ci/Dockerfile.gpu, pyproject.toml, uv.lock]
 
@@ -91,6 +100,10 @@ docker-build:
         --destination "${LOCAL_REGISTRY}:${CI_COMMIT_SHORT_SHA}"
         --destination "${LOCAL_REGISTRY}:latest"
         --cache=true
+        --insecure-registry=gitlab.hephaestus:5050
+        --snapshot-mode=redo
+        --compressed-caching=false
+        --use-new-run
   rules:
     - changes: [tame/Dockerfile, tame/pyproject.toml, tame/**/*.py]
 
