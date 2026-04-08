@@ -2,7 +2,7 @@
 #
 # Docker builds use BuildKit (docker buildx) via DinD on the privileged runner.
 # Registry: gitlab.hephaestus:5050 (HTTP, insecure).
-# Tags: hephaestus (check/build), workstation (training).
+# Tags: hephaestus (check), privileged (docker builds), workstation (training).
 
 variables:
   LOCAL_REGISTRY: "gitlab.hephaestus:5050/mipkovich/tame-swarm"
@@ -36,7 +36,7 @@ stages:
     - docker buildx inspect --bootstrap
   after_script:
     - docker buildx rm ci-builder 2>/dev/null || true
-  tags: [hephaestus, build]
+  tags: [privileged]
 
 # --- CI image rebuild ---
 rebuild-ci-cpu:
