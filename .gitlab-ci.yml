@@ -74,6 +74,7 @@ lint:
   tags: [hephaestus]
   image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
   script:
+    - uv sync --extra dev
     - uv run ruff check .
     - uv run ruff format --check .
 
@@ -82,6 +83,7 @@ test:
   tags: [hephaestus]
   image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
   script:
+    - uv sync --extra dev
     - uv run pytest tests/ -x --tb=short -m "not gpu"
 
 test-gpu:
