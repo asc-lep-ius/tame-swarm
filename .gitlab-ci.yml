@@ -56,6 +56,7 @@ rebuild-ci-cpu:
 rebuild-ci-gpu:
   stage: rebuild-ci
   extends: .docker-build
+  timeout: 3h
   script:
     - GPU_HASH=$(cat ci/Dockerfile.gpu pyproject.toml uv.lock | sha256sum | cut -c1-16)
     - docker buildx build
@@ -95,6 +96,7 @@ test-gpu:
 docker-build:
   stage: build
   extends: .docker-build
+  timeout: 3h
   script:
     - docker buildx build
         --file tame/Dockerfile
