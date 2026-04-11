@@ -74,22 +74,28 @@ rebuild-ci-gpu:
     - when: manual
       allow_failure: true
 
+# --- Python job template (pre-built CI image) ---
+.python-job:
+  image: "${LOCAL_REGISTRY}/ci-cpu:latest"
+  variables:
+    UV_LINK_MODE: copy
+  before_script:
+    - uv sync --extra dev
+
 # --- Check stage ---
 lint:
   stage: check
   tags: [hephaestus]
-  image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+  extends: .python-job
   script:
-    - uv sync --extra dev
     - uv run ruff check .
     - uv run ruff format --check .
 
 test:
   stage: check
   tags: [hephaestus]
-  image: ghcr.io/astral-sh/uv:python3.12-bookworm-slim
+  extends: .python-job
   script:
-    - uv sync --extra dev
     - uv run pytest tests/ -x --tb=short -m "not gpu"
 
 test-gpu:
