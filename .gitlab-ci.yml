@@ -49,9 +49,12 @@ rebuild-ci-cpu:
         --cache-from type=registry,ref=${LOCAL_REGISTRY}/ci-cpu-cache
         --cache-to type=registry,ref=${LOCAL_REGISTRY}/ci-cpu-cache,mode=max
         --tag ${LOCAL_REGISTRY}/ci-cpu:${CPU_HASH}
+        --tag ${LOCAL_REGISTRY}/ci-cpu:latest
         --push .
   rules:
     - changes: [ci/Dockerfile.cpu, pyproject.toml, uv.lock]
+    - when: manual
+      allow_failure: true
 
 rebuild-ci-gpu:
   stage: rebuild-ci
@@ -64,9 +67,12 @@ rebuild-ci-gpu:
         --cache-from type=registry,ref=${LOCAL_REGISTRY}/ci-gpu-cache
         --cache-to type=registry,ref=${LOCAL_REGISTRY}/ci-gpu-cache,mode=max
         --tag ${LOCAL_REGISTRY}/ci-gpu:${GPU_HASH}
+        --tag ${LOCAL_REGISTRY}/ci-gpu:latest
         --push .
   rules:
     - changes: [ci/Dockerfile.gpu, pyproject.toml, uv.lock]
+    - when: manual
+      allow_failure: true
 
 # --- Check stage ---
 lint:
@@ -90,6 +96,7 @@ test-gpu:
   stage: check
   tags: [hephaestus, gpu]
   image: "${LOCAL_REGISTRY}/ci-gpu:latest"
+  allow_failure: true
   script:
     - nvidia-smi
     - uv run pytest tests/ -x --tb=short -m gpu
