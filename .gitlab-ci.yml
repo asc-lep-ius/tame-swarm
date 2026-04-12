@@ -79,6 +79,7 @@ rebuild-ci-gpu:
   image: "${LOCAL_REGISTRY}/ci-cpu:latest"
   variables:
     UV_LINK_MODE: copy
+    UV_PROJECT_ENVIRONMENT: /app/.venv
   before_script:
     - uv sync --extra dev
 
@@ -102,7 +103,12 @@ test-gpu:
   stage: check
   tags: [hephaestus, gpu]
   image: "${LOCAL_REGISTRY}/ci-gpu:latest"
+  variables:
+    UV_LINK_MODE: copy
+    UV_PROJECT_ENVIRONMENT: /app/.venv
   allow_failure: true
+  before_script:
+    - uv sync --extra dev
   script:
     - nvidia-smi
     - uv run pytest tests/ -x --tb=short -m gpu
