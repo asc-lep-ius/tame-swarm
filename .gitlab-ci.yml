@@ -1,0 +1,159 @@
+# tame-swarm CI — local GitLab runners + registry
+#
+# Docker builds use BuildKit (docker buildx) via DinD on the privileged runner.
+# Registry: gitlab.hephaestus:5050 (HTTP, insecure).
+# Tags: hephaestus (check), privileged (docker builds), workstation (training).
+
+variables:
+  LOCAL_REGISTRY: "gitlab.hephaestus:5050/mipkovich/tame-swarm"
+
+stages:
+  - rebuild-ci
+  - check
+  - build
+  - train
+
+# --- Docker build template (BuildKit + DinD) ---
+.docker-build:
+  image: docker:27-cli
+  services:
+    - name: docker:27-dind
+      command: ["--insecure-registry=gitlab.hephaestus:5050"]
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+    - |
+      cat > /tmp/buildkitd.toml << EOF
+      [registry."gitlab.hephaestus:5050"]
+        http = true
+      EOF
+    - docker buildx create --use --name ci-builder
+        --driver docker-container
+        --driver-opt network=host
+        --config /tmp/buildkitd.toml
+    - docker buildx inspect --bootstrap
+  after_script:
+    - docker buildx rm ci-builder 2>/dev/null || true
+  tags: [privileged]
+
+# --- CI image rebuild ---
+rebuild-ci-cpu:
+  stage: rebuild-ci
+  extends: .docker-build
+  script:
+    - CPU_HASH=$(cat ci/Dockerfile.cpu pyproject.toml uv.lock | sha256sum | cut -c1-16)
+    - docker buildx build
+        --file ci/Dockerfile.cpu
+        --cache-from type=registry,ref=${LOCAL_REGISTRY}/ci-cpu-cache
+        --cache-to type=registry,ref=${LOCAL_REGISTRY}/ci-cpu-cache,mode=max
+        --tag ${LOCAL_REGISTRY}/ci-cpu:${CPU_HASH}
+        --tag ${LOCAL_REGISTRY}/ci-cpu:latest
+        --push .
+  rules:
+    - changes: [ci/Dockerfile.cpu, pyproject.toml, uv.lock]
+    - when: manual
+      allow_failure: true
+
+rebuild-ci-gpu:
+  stage: rebuild-ci
+  extends: .docker-build
+  timeout: 3h
+  script:
+    - GPU_HASH=$(cat ci/Dockerfile.gpu pyproject.toml uv.lock | sha256sum | cut -c1-16)
+    - docker buildx build
+        --file ci/Dockerfile.gpu
+        --cache-from type=registry,ref=${LOCAL_REGISTRY}/ci-gpu-cache
+        --cache-to type=registry,ref=${LOCAL_REGISTRY}/ci-gpu-cache,mode=max
+        --tag ${LOCAL_REGISTRY}/ci-gpu:${GPU_HASH}
+        --tag ${LOCAL_REGISTRY}/ci-gpu:latest
+        --push .
+  rules:
+    - changes: [ci/Dockerfile.gpu, pyproject.toml, uv.lock]
+    - when: manual
+      allow_failure: true
+
+# --- Python job template (pre-built CI image) ---
+.python-job:
+  image: "${LOCAL_REGISTRY}/ci-cpu:latest"
+  variables:
+    UV_LINK_MODE: copy
+    UV_PROJECT_ENVIRONMENT: /app/.venv
+  before_script:
+    - uv sync --extra dev
+
+# --- Check stage ---
+lint:
+  stage: check
+  tags: [hephaestus]
+  extends: .python-job
+  script:
+    - uv run ruff check .
+    - uv run ruff format --check .
+
+test:
+  stage: check
+  tags: [hephaestus]
+  extends: .python-job
+  script:
+    - uv run pytest tests/ -x --tb=short -m "not gpu"
+
+test-gpu:
+  stage: check
+  tags: [hephaestus, gpu]
+  image: "${LOCAL_REGISTRY}/ci-gpu:latest"
+  variables:
+    UV_LINK_MODE: copy
+    UV_PROJECT_ENVIRONMENT: /app/.venv
+  allow_failure: true
+  before_script:
+    - uv sync --extra dev
+  script:
+    - nvidia-smi
+    - uv run pytest tests/ -x --tb=short -m gpu
+
+# --- Build stage ---
+docker-build:
+  stage: build
+  extends: .docker-build
+  timeout: 3h
+  script:
+    - docker buildx build
+        --file tame/Dockerfile
+        --cache-from type=registry,ref=${LOCAL_REGISTRY}/build-cache
+        --cache-to type=registry,ref=${LOCAL_REGISTRY}/build-cache,mode=max
+        --tag ${LOCAL_REGISTRY}:${CI_COMMIT_SHORT_SHA}
+        --tag ${LOCAL_REGISTRY}:latest
+        --push
+        tame/
+  rules:
+    - changes: [tame/Dockerfile, tame/pyproject.toml, tame/**/*.py]
+
+# --- Training (workstation) ---
+train-smoke:
+  stage: train
+  tags: [workstation, gpu-train]
+  resource_group: gpu
+  image: "${LOCAL_REGISTRY}:latest"
+  timeout: 30m
+  script:
+    - nvidia-smi
+    - python -c "import torch; assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))"
+    - python tame/train.py --epochs 1 --smoke-test || echo "Smoke test not yet implemented"
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
+perf-regression:
+  stage: train
+  tags: [workstation, gpu-train]
+  resource_group: gpu
+  image: "${LOCAL_REGISTRY}:latest"
+  timeout: 1h
+  allow_failure: true
+  script:
+    - echo "Performance regression test placeholder"
+    - echo "Compare inference latency against baseline"
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      when: manual

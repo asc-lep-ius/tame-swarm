@@ -88,7 +88,7 @@ class TAMEApplication:
         )
 
         if hasattr(model, "hf_device_map"):
-            devices_used = set(model.hf_device_map.values())
+            devices_used = set(model.hf_device_map.values())  # pyright: ignore[reportCallIssue] # hf_device_map is a dict at runtime, stubs see Tensor
             logger.info("[GESTATIONAL] Model distributed across devices: %s", devices_used)
 
         logger.info("[GESTATIONAL] Base model loaded")
@@ -97,7 +97,9 @@ class TAMEApplication:
 
         layers_to_modify = list(range(profile["mob_layers_start"], profile["mob_layers_end"]))
 
-        logger.info("[MORPHOGENESIS] Targeting %d layers for MoB transformation", len(layers_to_modify))
+        logger.info(
+            "[MORPHOGENESIS] Targeting %d layers for MoB transformation", len(layers_to_modify)
+        )
         model = apply_mob_to_model(model, mob_config, layers_to_modify)
 
         logger.info(
@@ -110,7 +112,7 @@ class TAMEApplication:
 
         logger.info("[DIAGNOSTIC] Testing MoB output validity...")
         try:
-            test_input = tokenizer("Test", return_tensors="pt").to(model.device)
+            test_input = tokenizer("Test", return_tensors="pt").to(model.device)  # pyright: ignore[reportCallIssue] # AutoTokenizer stubs lack __call__
             with torch.inference_mode():
                 test_output = model(**test_input, output_hidden_states=True)
                 last_hidden = test_output.hidden_states[-1]
@@ -126,9 +128,13 @@ class TAMEApplication:
                     has_inf,
                 )
                 if has_nan or has_inf:
-                    logger.error("[DIAGNOSTIC] WARNING: Model producing NaN/Inf! Check MoB configuration.")
+                    logger.error(
+                        "[DIAGNOSTIC] WARNING: Model producing NaN/Inf! Check MoB configuration."
+                    )
                 elif mean_val < 0.01 or std_val < 0.01:
-                    logger.warning("[DIAGNOSTIC] WARNING: Hidden states may be collapsed (very low variance)")
+                    logger.warning(
+                        "[DIAGNOSTIC] WARNING: Hidden states may be collapsed (very low variance)"
+                    )
                 else:
                     logger.info("[DIAGNOSTIC] MoB output looks valid")
         except Exception as e:
@@ -151,9 +157,13 @@ class TAMEApplication:
                         )
                     break
                 except Exception as e:
-                    logger.warning("[MORPHOGENESIS] Failed to load mob_state from %s: %s", state_path, e)
+                    logger.warning(
+                        "[MORPHOGENESIS] Failed to load mob_state from %s: %s", state_path, e
+                    )
         else:
-            logger.info("[MORPHOGENESIS] No trained mob_state found - experts start with default wealth")
+            logger.info(
+                "[MORPHOGENESIS] No trained mob_state found - experts start with default wealth"
+            )
 
         logger.info("[HOMEOSTASIS] Extracting steering vectors for goal persistence...")
 
@@ -181,7 +191,7 @@ class TAMEApplication:
         logger.info("=" * 60)
 
         return cls(
-            model=model,
+            model=model,  # pyright: ignore[reportArgumentType] # apply_mob_to_model returns Module but is still AutoModelForCausalLM at runtime
             tokenizer=tokenizer,
             homeostat=homeostat,
             mob_config=mob_config,
@@ -190,18 +200,18 @@ class TAMEApplication:
         )
 
     def start_mob_tracking(self) -> None:
-        for layer in self.model.model.layers:
+        for layer in self.model.model.layers:  # pyright: ignore[reportAttributeAccessIssue] # HuggingFace Auto* stubs lack runtime model internals
             if hasattr(layer, "mlp") and isinstance(layer.mlp, MixtureOfBidders):
                 layer.mlp.start_tracking()
 
     def stop_mob_tracking(self) -> None:
-        for layer in self.model.model.layers:
+        for layer in self.model.model.layers:  # pyright: ignore[reportAttributeAccessIssue] # HuggingFace Auto* stubs lack runtime model internals
             if hasattr(layer, "mlp") and isinstance(layer.mlp, MixtureOfBidders):
                 layer.mlp.stop_tracking()
 
     def get_mob_wealth_traces(self) -> dict[str, list[list[float]]]:
         traces: dict[str, list[list[float]]] = {}
-        for idx, layer in enumerate(self.model.model.layers):
+        for idx, layer in enumerate(self.model.model.layers):  # pyright: ignore[reportAttributeAccessIssue] # HuggingFace Auto* stubs lack runtime model internals
             if hasattr(layer, "mlp") and isinstance(layer.mlp, MixtureOfBidders):
                 history = layer.mlp.get_wealth_history()
                 if history:

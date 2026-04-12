@@ -1,9 +1,8 @@
+import pytest
 import torch
 import torch.nn as nn
 
-import pytest
-
-from mob import MoBConfig, MixtureOfBidders, apply_mob_to_model, save_mob_state, load_mob_state
+from mob import MixtureOfBidders, MoBConfig, apply_mob_to_model, load_mob_state, save_mob_state
 
 
 def test_forward_output_shape(mob_layer, random_hidden_states):
@@ -140,10 +139,9 @@ def test_apply_mob_replaces_mlp(tiny_config):
     class FakeTransformer(nn.Module):
         def __init__(self, hidden_dim, intermediate_dim, num_layers):
             super().__init__()
-            self.layers = nn.ModuleList([
-                FakeTransformerLayer(hidden_dim, intermediate_dim)
-                for _ in range(num_layers)
-            ])
+            self.layers = nn.ModuleList(
+                [FakeTransformerLayer(hidden_dim, intermediate_dim) for _ in range(num_layers)]
+            )
 
     class FakeModel(nn.Module):
         def __init__(self, hidden_dim, intermediate_dim, num_layers):

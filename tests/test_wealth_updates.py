@@ -1,9 +1,8 @@
-import torch
 import pytest
+import torch
 
-from mob import MoBConfig, MixtureOfBidders
+from mob import MixtureOfBidders, MoBConfig
 from mob.utils import get_mob_statistics
-
 
 STABILITY_CONFIG = MoBConfig(
     num_experts=2,

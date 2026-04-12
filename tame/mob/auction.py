@@ -44,8 +44,10 @@ class VCGAuctioneer(nn.Module):
             masked_bids = bids.scatter(
                 -1, winner_j_idx, torch.full_like(winner_j_idx, float("-inf"), dtype=bids.dtype)
             )
-            top_without_j, _ = torch.topk(masked_bids, k - 1, dim=-1) if k > 1 else (
-                torch.zeros(batch, seq_len, 0, device=bids.device), None
+            top_without_j, _ = (
+                torch.topk(masked_bids, k - 1, dim=-1)
+                if k > 1
+                else (torch.zeros(batch, seq_len, 0, device=bids.device), None)
             )
             welfare_without_j = top_without_j.sum(dim=-1)
             payments[:, :, j] = (welfare_without_j - other_winner_welfare[:, :, j]).clamp(min=0)

@@ -1,0 +1,8 @@
+{
+  "pythonVersion": "3.10",
+  "venvPath": ".",
+  "venv": ".venv",
+  "include": ["tame"],
+  "typeCheckingMode": "basic",
+  "reportMissingImports": false
+}

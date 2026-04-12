@@ -131,7 +131,7 @@ cd tame
 docker compose -f docker-compose.dev.yml up --build
 ```
 
-The first run downloads the base model (~5 GB for Gemma-2-2B). Subsequent runs use the local cache.
+The first run downloads the base model (~5 GB for Gemma-2-2B). If you want to use Gemma-2-2B, you need a huggingface account and request access from google then add the "HF_TOKEN" to the .env file, which they grant instantly upon request AFAIK. Subsequent runs use the local cache.
 
 ### Verify
 

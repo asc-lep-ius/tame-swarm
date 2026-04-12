@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 
 class ConfidenceHead(nn.Module):
-    """Lightweight linear layer for each expert to predict its confidence in handling a given token."""
+    """Lightweight linear layer for each expert to predict its confidence."""
 
     def __init__(self, hidden_dim: int, expert_id: int = 0, num_experts: int = 8):
         super().__init__()

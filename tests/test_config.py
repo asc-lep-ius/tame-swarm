@@ -1,4 +1,4 @@
-from config import MODEL_PROFILES, get_active_profile, ModelProfile
+from config import MODEL_PROFILES, get_active_profile
 
 
 def test_active_profile_exists():
@@ -9,7 +9,14 @@ def test_active_profile_exists():
 
 
 def test_all_profiles_have_required_keys():
-    required_keys = {"model_id", "hidden_dim", "intermediate_dim", "num_layers", "mob_layers_start", "mob_layers_end"}
+    required_keys = {
+        "model_id",
+        "hidden_dim",
+        "intermediate_dim",
+        "num_layers",
+        "mob_layers_start",
+        "mob_layers_end",
+    }
     for name, profile in MODEL_PROFILES.items():
         missing = required_keys - set(profile.keys())
         assert not missing, f"Profile '{name}' missing keys: {missing}"

@@ -34,6 +34,9 @@ dev = [
     "tame-swarm[train,serve,chat]",
     "pytest>=7.0.0",
     "ruff>=0.4.0",
+    "hypothesis>=6.0.0",
+    "pyright>=1.1.0",
+    "pre-commit>=3.0.0",
 ]
 
 [tool.ruff]
@@ -42,10 +45,19 @@ line-length = 100
 src = ["tame"]
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "W", "UP"]
+select = ["E", "F", "I", "W", "UP", "B", "SIM"]
+
+[tool.ruff.lint.per-file-ignores]
+"tame/routes.py" = ["B008"]  # FastAPI Depends() in parameter defaults is idiomatic
+"tame/train.py" = ["E402"]  # logging setup before imports is intentional
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-m 'not gpu and not slow'"
+markers = [
+    "gpu: tests requiring GPU hardware",
+    "slow: long-running tests",
+]
 
 [build-system]
 requires = ["setuptools>=68.0"]

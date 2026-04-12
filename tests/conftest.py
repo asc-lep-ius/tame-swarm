@@ -6,8 +6,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "tame"))
 
-from mob import MoBConfig, MixtureOfBidders
-
+from mob import MixtureOfBidders, MoBConfig
 
 TINY_CONFIG = MoBConfig(
     num_experts=2,
