@@ -5,6 +5,8 @@ from typing import cast
 import torch
 import torch.nn as nn
 
+from coupling import CouplingMetrics, SteeringCoupling, SteeringCouplingConfig
+
 from .auction import VCGAuctioneer
 from .experts import ConfidenceHead, Expert, LightweightExpert
 from .mob_config import MoBConfig
@@ -23,6 +25,7 @@ class MoBStats:
     expert_usage: torch.Tensor
     expert_performance: torch.Tensor
     router_z_loss: torch.Tensor
+    coupling_metrics: CouplingMetrics | None = None
 
 
 class MixtureOfBidders(WealthUpdateMixin, nn.Module):
@@ -100,6 +103,7 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         self._cached_expert_token_masks: list[torch.Tensor] | None = None
         self._loss_feedback_pending: bool = False
         self._cached_calibration_loss: torch.Tensor | None = None
+        self._last_coupling_metrics: CouplingMetrics | None = None
 
     def forward(
         self,
@@ -109,9 +113,18 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         """Forward pass through the MoB layer."""
         batch_size, seq_len, hidden_dim = hidden_states.shape
 
+        confidence_hidden_states = hidden_states
+        coupling_metrics: CouplingMetrics | None = None
+        coupling = self._get_coupling()
+        if coupling is not None:
+            confidence_hidden_states = coupling(hidden_states)
+            coupling_metrics = coupling.last_metrics
+
         confidence_logits = torch.stack(
             [
-                cast(ConfidenceHead, confidence_head).forward_logits(hidden_states).squeeze(-1)
+                cast(ConfidenceHead, confidence_head)
+                .forward_logits(confidence_hidden_states)
+                .squeeze(-1)
                 for confidence_head in self.confidence_heads
             ],
             dim=-1,
@@ -167,12 +180,54 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
             expert_usage=self.expert_usage_count.detach().clone(),
             expert_performance=self.expert_performance_ema.detach().clone(),
             router_z_loss=router_z_loss.detach(),
+            coupling_metrics=coupling_metrics,
         )
+        self._last_coupling_metrics = coupling_metrics
 
         if self._track_wealth:
             self.wealth_history.append(self.expert_wealth.cpu().tolist())
 
         return output
+
+    def attach_coupling(
+        self,
+        steering_direction: torch.Tensor,
+        config: SteeringCouplingConfig | None = None,
+    ) -> SteeringCoupling:
+        coupling_config = config or SteeringCouplingConfig(hidden_dim=self.config.hidden_dim)
+        if coupling_config.hidden_dim != self.config.hidden_dim:
+            raise ValueError(
+                f"Coupling hidden_dim {coupling_config.hidden_dim} does not match "
+                f"MoB hidden_dim {self.config.hidden_dim}"
+            )
+
+        if hasattr(self, "coupling"):
+            self.detach_coupling()
+
+        coupling = SteeringCoupling(coupling_config, steering_direction)
+        reference_parameter = next(self.confidence_heads.parameters())
+        coupling.to(device=reference_parameter.device, dtype=reference_parameter.dtype)
+        self.add_module("coupling", coupling)
+        self._last_coupling_metrics = None
+        return coupling
+
+    def detach_coupling(self) -> None:
+        if hasattr(self, "coupling"):
+            delattr(self, "coupling")
+        self._last_coupling_metrics = None
+        self.last_stats = None
+
+    def set_coupling_step(self, step: int) -> "MixtureOfBidders":
+        if step < 0:
+            raise ValueError("coupling step must be non-negative")
+
+        coupling = self._get_coupling()
+        if coupling is not None:
+            coupling.set_coupling_step(step)
+        return self
+
+    def _get_coupling(self) -> SteeringCoupling | None:
+        return cast(SteeringCoupling | None, getattr(self, "coupling", None))
 
     def _compute_router_z_loss(self, confidence_logits: torch.Tensor) -> torch.Tensor:
         log_z = torch.logsumexp(confidence_logits.float(), dim=-1)

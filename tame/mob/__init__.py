@@ -1,3 +1,11 @@
+from coupling import (
+    CouplingMetrics,
+    SteeringCoupling,
+    SteeringCouplingConfig,
+    attach_coupling,
+    detach_coupling,
+)
+
 from .auction import VCGAuctioneer
 from .core import MixtureOfBidders, MoBStats, apply_mob_to_model
 from .experts import ConfidenceHead, Expert, LightweightExpert
@@ -17,6 +25,11 @@ __all__ = [
     "Expert",
     "LightweightExpert",
     "VCGAuctioneer",
+    "SteeringCouplingConfig",
+    "CouplingMetrics",
+    "SteeringCoupling",
+    "attach_coupling",
+    "detach_coupling",
     "MoBStats",
     "MixtureOfBidders",
     "apply_mob_to_model",

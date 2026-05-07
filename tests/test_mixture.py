@@ -37,6 +37,7 @@ def test_forward_updates_last_stats(mob_layer, random_hidden_states):
     assert stats.expert_wealth.shape == (mob_layer.config.num_experts,)
     assert stats.expert_usage.shape == (mob_layer.config.num_experts,)
     assert stats.expert_performance.shape == (mob_layer.config.num_experts,)
+    assert stats.coupling_metrics is None
 
 
 def test_forward_records_detached_finite_router_z_loss(mob_layer, random_hidden_states):
