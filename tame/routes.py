@@ -256,8 +256,8 @@ async def generate_stream(req: GenerateRequest, tame: TAMEApplication = Depends(
                         for layer in tame.model.model.layers:  # pyright: ignore[reportAttributeAccessIssue] # HuggingFace Auto* stubs lack runtime model internals
                             if hasattr(layer, "mlp") and hasattr(layer.mlp, "last_stats"):
                                 stats = layer.mlp.last_stats
-                                if stats and "expert_wealth" in stats:
-                                    wealth = stats["expert_wealth"]
+                                if stats is not None:
+                                    wealth = stats.expert_wealth
                                     top_expert = wealth.argmax().item()
                                     status_msg += f" | Expert {top_expert} leading"
                                     break

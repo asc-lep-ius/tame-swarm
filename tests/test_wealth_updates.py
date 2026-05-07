@@ -1,8 +1,11 @@
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from mob import MixtureOfBidders, MoBConfig
-from mob.utils import get_mob_statistics
+from mob.utils import get_mob_statistics, get_total_router_z_loss
+from train import TAMETrainer, TrainingConfig
 
 STABILITY_CONFIG = MoBConfig(
     num_experts=2,
@@ -138,3 +141,98 @@ def test_calibration_loss_finite():
 
     cal_loss = mob.get_confidence_calibration_loss()
     assert torch.isfinite(cal_loss).all(), f"Calibration loss should be finite, got {cal_loss}"
+
+
+def test_total_router_z_loss_aggregates_live_layer_losses() -> None:
+    mob_a = _build_training_mob()
+    mob_b = _build_training_mob()
+    model = torch.nn.Sequential(mob_a, mob_b)
+    hidden_states = torch.randn(2, 4, STABILITY_CONFIG.hidden_dim, requires_grad=True)
+
+    model(hidden_states)
+    router_z_loss = get_total_router_z_loss(model)
+
+    assert torch.isfinite(router_z_loss)
+    assert router_z_loss.item() >= 0.0
+    assert router_z_loss.requires_grad
+
+    router_z_loss.backward()
+    assert any(
+        parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        for parameter in mob_a.confidence_heads.parameters()
+    )
+
+
+class TinyCausalModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        hidden_dim = 8
+        vocab_size = 11
+        self.embedding = torch.nn.Embedding(vocab_size, hidden_dim)
+        self.mob = MixtureOfBidders(
+            MoBConfig(
+                num_experts=2,
+                top_k=1,
+                hidden_dim=hidden_dim,
+                intermediate_dim=16,
+                adapter_rank=2,
+                adapter_alpha=2.0,
+                use_shared_base=True,
+                use_vcg_payments=True,
+                use_differentiable_routing=True,
+                use_loss_feedback=True,
+                use_local_quality=True,
+                confidence_z_loss_weight=0.1,
+            )
+        )
+        self.lm_head = torch.nn.Linear(hidden_dim, vocab_size)
+        self.forward_coupling_step: int | None = None
+
+        self.mob.attach_coupling(
+            torch.ones(hidden_dim),
+            config=None,
+        )
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        labels: torch.Tensor | None,
+        use_cache: bool,
+    ) -> SimpleNamespace:
+        del attention_mask, labels, use_cache
+        self.forward_coupling_step = int(self.mob.coupling._coupling_step.item())
+        hidden_states = self.embedding(input_ids)
+        hidden_states = self.mob(hidden_states)
+        return SimpleNamespace(logits=self.lm_head(hidden_states))
+
+
+def test_train_step_reports_router_z_loss_and_sets_coupling_step() -> None:
+    trainer = TAMETrainer(
+        TrainingConfig(
+            device="cpu",
+            dtype="float32",
+            gradient_accumulation_steps=2,
+            wealth_update_frequency=1,
+        )
+    )
+    model = TinyCausalModel()
+    trainer.model = model
+    trainer.global_step = 7
+
+    input_ids = torch.tensor([[1, 2, 3, 4], [4, 3, 2, 1]])
+    batch = {
+        "input_ids": input_ids,
+        "attention_mask": torch.ones_like(input_ids),
+        "labels": input_ids.clone(),
+    }
+
+    metrics = trainer.train_step(batch)
+
+    assert model.forward_coupling_step == trainer.global_step
+    assert torch.isfinite(torch.tensor(metrics["router_z_loss"]))
+    assert metrics["router_z_loss"] >= 0.0
+    assert metrics["total_loss"] == pytest.approx(
+        metrics["loss"] + metrics["calibration_loss"] + metrics["router_z_loss"],
+        rel=1e-6,
+    )

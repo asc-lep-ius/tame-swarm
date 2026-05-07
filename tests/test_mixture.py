@@ -1,8 +1,17 @@
+from operator import contains
+
 import pytest
 import torch
 import torch.nn as nn
 
-from mob import MixtureOfBidders, MoBConfig, apply_mob_to_model, load_mob_state, save_mob_state
+from mob import (
+    MixtureOfBidders,
+    MoBConfig,
+    MoBStats,
+    apply_mob_to_model,
+    load_mob_state,
+    save_mob_state,
+)
 
 
 def test_forward_output_shape(mob_layer, random_hidden_states):
@@ -19,15 +28,62 @@ def test_forward_no_nan_inf(mob_layer, random_hidden_states):
 def test_forward_updates_last_stats(mob_layer, random_hidden_states):
     mob_layer(random_hidden_states)
 
-    expected_keys = {
-        "confidences",
-        "selected_experts",
-        "routing_weights",
-        "expert_wealth",
-        "expert_usage",
-        "expert_performance",
-    }
-    assert expected_keys.issubset(mob_layer.last_stats.keys())
+    stats = mob_layer.last_stats
+    assert isinstance(stats, MoBStats)
+    assert stats.confidence_logits.shape == (1, 8, mob_layer.config.num_experts)
+    assert stats.confidences.shape == (1, 8, mob_layer.config.num_experts)
+    assert stats.selected_experts.shape == (1, 8, mob_layer.config.top_k)
+    assert stats.routing_weights.shape == (1, 8, mob_layer.config.top_k)
+    assert stats.expert_wealth.shape == (mob_layer.config.num_experts,)
+    assert stats.expert_usage.shape == (mob_layer.config.num_experts,)
+    assert stats.expert_performance.shape == (mob_layer.config.num_experts,)
+    assert stats.coupling_metrics is None
+
+
+def test_forward_records_detached_finite_router_z_loss(mob_layer, random_hidden_states):
+    mob_layer(random_hidden_states)
+
+    stats = mob_layer.last_stats
+    assert isinstance(stats, MoBStats)
+    assert torch.isfinite(stats.router_z_loss)
+    assert stats.router_z_loss >= 0.0
+    assert not stats.router_z_loss.requires_grad
+    assert not stats.confidence_logits.requires_grad
+    assert not stats.confidences.requires_grad
+
+
+def test_router_z_loss_matches_logsumexp_formula_with_default_weight(tiny_config):
+    mob = MixtureOfBidders(tiny_config)
+    logits = torch.tensor(
+        [
+            [[0.25, -1.5], [2.0, 0.5]],
+            [[-0.75, 1.25], [0.0, -0.25]],
+        ],
+        dtype=torch.float16,
+    )
+
+    assert tiny_config.confidence_z_loss_weight == pytest.approx(0.0001)
+    expected = (
+        torch.logsumexp(logits.float(), dim=-1).square().mean()
+        * tiny_config.confidence_z_loss_weight
+    )
+
+    assert torch.allclose(mob._compute_router_z_loss(logits), expected)
+
+
+def test_mob_stats_does_not_support_mapping_style_access(mob_layer, random_hidden_states):
+    mob_layer(random_hidden_states)
+
+    stats = mob_layer.last_stats
+    assert isinstance(stats, MoBStats)
+    assert stats.expert_wealth.shape == (mob_layer.config.num_experts,)
+
+    with pytest.raises(TypeError):
+        contains(stats, "expert_wealth")
+    with pytest.raises(TypeError):
+        stats["expert_wealth"]
+    with pytest.raises(AttributeError):
+        stats.keys()
 
 
 def test_save_load_roundtrip(tmp_path, tiny_config):

@@ -81,7 +81,13 @@ def test_vcg_differentiable_mode():
     wealth = torch.ones(4)
 
     _, routing_weights, _ = auctioneer(confidences, wealth)
-    loss = routing_weights.sum()
+    objective_weights = torch.arange(
+        1,
+        routing_weights.numel() + 1,
+        device=routing_weights.device,
+        dtype=routing_weights.dtype,
+    ).reshape_as(routing_weights)
+    loss = (routing_weights * objective_weights).sum()
     loss.backward()
     assert confidences.grad is not None
     assert (confidences.grad.abs() > 0).any()

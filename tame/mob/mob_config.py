@@ -23,6 +23,7 @@ class MoBConfig:
     use_local_quality: bool = True
     use_differentiable_routing: bool = True
     confidence_calibration_weight: float = 0.15
+    confidence_z_loss_weight: float = 0.0001
     loss_ema_decay: float = 0.92
     inference_wealth_decay: float = 0.98
     inference_exploration_bonus: float = 0.03
