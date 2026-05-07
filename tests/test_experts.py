@@ -19,6 +19,27 @@ def test_confidence_head_output_range():
     assert (out <= 1.0).all()
 
 
+def test_confidence_head_forward_logits_clamps_projection():
+    head = ConfidenceHead(hidden_dim=2)
+    with torch.no_grad():
+        head.proj.weight.fill_(100.0)
+        head.proj.bias.zero_()
+
+    high_logits = head.forward_logits(torch.ones(1, 3, 2))
+    low_logits = head.forward_logits(-torch.ones(1, 3, 2))
+
+    assert high_logits.shape == (1, 3, 1)
+    assert torch.equal(high_logits, torch.full_like(high_logits, 20.0))
+    assert torch.equal(low_logits, torch.full_like(low_logits, -20.0))
+
+
+def test_confidence_head_forward_is_sigmoid_of_logits():
+    head = ConfidenceHead(hidden_dim=32)
+    x = torch.randn(2, 4, 32)
+
+    assert torch.allclose(head(x), torch.sigmoid(head.forward_logits(x)))
+
+
 def test_expert_output_shape():
     expert = Expert(hidden_dim=32, intermediate_dim=64)
     x = torch.randn(2, 4, 32)

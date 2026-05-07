@@ -1,5 +1,6 @@
 import logging
-from typing import cast
+from dataclasses import dataclass
+from typing import ClassVar, cast
 
 import torch
 import torch.nn as nn
@@ -10,6 +11,40 @@ from .mob_config import MoBConfig
 from .wealth import WealthUpdateMixin
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class MoBStats:
+    confidence_logits: torch.Tensor
+    confidences: torch.Tensor
+    selected_experts: torch.Tensor
+    routing_weights: torch.Tensor
+    expert_wealth: torch.Tensor
+    expert_usage: torch.Tensor
+    expert_performance: torch.Tensor
+    router_z_loss: torch.Tensor
+
+    _fields: ClassVar[tuple[str, ...]] = (
+        "confidence_logits",
+        "confidences",
+        "selected_experts",
+        "routing_weights",
+        "expert_wealth",
+        "expert_usage",
+        "expert_performance",
+        "router_z_loss",
+    )
+
+    def __contains__(self, key: object) -> bool:
+        return isinstance(key, str) and key in self._fields
+
+    def __getitem__(self, key: str) -> torch.Tensor:
+        if key not in self:
+            raise KeyError(key)
+        return getattr(self, key)
+
+    def keys(self) -> tuple[str, ...]:
+        return self._fields
 
 
 class MixtureOfBidders(WealthUpdateMixin, nn.Module):
@@ -75,7 +110,7 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
             torch.zeros(config.num_experts),
         )
 
-        self.last_stats: dict = {}
+        self.last_stats: MoBStats | None = None
 
         self.wealth_history: list[list[float]] = []
         self._track_wealth: bool = False
@@ -96,9 +131,15 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         """Forward pass through the MoB layer."""
         batch_size, seq_len, hidden_dim = hidden_states.shape
 
-        confidences = torch.stack(
-            [head(hidden_states).squeeze(-1) for head in self.confidence_heads], dim=-1
+        confidence_logits = torch.stack(
+            [
+                cast(ConfidenceHead, confidence_head).forward_logits(hidden_states).squeeze(-1)
+                for confidence_head in self.confidence_heads
+            ],
+            dim=-1,
         )
+        confidences = torch.sigmoid(confidence_logits)
+        router_z_loss = self._compute_router_z_loss(confidence_logits)
 
         selected_experts, routing_weights, payments = self.auctioneer(
             confidences, self.expert_wealth
@@ -139,19 +180,25 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
                     selected_experts, routing_weights, confidences, payments
                 )
 
-        self.last_stats = {
-            "confidences": confidences.detach(),
-            "selected_experts": selected_experts.detach(),
-            "routing_weights": routing_weights.detach(),
-            "expert_wealth": self.expert_wealth.clone(),
-            "expert_usage": self.expert_usage_count.clone(),
-            "expert_performance": self.expert_performance_ema.clone(),
-        }
+        self.last_stats = MoBStats(
+            confidence_logits=confidence_logits.detach(),
+            confidences=confidences.detach(),
+            selected_experts=selected_experts.detach(),
+            routing_weights=routing_weights.detach(),
+            expert_wealth=self.expert_wealth.detach().clone(),
+            expert_usage=self.expert_usage_count.detach().clone(),
+            expert_performance=self.expert_performance_ema.detach().clone(),
+            router_z_loss=router_z_loss.detach(),
+        )
 
         if self._track_wealth:
             self.wealth_history.append(self.expert_wealth.cpu().tolist())
 
         return output
+
+    def _compute_router_z_loss(self, confidence_logits: torch.Tensor) -> torch.Tensor:
+        log_z = torch.logsumexp(confidence_logits.float(), dim=-1)
+        return log_z.square().mean() * self.config.confidence_z_loss_weight
 
     def _forward_training(
         self,

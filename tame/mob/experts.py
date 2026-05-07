@@ -2,6 +2,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+CONFIDENCE_LOGIT_MIN = -20.0
+CONFIDENCE_LOGIT_MAX = 20.0
+
 
 class ConfidenceHead(nn.Module):
     """Lightweight linear layer for each expert to predict its confidence."""
@@ -15,6 +18,16 @@ class ConfidenceHead(nn.Module):
         bias_offset = (expert_id - num_experts / 2) * 0.1
         nn.init.constant_(self.proj.bias, bias_offset)
 
+    def forward_logits(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Input tensor of shape (batch, seq_len, hidden_dim)
+        Returns:
+            Clamped confidence logits of shape (batch, seq_len, 1)
+        """
+        logits = self.proj(x)
+        return torch.clamp(logits, min=CONFIDENCE_LOGIT_MIN, max=CONFIDENCE_LOGIT_MAX)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Args:
@@ -22,9 +35,7 @@ class ConfidenceHead(nn.Module):
         Returns:
             Confidence scores of shape (batch, seq_len, 1)
         """
-        logits = self.proj(x)
-        logits = torch.clamp(logits, min=-20.0, max=20.0)
-        return torch.sigmoid(logits)
+        return torch.sigmoid(self.forward_logits(x))
 
 
 class Expert(nn.Module):

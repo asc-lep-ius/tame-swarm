@@ -2,7 +2,14 @@ import pytest
 import torch
 import torch.nn as nn
 
-from mob import MixtureOfBidders, MoBConfig, apply_mob_to_model, load_mob_state, save_mob_state
+from mob import (
+    MixtureOfBidders,
+    MoBConfig,
+    MoBStats,
+    apply_mob_to_model,
+    load_mob_state,
+    save_mob_state,
+)
 
 
 def test_forward_output_shape(mob_layer, random_hidden_states):
@@ -19,15 +26,27 @@ def test_forward_no_nan_inf(mob_layer, random_hidden_states):
 def test_forward_updates_last_stats(mob_layer, random_hidden_states):
     mob_layer(random_hidden_states)
 
-    expected_keys = {
-        "confidences",
-        "selected_experts",
-        "routing_weights",
-        "expert_wealth",
-        "expert_usage",
-        "expert_performance",
-    }
-    assert expected_keys.issubset(mob_layer.last_stats.keys())
+    stats = mob_layer.last_stats
+    assert isinstance(stats, MoBStats)
+    assert stats.confidence_logits.shape == (1, 8, mob_layer.config.num_experts)
+    assert stats.confidences.shape == (1, 8, mob_layer.config.num_experts)
+    assert stats.selected_experts.shape == (1, 8, mob_layer.config.top_k)
+    assert stats.routing_weights.shape == (1, 8, mob_layer.config.top_k)
+    assert stats.expert_wealth.shape == (mob_layer.config.num_experts,)
+    assert stats.expert_usage.shape == (mob_layer.config.num_experts,)
+    assert stats.expert_performance.shape == (mob_layer.config.num_experts,)
+
+
+def test_forward_records_detached_finite_router_z_loss(mob_layer, random_hidden_states):
+    mob_layer(random_hidden_states)
+
+    stats = mob_layer.last_stats
+    assert isinstance(stats, MoBStats)
+    assert torch.isfinite(stats.router_z_loss)
+    assert stats.router_z_loss >= 0.0
+    assert not stats.router_z_loss.requires_grad
+    assert not stats.confidence_logits.requires_grad
+    assert not stats.confidences.requires_grad
 
 
 def test_save_load_roundtrip(tmp_path, tiny_config):

@@ -1,5 +1,5 @@
 from .auction import VCGAuctioneer
-from .core import MixtureOfBidders, apply_mob_to_model
+from .core import MixtureOfBidders, MoBStats, apply_mob_to_model
 from .experts import ConfidenceHead, Expert, LightweightExpert
 from .mob_config import MoBConfig
 from .utils import (
@@ -17,6 +17,7 @@ __all__ = [
     "Expert",
     "LightweightExpert",
     "VCGAuctioneer",
+    "MoBStats",
     "MixtureOfBidders",
     "apply_mob_to_model",
     "get_mob_layers",
