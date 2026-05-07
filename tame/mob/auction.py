@@ -15,7 +15,8 @@ class VCGAuctioneer(nn.Module):
         confidences: torch.Tensor,
         wealth: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        bids = confidences * wealth.unsqueeze(0).unsqueeze(0)
+        wealth_snapshot = wealth.detach().clone()
+        bids = confidences * wealth_snapshot.unsqueeze(0).unsqueeze(0)
         top_bids, selected_experts = torch.topk(bids, self.top_k, dim=-1)
         payments = self._compute_vcg_payments(bids, selected_experts)
 

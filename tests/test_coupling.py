@@ -6,7 +6,13 @@ from pathlib import Path
 import pytest
 import torch
 
-from mob import CouplingMetrics, MixtureOfBidders, SteeringCoupling, SteeringCouplingConfig
+from mob import (
+    CouplingMetrics,
+    MixtureOfBidders,
+    MoBConfig,
+    SteeringCoupling,
+    SteeringCouplingConfig,
+)
 
 
 def test_public_tame_mob_imports_work_from_repo_root() -> None:
@@ -191,3 +197,69 @@ def test_mob_stats_include_coupling_metrics_only_when_coupling_is_attached(
 
     assert mob_layer.last_stats is not None
     assert isinstance(mob_layer.last_stats.coupling_metrics, CouplingMetrics)
+
+
+def test_active_coupling_preserves_vcg_auction_inputs() -> None:
+    config = MoBConfig(
+        num_experts=3,
+        top_k=2,
+        hidden_dim=4,
+        intermediate_dim=8,
+        adapter_rank=2,
+        adapter_alpha=2.0,
+        use_shared_base=True,
+        use_vcg_payments=True,
+        use_differentiable_routing=False,
+        use_loss_feedback=True,
+        use_local_quality=False,
+    )
+    baseline = MixtureOfBidders(config)
+    coupled = MixtureOfBidders(config)
+    coupled.load_state_dict(baseline.state_dict())
+
+    with torch.no_grad():
+        baseline.expert_wealth.copy_(torch.tensor([1.0, 1.3, 0.7]))
+        coupled.expert_wealth.copy_(baseline.expert_wealth)
+        for coefficient, confidence_head in zip(
+            [1.2, -0.8, 0.4], baseline.confidence_heads, strict=True
+        ):
+            confidence_head.proj.weight.zero_()
+            confidence_head.proj.weight[0, 0] = coefficient
+            confidence_head.proj.bias.zero_()
+        coupled.load_state_dict(baseline.state_dict())
+
+    coupled.attach_coupling(
+        torch.tensor([1.0, 0.0, 0.0, 0.0]),
+        SteeringCouplingConfig(
+            hidden_dim=config.hidden_dim,
+            coupling_beta=1.0,
+            warmup_steps=1,
+            max_coupling_fraction=2.0,
+        ),
+    )
+    with torch.no_grad():
+        coupled.coupling.projection.weight.zero_()
+        coupled.coupling.projection.weight[0, 0] = 1.0
+    coupled.set_coupling_step(1)
+
+    hidden_states = torch.tensor([[[0.5, 0.1, 0.0, 0.0], [-0.25, 0.0, 0.2, 0.0]]])
+    baseline.train()
+    coupled.train()
+
+    baseline(hidden_states, update_wealth=False)
+    coupled(hidden_states, update_wealth=False)
+
+    assert baseline.last_stats is not None
+    assert coupled.last_stats is not None
+    assert not torch.allclose(coupled.last_stats.confidences, baseline.last_stats.confidences)
+
+    bids = coupled.last_stats.confidences * coupled.expert_wealth.view(1, 1, -1)
+    expected_selected = torch.topk(bids, config.top_k, dim=-1).indices
+    _, _, expected_payments = coupled.auctioneer(
+        coupled.last_stats.confidences,
+        coupled.expert_wealth,
+    )
+
+    assert torch.equal(coupled.last_stats.selected_experts, expected_selected)
+    assert coupled._cached_payments is not None
+    assert torch.allclose(coupled._cached_payments, expected_payments, atol=1e-6)

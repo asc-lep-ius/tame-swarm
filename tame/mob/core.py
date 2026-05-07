@@ -108,6 +108,7 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         self._cached_expert_token_masks: list[torch.Tensor] | None = None
         self._loss_feedback_pending: bool = False
         self._cached_calibration_loss: torch.Tensor | None = None
+        self._cached_router_z_loss: torch.Tensor | None = None
         self._last_coupling_metrics: CouplingMetrics | None = None
 
     def forward(
@@ -136,6 +137,7 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         )
         confidences = torch.sigmoid(confidence_logits)
         router_z_loss = self._compute_router_z_loss(confidence_logits)
+        self._cached_router_z_loss = router_z_loss
 
         selected_experts, routing_weights, payments = self.auctioneer(
             confidences, self.expert_wealth
@@ -221,6 +223,11 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
             delattr(self, "coupling")
         self._last_coupling_metrics = None
         self.last_stats = None
+
+    def get_router_z_loss(self) -> torch.Tensor:
+        if self._cached_router_z_loss is None:
+            return torch.tensor(0.0, device=self.expert_wealth.device)
+        return self._cached_router_z_loss
 
     def set_coupling_step(self, step: int) -> "MixtureOfBidders":
         if step < 0:

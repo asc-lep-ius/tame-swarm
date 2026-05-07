@@ -57,6 +57,31 @@ def get_total_calibration_loss(model: nn.Module) -> torch.Tensor:
     return total_loss
 
 
+def get_total_router_z_loss(model: nn.Module) -> torch.Tensor:
+    """
+    Sum live router z-losses from all MoB layers.
+
+    Args:
+        model: Model containing MoB layers
+
+    Returns:
+        Sum of current non-detached router z-losses from all MoB layers
+    """
+    total_loss: torch.Tensor | None = None
+    for mob in get_mob_layers(model):
+        router_z_loss = mob.get_router_z_loss()
+        if total_loss is None:
+            total_loss = router_z_loss
+            continue
+        if router_z_loss.device != total_loss.device:
+            total_loss = total_loss.to(router_z_loss.device)
+        total_loss = total_loss + router_z_loss
+
+    if total_loss is None:
+        return torch.tensor(0.0)
+    return total_loss
+
+
 def get_mob_statistics(model: nn.Module) -> dict[str, torch.Tensor | list[torch.Tensor]]:
     """
     Aggregate statistics from all MoB layers for monitoring.

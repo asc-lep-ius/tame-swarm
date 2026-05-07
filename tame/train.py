@@ -90,6 +90,7 @@ from mob import (
     get_mob_layers,
     get_mob_statistics,
     get_total_calibration_loss,
+    get_total_router_z_loss,
     save_mob_state,
     update_all_mob_from_loss,
 )
@@ -194,7 +195,12 @@ class TAMETrainer:
         # Training state
         self.global_step = 0
         self.best_loss = float("inf")
-        self._last_avg_metrics = {"loss": 0.0, "calibration_loss": 0.0, "perplexity": 0.0}
+        self._last_avg_metrics = {
+            "loss": 0.0,
+            "calibration_loss": 0.0,
+            "router_z_loss": 0.0,
+            "perplexity": 0.0,
+        }
 
         # Wealth history for analysis
         self.wealth_history: list[dict[str, Any]] = []
@@ -693,6 +699,9 @@ class TAMETrainer:
 
         batch_size, seq_len = input_ids.shape
 
+        for mob in get_mob_layers(self.model):
+            mob.set_coupling_step(self.global_step)
+
         # Forward pass
         outputs = self.model(  # pyright: ignore[reportCallIssue] # model forward call signature varies by runtime model type
             input_ids=input_ids,
@@ -743,20 +752,24 @@ class TAMETrainer:
         # =========================================================
         # This teaches confidence heads to predict when they'll do well
         calibration_loss = get_total_calibration_loss(self.model)
+        router_z_loss = get_total_router_z_loss(self.model)
 
         # Total loss
-        total_loss = main_loss + calibration_loss
+        total_loss = main_loss + calibration_loss + router_z_loss
 
         # NaN guard: skip backprop if loss is NaN to prevent gradient corruption
         if torch.isnan(total_loss) or torch.isinf(total_loss):
             cal_val = calibration_loss.item() if isinstance(calibration_loss, torch.Tensor) else 0
+            router_val = router_z_loss.item() if isinstance(router_z_loss, torch.Tensor) else 0
             logger.warning(
                 f"Step {self.global_step}: NaN/Inf loss detected "
-                f"(main={main_loss.item()}, cal={cal_val}), skipping backward"
+                f"(main={main_loss.item()}, cal={cal_val}, router_z={router_val}), "
+                "skipping backward"
             )
             return {
                 "loss": float("nan"),
                 "calibration_loss": 0.0,
+                "router_z_loss": 0.0,
                 "total_loss": float("nan"),
                 "perplexity": float("nan"),
             }
@@ -772,6 +785,9 @@ class TAMETrainer:
             "calibration_loss": calibration_loss.item()
             if isinstance(calibration_loss, torch.Tensor)
             else 0.0,
+            "router_z_loss": router_z_loss.item()
+            if isinstance(router_z_loss, torch.Tensor)
+            else 0.0,
             "total_loss": total_loss.item(),
             "perplexity": math.exp(min(main_loss.item(), 20)),  # Cap to prevent overflow
         }
@@ -782,7 +798,7 @@ class TAMETrainer:
         logger.info("=" * 100)
         logger.info(
             f"{'Step':>6} | {'Prog':>5} | {'Loss':>7} | {'PPL':>10}"
-            f" | {'Cal':>6} | {'Mean Wealth':>12} | {'Std Dev':>8}"
+            f" | {'Cal':>6} | {'Z':>6} | {'Mean Wealth':>12} | {'Std Dev':>8}"
             f" | {'Gini':>6} | {'Perf EMA':>9}"
         )
         logger.info("-" * 100)
@@ -798,7 +814,12 @@ class TAMETrainer:
 
         # Training loop
         self.model.train()
-        accumulated_metrics = {"loss": 0.0, "calibration_loss": 0.0, "perplexity": 0.0}
+        accumulated_metrics = {
+            "loss": 0.0,
+            "calibration_loss": 0.0,
+            "router_z_loss": 0.0,
+            "perplexity": 0.0,
+        }
 
         data_iter = iter(self.train_dataloader)
 
@@ -879,6 +900,7 @@ class TAMETrainer:
         loss = metrics.get("loss", float("nan"))
         ppl = metrics.get("perplexity", float("nan"))
         cal = metrics.get("calibration_loss", 0.0)
+        router_z = metrics.get("router_z_loss", 0.0)
 
         if stats:
             _mw = stats["mean_wealth"]
@@ -905,6 +927,7 @@ class TAMETrainer:
                     "loss": loss,
                     "perplexity": ppl,
                     "calibration_loss": cal,
+                    "router_z_loss": router_z,
                     "mean_wealth": mean_wealth,
                     "wealth_std": std_wealth,
                     "wealth_gini": gini,
@@ -918,7 +941,7 @@ class TAMETrainer:
             # Log comprehensive line
             logger.info(
                 f"{step:>6} | {progress:>4.0f}% | {loss:>7.4f}"
-                f" | {ppl:>10.2f} | {cal:>6.4f}"
+                f" | {ppl:>10.2f} | {cal:>6.4f} | {router_z:>6.4f}"
                 f" | {mean_wealth:>12.2f} | {std_wealth:>8.2f}"
                 f" | {gini:>6.4f} | {perf_sign}{perf_ema:>8.4f}"
             )
