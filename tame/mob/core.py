@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass
-from typing import ClassVar, cast
+from typing import cast
 
 import torch
 import torch.nn as nn
@@ -23,28 +23,6 @@ class MoBStats:
     expert_usage: torch.Tensor
     expert_performance: torch.Tensor
     router_z_loss: torch.Tensor
-
-    _fields: ClassVar[tuple[str, ...]] = (
-        "confidence_logits",
-        "confidences",
-        "selected_experts",
-        "routing_weights",
-        "expert_wealth",
-        "expert_usage",
-        "expert_performance",
-        "router_z_loss",
-    )
-
-    def __contains__(self, key: object) -> bool:
-        return isinstance(key, str) and key in self._fields
-
-    def __getitem__(self, key: str) -> torch.Tensor:
-        if key not in self:
-            raise KeyError(key)
-        return getattr(self, key)
-
-    def keys(self) -> tuple[str, ...]:
-        return self._fields
 
 
 class MixtureOfBidders(WealthUpdateMixin, nn.Module):
