@@ -1,10 +1,21 @@
-from coupling import (
-    CouplingMetrics,
-    SteeringCoupling,
-    SteeringCouplingConfig,
-    attach_coupling,
-    detach_coupling,
-)
+try:
+    from ..coupling import (
+        CouplingMetrics,
+        SteeringCoupling,
+        SteeringCouplingConfig,
+        attach_coupling,
+        detach_coupling,
+    )
+except ImportError:
+    if __package__ != "mob":
+        raise
+    from coupling import (
+        CouplingMetrics,
+        SteeringCoupling,
+        SteeringCouplingConfig,
+        attach_coupling,
+        detach_coupling,
+    )
 
 from .auction import VCGAuctioneer
 from .core import MixtureOfBidders, MoBStats, apply_mob_to_model

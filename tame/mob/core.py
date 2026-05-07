@@ -5,7 +5,12 @@ from typing import cast
 import torch
 import torch.nn as nn
 
-from coupling import CouplingMetrics, SteeringCoupling, SteeringCouplingConfig
+try:
+    from ..coupling import CouplingMetrics, SteeringCoupling, SteeringCouplingConfig
+except ImportError:
+    if __package__ != "mob":
+        raise
+    from coupling import CouplingMetrics, SteeringCoupling, SteeringCouplingConfig
 
 from .auction import VCGAuctioneer
 from .experts import ConfidenceHead, Expert, LightweightExpert

@@ -1,7 +1,33 @@
+import os
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 import torch
 
 from mob import CouplingMetrics, MixtureOfBidders, SteeringCoupling, SteeringCouplingConfig
+
+
+def test_public_tame_mob_imports_work_from_repo_root() -> None:
+    repo_root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env.pop("PYTHONPATH", None)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from tame.mob import MixtureOfBidders, SteeringCouplingConfig",
+        ],
+        cwd=repo_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def _clone_mob_with_same_weights(source: MixtureOfBidders) -> MixtureOfBidders:
