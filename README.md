@@ -25,7 +25,7 @@
 
 In the TAME framework, intelligence isn't a "thing" you have; it's a collective competency across scales. Traditional LLMs are like a single, giant, frozen cell. TAME-Swarm unfetters this architecture by treating the model as a tissue of sub-agents:
 
-**Mixture of Bidders (MoB)** represents the Evolutionary Economy. It recognizes that "competence without comprehension" is the engine of life. By forcing experts to compete and profit, we replicate the bio-economic pressure that drives cellular specialization. The core novelty is replacing the standard learned MoE router (a central planner) with a **VCG (Vickrey-Clarke-Groves) auction** — a mechanism from economic theory that provably incentivises truthful bidding. Each expert accumulates wealth by performing well, creating emergent specialisation without any supervised routing signal.
+**Mixture of Bidders (MoB)** represents the Evolutionary Economy. It recognizes that "competence without comprehension" is the engine of life. By forcing experts to compete and profit, we replicate the bio-economic pressure that drives cellular specialization. The core novelty is replacing the standard learned MoE router (a central planner) with a **VCG (Vickrey-Clarke-Groves) auction** — a mechanism from economic theory under which no expert can improve its own payoff by misreporting its confidence for a token. Each expert accumulates wealth by performing well, creating emergent specialisation without any supervised routing signal.
 
 **Cognitive Homeostasis** represents the Bioelectric Target Pattern. Just as an embryo "knows" to build a face even if the cells are scrambled, our steering vectors act as a "moral and logical pH balance," pulling the swarm back to its goal-state whenever the stochasticity of the auction drifts too far. The controller dynamically adjusts injection strength based on how far the model's latent representation has drifted from the target.
 
@@ -65,13 +65,15 @@ In the TAME framework, intelligence isn't a "thing" you have; it's a collective 
 
 ### Module 1 — Mixture of Bidders (MoB): *The Body*
 
-Standard Mixture-of-Experts uses a learned router — a centralised command economy. MoB replaces it with a **VCG (Vickrey-Clarke-Groves) auction**: each expert maintains a *wallet* of credits, bids `confidence × wealth` for every token, and only the top-k winners are activated.
+Standard Mixture-of-Experts uses a learned router — one gating network trained by the global loss, which is a central planner by construction. MoB replaces it with a **VCG (Vickrey-Clarke-Groves) auction**: each expert maintains a *wallet* of credits, bids `confidence × wealth` for every token, and the top-k winners split the output evenly.
+
+The substantive difference from a learned router is *where the training signal comes from*. No gradient from the language-modelling loss reaches a confidence head: winners share the output equally, so the routing decision is not differentiable with respect to any report. Each head is trained solely on the value that expert realised on the tokens it personally won. The experts' FFN adapters are still trained by the global loss — it is the *router* that is decentralised, not the whole layer.
 
 **Why it matters:**
 
-- **Truthful bidding** — the VCG mechanism (from mechanism design theory) mathematically incentivises experts to bid their true value; no expert can gain by misreporting confidence.
+- **Truthful bidding** — for a single token, an expert cannot raise its own payoff by misreporting. The allocation is monotone in an expert's report, each winner is charged its critical value `b₍ₖ₊₁₎ / wᵢ`, and every winner receives the same `1/k` share regardless of what it reported. That is the standard strategyproofness argument for a single-parameter mechanism, and `tests/test_auction.py` checks it by exhaustive deviation rather than by assertion. **Scope:** this is a property of the per-token stage game. Wealth persists across tokens, so an expert's reports shape its future bids and prices; the repeated game is *not* covered, and no claim is made that a head's reported confidence is a *correct* estimate of its value — only that it has no incentive to distort whatever estimate it holds.
 - **Emergent specialisation** — experts that reduce loss earn more credits, reinforcing their niche. The Gini coefficient of the wealth distribution measures specialisation: higher Gini = more differentiation.
-- **No router collapse** — the decentralised market avoids the single-point-of-failure of a learned gating network.
+- **No router collapse (untested)** — the argument is that a market with per-expert wealth has no single gating network to collapse. It is an argument, not a result: nothing here has been measured against a learned-router baseline. The gate-swap baseline that would evidence it is [#12](#phase-05--mechanism-correction); until then treat this as motivation.
 - **Memory-efficient** — shared base weights + LoRA-rank adapters keep VRAM overhead to ~3 MB per expert per layer at rank 32.
 
 **Implementation details:**
@@ -79,7 +81,10 @@ Standard Mixture-of-Experts uses a learned router — a centralised command econ
 - **Upcycling, not training from scratch.** MoB layers are initialised by copying the pretrained FFN weights to a shared base. Each expert starts as the identity transform (LoRA B-matrices zeroed) plus small Gaussian jitter to break symmetry. This preserves the original model's behaviour on day zero.
 - **Layer selection matters.** Only middle layers (20–70% of model depth) are converted to MoB. Early layers handle tokenisation/syntax and late layers handle output formatting — modifying them degrades base performance.
 - **Sparse computation.** Both training and inference use sparse gather/scatter — only selected tokens pass through their assigned experts. This is $O(\text{top\_k} \times \text{tokens})$ rather than $O(\text{experts} \times \text{tokens})$.
+- **Per-expert value objective.** Each `ConfidenceHead` is regressed onto the loss reduction its expert delivered on the tokens it won, measured against the baseline that expert held when it bid. Because the mechanism is strategyproof, an expert's utility-maximising report *is* its value, so this objective and utility maximisation have the same optimum — the discrete utility has zero gradient almost everywhere, and the regression is its tractable form. **Limit:** value is only observed where an expert won, so the targets carry the selection bias of any bandit-feedback signal.
+- **Quasi-linear wealth.** Wealth moves by `reward − payment`: the VCG transfer is subtracted in reward units rather than scaling the reward. Quasi-linearity is a precondition of every VCG result.
 - **Three wealth-update paths** exist today: loss-based feedback (training, primary), local output-quality proxy (inference), and participation-based (fallback). [Phase 2](#phase-2--economy-stabilisation) will unify these into a single parameterised mechanism.
+- **Gate-swap baseline.** `routing_share="softmax"` restores the own-bid-weighted gate MoB used previously. It is retained deliberately as the comparison arm for [#12](#phase-05--mechanism-correction), and it is *not* incentive compatible — a winner can enlarge its own share of the output while its price stays fixed.
 
 ### Module 2 — Cognitive Homeostasis: *The Mind*
 
@@ -91,7 +96,7 @@ Activation **Steering Vectors** encode goals (truthfulness, safety, reasoning) a
 
 - **Zero context-window cost** — no system-prompt tokens consumed; steering operates entirely in weight/activation space.
 - **Latent-space operation** — acts on the residual stream, not on text tokens. This makes it harder (though not impossible) for prompt-based attacks to circumvent, since the correction bypasses the text channel entirely. Formal adversarial evaluation is planned but not yet complete.
-- **Orthogonal projection** prevents capability damage by projecting steering vectors to be orthogonal to the model's general-capability subspace, avoiding the "lobotomy" problem where steering degrades base performance.
+- **Orthogonal projection** targets the "lobotomy" problem, where steering degrades base performance. A general corpus is run through the model, the leading principal components of the per-token activations at each steered layer are taken as the capability subspace, and the steering vector is projected orthogonal to it before injection. **Validation status:** the mechanism is wired end-to-end and tested, but capability *preservation* has not been measured — that needs the held-out benchmark in [#12](#phase-05--mechanism-correction). Treat it as a targeted mitigation, not a demonstrated one.
 
 **Implementation details:**
 
@@ -193,8 +198,8 @@ docker compose -f docker-compose.train.yml run --rm train --mode full --steps 50
 | Phase | Description |
 |-------|-------------|
 | **Wealth Updates** | Experts that reduce loss gain credits; poor performers lose them |
-| **VCG Auction Routing** | Wealth differentials cause tokens to be routed to the most competent expert |
-| **Confidence Calibration** | Each expert's confidence head learns to predict its actual contribution |
+| **VCG Auction Routing** | Wealth differentials shift which experts can afford to win a token; whether the winners are the *most competent* ones is the hypothesis under test, not an established result |
+| **Confidence Calibration** | Each expert's confidence head is regressed onto the value that expert realised on the tokens it won — the only training signal a head receives |
 | **Checkpoint Persistence** | `mob_state.pt` saves the full economic state for later inference |
 
 ### Training Outputs
@@ -305,9 +310,9 @@ docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
 
 | Concept | File(s) | What to Know |
 |---------|---------|--------------|
-| **VCG Auction** | `mob/auction.py` | VCG externality-based auction from mechanism design theory; guarantees truthful bidding. `ConfidenceHead` predicts each expert's value. Each winner pays their VCG externality — the decrease in social welfare caused by their participation. |
+| **VCG Auction** | `mob/auction.py` | Externality-priced top-*k* auction. Each winner pays `b₍ₖ₊₁₎ / wᵢ` — the displaced welfare, divided by its own weight so the price is in the units it reports — and receives a `1/k` share that ignores its own bid. Strategyproof per token; see the scope note under Module 1. `ConfidenceHead` reports each expert's estimated value and is trained only on that expert's own outcomes. |
 | **Wealth Economy** | `mob/wealth.py` | `expert_wealth` buffers persist across batches. Three update paths exist (loss-based, quality-proxy, participation); `wealth_decay` and `reward_scale` control dynamics. The Gini coefficient is the primary health metric — too low (< 0.1) means experts aren't specialising, too high (> 0.6) means monopoly risk. |
-| **Steering Vectors** | `steering.py` | Extracted via Difference-in-Means on contrastive prompt pairs; injected as residual-stream additions. Currently uses 4 contrastive pairs (thin). Orthogonal projection prevents capability damage. |
+| **Steering Vectors** | `steering.py` | Extracted via Difference-in-Means on contrastive prompt pairs; injected as residual-stream additions. Currently uses 4 contrastive pairs (thin). Orthogonal projection removes the leading principal components of general-corpus activations before injection; capability preservation is not yet measured. |
 | **Adaptive Control** | `steering.py` | P-controller (not PID yet) with `kp`, `target_alignment`, and `max_strength`. Adjusts injection strength at each forward pass based on cosine alignment with the goal direction. |
 | **Model Profiles** | `config.py` | `MODEL_PROFILES` dict maps model names to hidden dimensions and layer ranges. Change `ACTIVE_MODEL` to switch. |
 | **Upcycling** | `mob/experts.py` | `from_pretrained_ffn()` copies pretrained FFN weights to MoB shared base. Experts start as identity + jitter. No training-from-scratch required. |
@@ -338,7 +343,8 @@ STEERING_CONFIG = SteeringConfig(
     target_alignment=0.7,    # Cosine-similarity setpoint
     kp=0.5,                  # Proportional gain (higher = more aggressive correction)
     max_strength=1.5,        # Safety cap on injection strength
-    orthogonal_projection=True,  # Prevent capability damage from steering
+    orthogonal_projection=True,   # Project the goal out of the capability subspace
+    capability_subspace_rank=8,   # Principal components treated as capability
 )
 ```
 
@@ -350,7 +356,7 @@ The training loop logs comprehensive statistics every `log_frequency` steps. Her
 |--------|---------------|---------------|
 | **Loss** | Decreasing | Standard language modelling loss |
 | **Perplexity** | Decreasing | Exponential of loss; lower = more confident predictions |
-| **Calibration Loss** | 0.01–0.1 | Confidence head accuracy; should decrease as heads learn to predict their contribution |
+| **Calibration Loss** | 0.01–0.1 | Per-expert value objective; should decrease as heads learn to report the value they realise. A flat line at a constant means no gradient is reaching the heads |
 | **Mean Wealth** | 50–500 | Average expert credits; should be stable, not pinned at floor or ceiling |
 | **Wealth Std Dev** | > 10 | Divergence between experts; low std = no specialisation |
 | **Gini Coefficient** | 0.10–0.50 | Wealth inequality. < 0.10 = experts converging (increase `reward_scale` or `jitter_std`). > 0.60 = monopoly risk (increase `min_wealth` or decrease `max_wealth`). |
@@ -364,8 +370,9 @@ The training loop logs comprehensive statistics every `log_frequency` steps. Her
 | Gini > 0.6, one expert dominates | Wealth monopoly | Increase `min_wealth`, decrease `max_wealth`, or increase `wealth_decay` |
 | Mean wealth pinned at ceiling | Rewards too generous | Decrease `reward_scale` or increase `wealth_decay` |
 | Mean wealth pinned at floor | Decay too aggressive | Decrease `wealth_decay` (0.997 → 0.999) or increase `reward_scale` |
-| NaN in loss or hidden states | Numerical instability | Check bfloat16 clamping; reduce `adapter_rank`; enable `orthogonal_projection` |
-| Steering degrades output quality | Over-steering | Lower `base_strength` (0.3 → 0.15); enable `orthogonal_projection` |
+| NaN in loss or hidden states | Numerical instability | Check bfloat16 clamping; reduce `adapter_rank` |
+| Steering degrades output quality | Over-steering, or the goal overlaps the capability subspace | Lower `base_strength` (0.3 → 0.15); raise `capability_subspace_rank` (8 → 16) |
+| Log warns the projection left < 5% of the steering vector | The goal direction lies inside the capability subspace, so steering runs unprojected | Lower `capability_subspace_rank`, or widen the contrastive pairs so the goal is less collinear with general activity |
 
 ---
 
@@ -417,18 +424,18 @@ The `/generate/stream` endpoint returns Server-Sent Events (SSE) with three even
 This project implements ideas from the following research areas:
 
 - **TAME Framework** — Michael Levin's theory that intelligence is an emergent property of competent sub-agents cooperating under homeostatic pressure, not a monolithic central process. Cognition scales from cells to tissues to organisms through the same mechanisms; TAME-Swarm applies this to transformer layers. See [Levin 2022](https://arxiv.org/abs/2201.10346).
-- **Mechanism Design Theory** — The VCG auction (Vickrey 1961, Clarke 1971, Groves 1973) is the only general mechanism that guarantees truthful bidding — no expert can benefit from misreporting its confidence. This is a provable property, not an empirical hope, making the routing economy formally incentive-compatible.
+- **Mechanism Design Theory** — The VCG family (Vickrey 1961, Clarke 1971, Groves 1973) prices each winner at the externality it imposes. MoB runs the single-parameter case: a monotone top-*k* allocation with critical-value payments, which is strategyproof for a single token (Myerson 1981). Three things are needed to make that statement mean anything here, and all three are in the code — the payment is divided by the winner's own wealth, because the allocation maximises a *weighted* welfare; a winner's share of the output does not depend on its own report; and wealth is updated quasi-linearly as `reward − payment`. The claim is bounded: it is about the per-token stage game with the wealth vector held fixed, not about the repeated game the wealth dynamics create.
 - **Activation Engineering** — Steering vectors discovered via contrastive activation analysis (Turner et al., 2023; Rimsky et al., 2024) provide zero-cost behavioural control in latent space. TAME-Swarm uses the Difference-in-Means extraction method and adds adaptive proportional control for dynamic strength.
 - **Active Inference / Free Energy Principle** — The steering controller approximates active inference by maintaining a "preferred state" in activation space. The system minimises the distance between its current hidden state and the target direction, analogous to how biological systems minimise free energy relative to their homeostatic setpoint.
-- **Sparse Mixture of Experts** — Token-level routing enables efficient scaling (Shazeer et al., 2017; Fedus et al., 2021). Standard MoE uses a learned gating network — a centralised router prone to collapse. TAME-Swarm replaces this with decentralised economic allocation where routing emerges from competitive bidding.
+- **Sparse Mixture of Experts** — Token-level routing enables efficient scaling (Shazeer et al., 2017; Fedus et al., 2021). Standard MoE trains one gating network from the global loss. TAME-Swarm removes that gradient path entirely: no language-modelling gradient reaches a confidence head, and each head is trained only on the value its own expert realised. Whether this routes *better* than a learned gate is unmeasured — see [#12](#phase-05--mechanism-correction).
 
 ### From Biology to Code
 
 | Biological Principle | TAME-Swarm Implementation | Status |
 |---------------------|---------------------------|--------|
-| Multicellular tissue with specialised organs | Expert pool with VCG auction routing | Implemented |
-| Homeostatic setpoints (temperature, pH) | Steering vectors as target directions in activation space | Implemented |
-| Morphogenetic field shaping cell behaviour | Steering signal coupled into expert confidence & routing | Phase 1 |
+| Multicellular tissue with specialised organs | Expert pool with VCG auction routing | Implemented; routing quality unmeasured |
+| Homeostatic setpoints (temperature, pH) | Steering vectors as target directions in activation space | Implemented; 4 contrastive pairs per goal (thin) |
+| Morphogenetic field shaping cell behaviour | Steering signal coupled into expert confidence & routing | `coupling.py` exists but nothing attaches it at runtime — Phase 1 |
 | Metabolic homeostasis (energy regulation) | Unified wealth economy with formal stability analysis | Phase 2 |
 | Organ-level agency (not single-cell reflexes) | Chunk-level VCG routing with per-expert working memory | Phase 3 |
 | Multi-scale nested agents (cells → tissues → organs) | Inter-layer wealth coupling + hierarchical auction | Phase 4 |
@@ -445,6 +452,9 @@ Improvements are ordered by **dependency** — each phase unlocks multiplicative
 
 ```
 Phase 0: Config + Split + Tests                           ✔ DONE
+    │
+    ▼
+Phase 0.5: Mechanism Correction + Baselines               ◐ IN PROGRESS
     │
     ▼
 Phase 1: Steering ↔ Economy Coupling → Better Contrastive Data → PID Controller
@@ -470,6 +480,7 @@ Phase 5: RMT Gap Junctions → Allostasis
 - [x] Chat UI — Gradio interface with live VCG auction & steering visualisation
 - [x] Multi-model support — Gemma 2B, Llama 3B, Mistral 7B
 - [x] Phase 0 — shared `config.py`, `mob/` package split, `main.py` split (app/routes/models/dependencies), test suite, security hardening, code quality cleanup
+- [x] Phase 0.5 (partial) — VCG payments corrected and made quasi-linear; the auction made strategyproof (weighted price divided by own weight, share independent of own bid); confidence heads given a per-expert value objective in place of an inert calibration loss; capability subspace estimated and wired into steering; README mechanism claims reconciled with the code
 
 ---
 
@@ -488,6 +499,27 @@ Phase 5: RMT Gap Junctions → Allostasis
 
 ---
 
+<a name="phase-05--mechanism-correction"></a>
+
+### Phase 0.5 — Mechanism Correction & Baselines
+
+*"Fix the arithmetic before anything reads it."*
+
+An audit of the mechanism claims against the implementation. The auction the architecture is named for was priced wrong, the objective that was supposed to train the confidence heads carried no gradient, and the documented mitigation for steering's best-known failure mode was a parameter nothing ever set.
+
+| Task | Description | Status |
+|------|-------------|--------|
+| **#9. VCG payments** | Exclusion set took `k-1`, so every payment was identically zero and the `clamp(min=0)` hid it. Fixed, and payments made quasi-linear transfers rather than a multiplicative haircut on rewards | Done |
+| **#10. Mechanism claims** | Weighted price divided by the winner's own weight; routing share made independent of own bids; confidence heads given a per-expert value objective; capability subspace estimated and wired through to injection; README reconciled | Done |
+| **#11. Routing temperature** | Decouple the softmax temperature from the absolute wealth scale, so bid magnitudes stop doubling as a sharpness knob | Not started |
+| **#12. Held-out eval & baselines** | The gate-swap baseline and held-out benchmark that every "better than a learned router" and "preserves capability" claim above is waiting on | Not started |
+| **#13. Reproducibility** | Determinism, seed control and a measured noise floor, so an ablation's effect can be told apart from its variance | Not started |
+| **#14. Coupling activation** | Warmup default and non-vacuous tests for the `coupling.py` path that nothing currently attaches | Not started |
+
+**Why before Phase 1:** every Phase 1 ablation is measured on top of the routing this phase prices and the baselines it establishes. Correcting the mechanism afterwards invalidates whatever was collected in between.
+
+---
+
 <a name="phase-1--steering-economy-coupling"></a>
 
 ### Phase 1 — Steering–Economy Coupling
@@ -498,7 +530,7 @@ This is the **single highest-impact architectural change**. Currently MoB and St
 
 | Task | Description | Status |
 |------|-------------|--------|
-| **1a. Inject steering into confidence** | Modify `ConfidenceHead` so steering alignment modulates expert bids: $\text{bid}_i = c_i \times W_i \times (1 + \beta \cdot \cos(E_i(h),\, v_{\text{steer}}))$ — experts that move the representation *toward* the goal bid higher | Not started |
+| **1a. Inject steering into confidence** | Modify `ConfidenceHead` so steering alignment modulates expert bids: $\text{bid}_i = c_i \times W_i \times (1 + \beta \cdot \cos(E_i(h),\, v_{\text{steer}}))$ — experts that move the representation *toward* the goal bid higher | Partial — `coupling.py` implements the perception-mode coupling and `MixtureOfBidders.attach_coupling` wires it, but nothing attaches it at runtime |
 | **1b. Enrich contrastive data** | Expand `STEERING_TEMPLATES` from 4 to 50–200 diverse contrastive pairs per goal, producing genuine latent-trait directions instead of prompt-surface features | Not started |
 | **1c. PID controller** | Upgrade P-only controller to full PID with anti-windup — integral term eliminates steady-state error, derivative term dampens oscillation under stochastic sampling | Not started |
 
