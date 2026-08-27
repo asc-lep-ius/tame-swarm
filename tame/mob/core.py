@@ -105,6 +105,10 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         self._cached_selected_experts: torch.Tensor | None = None
         self._cached_routing_weights: torch.Tensor | None = None
         self._cached_confidences: torch.Tensor | None = None
+        # Kept attached to the graph so update_wealth_from_loss can build each
+        # expert's value objective; the detached copy above is what the wealth
+        # arithmetic reads. Cleared as soon as the objective is built.
+        self._live_confidences: torch.Tensor | None = None
         self._cached_payments: torch.Tensor | None = None
         self._cached_expert_token_masks: list[torch.Tensor] | None = None
         self._loss_feedback_pending: bool = False
@@ -162,6 +166,7 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
             self._cached_selected_experts = selected_experts.detach()
             self._cached_routing_weights = routing_weights.detach()
             self._cached_confidences = confidences.detach()
+            self._live_confidences = confidences
             self._cached_payments = payments.detach() if payments is not None else None
             self._loss_feedback_pending = True
 

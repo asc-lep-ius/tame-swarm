@@ -453,3 +453,146 @@ def test_non_loss_paths_apply_the_transfer(path, overrides):
     # A magnitude floor, not just a sign: float noise would satisfy `> 0`.
     assert calls[0].charge.max() > 1e-3, "fixture charges nothing; the comparison is vacuous"
     assert torch.allclose(wealth_paying, wealth_free - calls[0].charge, atol=1e-5)
+
+
+def _confidence_head_grads(mob: MixtureOfBidders) -> list[float]:
+    return [
+        0.0 if head.proj.weight.grad is None else head.proj.weight.grad.abs().sum().item()
+        for head in mob.confidence_heads
+    ]
+
+
+def test_value_objective_carries_gradient():
+    """The objective has to reach an optimiser, not just be added to a scalar.
+
+    It previously did not: the loss was built from the detached confidence cache
+    inside ``torch.no_grad()``, so it summed into the training loss as a constant
+    and trained nothing. A finiteness check passed the whole time.
+    """
+    mob = _build_training_mob()
+    mob(torch.randn(1, 8, 32))
+    mob.update_wealth_from_loss(torch.randn(1, 8).abs())
+
+    objective = mob.get_confidence_calibration_loss()
+
+    assert objective.requires_grad, "value objective is detached and trains nothing"
+    assert objective.grad_fn is not None
+
+    objective.backward()
+    assert any(grad > 0.0 for grad in _confidence_head_grads(mob))
+
+
+def test_value_objective_is_the_only_gradient_reaching_confidence_heads():
+    """No central planner: the language-modelling loss must not route.
+
+    Backpropagating the layer output alone has to leave every confidence head
+    untouched. If a gradient appears here, the uniform share has been reverted and
+    the heads are once again slices of the global objective rather than agents.
+    """
+    mob = _build_training_mob()
+
+    output = mob(torch.randn(1, 8, 32))
+    output.sum().backward()
+
+    assert all(grad == 0.0 for grad in _confidence_head_grads(mob))
+    assert any(
+        expert.gate_adapter_B.weight.grad.abs().sum().item() > 0.0 for expert in mob.experts
+    ), "the language-modelling loss must still train the expert adapters"
+
+
+def test_value_objective_is_local_to_each_expert():
+    """Expert i's realised value may only move expert i's report.
+
+    An expert at zero wealth bids zero and cannot win a slot, so it realises no
+    value and must receive no gradient. If it does, the objective is reading
+    outcomes that belong to other experts.
+    """
+    config = replace(STABILITY_CONFIG, num_experts=4, top_k=1)
+    mob = MixtureOfBidders(config)
+    mob.train()
+    mob.expert_wealth[3] = 0.0
+
+    mob(torch.randn(2, 8, 32))
+    winners = set(mob.last_stats.selected_experts.flatten().tolist())
+    assert 3 not in winners, "a bankrupt expert cannot win a slot"
+
+    mob.update_wealth_from_loss(torch.randn(2, 8).abs())
+    mob.get_confidence_calibration_loss().backward()
+
+    for expert_idx, grad in enumerate(_confidence_head_grads(mob)):
+        if expert_idx in winners:
+            assert grad > 0.0, f"winner {expert_idx} got no value signal"
+        else:
+            assert grad == 0.0, f"expert {expert_idx} was trained on a token it never won"
+
+
+def test_value_objective_excludes_masked_tokens():
+    """Padding is dropped, not scored as a token of zero loss.
+
+    The reward path multiplies masked positions by zero, which as a *target* reads
+    as the largest loss reduction an expert can achieve — so padding would teach
+    every winner to report maximum confidence.
+    """
+    mob = _build_training_mob()
+    mob(torch.randn(1, 8, 32))
+
+    per_token_loss = torch.randn(1, 8).abs()
+    token_mask = torch.ones(1, 8)
+    token_mask[0, 4:] = 0.0
+    mob.update_wealth_from_loss(per_token_loss, token_mask)
+    masked_objective = mob.get_confidence_calibration_loss().item()
+
+    mob_reference = _build_training_mob()
+    mob_reference.load_state_dict(mob.state_dict())
+    mob_reference(torch.randn(1, 8, 32))
+    padded_loss = per_token_loss.clone()
+    padded_loss[0, 4:] = 0.0
+    mob_reference.update_wealth_from_loss(padded_loss)
+    zero_loss_objective = mob_reference.get_confidence_calibration_loss().item()
+
+    assert masked_objective != pytest.approx(zero_loss_objective, abs=1e-6)
+
+
+def test_value_objective_releases_the_graph_after_use():
+    """The live confidence cache pins a graph; it must not survive the update."""
+    mob = _build_training_mob()
+    mob(torch.randn(1, 8, 32))
+    assert mob._live_confidences is not None
+
+    mob.update_wealth_from_loss(torch.randn(1, 8).abs())
+    assert mob._live_confidences is None
+
+
+def test_value_objective_matches_its_definition():
+    """Rebuild the objective from the mechanism statement rather than the code.
+
+    Each winner's target is ``sigmoid(scale * (baseline - loss))`` on the tokens it
+    won, where ``baseline`` is the value it held when it bid -- not the one the
+    reward loop leaves behind, which has already absorbed the very batch the expert
+    is being judged on.
+    """
+    mob = _build_training_mob()
+    hidden = torch.randn(1, 8, 32)
+    mob(hidden)
+
+    confidences = mob.last_stats.confidences
+    selected = mob.last_stats.selected_experts
+    baselines = mob.expert_baseline_loss.clone()
+
+    per_token_loss = torch.full((1, 8), 4.0)
+    mob.update_wealth_from_loss(per_token_loss)
+
+    assert not torch.allclose(baselines, mob.expert_baseline_loss), (
+        "fixture must actually move the baseline, or the snapshot is untested"
+    )
+
+    terms = []
+    for expert_idx in range(mob.config.num_experts):
+        won = (selected == expert_idx).any(dim=-1)
+        if not won.any():
+            continue
+        target = torch.sigmoid(5.0 * (baselines[expert_idx] - per_token_loss[won]))
+        terms.append(torch.nn.functional.mse_loss(confidences[:, :, expert_idx][won], target))
+
+    expected = torch.stack(terms).mean() * mob.config.confidence_calibration_weight
+    assert mob.get_confidence_calibration_loss().item() == pytest.approx(expected.item(), abs=1e-6)

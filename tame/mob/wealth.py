@@ -29,6 +29,7 @@ class WealthUpdateMixin:
     _cached_selected_experts: torch.Tensor | None
     _cached_routing_weights: torch.Tensor | None
     _cached_confidences: torch.Tensor | None
+    _live_confidences: torch.Tensor | None
     _cached_payments: torch.Tensor | None
     _cached_expert_token_masks: list[torch.Tensor] | None
     _loss_feedback_pending: bool
@@ -47,12 +48,13 @@ class WealthUpdateMixin:
         precondition for every VCG result, so the multiplicative haircut this
         replaces could not support an incentive claim of any kind.
 
-        Payments arrive in bid units (confidence x wealth), an order of magnitude
-        above the loss-reduction units rewards use; ``payment_scale`` is the bridge
-        between the two and is what keeps charges comparable to rewards instead of
-        pinning every expert to ``min_wealth``. Each expert pays its mean per-token
-        price weighted by its share of the batch, so an expert that wins few tokens
-        is charged proportionally less than one that wins many.
+        Payments arrive in an expert's own value units -- the weighted externality
+        already divided by its own wealth, which is what makes the mechanism
+        truthful -- while rewards are in loss-reduction units; ``payment_scale`` is
+        the bridge between the two and is what keeps charges comparable to rewards
+        instead of pinning every expert to ``min_wealth``. Each expert pays its mean
+        per-token price weighted by its share of the batch, so an expert that wins
+        few tokens is charged proportionally less than one that wins many.
         """
         charges = torch.zeros_like(self.expert_wealth)
         if not self.config.use_vcg_payments or payments is None:
@@ -74,22 +76,73 @@ class WealthUpdateMixin:
             return torch.tensor(0.0, device=self.expert_wealth.device)
         return self._cached_calibration_loss
 
-    def _compute_and_cache_calibration_loss(self, confidences: torch.Tensor):
-        target_confidence = torch.sigmoid(self.expert_performance_ema * CONFIDENCE_SIGMOID_SCALE)
+    def _compute_and_cache_calibration_loss(
+        self,
+        per_token_loss: torch.Tensor,
+        selected_experts: torch.Tensor,
+        baselines: torch.Tensor,
+        valid_mask: torch.Tensor | None,
+    ) -> None:
+        """Calibrate every confidence head against its own realised value.
 
-        mean_confidences = confidences.mean(dim=(0, 1))
+        This is the objective that makes an expert an agent. Under the uniform
+        routing share the language-modelling loss reaches the expert adapters but
+        not the confidence heads, so a head is trained by nothing except the
+        outcomes it personally realised: the value it delivered on the tokens it
+        personally won, priced against its own loss baseline. Gradient from expert
+        *i*'s term touches ``confidence_heads[i]`` alone.
 
-        if torch.isnan(mean_confidences).any() or torch.isnan(target_confidence).any():
-            self._cached_calibration_loss = torch.tensor(0.0, device=self.expert_wealth.device)
+        Reporting that value truthfully is also the utility-maximising thing for the
+        head to do. The auction pays each winner its critical value and hands it a
+        share that ignores its own report, so the mechanism is strategyproof and an
+        expert's optimal report *is* its value; the discrete utility has zero
+        gradient almost everywhere, and regressing onto the value is the tractable
+        form of the same optimum.
+
+        Two honest limits. Value is observed only where the expert won, so the
+        targets carry the selection bias of any bandit-feedback signal -- a head
+        learns what its wins were worth, not what its losses would have been worth.
+        And ``CONFIDENCE_SIGMOID_SCALE`` fixes the loss-reduction scale at which a
+        report saturates; it is a calibration constant, not a learned one.
+        """
+        live_confidences = self._live_confidences
+        self._live_confidences = None
+
+        zero = torch.zeros((), device=self.expert_wealth.device)
+        weight = self.config.confidence_calibration_weight
+        if live_confidences is None or weight == 0.0:
+            self._cached_calibration_loss = zero
             return
 
-        calibration_loss = F.mse_loss(mean_confidences, target_confidence.detach())
+        seq_len = per_token_loss.size(1)
+        if live_confidences.size(1) < seq_len:
+            self._cached_calibration_loss = zero
+            return
+        live_confidences = live_confidences[:, :seq_len, :]
 
-        if torch.isnan(calibration_loss):
-            self._cached_calibration_loss = torch.tensor(0.0, device=self.expert_wealth.device)
+        expert_terms = []
+        for expert_idx in range(self.config.num_experts):
+            won = (selected_experts == expert_idx).any(dim=-1)
+            if valid_mask is not None:
+                won = won & valid_mask
+            if not won.any():
+                continue
+
+            realised_value = (baselines[expert_idx] - per_token_loss[won]).detach()
+            target = torch.sigmoid(realised_value.float() * CONFIDENCE_SIGMOID_SCALE)
+            prediction = live_confidences[:, :, expert_idx][won].float()
+            expert_terms.append(F.mse_loss(prediction, target))
+
+        if not expert_terms:
+            self._cached_calibration_loss = zero
             return
 
-        self._cached_calibration_loss = calibration_loss * self.config.confidence_calibration_weight
+        objective = torch.stack(expert_terms).mean()
+        if not torch.isfinite(objective):
+            self._cached_calibration_loss = zero
+            return
+
+        self._cached_calibration_loss = objective * weight
 
     def update_wealth_from_loss(
         self,
@@ -130,9 +183,16 @@ class WealthUpdateMixin:
                         f"skipping wealth update"
                     )
                     self._loss_feedback_pending = False
+                    self._live_confidences = None
                     return
 
             seq_len = loss_seq_len
+
+            # The value objective reads the losses as measured. The reward path
+            # below zeroes masked positions instead of dropping them, which would
+            # read as a padding token of zero loss -- i.e. maximum realised value.
+            unmasked_loss = per_token_loss
+            valid_mask: torch.Tensor | None = None
 
             if token_mask is not None:
                 if token_mask.dim() == 1:
@@ -142,7 +202,12 @@ class WealthUpdateMixin:
                 elif token_mask.size(1) < seq_len:
                     pad_size = seq_len - token_mask.size(1)
                     token_mask = F.pad(token_mask, (0, pad_size), value=0)
+                valid_mask = token_mask > 0
                 per_token_loss = per_token_loss * token_mask
+
+            # Each expert's report is calibrated against the baseline it held when
+            # it bid, not the one the loop below leaves behind.
+            baselines = self.expert_baseline_loss.clone()
 
             self.expert_wealth *= self.config.wealth_decay
 
@@ -200,9 +265,11 @@ class WealthUpdateMixin:
             self.expert_wealth += expert_rewards
             self.expert_wealth.clamp_(min=self.config.min_wealth, max=self.config.max_wealth)
 
-            self._compute_and_cache_calibration_loss(confidences)
-
             self._loss_feedback_pending = False
+
+        self._compute_and_cache_calibration_loss(
+            unmasked_loss, selected_experts, baselines, valid_mask
+        )
 
     def _update_wealth_local_quality(
         self,
