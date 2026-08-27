@@ -16,6 +16,11 @@ class MoBConfig:
     jitter_std: float = 0.08
     reward_scale: float = 2.0
     use_vcg_payments: bool = True
+    # Converts VCG payments (bid units) into reward units for the quasi-linear
+    # wealth update; unscaled, a payment dwarfs a reward and floors every expert.
+    # Swept over 2000 steps: 0.02 charges ~9% of reward flow and never floors an
+    # expert, while 0.05+ pins experts to min_wealth and collapses the spread.
+    payment_scale: float = 0.02
     use_shared_base: bool = True
     adapter_rank: int = 64
     adapter_alpha: float = 16.0

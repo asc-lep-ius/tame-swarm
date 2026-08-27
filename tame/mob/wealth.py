@@ -16,10 +16,7 @@ LOSS_REWARD_MULTIPLIER = 50.0
 LOCAL_REWARD_MULTIPLIER = 5.0
 PARTICIPATION_REWARD_MULTIPLIER = 10.0
 COMPETITIVE_BONUS_FACTOR = 0.5
-PAYMENT_COST_FACTOR = 0.1
 WEALTH_EPSILON = 1e-6
-LOSS_PAYMENT_CLAMP_MAX = 0.3
-LOCAL_PAYMENT_CLAMP_MAX = 0.5
 
 
 class WealthUpdateMixin:
@@ -36,6 +33,41 @@ class WealthUpdateMixin:
     _cached_expert_token_masks: list[torch.Tensor] | None
     _loss_feedback_pending: bool
     _cached_calibration_loss: torch.Tensor | None
+
+    def _vcg_charges(
+        self,
+        payments: torch.Tensor | None,
+        selected_experts: torch.Tensor,
+        num_tokens: int,
+    ) -> torch.Tensor:
+        """Per-expert VCG transfer, expressed in the same units as rewards.
+
+        The utility model is quasi-linear: wealth moves by ``reward - charge``, with
+        the payment subtracted rather than scaling the reward. Quasi-linearity is a
+        precondition for every VCG result, so the multiplicative haircut this
+        replaces could not support an incentive claim of any kind.
+
+        Payments arrive in bid units (confidence x wealth), an order of magnitude
+        above the loss-reduction units rewards use; ``payment_scale`` is the bridge
+        between the two and is what keeps charges comparable to rewards instead of
+        pinning every expert to ``min_wealth``. Each expert pays its mean per-token
+        price weighted by its share of the batch, so an expert that wins few tokens
+        is charged proportionally less than one that wins many.
+        """
+        charges = torch.zeros_like(self.expert_wealth)
+        if not self.config.use_vcg_payments or payments is None:
+            return charges
+
+        for slot in range(self.config.top_k):
+            for expert_idx in range(self.config.num_experts):
+                mask = selected_experts[:, :, slot] == expert_idx
+                if not mask.any():
+                    continue
+                mean_payment = payments[:, :, slot][mask].mean()
+                token_share = mask.sum().float() / num_tokens
+                charges[expert_idx] += mean_payment * token_share
+
+        return charges * self.config.payment_scale
 
     def get_confidence_calibration_loss(self) -> torch.Tensor:
         if self._cached_calibration_loss is None:
@@ -115,7 +147,6 @@ class WealthUpdateMixin:
             self.expert_wealth *= self.config.wealth_decay
 
             expert_rewards = torch.zeros_like(self.expert_wealth)
-            expert_token_counts = torch.zeros_like(self.expert_wealth)
 
             for k in range(self.config.top_k):
                 for expert_idx in range(self.config.num_experts):
@@ -126,7 +157,6 @@ class WealthUpdateMixin:
                     expert_losses = per_token_loss[mask]
                     mean_loss = expert_losses.mean()
                     token_count = mask.sum().float()
-                    expert_token_counts[expert_idx] += token_count
 
                     baseline = self.expert_baseline_loss[expert_idx]
 
@@ -165,18 +195,7 @@ class WealthUpdateMixin:
                 )
                 expert_rewards += competitive_bonus
 
-            if self.config.use_vcg_payments and payments is not None:
-                for k in range(self.config.top_k):
-                    for expert_idx in range(self.config.num_experts):
-                        mask = selected_experts[:, :, k] == expert_idx
-                        if mask.any():
-                            mean_payment = payments[:, :, k][mask].mean()
-                            payment_fraction = mean_payment / (
-                                self.expert_wealth[expert_idx] + WEALTH_EPSILON
-                            )
-                            expert_rewards[expert_idx] *= 1.0 - payment_fraction.clamp(
-                                0, LOSS_PAYMENT_CLAMP_MAX
-                            )
+            expert_rewards -= self._vcg_charges(payments, selected_experts, batch_size * seq_len)
 
             self.expert_wealth += expert_rewards
             self.expert_wealth.clamp_(min=self.config.min_wealth, max=self.config.max_wealth)
@@ -242,20 +261,7 @@ class WealthUpdateMixin:
                 competitive_bonus = (expert_rewards - mean_reward) * COMPETITIVE_BONUS_FACTOR
                 expert_rewards += competitive_bonus.clamp(min=0)
 
-            if self.config.use_vcg_payments and payments is not None:
-                for k in range(self.config.top_k):
-                    for expert_idx in range(self.config.num_experts):
-                        mask = selected_experts[:, :, k] == expert_idx
-                        if mask.any():
-                            mean_payment = payments[:, :, k][mask].mean()
-                            payment_cost = (
-                                mean_payment
-                                * PAYMENT_COST_FACTOR
-                                / (self.expert_wealth[expert_idx] + WEALTH_EPSILON)
-                            )
-                            expert_rewards[expert_idx] *= 1.0 - payment_cost.clamp(
-                                0, LOCAL_PAYMENT_CLAMP_MAX
-                            )
+            expert_rewards -= self._vcg_charges(payments, selected_experts, num_tokens)
 
             if is_inference and self.config.inference_exploration_bonus > 0:
                 mean_usage = self.expert_usage_count.mean()
@@ -284,15 +290,12 @@ class WealthUpdateMixin:
             self.expert_wealth *= self.config.wealth_decay
 
             expert_rewards = torch.zeros_like(self.expert_wealth)
-            expert_selections = torch.zeros_like(self.expert_wealth)
 
             for k in range(self.config.top_k):
                 for expert_idx in range(self.config.num_experts):
                     mask = selected_experts[:, :, k] == expert_idx
                     if mask.any():
                         selection_count = mask.sum().float()
-                        expert_selections[expert_idx] += selection_count
-
                         selection_fraction = selection_count / num_tokens
                         mean_confidence = confidences[:, :, expert_idx][mask].mean()
                         mean_weight = routing_weights[:, :, k][mask].mean()
@@ -307,20 +310,7 @@ class WealthUpdateMixin:
                 competitive_bonus = (expert_rewards - mean_reward) * COMPETITIVE_BONUS_FACTOR
                 expert_rewards += competitive_bonus.clamp(min=0)
 
-            if self.config.use_vcg_payments and payments is not None:
-                for k in range(self.config.top_k):
-                    for expert_idx in range(self.config.num_experts):
-                        mask = selected_experts[:, :, k] == expert_idx
-                        if mask.any():
-                            mean_payment = payments[:, :, k][mask].mean()
-                            payment_cost = (
-                                mean_payment
-                                * PAYMENT_COST_FACTOR
-                                / (self.expert_wealth[expert_idx] + WEALTH_EPSILON)
-                            )
-                            expert_rewards[expert_idx] *= 1.0 - payment_cost.clamp(
-                                0, LOCAL_PAYMENT_CLAMP_MAX
-                            )
+            expert_rewards -= self._vcg_charges(payments, selected_experts, num_tokens)
 
             self.expert_wealth += expert_rewards
 
