@@ -75,7 +75,8 @@ class VCGAuctioneer(nn.Module):
             top_without_j, _ = torch.topk(masked_bids, k, dim=-1)
             payments[:, :, j] = top_without_j.sum(dim=-1) - other_winner_welfare[:, :, j]
 
-        self._assert_payments_well_formed(payments, bids)
+        if __debug__:
+            self._assert_payments_well_formed(payments, bids)
 
         return payments.to(out_dtype)
 
@@ -88,8 +89,10 @@ class VCGAuctioneer(nn.Module):
         fixed to stop pass as plausible. Finiteness is reported separately so that
         NaN bids are not surfaced as a negative price.
 
-        Both checks read from a single device-host sync, and bare asserts compile
-        out under -O, so this is free in tuned runs and one sync otherwise.
+        Both checks read from a single device-host sync. The ``if __debug__`` at the
+        call site is what keeps that sync out of tuned runs: once the asserts live
+        in a method, the call itself is not an assert and -O would otherwise strip
+        the checks while still paying for the sync.
         """
         low, high, max_bid = torch.stack(
             [payments.detach().min(), payments.detach().max(), bids.detach().abs().amax()]

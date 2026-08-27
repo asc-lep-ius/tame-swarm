@@ -290,6 +290,7 @@ def test_vcg_payment_survives_bfloat16_router_specialisation():
     assert torch.allclose(payments_bf16.float(), payments_fp32, rtol=0.05)
 
 
+@pytest.mark.skipif(not __debug__, reason="bare asserts are compiled out under -O")
 def test_vcg_nan_bids_report_as_non_finite_not_as_negative():
     """A NaN bid must name its own fault rather than masquerade as a negative price."""
     auctioneer = _make_auction(num_experts=4, top_k=2)
@@ -300,3 +301,31 @@ def test_vcg_nan_bids_report_as_non_finite_not_as_negative():
 
     with pytest.raises(AssertionError, match="not finite"):
         auctioneer(confidences, wealth)
+
+
+def test_vcg_payment_preserves_float64_precision():
+    """A float64 caller must not be silently downcast by the float32 accumulation.
+
+    The fp32 guard against bfloat16 cancellation has to lift precision, never cap
+    it. A hard ``.float()`` holds the error here around 1e-06; genuine float64
+    accumulation reaches ~2e-15, and the tolerance sits between the two regimes
+    with roughly 375x headroom on the passing side.
+    """
+    auctioneer = _make_auction(num_experts=6, top_k=2)
+    auctioneer.eval()
+
+    torch.manual_seed(19)
+    confidences = torch.rand(1, 4, 6, dtype=torch.float64)
+    wealth = torch.rand(6, dtype=torch.float64) * 10.0
+
+    _, _, payments = auctioneer(confidences, wealth)
+    bids = _bids(confidences, wealth)
+
+    # Guards the cast-back, not the accumulation dtype: `.to(out_dtype)` restores
+    # float64 even when the interior arithmetic is fp32, so the tolerance below is
+    # what actually pins the precision.
+    assert payments.dtype == torch.float64, "float64 input was downcast"
+    for t in range(bids.size(1)):
+        expected = _kth_highest(bids[0, t], 2)
+        for j in range(2):
+            assert abs(payments[0, t, j].item() - expected) < 1e-12
