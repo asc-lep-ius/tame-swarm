@@ -74,6 +74,7 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
             config.num_experts,
             config.top_k,
             differentiable=config.use_differentiable_routing,
+            routing_share=config.routing_share,
         )
 
         self.register_buffer(
