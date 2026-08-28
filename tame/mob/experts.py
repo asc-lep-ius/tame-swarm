@@ -7,7 +7,22 @@ CONFIDENCE_LOGIT_MAX = 20.0
 
 
 class ConfidenceHead(nn.Module):
-    """Lightweight linear layer for each expert to predict its confidence."""
+    """Each expert's report of the value it expects to deliver on a token.
+
+    The report is a *value estimate in loss-reduction units*, not a probability.
+    That is what lets one currency run through the whole mechanism: the report is
+    the bid, the price is the report's critical value, and the wealth update moves
+    by ``reward - charge`` with a single coefficient. A sigmoid report would be
+    bounded in (0, 1) while the reward it is supposed to predict is not, and the
+    two thresholds -- "win when report > price" and "profit when value > price" --
+    would not coincide.
+
+    ``softplus`` is what makes truthful reporting expressible at the bottom of the
+    range: an expert whose expected loss reduction is zero or negative would rather
+    not win, and reports ~0, which is the auction's way of abstaining. The logit
+    clamp bounds the report to roughly [0, 20] loss-reduction units, far above any
+    realistic value, so bids stay finite without a separate calibration constant.
+    """
 
     def __init__(self, hidden_dim: int, expert_id: int = 0, num_experts: int = 8):
         super().__init__()
@@ -33,9 +48,9 @@ class ConfidenceHead(nn.Module):
         Args:
             x: Input tensor of shape (batch, seq_len, hidden_dim)
         Returns:
-            Confidence scores of shape (batch, seq_len, 1)
+            Non-negative value reports of shape (batch, seq_len, 1)
         """
-        return torch.sigmoid(self.forward_logits(x))
+        return F.softplus(self.forward_logits(x))
 
 
 class Expert(nn.Module):

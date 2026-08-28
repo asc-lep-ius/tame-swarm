@@ -178,6 +178,18 @@ class TAMEApplication:
 
             homeostat = CognitiveHomeostat(steering_config)
             homeostat.add_steering_vectors(steering_vectors)
+
+            if steering_config.orthogonal_projection:
+                homeostat.estimate_capability_subspaces(model, tokenizer)
+                retention = homeostat.get_capability_retention()
+                if retention:
+                    logger.info(
+                        "[HOMEOSTASIS] Capability projection retains %.0f%%-%.0f%% "
+                        "of the steering vector across layers",
+                        100 * min(retention.values()),
+                        100 * max(retention.values()),
+                    )
+
             homeostat.attach_to_model(model)
 
             logger.info("[HOMEOSTASIS] Steering attached to %d layers", len(steering_vectors))

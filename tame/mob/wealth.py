@@ -11,11 +11,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-CONFIDENCE_SIGMOID_SCALE = 5.0
 LOSS_REWARD_MULTIPLIER = 50.0
 LOCAL_REWARD_MULTIPLIER = 5.0
 PARTICIPATION_REWARD_MULTIPLIER = 10.0
-COMPETITIVE_BONUS_FACTOR = 0.5
 WEALTH_EPSILON = 1e-6
 
 
@@ -29,30 +27,60 @@ class WealthUpdateMixin:
     _cached_selected_experts: torch.Tensor | None
     _cached_routing_weights: torch.Tensor | None
     _cached_confidences: torch.Tensor | None
+    _live_confidences: torch.Tensor | None
     _cached_payments: torch.Tensor | None
+    _cached_rebates: torch.Tensor | None
     _cached_expert_token_masks: list[torch.Tensor] | None
     _loss_feedback_pending: bool
     _cached_calibration_loss: torch.Tensor | None
+
+    def _transfer_coefficient(self, reward_multiplier: float) -> float:
+        """The single scale that makes ``reward - charge`` a quasi-linear utility.
+
+        Quasi-linearity means one coefficient multiplies both halves. A reward is
+        ``value x share x reward_scale x reward_multiplier`` and a charge is
+        ``price x payment_scale x <this>``, so the charge has to carry the reward's
+        own scale for the two to be in one currency.
+
+        Getting this wrong is not cosmetic. With a reward coefficient of 100 against
+        a charge coefficient of 0.3, an expert maximising wealth wins whenever
+        ``value > 0.006 x price`` while the auction only lets it win when
+        ``report > price`` -- so overreporting pays, and the mechanism's
+        strategyproofness says nothing about the economy that realises the payoff.
+
+        ``reward_multiplier`` is passed per call because the three wealth paths use
+        different ones; a single constant would only be quasi-linear for whichever
+        path it was derived from. ``payment_scale`` survives as a dimensionless
+        deviation from the balanced point, so 1.0 is the value the theory picks and
+        anything else is a deliberate over- or under-pricing.
+        """
+        return (
+            self.config.payment_scale
+            * self.config.reward_scale
+            * reward_multiplier
+            / self.config.top_k
+        )
 
     def _vcg_charges(
         self,
         payments: torch.Tensor | None,
         selected_experts: torch.Tensor,
         num_tokens: int,
+        reward_multiplier: float,
+        rebates: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Per-expert VCG transfer, expressed in the same units as rewards.
+        """Per-expert VCG transfer, in the same units and at the same scale as rewards.
 
         The utility model is quasi-linear: wealth moves by ``reward - charge``, with
         the payment subtracted rather than scaling the reward. Quasi-linearity is a
         precondition for every VCG result, so the multiplicative haircut this
         replaces could not support an incentive claim of any kind.
 
-        Payments arrive in bid units (confidence x wealth), an order of magnitude
-        above the loss-reduction units rewards use; ``payment_scale`` is the bridge
-        between the two and is what keeps charges comparable to rewards instead of
-        pinning every expert to ``min_wealth``. Each expert pays its mean per-token
-        price weighted by its share of the batch, so an expert that wins few tokens
-        is charged proportionally less than one that wins many.
+        Payments and rewards are both denominated in loss reduction -- the price is
+        the weighted externality divided by the winner's own wealth, and the report
+        that produced the bid is itself a loss-reduction estimate. Each expert pays
+        its mean per-token price weighted by its share of the batch, so an expert
+        that wins few tokens is charged proportionally less than one that wins many.
         """
         charges = torch.zeros_like(self.expert_wealth)
         if not self.config.use_vcg_payments or payments is None:
@@ -67,29 +95,97 @@ class WealthUpdateMixin:
                 token_share = mask.sum().float() / num_tokens
                 charges[expert_idx] += mean_payment * token_share
 
-        return charges * self.config.payment_scale
+        if rebates is not None:
+            # Cavallo redistribution: every expert is rebated, winners and losers
+            # alike, from a quantity none of them can influence. Netting it here
+            # keeps the wealth update a single transfer rather than two passes.
+            charges = charges - rebates.mean(dim=(0, 1))
+
+        return charges * self._transfer_coefficient(reward_multiplier)
 
     def get_confidence_calibration_loss(self) -> torch.Tensor:
         if self._cached_calibration_loss is None:
             return torch.tensor(0.0, device=self.expert_wealth.device)
         return self._cached_calibration_loss
 
-    def _compute_and_cache_calibration_loss(self, confidences: torch.Tensor):
-        target_confidence = torch.sigmoid(self.expert_performance_ema * CONFIDENCE_SIGMOID_SCALE)
+    def _compute_and_cache_calibration_loss(
+        self,
+        per_token_loss: torch.Tensor,
+        selected_experts: torch.Tensor,
+        baselines: torch.Tensor,
+        valid_mask: torch.Tensor | None,
+    ) -> None:
+        """Calibrate every confidence head against its own realised value.
 
-        mean_confidences = confidences.mean(dim=(0, 1))
+        This is the objective that makes an expert an agent. Under the uniform
+        routing share the language-modelling loss reaches the expert adapters but
+        not the confidence heads, so a head is trained by nothing except the
+        outcomes it personally realised: the value it delivered on the tokens it
+        personally won, priced against its own loss baseline.
 
-        if torch.isnan(mean_confidences).any() or torch.isnan(target_confidence).any():
-            self._cached_calibration_loss = torch.tensor(0.0, device=self.expert_wealth.device)
+        Expert *i*'s term reads ``confidences[:, :, i]``, which only
+        ``confidence_heads[i]`` produces, and the routing path reads *detached*
+        hidden states, so the gradient reaches that head and the coupling module and
+        stops there. It never reaches the backbone: every head is fed from the same
+        representation, so an undetached path would make each expert's private
+        objective a shared auxiliary loss on everything below the layer -- the
+        central planner arriving through the back door. Held by
+        ``test_value_objective_does_not_train_the_backbone``.
+
+        Reporting that value truthfully is also the utility-maximising thing for the
+        head to do. The auction pays each winner its critical value and hands it a
+        share that ignores its own report, so the mechanism is strategyproof and an
+        expert's optimal report *is* its value; the discrete utility has zero
+        gradient almost everywhere, and regressing onto the value is the tractable
+        form of the same optimum.
+
+        One honest limit. Value is observed only where the expert won, so the
+        targets carry the selection bias of any bandit-feedback signal -- a head
+        learns what its wins were worth, not what its losses would have been worth.
+        """
+        live_confidences = self._live_confidences
+        self._live_confidences = None
+
+        zero = torch.zeros((), device=self.expert_wealth.device)
+        weight = self.config.confidence_calibration_weight
+        if live_confidences is None or weight == 0.0:
+            self._cached_calibration_loss = zero
             return
 
-        calibration_loss = F.mse_loss(mean_confidences, target_confidence.detach())
+        seq_len = per_token_loss.size(1)
+        if live_confidences.size(1) < seq_len:
+            self._cached_calibration_loss = zero
+            return
+        live_confidences = live_confidences[:, :seq_len, :]
 
-        if torch.isnan(calibration_loss):
-            self._cached_calibration_loss = torch.tensor(0.0, device=self.expert_wealth.device)
+        expert_terms = []
+        for expert_idx in range(self.config.num_experts):
+            won = (selected_experts == expert_idx).any(dim=-1)
+            if valid_mask is not None:
+                won = won & valid_mask
+            if not won.any():
+                continue
+
+            realised_value = (baselines[expert_idx] - per_token_loss[won]).detach()
+            # Clamped at zero, not squashed: a non-positive realised value means the
+            # expert would rather not have won, and the truthful report of that is
+            # an abstaining bid. Clamping keeps report and reward in one currency,
+            # which a sigmoid target would break -- and on the winning set, where
+            # the reward is actually paid, clamp(0) is the identity.
+            target = realised_value.float().clamp_min(0.0)
+            prediction = live_confidences[:, :, expert_idx][won].float()
+            expert_terms.append(F.mse_loss(prediction, target))
+
+        if not expert_terms:
+            self._cached_calibration_loss = zero
             return
 
-        self._cached_calibration_loss = calibration_loss * self.config.confidence_calibration_weight
+        objective = torch.stack(expert_terms).mean()
+        if not torch.isfinite(objective):
+            self._cached_calibration_loss = zero
+            return
+
+        self._cached_calibration_loss = objective * weight
 
     def update_wealth_from_loss(
         self,
@@ -98,6 +194,7 @@ class WealthUpdateMixin:
     ):
         if not self._loss_feedback_pending or self._cached_selected_experts is None:
             logger.warning("update_wealth_from_loss called without pending forward pass")
+            self._live_confidences = None
             return
 
         with torch.no_grad():
@@ -105,6 +202,7 @@ class WealthUpdateMixin:
             routing_weights = self._cached_routing_weights
             confidences = self._cached_confidences
             payments = self._cached_payments
+            rebates = self._cached_rebates
 
             assert routing_weights is not None
             assert confidences is not None
@@ -124,15 +222,25 @@ class WealthUpdateMixin:
                     confidences = confidences[:, :loss_seq_len, :]
                     if payments is not None:
                         payments = payments[:, :loss_seq_len, :]
+                    if rebates is not None:
+                        rebates = rebates[:, :loss_seq_len, :]
                 else:
                     logger.warning(
                         f"Loss seq_len ({loss_seq_len}) > cached seq_len ({cached_seq_len}), "
                         f"skipping wealth update"
                     )
                     self._loss_feedback_pending = False
+                    self._live_confidences = None
+                    self._cached_calibration_loss = None
                     return
 
             seq_len = loss_seq_len
+
+            # The value objective reads the losses as measured. The reward path
+            # below zeroes masked positions instead of dropping them, which would
+            # read as a padding token of zero loss -- i.e. maximum realised value.
+            unmasked_loss = per_token_loss
+            valid_mask: torch.Tensor | None = None
 
             if token_mask is not None:
                 if token_mask.dim() == 1:
@@ -142,7 +250,12 @@ class WealthUpdateMixin:
                 elif token_mask.size(1) < seq_len:
                     pad_size = seq_len - token_mask.size(1)
                     token_mask = F.pad(token_mask, (0, pad_size), value=0)
+                valid_mask = token_mask > 0
                 per_token_loss = per_token_loss * token_mask
+
+            # Each expert's report is calibrated against the baseline it held when
+            # it bid, not the one the loop below leaves behind.
+            baselines = self.expert_baseline_loss.clone()
 
             self.expert_wealth *= self.config.wealth_decay
 
@@ -179,30 +292,24 @@ class WealthUpdateMixin:
                         + (1 - self.config.loss_ema_decay) * loss_reduction
                     )
 
-            if expert_rewards.abs().max() > WEALTH_EPSILON:
-                reward_std = (
-                    expert_rewards.std(correction=0)
-                    if expert_rewards.numel() >= 2
-                    else torch.tensor(WEALTH_EPSILON, device=expert_rewards.device)
-                )
-                normalized_rewards = (expert_rewards - expert_rewards.mean()) / (
-                    reward_std + WEALTH_EPSILON
-                )
-                competitive_bonus = (
-                    F.relu(normalized_rewards)
-                    * expert_rewards.abs().mean()
-                    * COMPETITIVE_BONUS_FACTOR
-                )
-                expert_rewards += competitive_bonus
-
-            expert_rewards -= self._vcg_charges(payments, selected_experts, batch_size * seq_len)
+            # The rebate is netted inside _vcg_charges, so wealth moves by a single
+            # transfer rather than a charge and a credit applied separately.
+            expert_rewards -= self._vcg_charges(
+                payments,
+                selected_experts,
+                batch_size * seq_len,
+                LOSS_REWARD_MULTIPLIER,
+                rebates,
+            )
 
             self.expert_wealth += expert_rewards
             self.expert_wealth.clamp_(min=self.config.min_wealth, max=self.config.max_wealth)
 
-            self._compute_and_cache_calibration_loss(confidences)
-
             self._loss_feedback_pending = False
+
+        self._compute_and_cache_calibration_loss(
+            unmasked_loss, selected_experts, baselines, valid_mask
+        )
 
     def _update_wealth_local_quality(
         self,
@@ -210,6 +317,7 @@ class WealthUpdateMixin:
         routing_weights: torch.Tensor,
         confidences: torch.Tensor,
         payments: torch.Tensor | None,
+        rebates: torch.Tensor | None,
         output: torch.Tensor,
     ):
         with torch.no_grad():
@@ -256,12 +364,9 @@ class WealthUpdateMixin:
                         reward * self.config.reward_scale * LOCAL_REWARD_MULTIPLIER
                     )
 
-            mean_reward = expert_rewards.mean()
-            if mean_reward > 0:
-                competitive_bonus = (expert_rewards - mean_reward) * COMPETITIVE_BONUS_FACTOR
-                expert_rewards += competitive_bonus.clamp(min=0)
-
-            expert_rewards -= self._vcg_charges(payments, selected_experts, num_tokens)
+            expert_rewards -= self._vcg_charges(
+                payments, selected_experts, num_tokens, LOCAL_REWARD_MULTIPLIER, rebates
+            )
 
             if is_inference and self.config.inference_exploration_bonus > 0:
                 mean_usage = self.expert_usage_count.mean()
@@ -282,6 +387,7 @@ class WealthUpdateMixin:
         routing_weights: torch.Tensor,
         confidences: torch.Tensor,
         payments: torch.Tensor | None = None,
+        rebates: torch.Tensor | None = None,
     ):
         with torch.no_grad():
             batch_size, seq_len, _ = confidences.shape
@@ -305,12 +411,13 @@ class WealthUpdateMixin:
                             base_reward * self.config.reward_scale * PARTICIPATION_REWARD_MULTIPLIER
                         )
 
-            mean_reward = expert_rewards.mean()
-            if mean_reward > 0:
-                competitive_bonus = (expert_rewards - mean_reward) * COMPETITIVE_BONUS_FACTOR
-                expert_rewards += competitive_bonus.clamp(min=0)
-
-            expert_rewards -= self._vcg_charges(payments, selected_experts, num_tokens)
+            expert_rewards -= self._vcg_charges(
+                payments,
+                selected_experts,
+                num_tokens,
+                PARTICIPATION_REWARD_MULTIPLIER,
+                rebates,
+            )
 
             self.expert_wealth += expert_rewards
 
