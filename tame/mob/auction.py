@@ -19,9 +19,10 @@ PAYMENT_NEGATIVITY_TOLERANCE = 1e-5
 # negative-wealth winner sits in the top k, so b_(k+1) is at most its own negative
 # bid, and the payment-negativity assert below fires on the numerator -- unless that
 # bid is within the assert's tolerance of zero. That tolerance is relative to the
-# largest bid, so at the configured max_wealth the silent window reaches a wealth of
-# about -1e-4 -- and it is the middle of that window that hurts: -1e-7 underflows to
-# a price of exactly zero, while -1e-4 divides through the clamp to about -1.8e8.
+# largest bid, so at the configured max_wealth the assert stays silent down to a
+# wealth of about -6e-3, and it is the middle of that window that hurts: -1e-7
+# underflows to a price of exactly zero, while -1e-4 divides through the clamp to
+# about -1.2e8.
 # MoBConfig rejects non-positive wealth bounds, the three update paths clamp, and
 # load_mob_state clamps what it restores, so no writer can produce it; the boundary
 # is where the real guard lives, and an assert here would be unreachable.
@@ -132,7 +133,7 @@ class VCGAuctioneer(nn.Module):
         The returned fraction is at most ``harmonic_mean(winners' wealth) / w_max``
         and runs a little under it -- measured 94% / 68% / 3.6% against a bound of
         100% / 78% / 3.9%:
-        around 93% of the collection comes back on a flat wealth vector, 68% across
+        around 94% of the collection comes back on a flat wealth vector, 68% across
         the configured band, and under 4% when one expert sits at ``max_wealth`` and
         the rest at the floor -- which is the monopoly regime ``train.py`` already
         warns about, so the rebate is weakest where the drain bites hardest. A

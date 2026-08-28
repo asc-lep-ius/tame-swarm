@@ -40,3 +40,14 @@ def test_non_positive_wealth_bounds_are_rejected():
 
     with pytest.raises(ValueError, match="initial_wealth must be positive"):
         MoBConfig(initial_wealth=-1.0)
+
+
+def test_inverted_wealth_band_is_rejected():
+    """`clamp_(min=15, max=-5)` returns -5.
+
+    Every clamp in the codebase exists to keep wealth inside the band; with the
+    bounds inverted they would each write a negative wealth instead, which is the
+    one way the auction's "no writer can produce a negative wealth" could be false.
+    """
+    with pytest.raises(ValueError, match="max_wealth"):
+        MoBConfig(min_wealth=15.0, max_wealth=5.0)

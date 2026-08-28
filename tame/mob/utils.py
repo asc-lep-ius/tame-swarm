@@ -204,6 +204,13 @@ def load_mob_state(
                 # older config with different bounds -- would reach that division
                 # rather than the boundary validation in MoBConfig.
                 mob.expert_wealth.clamp_(min=mob.config.min_wealth, max=mob.config.max_wealth)
+                if not torch.equal(mob.expert_wealth, wealth):
+                    logger.warning(
+                        f"{key}: restored wealth fell outside "
+                        f"[{mob.config.min_wealth}, {mob.config.max_wealth}] and was "
+                        f"clamped; a checkpoint from a different wealth band will "
+                        f"have its spread flattened onto the current bounds"
+                    )
             else:
                 logger.warning(
                     f"{key}: wealth shape mismatch "

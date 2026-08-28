@@ -51,6 +51,14 @@ class MoBConfig:
             raise ValueError(f"min_wealth must be positive, got {self.min_wealth}")
         if self.initial_wealth <= 0:
             raise ValueError(f"initial_wealth must be positive, got {self.initial_wealth}")
+        # An inverted band is worse than a merely odd one: clamp_(min=15, max=-5)
+        # returns -5, so every clamp that exists to keep wealth positive would write
+        # a negative wealth instead -- the one way the auction's "no writer can
+        # produce it" could be false.
+        if self.max_wealth < self.min_wealth:
+            raise ValueError(
+                f"max_wealth ({self.max_wealth}) must be at least min_wealth ({self.min_wealth})"
+            )
 
         if self.routing_share not in SUPPORTED_ROUTING_SHARES:
             shares = ", ".join(sorted(SUPPORTED_ROUTING_SHARES))
