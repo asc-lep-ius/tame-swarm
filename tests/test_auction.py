@@ -528,22 +528,24 @@ def test_softmax_baseline_rewards_overreporting():
     assert best_lie > truthful + PAYMENT_TOLERANCE
 
 
-def test_negative_wealth_cannot_reach_a_winner_slot():
+def test_negative_wealth_trips_the_negativity_assert():
     """Why there is no wealth assert beside the epsilon clamp.
 
-    Reports are non-negative, so a negative wealth is a negative bid, which loses to
-    any non-negative one. It can only win when every bid is negative -- and that
-    trips the payment-negativity assert first. A guard here would be unreachable
-    code documenting a protection that never runs.
+    A negative-wealth expert *can* win: with mixed signs a negative bid still places
+    in the top k when the alternatives are worse. What it cannot do is win quietly.
+    A negative-wealth winner sits in the top k, so b_(k+1) is at most its own
+    negative bid, and the payment-negativity assert fires on the numerator before
+    the division that the epsilon clamp guards. A second assert there would be
+    unreachable code documenting a protection that never runs.
     """
     auctioneer = _make_auction(num_experts=4, top_k=2)
     auctioneer.eval()
-
     confidences = torch.tensor([[[0.9, 0.7, 0.5, 0.3]]])
-    selected, _, payments, _ = auctioneer(confidences, torch.tensor([-0.5, 1.0, 2.0, 3.0]))
 
-    assert 0 not in selected[0, 0].tolist(), "a negative bid must not win a slot"
-    assert (payments >= 0).all()
+    # Mixed signs: bids are [-0.45, +0.70, -1.00, -0.90], so expert 0 wins a slot
+    # on negative wealth even though a positive bid exists.
+    with pytest.raises(AssertionError, match="negative"):
+        auctioneer(confidences, torch.tensor([-0.5, 1.0, -2.0, -3.0]))
 
     with pytest.raises(AssertionError, match="negative"):
         auctioneer(confidences, torch.tensor([-1.0, -2.0, -3.0, -4.0]))
@@ -588,26 +590,31 @@ def test_rebate_is_independent_of_the_recipients_own_bid():
 
 
 def test_rebate_never_exceeds_what_the_auction_collected():
-    """Budget feasibility: the mechanism cannot hand back money it did not take.
+    """Budget feasibility, in the currency the wealth ledger actually uses.
 
-    Checked in bid units, where the accounting closes: the collected total is
-    k * b_(k+1) and the rebate sums to at most that, with equality only when the
-    (k+1)-th and (k+2)-th bids coincide.
+    Both sides are the per-expert quantities the wealth update consumes: payments
+    already divided by each winner's own wealth, rebates divided by the pool's
+    largest. Checking this in bid units instead — multiplying wealth back in — tests
+    an inequality that holds even when the ledger's does not, which is exactly how a
+    rebate that over-paid by 7.4x passed a feasibility test.
     """
     torch.manual_seed(37)
     for num_experts, top_k in ((6, 2), (8, 3), (5, 1), (4, 2)):
         auctioneer = _make_auction(num_experts=num_experts, top_k=top_k)
         auctioneer.eval()
 
-        wealth = torch.rand(num_experts) * 10.0 + 1.0
+        # Spanning the configured min_wealth..max_wealth band, not a narrow
+        # random range: a per-recipient divisor only over-rebates once the
+        # spread is wide, so a tight fixture cannot see it.
+        wealth = torch.linspace(15.0, 750.0, num_experts)
         confidences = torch.rand(2, 6, num_experts)
         outcome = auctioneer(confidences, wealth)
 
-        collected = (outcome.payments * wealth[outcome.selected_experts]).sum(dim=-1)
-        returned = (outcome.rebates * wealth).sum(dim=-1)
+        collected = outcome.payments.sum(dim=-1)
+        returned = outcome.rebates.sum(dim=-1)
 
         assert (returned <= collected + PAYMENT_TOLERANCE).all(), (
-            f"n={num_experts} k={top_k}: rebate exceeds revenue"
+            f"n={num_experts} k={top_k}: rebate exceeds revenue in credits"
         )
         assert (returned > 0).any(), "fixture returns nothing; feasibility is vacuous"
 

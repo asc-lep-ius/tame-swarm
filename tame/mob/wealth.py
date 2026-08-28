@@ -292,12 +292,8 @@ class WealthUpdateMixin:
                         + (1 - self.config.loss_ema_decay) * loss_reduction
                     )
 
-            # Charge before the bonus, so the bonus rewards surplus rather than
-            # gross activity. On gross it subsidises winning a token the expert was
-            # charged for, which moves wealth's break-even below the auction's price
-            # -- the same "paid for winning, never charged" defect on a second axis.
-            # On the net it cannot: at value == price every net is zero, so the
-            # guard below does not fire and the crossing sits exactly at the price.
+            # The rebate is netted inside _vcg_charges, so wealth moves by a single
+            # transfer rather than a charge and a credit applied separately.
             expert_rewards -= self._vcg_charges(
                 payments,
                 selected_experts,

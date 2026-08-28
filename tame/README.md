@@ -71,9 +71,9 @@ Token hidden state h
 | `_update_wealth_local_quality()` | Inference (primary) | Output norm consistency + magnitude appropriateness | Proxy — no loss available |
 | `_update_wealth_participation()` | Fallback | Selection frequency × confidence × routing weight | Weakest — no quality signal |
 
-All three paths share the same structure: decay → compute reward → competitive bonus → VCG payment → clamp. [Phase 2](../README.md#phase-2--economy-stabilisation) will unify them into a single `WealthUpdater` class.
+All three paths share the same structure: decay → compute reward → VCG payment net of rebate → clamp. [Phase 2](../README.md#phase-2--economy-stabilisation) will unify them into a single `WealthUpdater` class.
 
-**Current limitation:** The wealth dynamics use named constants (`LOSS_REWARD_MULTIPLIER`, `COMPETITIVE_BONUS_FACTOR`, etc.) that are still hand-tuned without formal stability analysis. The system can oscillate between undertrained and monopoly states depending on hyperparameters. See the [tuning guide](../README.md#tuning-guide--diagnostics) for diagnostic interpretation.
+**Current limitation:** The wealth dynamics still use hand-tuned constants (`LOSS_REWARD_MULTIPLIER`, `LOCAL_REWARD_MULTIPLIER`, …) without formal stability analysis, and the system can oscillate between undertrained and monopoly states depending on hyperparameters. `payment_scale` is no longer among them — the transfer coefficient is derived so that `reward − charge` is a single quasi-linear utility. A sharper limitation is recorded in [#15](../README.md#phase-05--mechanism-correction): winning is currently unprofitable on the synthetic objective, so abstaining pays. See the [tuning guide](../README.md#tuning-guide--diagnostics) for diagnostic interpretation.
 
 ### Steering Controller
 
@@ -173,9 +173,9 @@ During training, the MoB economy learns from the *actual* loss signal. This is t
 1. Each batch computes **per-token cross-entropy loss** (unreduced, not averaged).
 2. For each MoB layer, **loss reduction vs expert baseline EMA** is computed for every expert.
 3. Experts that improve loss receive wealth proportional to `reward_scale × LOSS_REWARD_MULTIPLIER`.
-4. A **competitive bonus** normalises rewards across experts — above-average performers get extra.
-5. **VCG payments** reduce rewards proportionally to the winning bid, creating wealth circulation.
-6. A `confidence_calibration_weight` auxiliary loss trains confidence heads to predict routing quality (target: sigmoid of performance EMA).
+4. **VCG payments** are subtracted as a quasi-linear transfer — `wealth += reward − charge`, both at one derived coefficient — not as a proportional haircut on the reward.
+5. **Cavallo rebates** return most of what the auction collected. Each expert is rebated from the (k+1)-th highest bid *among the others*, divided by the pool's largest wealth, so the payout is report-independent and affordable in credits by construction.
+6. A `confidence_calibration_weight` auxiliary loss trains each confidence head on the loss reduction its own expert realised on the tokens it won (target: `clamp_min(baseline − loss, 0)`), and reaches that head alone — the routing path reads detached hidden states.
 
 ### Gradient Handling
 

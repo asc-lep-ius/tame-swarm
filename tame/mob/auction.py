@@ -14,16 +14,17 @@ PAYMENT_NEGATIVITY_TOLERANCE = 1e-5
 # when the displaced bid is also zero -- the numerator vanishes with the
 # denominator and the clamp returns a price of zero rather than an infinity.
 #
-# Negative wealth never reaches this clamp. Reports are non-negative, so a negative
-# wealth means a negative bid, which can only win when every bid is negative -- and
-# that case trips the payment-negativity assert below first. MoBConfig rejects
-# non-positive wealth bounds at the boundary, which is where the real guard lives;
-# an assert here would be unreachable.
+# Negative wealth never reaches this clamp, though not because it cannot win: with
+# mixed signs a negative bid can still place in the top k. It cannot win *quietly* --
+# a negative-wealth winner sits in the top k, so b_(k+1) is at most its own negative
+# bid, and the payment-negativity assert below fires on the numerator before the
+# division happens. MoBConfig rejects non-positive wealth bounds at the boundary,
+# which is where the real guard lives; an assert here would be unreachable.
 WEALTH_EPSILON = 1e-12
 
 
 class AuctionOutcome(NamedTuple):
-    """What one token's auction produced.
+    """What the auction produced, per token.
 
     ``rebates`` is per *expert*, not per winner slot: every expert is rebated,
     including the ones that lost, which is what keeps the rebate independent of a
@@ -99,15 +100,31 @@ class VCGAuctioneer(nn.Module):
         so every threshold stays exactly where the payment rule put it.
 
         Excluding *i* lifts the ranking by one place precisely when *i* sits in the
-        top k+1, which is what the two branches below are. The rebate is always
-        affordable: it sums to at most the collected total, with equality only when
-        the (k+1)-th and (k+2)-th bids coincide. Whatever is left over is the
-        unavoidable residual of budget balance, not a leak.
+        top k+1, which is what the two branches below are.
+
+        The divisor is the **largest** wealth in the pool, not the recipient's own.
+        Dividing by ``w_i`` is right for a *price* -- it restates an externality in
+        the winner's own units, which is why ``_compute_vcg_payments`` does it -- and
+        wrong for a lump-sum rebate: it pays the poorest expert the most, and
+        feasibility then holds only in bid units rather than in the credits the
+        wealth ledger is denominated in. Measured at the configured wealth band that
+        over-rebates by up to 7.4x and turns the transfer into a money pump that
+        flattens the very spread the economy exists to create.
+
+        Against ``w_max`` it is affordable by construction. Every rebate reference is
+        at most ``b_(k+1)``, so the payout is at most ``k * b_(k+1) / w_max``, while
+        the collection is ``sum_{j in winners} b_(k+1) / w_j`` and every ``w_j <=
+        w_max``. ``w_max`` is read from a detached wealth snapshot, so it is no more
+        influenced by a report than the exclusion rule is.
+
+        The cost is under-rebating when the wealth spread is wide, which is the
+        Green-Laffont residual made visible rather than hidden.
         """
         batch, seq_len, _ = bids.shape
         k, n = self.top_k, self.num_experts
 
-        if k >= n or n < k + 2:
+        # Subsumes k >= n: there is no (k+2)-th bid to rebate out of either way.
+        if n < k + 2:
             return torch.zeros(batch, seq_len, n, device=bids.device, dtype=bids.dtype)
 
         accumulate_dtype = torch.promote_types(bids.dtype, torch.float32)
@@ -121,7 +138,8 @@ class VCGAuctioneer(nn.Module):
         in_top_k_plus_one.scatter_(-1, ranked_idx[..., : k + 1], True)
 
         reference = torch.where(in_top_k_plus_one, displaced_without_self, displaced)
-        rebates = (k / n) * reference / wealth.to(accumulate_dtype).clamp_min(WEALTH_EPSILON)
+        largest_wealth = wealth.to(accumulate_dtype).max().clamp_min(WEALTH_EPSILON)
+        rebates = (k / n) * reference / largest_wealth
 
         return rebates.to(bids.dtype)
 
