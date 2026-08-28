@@ -61,5 +61,5 @@ def test_initial_wealth_outside_the_band_is_rejected(initial):
     them all onto a bound at once — which reads as a training artefact rather than
     the config error it is.
     """
-    with pytest.raises(ValueError, match="initial_wealth"):
+    with pytest.raises(ValueError, match="must lie within"):
         MoBConfig(min_wealth=15.0, max_wealth=750.0, initial_wealth=initial)

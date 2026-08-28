@@ -17,15 +17,17 @@ PAYMENT_NEGATIVITY_TOLERANCE = 1e-5
 # Negative wealth never reaches this clamp in production, though not because it
 # cannot win: with mixed signs a negative bid can still place in the top k. A
 # negative-wealth winner sits in the top k, so b_(k+1) is at most its own negative
-# bid, and the payment-negativity assert below fires on the numerator -- unless that
-# bid is within the assert's tolerance of zero. That tolerance is relative to the
+# bid, and the payment-negativity assert below fires on the numerator -- unless
+# b_(k+1) itself is within the assert's tolerance of zero. That tolerance is relative to the
 # largest bid, so at the configured max_wealth the assert stays silent down to a
 # wealth of about -6e-3, and it is the middle of that window that hurts: -1e-7
 # underflows to a price of exactly zero, while -1e-4 divides through the clamp to
 # about -1.2e8.
-# MoBConfig rejects non-positive wealth bounds, the three update paths clamp, and
-# load_mob_state clamps what it restores, so no writer can produce it; the boundary
-# is where the real guard lives, and an assert here would be unreachable.
+# MoBConfig rejects non-positive bounds, an inverted band, and an initial_wealth
+# that is non-positive or out of band -- that last pair is what makes the unclamped
+# constructor write in core.py safe -- and the three update paths and load_mob_state
+# clamp. No writer can produce it; the boundary is where the real guard lives, and
+# an assert here would be unreachable.
 WEALTH_EPSILON = 1e-12
 
 
@@ -135,10 +137,10 @@ class VCGAuctioneer(nn.Module):
         the configured band and 3.6% when one expert sits at ``max_wealth`` and the
         rest at the floor, against a bound of 100% / 78% / 3.9%. That last regime is
         the monopoly state ``train.py`` already warns about, so the rebate is weakest
-        where the drain bites hardest. A
-        tighter safe divisor exists (the harmonic mean of the k richest wealths, also
-        report-independent); choosing it is mechanism design, and the option is
-        recorded on the #15 row of the roadmap in the top-level README.
+        where the drain bites hardest. A tighter safe divisor exists -- the harmonic
+        mean of the k richest wealths, also report-independent -- but choosing it is
+        mechanism design, and the option is recorded on the #15 row of the roadmap in
+        the top-level README.
         """
         batch, seq_len, _ = bids.shape
         k, n = self.top_k, self.num_experts

@@ -215,13 +215,19 @@ def load_mob_state(
                     neginf=mob.config.min_wealth,
                 )
                 mob.expert_wealth.clamp_(min=mob.config.min_wealth, max=mob.config.max_wealth)
-                if not torch.equal(mob.expert_wealth, wealth):
+                repaired = int((mob.expert_wealth != wealth).sum().item())
+                non_finite = int((~torch.isfinite(wealth)).sum().item())
+                if repaired or non_finite:
+                    # The count matters: a whole ledger reset to flat is a different
+                    # event from one entry nudged onto a bound, and without it both
+                    # produce the same line in a training log.
                     logger.warning(
-                        f"{key}: restored wealth was not usable as saved and has been "
-                        f"repaired into [{mob.config.min_wealth}, "
+                        f"{key}: {repaired} of {wealth.numel()} restored wealth values "
+                        f"were not usable as saved ({non_finite} non-finite) and have "
+                        f"been repaired into [{mob.config.min_wealth}, "
                         f"{mob.config.max_wealth}]; a checkpoint from a different "
-                        f"wealth band will have its spread flattened onto the current "
-                        f"bounds, and a non-finite entry reset to initial_wealth"
+                        f"wealth band has its spread flattened onto the current bounds, "
+                        f"and a non-finite entry is reset to initial_wealth"
                     )
             else:
                 logger.warning(

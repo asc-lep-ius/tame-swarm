@@ -535,12 +535,17 @@ def test_negative_wealth_trips_the_negativity_assert():
     in the top k when the alternatives are worse. A negative-wealth winner sits in
     the top k, so b_(k+1) is at most its own negative bid, and the payment-negativity
     assert fires on the numerator before the division that the epsilon clamp guards
-    -- unless that bid is inside the assert's tolerance of zero. That tolerance is
+    -- unless `b_(k+1)` itself is inside the assert's tolerance of zero. Not the
+    winner's own bid: in this fixture `w0 = -1e-7` puts that at -9e-8, well inside
+    tolerance, and the assert still fires because experts 2 and 3 drag `b_(k+1)` to
+    about -0.9. That tolerance is
     `1e-5 * max(max_bid, 1.0)`, so the silent window scales with the largest bid
     rather than sitting at a fixed wealth; `auction.py` records what it comes to at
-    the configured `max_wealth`. Four guards keep the pipeline out of it: MoBConfig
-    rejects non-positive bounds and an inverted band, the three update paths clamp,
-    and `load_mob_state` clamps what it restores. A second assert here would be
+    the configured `max_wealth`. The pipeline is kept out of it by MoBConfig, which
+    rejects non-positive bounds, an inverted band, and an `initial_wealth` that is
+    non-positive or outside the band — that last pair is what makes the unclamped
+    constructor write in `core.py` safe — plus the clamps on the three update paths
+    and on `load_mob_state`. A second assert here would be
     unreachable code documenting a protection that never runs.
     """
     auctioneer = _make_auction(num_experts=4, top_k=2)
@@ -628,8 +633,8 @@ def test_rebate_never_exceeds_what_the_auction_collected():
         # Measured slack, credit vs bid-unit: 16.6/2.5, 24.7/2.4, 2.0/2.0, 72.4/61.6.
         # So this bound is the tight one wherever k >= 2 and n > k + 2 -- a 3%
         # reference inflation trips it while the credit assertion sleeps through.
-        # All four fixtures share one wealth spread, so that is what separates
-        # them, not the spread. On n=5 k=1 the two coincide, because a lone winner
+        # All four fixtures share one wealth spread, so the k/n relation is what
+        # separates them, not the spread. On n=5 k=1 the two coincide, because a lone winner
         # collapses the harmonic mean onto its own wealth and the tight token is
         # one the richest expert takes; on n=4 k=2 both are slack, because
         # k + 2 == n leaves the reference at the bottom of the bid vector.

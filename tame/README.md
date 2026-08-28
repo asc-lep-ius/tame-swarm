@@ -302,7 +302,9 @@ The `/generate/stream` endpoint spawns a raw `Thread` for generation while the a
 ### Numerical Stability
 
 Multiple bfloat16 guards exist throughout the codebase:
-- `ConfidenceHead` clamps pre-sigmoid logits to [−20, 20]
+- `ConfidenceHead` clamps logits to [−20, 20] before the softplus, which bounds the
+  reported value at ~20 loss-reduction units — the report is unbounded above in
+  principle, and this is the only thing that keeps a bid finite
 - `LightweightExpert` clamps adapter output to [−65000, 65000]
 - MoB forward pass uses `torch.nan_to_num()` on the combined output
 - Training loop skips backward pass entirely if loss is NaN/Inf
