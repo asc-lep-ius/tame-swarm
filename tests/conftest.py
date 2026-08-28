@@ -178,3 +178,20 @@ def held_out_split(fake_tokenizer):
     return build_held_out_split(
         "wikitext", "wikitext-2-raw-v1", fake_tokenizer, 16, fake_load_dataset, num_sequences=8
     )
+
+
+@pytest.fixture
+def padded_held_out_split(fake_tokenizer):
+    """A split that actually contains padding, which ``held_out_split`` does not.
+
+    Every conftest document is longer than 16 characters, so at the default length
+    ``FakeTokenizer`` truncates and the attention mask comes back all ones -- a
+    fixture that cannot fail if padding is scored. At 48 the same documents leave
+    roughly 40% of each row as pad, which is the regime a real corpus of short
+    paragraphs sits in.
+    """
+    from evaluation import build_held_out_split
+
+    return build_held_out_split(
+        "wikitext", "wikitext-2-raw-v1", fake_tokenizer, 48, fake_load_dataset, num_sequences=8
+    )
