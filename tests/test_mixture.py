@@ -1,3 +1,4 @@
+import logging
 from operator import contains
 
 import pytest
@@ -215,3 +216,74 @@ def test_apply_mob_replaces_mlp(tiny_config):
 
     untouched = fake_model.model.layers[0].mlp
     assert not isinstance(untouched, MixtureOfBidders)
+
+
+def test_restored_wealth_is_clamped_to_the_configured_bounds(tmp_path, tiny_config, caplog):
+    """A checkpoint is the fourth writer to expert_wealth, and the only external one.
+
+    The three update paths clamp; `load_mob_state` did not. The auction divides each
+    winner's price by its own wealth, so a restored zero or negative entry reaches
+    that division rather than the boundary validation in `MoBConfig` — and a
+    negative one small enough to sit inside the payment-negativity tolerance would
+    reach that division instead of an invariant; `auction.py` records the window and
+    the price it produces.
+    """
+
+    class FakeModel(nn.Module):
+        def __init__(self, mob):
+            super().__init__()
+            self.mob = mob
+
+    mob = MixtureOfBidders(tiny_config)
+    save_path = str(tmp_path / "mob_state.pt")
+    save_mob_state(FakeModel(mob), save_path)
+
+    # A checkpoint that a truncated write, a hand edit, or an older config could
+    # plausibly produce: one bankrupt expert, one above the ceiling.
+    state = torch.load(save_path, weights_only=True)
+    state["layer_0"]["wealth"] = [-1e-4, tiny_config.max_wealth * 10]
+    torch.save(state, save_path)
+
+    restored = MixtureOfBidders(tiny_config)
+    with caplog.at_level(logging.WARNING, logger="mob.utils"):
+        load_mob_state(FakeModel(restored), save_path)
+
+    assert (restored.expert_wealth >= tiny_config.min_wealth).all()
+    assert (restored.expert_wealth <= tiny_config.max_wealth).all()
+    assert any("repaired" in message for message in caplog.messages), (
+        "every other rejection in load_mob_state logs; this one must too"
+    )
+
+
+def test_restored_wealth_repairs_non_finite_entries(tmp_path, tiny_config, caplog):
+    """`clamp_` passes NaN through, so a diverged run's checkpoint would survive it.
+
+    That matters most where the guard is thinnest: under `-O` the auction's
+    finiteness assert is compiled out, so a NaN wealth would reach the bid silently.
+    A non-finite entry is reset to `initial_wealth` rather than to a bound, because
+    its true value is unknown rather than extreme.
+    """
+
+    class FakeModel(nn.Module):
+        def __init__(self, mob):
+            super().__init__()
+            self.mob = mob
+
+    mob = MixtureOfBidders(tiny_config)
+    save_path = str(tmp_path / "mob_state.pt")
+    save_mob_state(FakeModel(mob), save_path)
+
+    state = torch.load(save_path, weights_only=True)
+    state["layer_0"]["wealth"] = [float("nan"), float("inf")]
+    torch.save(state, save_path)
+
+    restored = MixtureOfBidders(tiny_config)
+    with caplog.at_level(logging.WARNING, logger="mob.utils"):
+        load_mob_state(FakeModel(restored), save_path)
+
+    assert torch.isfinite(restored.expert_wealth).all()
+    assert restored.expert_wealth[0].item() == pytest.approx(tiny_config.initial_wealth)
+    assert restored.expert_wealth[1].item() == pytest.approx(tiny_config.max_wealth)
+    assert any("repaired" in message for message in caplog.messages), (
+        "a silent repair is the one thing this function does not do elsewhere"
+    )

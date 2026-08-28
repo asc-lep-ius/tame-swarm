@@ -4,6 +4,7 @@ from typing import cast
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 try:
     from ..coupling import CouplingMetrics, SteeringCoupling, SteeringCouplingConfig
@@ -74,6 +75,7 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
             config.num_experts,
             config.top_k,
             differentiable=config.use_differentiable_routing,
+            routing_share=config.routing_share,
         )
 
         self.register_buffer(
@@ -104,7 +106,12 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         self._cached_selected_experts: torch.Tensor | None = None
         self._cached_routing_weights: torch.Tensor | None = None
         self._cached_confidences: torch.Tensor | None = None
+        # Kept attached to the graph so update_wealth_from_loss can build each
+        # expert's value objective; the detached copy above is what the wealth
+        # arithmetic reads. Cleared as soon as the objective is built.
+        self._live_confidences: torch.Tensor | None = None
         self._cached_payments: torch.Tensor | None = None
+        self._cached_rebates: torch.Tensor | None = None
         self._cached_expert_token_masks: list[torch.Tensor] | None = None
         self._loss_feedback_pending: bool = False
         self._cached_calibration_loss: torch.Tensor | None = None
@@ -119,11 +126,27 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         """Forward pass through the MoB layer."""
         batch_size, seq_len, hidden_dim = hidden_states.shape
 
-        confidence_hidden_states = hidden_states
+        # Both caches belong to the forward pass that produced them. The value
+        # objective holds a live graph, so a stale one is not a harmless constant
+        # the way the old detached calibration loss was -- a training step that
+        # forwards without calling update_wealth_from_loss would backward through a
+        # graph the previous step already freed.
+        self._cached_calibration_loss = None
+        self._live_confidences = None
+
+        # The routing path observes the representation; it does not reshape it. Every
+        # head reads the same hidden states, so without this detach each expert's
+        # private value objective backpropagates into the backbone that every other
+        # expert reads -- a shared auxiliary loss, which is the central planner the
+        # auction exists to replace. Detaching the input rather than the coupling
+        # output keeps SteeringCoupling.projection trainable.
+        routing_hidden_states = hidden_states.detach()
+
+        confidence_hidden_states = routing_hidden_states
         coupling_metrics: CouplingMetrics | None = None
         coupling = self._get_coupling()
         if coupling is not None:
-            confidence_hidden_states = coupling(hidden_states)
+            confidence_hidden_states = coupling(routing_hidden_states)
             coupling_metrics = coupling.last_metrics
 
         confidence_logits = torch.stack(
@@ -135,13 +158,20 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
             ],
             dim=-1,
         )
-        confidences = torch.sigmoid(confidence_logits)
+        # Must match ConfidenceHead.forward. The report is a loss-reduction estimate,
+        # not a probability: a sigmoid here caps it at 1.0 while the reward it is
+        # trained to predict is unbounded, so "win when report > price" and "profit
+        # when value > price" stop being the same threshold. forward_logits is used
+        # rather than forward only so the z-loss can read the pre-activation logits.
+        confidences = F.softplus(confidence_logits)
         router_z_loss = self._compute_router_z_loss(confidence_logits)
         self._cached_router_z_loss = router_z_loss
 
-        selected_experts, routing_weights, payments = self.auctioneer(
-            confidences, self.expert_wealth
-        )
+        outcome = self.auctioneer(confidences, self.expert_wealth)
+        selected_experts = outcome.selected_experts
+        routing_weights = outcome.routing_weights
+        payments = outcome.payments
+        rebates = outcome.rebates
 
         output = torch.zeros_like(hidden_states)
 
@@ -161,21 +191,23 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
             self._cached_selected_experts = selected_experts.detach()
             self._cached_routing_weights = routing_weights.detach()
             self._cached_confidences = confidences.detach()
+            self._live_confidences = confidences
             self._cached_payments = payments.detach() if payments is not None else None
+            self._cached_rebates = rebates.detach() if rebates is not None else None
             self._loss_feedback_pending = True
 
         if update_wealth and self.config.use_local_quality and not self.config.use_loss_feedback:
             self._update_wealth_local_quality(
-                selected_experts, routing_weights, confidences, payments, output
+                selected_experts, routing_weights, confidences, payments, rebates, output
             )
         elif update_wealth and self.training:
             if self.config.use_local_quality and not self.config.use_loss_feedback:
                 self._update_wealth_local_quality(
-                    selected_experts, routing_weights, confidences, payments, output
+                    selected_experts, routing_weights, confidences, payments, rebates, output
                 )
             elif not self.config.use_local_quality:
                 self._update_wealth_participation(
-                    selected_experts, routing_weights, confidences, payments
+                    selected_experts, routing_weights, confidences, payments, rebates
                 )
 
         self.last_stats = MoBStats(

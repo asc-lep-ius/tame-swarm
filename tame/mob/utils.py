@@ -197,6 +197,38 @@ def load_mob_state(
             wealth = torch.tensor(state["wealth"], device=device, dtype=mob.expert_wealth.dtype)
             if wealth.shape == mob.expert_wealth.shape:
                 mob.expert_wealth.copy_(wealth)
+                # The three update paths clamp; a restore is the fourth writer and
+                # the only one reading from outside the process. The auction divides
+                # each price by the winner's own wealth, so a checkpoint carrying a
+                # zero or negative entry -- truncated, hand-edited, or written by an
+                # older config with different bounds -- would reach that division
+                # rather than the boundary validation in MoBConfig.
+                # NaN is the reason this is not a bare clamp: clamp_ passes it
+                # through, and a diverged run's checkpoint is at least as likely as a
+                # hand-edited one. Under -O the finiteness assert in the auction is
+                # compiled out, so a NaN wealth would otherwise reach the bid
+                # silently. Non-finite entries reset to initial_wealth rather than to
+                # a bound, because their true value is unknown rather than extreme.
+                mob.expert_wealth.nan_to_num_(
+                    nan=mob.config.initial_wealth,
+                    posinf=mob.config.max_wealth,
+                    neginf=mob.config.min_wealth,
+                )
+                mob.expert_wealth.clamp_(min=mob.config.min_wealth, max=mob.config.max_wealth)
+                repaired = int((mob.expert_wealth != wealth).sum().item())
+                non_finite = int((~torch.isfinite(wealth)).sum().item())
+                if repaired or non_finite:
+                    # The count matters: a whole ledger reset to flat is a different
+                    # event from one entry nudged onto a bound, and without it both
+                    # produce the same line in a training log.
+                    logger.warning(
+                        f"{key}: {repaired} of {wealth.numel()} restored wealth values "
+                        f"were not usable as saved ({non_finite} non-finite) and have "
+                        f"been repaired into [{mob.config.min_wealth}, "
+                        f"{mob.config.max_wealth}]; a checkpoint from a different "
+                        f"wealth band has its spread flattened onto the current bounds, "
+                        f"and a non-finite entry is reset to initial_wealth"
+                    )
             else:
                 logger.warning(
                     f"{key}: wealth shape mismatch "
