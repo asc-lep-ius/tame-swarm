@@ -31,10 +31,21 @@ class MoBConfig:
     use_local_quality: bool = True
     # "uniform" splits the output 1/top_k across winners, which is what makes the
     # auction strategyproof and keeps the language-modelling loss out of the
-    # confidence heads. "softmax" restores the own-bid-weighted gate as the
+    # confidence heads. "proportional" restores an own-bid-weighted gate as the
     # gate-swap baseline; use_differentiable_routing only applies in that mode.
     routing_share: str = ROUTING_SHARE_UNIFORM
     use_differentiable_routing: bool = True
+    # Sharpness of the "proportional" gate, applied in the log domain: a winner's
+    # share is bid ** (1 / routing_temperature), normalised over the winners. 1.0 is
+    # plain bid-proportional and is the default because it introduces no constant
+    # that has to be re-tuned when anything else moves. Below 1.0 approaches argmax,
+    # above 1.0 approaches the uniform split; every value is invariant to a uniform
+    # rescaling of wealth, so this is a sharpness choice and not, as the raw bid
+    # scale was, a sharpness side effect. Exact in the algebra, and measured under
+    # 1e-6 in float32 down to tau=0.1 -- see _log_bids, which normalises before the
+    # log precisely so that bound does not degrade as the gate sharpens. Ignored
+    # under the uniform share.
+    routing_temperature: float = 1.0
     confidence_calibration_weight: float = 0.15
     confidence_z_loss_weight: float = 0.0001
     loss_ema_decay: float = 0.92
@@ -66,6 +77,13 @@ class MoBConfig:
             raise ValueError(
                 f"initial_wealth ({self.initial_wealth}) must lie within "
                 f"[{self.min_wealth}, {self.max_wealth}]"
+            )
+
+        # Zero divides, and a negative temperature inverts the ranking so the gate
+        # would hand the largest share to the expert that bid least.
+        if self.routing_temperature <= 0:
+            raise ValueError(
+                f"routing_temperature must be positive, got {self.routing_temperature}"
             )
 
         if self.routing_share not in SUPPORTED_ROUTING_SHARES:

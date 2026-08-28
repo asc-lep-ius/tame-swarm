@@ -85,6 +85,7 @@ except ImportError:
 
 from config import get_active_profile
 from mob import (
+    ROUTING_SATURATION_THRESHOLD,
     MoBConfig,
     apply_mob_to_model,
     get_mob_layers,
@@ -96,6 +97,24 @@ from mob import (
 )
 
 _profile = get_active_profile()
+
+
+# Below this, top_k slots are buying less than one extra expert's worth of mixing.
+# Only meaningful for top_k > 1: at top_k == 1 the effective count is 1.0 and the
+# saturated fraction 1.0 by construction, and neither is a fault.
+MIN_HEALTHY_EFFECTIVE_EXPERTS = 1.5
+
+
+def _scalar(value: object) -> float:
+    """Sync one aggregate statistic to the host, or report it as missing.
+
+    ``get_mob_statistics`` omits the gate diagnostics until every MoB layer has
+    forwarded at least once, and a partial average would be worse than an absent
+    number. NaN formats and stores as one; a zero would read as a collapsed gate.
+    """
+    if isinstance(value, torch.Tensor):
+        return float(value.item())
+    return float("nan")
 
 
 @dataclass
@@ -795,13 +814,13 @@ class TAMETrainer:
     def train(self):
         """Main training loop."""
         logger.info("Starting training...")
-        logger.info("=" * 100)
+        logger.info("=" * 118)
         logger.info(
             f"{'Step':>6} | {'Prog':>5} | {'Loss':>7} | {'PPL':>10}"
             f" | {'Cal':>6} | {'Z':>6} | {'Mean Wealth':>12} | {'Std Dev':>8}"
-            f" | {'Gini':>6} | {'Perf EMA':>9}"
+            f" | {'Gini':>6} | {'Perf EMA':>9} | {'Top1':>6} | {'EffExp':>6}"
         )
-        logger.info("-" * 100)
+        logger.info("-" * 118)
 
         assert self.model is not None
         assert self.train_dataloader is not None
@@ -878,15 +897,16 @@ class TAMETrainer:
         self._log_training_step(self.config.max_steps)
         self._save_checkpoint(self.config.max_steps, final=True)
 
-        logger.info("=" * 100)
+        logger.info("=" * 118)
         logger.info("Training complete!")
 
     def _log_training_step(self, step: int):
         """
         Log comprehensive training statistics for fine-tuning analysis.
 
-        Outputs: Step, Progress%, Loss, Perplexity, Calibration Loss,
-                 Mean Wealth, Std Dev, Gini Coefficient, Performance EMA
+        Outputs: Step, Progress%, Loss, Perplexity, Calibration Loss, Router Z,
+                 Mean Wealth, Std Dev, Gini Coefficient, Performance EMA,
+                 mean top-1 routing weight, effective expert count.
         """
         assert self.model is not None
         # Get MoB wealth statistics
@@ -919,6 +939,14 @@ class TAMETrainer:
             assert isinstance(_pe, torch.Tensor)
             perf_ema = float(_pe.item())
 
+            # What the gate actually did, as opposed to what top_k configures. These
+            # are the statistics that would have surfaced a gate saturating on the
+            # absolute wealth scale, so they belong on the line that is read every
+            # run rather than in a field someone has to know to go and fetch.
+            top1 = _scalar(stats.get("routing_top1_mean"))
+            effective_experts = _scalar(stats.get("routing_effective_experts"))
+            saturated = _scalar(stats.get("routing_top1_saturated_fraction"))
+
             # Store for analysis
             self.wealth_history.append(
                 {
@@ -932,6 +960,9 @@ class TAMETrainer:
                     "wealth_std": std_wealth,
                     "wealth_gini": gini,
                     "mean_performance": perf_ema,
+                    "routing_top1_mean": top1,
+                    "routing_top1_saturated_fraction": saturated,
+                    "routing_effective_experts": effective_experts,
                 }
             )
 
@@ -944,7 +975,20 @@ class TAMETrainer:
                 f" | {ppl:>10.2f} | {cal:>6.4f} | {router_z:>6.4f}"
                 f" | {mean_wealth:>12.2f} | {std_wealth:>8.2f}"
                 f" | {gini:>6.4f} | {perf_sign}{perf_ema:>8.4f}"
+                f" | {top1:>6.4f} | {effective_experts:>6.3f}"
             )
+
+            # The sparse-computation claim is O(top_k x tokens), and it is paid
+            # whether or not the second winner contributes anything. This says
+            # whether it bought anything -- a question that only exists once there
+            # is a second winner to buy, hence the top_k guard.
+            if self.config.top_k > 1 and effective_experts < MIN_HEALTHY_EFFECTIVE_EXPERTS:
+                logger.warning(
+                    f"  ⚠ Effective expert count {effective_experts:.3f} with "
+                    f"top_k={self.config.top_k} - {saturated:.0%} of tokens route "
+                    f"above {ROUTING_SATURATION_THRESHOLD} to one expert. The gate "
+                    "is paying for experts it is not mixing."
+                )
 
             # Warnings for unhealthy dynamics
             if gini < 0.10:

@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from mob import VCGAuctioneer
+from mob import VCGAuctioneer, routing_diagnostics
 
 PAYMENT_TOLERANCE = 1e-5
 
@@ -66,12 +66,14 @@ def test_vcg_higher_bid_wins():
 
 
 def test_vcg_differentiable_mode():
-    """The straight-through gate survives, but only as the softmax baseline.
+    """The straight-through gate survives, but only as the proportional baseline.
 
     Under the uniform share this gradient path is deliberately absent; see
     ``test_uniform_share_carries_no_gradient_into_confidences``.
     """
-    auctioneer = _make_auction(num_experts=4, top_k=2, differentiable=True, routing_share="softmax")
+    auctioneer = _make_auction(
+        num_experts=4, top_k=2, differentiable=True, routing_share="proportional"
+    )
     auctioneer.train()
 
     confidences = torch.randn(1, 4, 4).abs().requires_grad_(True)
@@ -347,8 +349,14 @@ def test_vcg_payment_preserves_float64_precision():
 
 
 def test_routing_share_rejects_unknown_mode():
+    """ "softmax" is the retired name, and is rejected rather than aliased.
+
+    The gate it named saturated on the absolute wealth scale. Silently mapping it
+    onto the scale-invariant share would let an old config keep running while the
+    numbers it produces mean something else.
+    """
     with pytest.raises(ValueError, match="Unsupported routing share"):
-        VCGAuctioneer(4, 2, routing_share="proportional")
+        VCGAuctioneer(4, 2, routing_share="softmax")
 
 
 def test_uniform_share_is_flat_and_ignores_own_bid():
@@ -392,14 +400,14 @@ def test_uniform_share_carries_no_gradient_into_confidences():
     assert not routing_weights.requires_grad
 
 
-def test_softmax_share_lets_a_winner_buy_influence_for_free():
+def test_proportional_share_lets_a_winner_buy_influence_for_free():
     """Negative control: the gate-swap baseline is not incentive compatible.
 
     Same winners, same price, strictly larger share. This is the defect the uniform
     share exists to remove, kept as a live test so the baseline is documented by
     behaviour rather than by assertion.
     """
-    auctioneer = _make_auction(num_experts=4, top_k=2, routing_share="softmax")
+    auctioneer = _make_auction(num_experts=4, top_k=2, routing_share="proportional")
     auctioneer.eval()
 
     wealth = torch.ones(4)
@@ -462,7 +470,7 @@ def _expert_zero_utility(auctioneer, report: float, true_value: float) -> float:
     Influence is the winner's share renormalised by an equal split, so it is
     identically 1.0 under the uniform rule and the expression reduces to the
     textbook ``v * 1[win] - p``. It is written this way so the same utility is
-    defined for the softmax baseline, where a winner's slice does move with its own
+    defined for the proportional baseline, where a winner's slice does move with its own
     report and the deviation test below must be able to see that.
     """
     confidences = _UTILITY_FIELD.clone()
@@ -507,7 +515,7 @@ def test_truthful_reporting_maximises_expert_utility():
     assert winning_outcomes == {True, False}, "sweep must straddle the critical value"
 
 
-def test_softmax_baseline_rewards_overreporting():
+def test_proportional_baseline_rewards_overreporting():
     """Negative control for the deviation sweep above.
 
     The same utility, the same fixture, the same truthful report -- but with the
@@ -515,7 +523,7 @@ def test_softmax_baseline_rewards_overreporting():
     baseline *fails* the property is what stops the test above from passing for
     reasons unrelated to the mechanism.
     """
-    auctioneer = _make_auction(num_experts=5, top_k=2, routing_share="softmax")
+    auctioneer = _make_auction(num_experts=5, top_k=2, routing_share="proportional")
     auctioneer.eval()
 
     true_value = 0.5
@@ -738,3 +746,220 @@ def test_rebate_is_bounded_from_below_by_the_cavallo_reference():
 
     assert (outcome.rebates.sum(dim=-1) >= floor - PAYMENT_TOLERANCE).all()
     assert (floor > 0).any(), "fixture has no lower bound to check"
+
+
+def test_routing_weights_are_invariant_to_a_uniform_wealth_rescale():
+    """Scale invariance is the property #11 is written against, not sharpness.
+
+    A sharp gate is a design choice. A gate whose sharpness is a side effect of the
+    absolute wealth scale is a confound, because that scale drifts as the economy
+    runs and every measurement read through the gate moves with it. The negative
+    control is the gate this one replaced: softmax over the raw bids, which is not
+    scale invariant and whose weights collapse onto 1.0 as the same wealth vector is
+    multiplied up.
+
+    The range below spans sixteen orders of magnitude, far past anything the
+    ``[min_wealth, max_wealth]`` band can reach; the residual is float32 rounding on
+    the log -- under 2e-7 over 400 draws across all six scales, measured 1.79e-7.
+    ``rtol=0`` below so that the stated ``atol`` is the tolerance actually applied:
+    routing weights are O(0.5), so ``allclose``'s default ``rtol=1e-5`` would
+    otherwise widen it by two orders of magnitude and hide a regression.
+    """
+    auctioneer = _make_auction(num_experts=8, top_k=2, routing_share="proportional")
+    auctioneer.eval()
+
+    confidences = torch.rand(4, 64, 8) + 0.05
+    wealth = torch.tensor([15.0, 25.0, 45.0, 75.0, 130.0, 230.0, 420.0, 750.0])
+    _, baseline, _, _ = auctioneer(confidences, wealth)
+
+    for scale in (1e-8, 1e-2, 0.1, 10.0, 1e2, 1e8):
+        _, rescaled, _, _ = auctioneer(confidences, wealth * scale)
+        assert torch.allclose(rescaled, baseline, rtol=0, atol=1e-6), (
+            f"routing weights moved under a uniform wealth rescale of {scale:g}"
+        )
+
+    # The control uses a *flat* wealth vector at each end of the configured band, so
+    # the only thing that changes between the two is the scale -- no expert has
+    # gained on any other. The scale-invariant gate cannot see that difference; the
+    # raw-bid gate reads it as a temperature.
+    flat_top1 = [
+        torch.softmax(torch.topk(confidences * torch.full((8,), level), 2, dim=-1).values, dim=-1)
+        .amax(dim=-1)
+        .median()
+        .item()
+        for level in (15.0, 750.0)
+    ]
+    assert flat_top1[1] > flat_top1[0] + 0.05, (
+        "negative control: the raw-bid gate must sharpen with the wealth scale"
+    )
+
+    invariant_top1 = []
+    for level in (15.0, 750.0):
+        _, flat_weights, _, _ = auctioneer(confidences, torch.full((8,), level))
+        invariant_top1.append(flat_weights.amax(dim=-1).median().item())
+    assert invariant_top1[1] == pytest.approx(invariant_top1[0], abs=1e-6)
+
+
+def test_train_and_eval_routing_paths_produce_identical_weights():
+    """The straight-through path may add a gradient, never a different forward value.
+
+    Anything else makes a training curve and an evaluation number products of two
+    different models. The paths are separate code -- one gathers a renormalised
+    share out of a full-width softmax, the other takes a softmax over the winners --
+    so the identity is a claim about the algebra and is checked rather than assumed.
+
+    One honest limit, in float16 only. The two paths reach the same value by
+    different orders of operation, agreeing in float32 to 1.19e-7; casting that back
+    to float16 can round either way, so occasionally a single token's weight differs
+    by one ulp (4.9e-4). Measured at this test's own shape over 4000 paired draws on
+    identical inputs: 51/4000 draws here and 68/4000 for the pre-#11 gate -- 1.3% and
+    1.7% of draws, which is 0.005% and 0.007% of individual tokens. Present in both
+    forms and therefore inherent to having two paths, not something the log domain
+    introduced. bfloat16 -- the training dtype -- is exact, as is float64.
+    """
+    auctioneer = _make_auction(num_experts=8, top_k=2, routing_share="proportional")
+    confidences = torch.rand(4, 64, 8) + 0.05
+    wealth = torch.tensor([15.0, 25.0, 45.0, 75.0, 130.0, 230.0, 420.0, 750.0])
+
+    auctioneer.train()
+    _, train_weights, _, _ = auctioneer(confidences, wealth)
+    auctioneer.eval()
+    _, eval_weights, _, _ = auctioneer(confidences, wealth)
+
+    # rtol=0 for the reason given in the rescale test: the default rtol would widen
+    # this by two orders of magnitude. Measured max deviation is 1.19e-7 in float32
+    # and exactly zero in bf16 and float64.
+    assert torch.allclose(train_weights, eval_weights, rtol=0, atol=1e-6)
+
+
+@pytest.mark.parametrize("temperature", [0.1, 0.25, 1.0, 4.0])
+def test_routing_temperature_stays_invariant_at_every_setting(temperature):
+    """Temperature is a deliberate sharpness dial, and it must not reintroduce drift.
+
+    Applied in the log domain it exponentiates the bid rather than shifting it, so
+    a uniform wealth rescale is still the constant that softmax absorbs. A
+    temperature applied to the raw bids would sharpen at one wealth scale and
+    saturate at another, which is the defect the log domain removes.
+
+    The sharp end is the one that matters. Invariance is exact in the algebra at
+    every ``tau``, but in float32 any error surviving the log gets multiplied by
+    ``1 / tau``. ``_log_bids`` normalises bids before the log so nothing survives it
+    to be multiplied; normalising *after* instead leaves a residual peaking above
+    5e-6 at ``tau=0.1``. Measured on this test's own protocol -- shape (2, 32, 8),
+    rescale 1e8, 500 draws per setting -- the current form fails 0/500 at every
+    ``tau`` (peaks 6.0e-7 at 0.1 down to 8.9e-8 at 4.0) while the shift-after form
+    fails 500/500 at ``tau=0.1`` and 462/500 at 0.25.
+
+    Both details below are load-bearing. ``rtol=0`` because ``allclose``'s default
+    ``rtol=1e-5`` against weights of O(0.5) makes the operative tolerance ~1.1e-5,
+    which caught the shift-after form on only a few percent of draws; and the 1e8
+    rescale because at 1e3 the regression is smaller than that same slack. Together
+    they take this from a few-percent guard to a total one at the setting it exists
+    to protect.
+    """
+    auctioneer = VCGAuctioneer(8, 2, routing_share="proportional", temperature=temperature)
+    auctioneer.eval()
+
+    confidences = torch.rand(2, 32, 8) + 0.05
+    wealth = torch.tensor([15.0, 25.0, 45.0, 75.0, 130.0, 230.0, 420.0, 750.0])
+
+    _, weights, _, _ = auctioneer(confidences, wealth)
+    _, rescaled, _, _ = auctioneer(confidences, wealth * 1e8)
+    assert torch.allclose(weights, rescaled, rtol=0, atol=1e-6)
+
+
+def test_routing_temperature_orders_sharpness():
+    """Below 1.0 approaches argmax, above 1.0 approaches the uniform split."""
+    confidences = torch.rand(2, 64, 8) + 0.05
+    wealth = torch.tensor([15.0, 25.0, 45.0, 75.0, 130.0, 230.0, 420.0, 750.0])
+
+    top1_by_temperature = []
+    for temperature in (0.25, 1.0, 4.0):
+        auctioneer = VCGAuctioneer(8, 2, routing_share="proportional", temperature=temperature)
+        auctioneer.eval()
+        _, weights, _, _ = auctioneer(confidences, wealth)
+        top1_by_temperature.append(weights.amax(dim=-1).mean().item())
+
+    sharp, plain, flat = top1_by_temperature
+    assert sharp > plain > flat
+    assert flat > 0.5, "the uniform split is the limit, not a value temperature reaches"
+
+
+@pytest.mark.parametrize("temperature", [0.0, -1.0])
+def test_routing_temperature_rejects_non_positive(temperature):
+    """Zero divides; a negative temperature hands the largest share to the low bid."""
+    with pytest.raises(ValueError, match="temperature must be positive"):
+        VCGAuctioneer(4, 2, routing_share="proportional", temperature=temperature)
+
+
+def test_zero_bids_share_out_rather_than_producing_nan():
+    """``log(0)`` is the one input the log-domain gate has to survive.
+
+    A production bid cannot reach the floor -- the confidence logit is clamped at
+    -20 and ``min_wealth`` is positive -- but a gate that returns NaN on an
+    all-abstaining token would fail somewhere far from the cause.
+    """
+    auctioneer = _make_auction(num_experts=4, top_k=2, routing_share="proportional")
+    auctioneer.eval()
+
+    _, weights, _, _ = auctioneer(torch.zeros(1, 1, 4), torch.ones(4))
+
+    assert torch.isfinite(weights).all()
+    assert torch.allclose(weights, torch.full_like(weights, 0.5))
+
+
+def test_routing_diagnostics_report_the_uniform_share_exactly():
+    """Under the uniform share the diagnostics have known closed forms.
+
+    ``top_k`` is a configuration; ``exp(entropy)`` is what happened. Pinning the one
+    case where the two must coincide is what makes the statistic readable when they
+    do not.
+    """
+    weights = torch.full((2, 8, 4), 0.25)
+    diagnostics = routing_diagnostics(weights)
+
+    assert diagnostics.top1_mean.item() == pytest.approx(0.25)
+    assert diagnostics.top1_median.item() == pytest.approx(0.25)
+    assert diagnostics.top1_saturated_fraction.item() == pytest.approx(0.0)
+    assert diagnostics.effective_experts.item() == pytest.approx(4.0, abs=1e-5)
+
+
+def test_routing_diagnostics_expose_a_collapsed_gate():
+    """The failure the statistic exists to name: top_k slots, one expert's worth of mixing."""
+    collapsed = torch.tensor([[[1.0, 0.0], [0.999, 0.001]]])
+    diagnostics = routing_diagnostics(collapsed)
+
+    assert diagnostics.effective_experts.item() < 1.05
+    assert diagnostics.top1_saturated_fraction.item() == pytest.approx(1.0)
+
+
+def test_routing_diagnostics_stay_on_device_as_tensors():
+    """Reducing to a float here forces a sync per layer per step; the caller decides when."""
+    diagnostics = routing_diagnostics(torch.full((1, 4, 2), 0.5))
+
+    assert all(isinstance(field, torch.Tensor) for field in diagnostics)
+    assert all(field.ndim == 0 for field in diagnostics)
+
+
+def test_proportional_share_is_the_bid_ratio_at_unit_temperature():
+    """The gate's definition, asserted directly rather than inferred.
+
+    Every other test here pins a *property* -- invariance, sharpness ordering, the
+    incentive defect. None of them would notice if the share stopped being
+    proportional to the bid while staying scale-invariant and monotone. Two winners
+    make the statement exact: ``w_i / w_j == b_i / b_j``.
+    """
+    auctioneer = _make_auction(num_experts=6, top_k=2, routing_share="proportional")
+    auctioneer.eval()
+
+    confidences = torch.rand(2, 32, 6) + 0.05
+    wealth = torch.tensor([15.0, 40.0, 75.0, 130.0, 300.0, 750.0])
+
+    selected, weights, _, _ = auctioneer(confidences, wealth)
+    winning_bids = torch.gather(confidences * wealth, -1, selected)
+
+    assert torch.allclose(
+        weights[..., 0] / weights[..., 1],
+        winning_bids[..., 0] / winning_bids[..., 1],
+        atol=1e-5,
+    )

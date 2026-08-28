@@ -106,7 +106,7 @@ def get_mob_statistics(model: nn.Module) -> dict[str, torch.Tensor | list[torch.
         n * torch.sum(sorted_wealth)
     ) - (n + 1) / n
 
-    return {
+    statistics: dict[str, torch.Tensor | list[torch.Tensor]] = {
         "mean_wealth": all_wealth.mean(),
         "wealth_std": all_wealth.std(),
         "wealth_gini": gini.abs(),
@@ -114,6 +114,26 @@ def get_mob_statistics(model: nn.Module) -> dict[str, torch.Tensor | list[torch.
         "layer_wealth": [mob.expert_wealth.clone() for mob in mob_layers],
         "layer_performance": [mob.expert_performance_ema.clone() for mob in mob_layers],
     }
+
+    # Absent until every layer has forwarded at least once; a partial average over
+    # whichever layers happen to have run would be worse than no number at all.
+    routing = [mob.last_stats.routing for mob in mob_layers if mob.last_stats is not None]
+    if len(routing) == len(mob_layers):
+        # Every layer sees the same tokens, so a mean over layers of a per-layer mean
+        # or fraction is the pooled quantity. A median is not composable that way, so
+        # it is reported per layer rather than averaged into something that looks
+        # like a median of the whole model and is not one.
+        statistics["routing_top1_mean"] = torch.stack([r.top1_mean for r in routing]).mean()
+        statistics["routing_top1_saturated_fraction"] = torch.stack(
+            [r.top1_saturated_fraction for r in routing]
+        ).mean()
+        statistics["routing_effective_experts"] = torch.stack(
+            [r.effective_experts for r in routing]
+        ).mean()
+        statistics["layer_routing_top1_median"] = [r.top1_median for r in routing]
+        statistics["layer_routing_effective_experts"] = [r.effective_experts for r in routing]
+
+    return statistics
 
 
 def load_mob_state(
