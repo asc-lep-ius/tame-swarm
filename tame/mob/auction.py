@@ -32,17 +32,23 @@ WEALTH_EPSILON = 1e-12
 
 
 class AuctionOutcome(NamedTuple):
-    """What the auction produced, per token.
+    """What a gate produced, per token.
 
     ``rebates`` is per *expert*, not per winner slot: every expert is rebated,
     including the ones that lost, which is what keeps the rebate independent of a
     winner's own report.
+
+    ``payments`` and ``rebates`` are optional because the #12 control arm
+    (:class:`~mob.softmax_router.SoftmaxRouter`) runs no auction. ``None`` there
+    says *no transfer was computed*, which the wealth paths must not confuse with
+    an auction that computed zeros -- the defect #9 fixed looked exactly like the
+    latter.
     """
 
     selected_experts: torch.Tensor
     routing_weights: torch.Tensor
-    payments: torch.Tensor
-    rebates: torch.Tensor
+    payments: torch.Tensor | None
+    rebates: torch.Tensor | None
 
 
 ROUTING_SHARE_UNIFORM = "uniform"

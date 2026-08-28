@@ -255,7 +255,7 @@ def test_active_coupling_preserves_vcg_auction_inputs() -> None:
 
     bids = coupled.last_stats.confidences * coupled.expert_wealth.view(1, 1, -1)
     expected_selected = torch.topk(bids, config.top_k, dim=-1).indices
-    _, _, expected_payments, _ = coupled.auctioneer(
+    _, _, expected_payments, _ = coupled.gate(
         coupled.last_stats.confidences,
         coupled.expert_wealth,
     )
