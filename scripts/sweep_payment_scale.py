@@ -54,8 +54,8 @@ def run(payment_scale: float, seed: int) -> dict[str, float]:
     rewards: list[float] = []
     original = mob._vcg_charges
 
-    def spy(payments, selected, num_tokens, reward_multiplier):
-        charge = original(payments, selected, num_tokens, reward_multiplier)
+    def spy(payments, selected, num_tokens, reward_multiplier, rebates=None):
+        charge = original(payments, selected, num_tokens, reward_multiplier, rebates)
         charges.append(charge.sum().item())
         return charge
 
