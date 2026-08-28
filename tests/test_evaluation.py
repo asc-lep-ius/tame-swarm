@@ -244,3 +244,65 @@ def test_repeated_evaluation_returns_the_identical_loss(
     assert first.loss == second.loss
     assert first.num_tokens == second.num_tokens
 
+
+def _trainer(**overrides):
+    from train import TAMETrainer, TrainingConfig
+
+    base = {"device": "cpu", "dataset_name": "wikitext", "dataset_config": "wikitext-2-raw-v1"}
+    base.update(overrides)
+    return TAMETrainer(TrainingConfig(**base))
+
+
+def test_a_cached_split_from_another_corpus_is_refused(held_out_split, tmp_path):
+    """Parity cannot catch this: every arm reads the same stale cache and agrees.
+
+    ``HeldOutSplit.load`` proves the file is self-consistent, which is a different
+    question from whether it is the split this run asked for.
+    """
+    trainer = _trainer(dataset_name="openwebtext", max_seq_length=16)
+
+    with pytest.raises(ValueError, match="dataset: cached"):
+        trainer._assert_cache_matches_config(held_out_split, tmp_path / "split.pt")
+
+
+def test_a_cached_split_of_another_length_is_refused(held_out_split, tmp_path):
+    trainer = _trainer(max_seq_length=512)
+
+    with pytest.raises(ValueError, match="max_seq_length: cached 16 vs configured 512"):
+        trainer._assert_cache_matches_config(held_out_split, tmp_path / "split.pt")
+
+
+def test_a_larger_cached_split_is_refused(held_out_split, tmp_path):
+    """A cache bigger than the config asked for was built for a different experiment.
+
+    ``held_out_sequences`` exists so the split size is a property of the experiment
+    rather than of whichever run built the cache first; this guard is the only thing
+    that enforces it.
+    """
+    trainer = _trainer(max_seq_length=16, held_out_sequences=4)
+
+    with pytest.raises(ValueError, match="held_out_sequences: cached 8 vs configured 4"):
+        trainer._assert_cache_matches_config(held_out_split, tmp_path / "split.pt")
+
+
+def test_a_smaller_cached_split_warns_rather_than_refusing(held_out_split, tmp_path, caplog):
+    """A short split is also what a source that ran out of usable rows produces.
+
+    Refusing it would make a small corpus unusable, so this is the one direction
+    that reports rather than stops.
+    """
+    trainer = _trainer(max_seq_length=16, held_out_sequences=64)
+
+    with caplog.at_level("WARNING"):
+        trainer._assert_cache_matches_config(held_out_split, tmp_path / "split.pt")
+
+    assert "8 sequences against the configured 64" in caplog.text
+
+
+def test_a_matching_cached_split_is_accepted(held_out_split, tmp_path, caplog):
+    trainer = _trainer(max_seq_length=16, held_out_sequences=8)
+
+    with caplog.at_level("WARNING"):
+        trainer._assert_cache_matches_config(held_out_split, tmp_path / "split.pt")
+
+    assert caplog.text == ""
