@@ -622,12 +622,16 @@ def test_rebate_never_exceeds_what_the_auction_collected():
         assert (returned > 0).any(), "fixture returns nothing; feasibility is vacuous"
 
         # The classical Cavallo bound, which does not depend on the divisor: every
-        # reference is at most b_(k+1), so sum_i (k/n) * ref_i <= k * b_(k+1). The
-        # credit assertion above cannot see a corrupted reference on its own — the
-        # w_max margin is wide enough to swallow one.
+        # reference is at most b_(k+1), so sum_i (k/n) * ref_i <= k * b_(k+1). This
+        # is tight (about 2% slack) on every fixture, whereas the credit assertion
+        # above leaves 20-33% on the wide-spread ones — so a modest reference
+        # inflation shows up here first.
         payout_in_bid_units = (outcome.rebates * wealth.max()).sum(dim=-1)
         displaced = torch.sort(_bids(confidences, wealth), dim=-1, descending=True)[0][..., top_k]
-        assert (payout_in_bid_units <= top_k * displaced + PAYMENT_TOLERANCE).all(), (
+        # Relative, not absolute: these are bid-unit quantities of order 100, where
+        # a 1e-5 absolute tolerance is really no tolerance at all.
+        bound = top_k * displaced
+        assert (payout_in_bid_units <= bound * (1 + PAYMENT_TOLERANCE)).all(), (
             f"n={num_experts} k={top_k}: exclusion rule returned too large a reference"
         )
 
@@ -667,3 +671,54 @@ def test_rebate_leaves_the_deviation_sweep_intact():
             assert _expert_zero_utility(auctioneer, report, true_value) <= (
                 truthful + PAYMENT_TOLERANCE
             )
+
+
+@pytest.mark.parametrize(
+    ("regime", "wealth", "expected_return"),
+    [
+        ("flat", torch.full((8,), 100.0), 0.94),
+        ("configured band", torch.linspace(15.0, 750.0, 8), 0.68),
+        ("max_wealth monopoly", torch.tensor([750.0] + [15.0] * 7), 0.04),
+    ],
+)
+def test_returned_fraction_matches_the_documented_regimes(regime, wealth, expected_return):
+    """Pin the numbers both READMEs quote, and pin them from below.
+
+    Feasibility only bounds the rebate from above, so a divisor returning 1% of
+    Cavallo passes every other test here while making the documented 94/68/4%
+    figures wrong. This is the test that fails when the divisor changes — which it
+    is expected to, under #15 — and it should fail, because the prose changes with
+    it.
+    """
+    torch.manual_seed(11)
+    auctioneer = _make_auction(num_experts=8, top_k=2)
+    auctioneer.eval()
+
+    outcome = auctioneer(torch.rand(64, 16, 8), wealth)
+    returned = outcome.rebates.sum(dim=-1).sum() / outcome.payments.sum(dim=-1).sum()
+
+    assert returned.item() == pytest.approx(expected_return, abs=0.02), (
+        f"{regime}: returned fraction moved; the README figures need updating too"
+    )
+
+
+def test_rebate_is_bounded_from_below_by_the_cavallo_reference():
+    """A uniformly down-scaled reference is feasible, wrong, and otherwise invisible.
+
+    Every other assertion here bounds the rebate from above. Without this one, a
+    rule handing back a hundredth of what Cavallo specifies passes the whole file.
+    """
+    auctioneer = _make_auction(num_experts=6, top_k=2)
+    auctioneer.eval()
+
+    wealth = torch.linspace(15.0, 750.0, 6)
+    confidences = torch.rand(4, 8, 6)
+    outcome = auctioneer(confidences, wealth)
+
+    bids = _bids(confidences, wealth)
+    ranked = torch.sort(bids, dim=-1, descending=True)[0]
+    # Every reference is at least b_(k+2), so the payout is at least (k/n)*n*b_(k+2).
+    floor = (2 / 6) * 6 * ranked[..., 3] / wealth.max()
+
+    assert (outcome.rebates.sum(dim=-1) >= floor - PAYMENT_TOLERANCE).all()
+    assert (floor > 0).any(), "fixture has no lower bound to check"

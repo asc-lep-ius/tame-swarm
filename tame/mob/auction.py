@@ -18,10 +18,13 @@ PAYMENT_NEGATIVITY_TOLERANCE = 1e-5
 # cannot win: with mixed signs a negative bid can still place in the top k. A
 # negative-wealth winner sits in the top k, so b_(k+1) is at most its own negative
 # bid, and the payment-negativity assert below fires on the numerator -- unless that
-# bid is within the assert's tolerance of zero, which a wealth of about -1e-7 would
-# be. MoBConfig rejects non-positive wealth bounds and all three update paths clamp
-# to min_wealth, so that residual case cannot arise; the boundary is where the real
-# guard lives, and an assert here would be unreachable.
+# bid is within the assert's tolerance of zero. That tolerance is relative to the
+# largest bid, so at the configured max_wealth the silent window reaches a wealth of
+# about -1e-4 -- and it is the middle of that window that hurts: -1e-7 underflows to
+# a price of exactly zero, while -1e-4 divides through the clamp to about -1.8e8.
+# MoBConfig rejects non-positive wealth bounds, the three update paths clamp, and
+# load_mob_state clamps what it restores, so no writer can produce it; the boundary
+# is where the real guard lives, and an assert here would be unreachable.
 WEALTH_EPSILON = 1e-12
 
 
@@ -88,7 +91,7 @@ class VCGAuctioneer(nn.Module):
         return AuctionOutcome(selected_experts, routing_weights, payments, rebates)
 
     def _compute_rebates(self, bids: torch.Tensor, wealth: torch.Tensor) -> torch.Tensor:
-        """Return most of the collected payment without touching anyone's incentives.
+        """Return part of the collected payment without touching anyone's incentives.
 
         VCG prices have no recipient here. Burned, they make the expert economy an
         open system: with payments correctly scaled the outflow dwarfs the reward
@@ -126,14 +129,16 @@ class VCGAuctioneer(nn.Module):
         reports this token.
 
         The cost is under-rebating, and it is regime-dependent rather than small.
-        The returned fraction is roughly ``harmonic_mean(winners' wealth) / w_max``:
+        The returned fraction is at most ``harmonic_mean(winners' wealth) / w_max``
+        and runs a little under it -- measured 94% / 68% / 3.6% against a bound of
+        100% / 78% / 3.9%:
         around 93% of the collection comes back on a flat wealth vector, 68% across
         the configured band, and under 4% when one expert sits at ``max_wealth`` and
         the rest at the floor -- which is the monopoly regime ``train.py`` already
         warns about, so the rebate is weakest where the drain bites hardest. A
         tighter safe divisor exists (the harmonic mean of the k richest wealths, also
-        report-independent); choosing it is mechanism design and belongs with the
-        rest of the economy work in #15.
+        report-independent); choosing it is mechanism design, and the option is
+        recorded on the #15 row of the roadmap in the top-level README.
         """
         batch, seq_len, _ = bids.shape
         k, n = self.top_k, self.num_experts
@@ -276,8 +281,9 @@ class VCGAuctioneer(nn.Module):
             f"VCG payment is negative ({low:.3e}); the auction's welfare accounting is inconsistent"
         )
         # WEALTH_EPSILON exists to keep a zero-wealth winner from dividing by zero,
-        # not to absorb a negative one: clamping a negative wealth up to 1e-12 turns
-        # a valid numerator into an enormous positive price with nothing complaining.
+        # not to absorb a negative one: a negative-wealth winner drags b_(k+1) below
+        # zero too, so clamping its wealth up to 1e-12 divides a negative numerator
+        # into an enormous negative price with nothing complaining.
 
     def _differentiable_routing(
         self, bids: torch.Tensor, selected_experts: torch.Tensor

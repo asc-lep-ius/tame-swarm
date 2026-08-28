@@ -197,6 +197,13 @@ def load_mob_state(
             wealth = torch.tensor(state["wealth"], device=device, dtype=mob.expert_wealth.dtype)
             if wealth.shape == mob.expert_wealth.shape:
                 mob.expert_wealth.copy_(wealth)
+                # The three update paths clamp; a restore is the fourth writer and
+                # the only one reading from outside the process. The auction divides
+                # each price by the winner's own wealth, so a checkpoint carrying a
+                # zero or negative entry -- truncated, hand-edited, or written by an
+                # older config with different bounds -- would reach that division
+                # rather than the boundary validation in MoBConfig.
+                mob.expert_wealth.clamp_(min=mob.config.min_wealth, max=mob.config.max_wealth)
             else:
                 logger.warning(
                     f"{key}: wealth shape mismatch "

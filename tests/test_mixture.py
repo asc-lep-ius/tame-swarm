@@ -215,3 +215,35 @@ def test_apply_mob_replaces_mlp(tiny_config):
 
     untouched = fake_model.model.layers[0].mlp
     assert not isinstance(untouched, MixtureOfBidders)
+
+
+def test_restored_wealth_is_clamped_to_the_configured_bounds(tmp_path, tiny_config):
+    """A checkpoint is the fourth writer to expert_wealth, and the only external one.
+
+    The three update paths clamp; `load_mob_state` did not. The auction divides each
+    winner's price by its own wealth, so a restored zero or negative entry reaches
+    that division rather than the boundary validation in `MoBConfig` — and a
+    negative one small enough to sit inside the payment-negativity tolerance turns
+    into a price of about -1.8e8 with nothing complaining.
+    """
+
+    class FakeModel(nn.Module):
+        def __init__(self, mob):
+            super().__init__()
+            self.mob = mob
+
+    mob = MixtureOfBidders(tiny_config)
+    save_path = str(tmp_path / "mob_state.pt")
+    save_mob_state(FakeModel(mob), save_path)
+
+    # A checkpoint that a truncated write, a hand edit, or an older config could
+    # plausibly produce: one bankrupt expert, one above the ceiling.
+    state = torch.load(save_path, weights_only=True)
+    state["layer_0"]["wealth"] = [-1e-4, tiny_config.max_wealth * 10]
+    torch.save(state, save_path)
+
+    restored = MixtureOfBidders(tiny_config)
+    load_mob_state(FakeModel(restored), save_path)
+
+    assert (restored.expert_wealth >= tiny_config.min_wealth).all()
+    assert (restored.expert_wealth <= tiny_config.max_wealth).all()
