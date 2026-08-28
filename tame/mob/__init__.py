@@ -17,7 +17,12 @@ except ImportError:
         detach_coupling,
     )
 
-from .auction import VCGAuctioneer
+from .auction import (
+    ROUTING_SATURATION_THRESHOLD,
+    RoutingDiagnostics,
+    VCGAuctioneer,
+    routing_diagnostics,
+)
 from .core import MixtureOfBidders, MoBStats, apply_mob_to_model
 from .experts import ConfidenceHead, Expert, LightweightExpert
 from .mob_config import MoBConfig
@@ -37,6 +42,9 @@ __all__ = [
     "Expert",
     "LightweightExpert",
     "VCGAuctioneer",
+    "RoutingDiagnostics",
+    "routing_diagnostics",
+    "ROUTING_SATURATION_THRESHOLD",
     "SteeringCouplingConfig",
     "CouplingMetrics",
     "SteeringCoupling",

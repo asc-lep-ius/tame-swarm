@@ -13,7 +13,7 @@ except ImportError:
         raise
     from coupling import CouplingMetrics, SteeringCoupling, SteeringCouplingConfig
 
-from .auction import VCGAuctioneer
+from .auction import RoutingDiagnostics, VCGAuctioneer, routing_diagnostics
 from .experts import ConfidenceHead, Expert, LightweightExpert
 from .mob_config import MoBConfig
 from .wealth import WealthUpdateMixin
@@ -31,6 +31,7 @@ class MoBStats:
     expert_usage: torch.Tensor
     expert_performance: torch.Tensor
     router_z_loss: torch.Tensor
+    routing: RoutingDiagnostics
     coupling_metrics: CouplingMetrics | None = None
 
 
@@ -76,6 +77,7 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
             config.top_k,
             differentiable=config.use_differentiable_routing,
             routing_share=config.routing_share,
+            temperature=config.routing_temperature,
         )
 
         self.register_buffer(
@@ -219,6 +221,10 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
             expert_usage=self.expert_usage_count.detach().clone(),
             expert_performance=self.expert_performance_ema.detach().clone(),
             router_z_loss=router_z_loss.detach(),
+            # The statistic that would have surfaced a gate saturating on the wealth
+            # scale, so it is recorded on every step rather than reached for after a
+            # result looks wrong. Left as device tensors; the training loop syncs.
+            routing=routing_diagnostics(routing_weights),
             coupling_metrics=coupling_metrics,
         )
         self._last_coupling_metrics = coupling_metrics

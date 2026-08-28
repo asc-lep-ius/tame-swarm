@@ -18,6 +18,8 @@ def test_default_values_match_expected():
     assert cfg.adapter_rank == 64
     assert cfg.adapter_alpha == 16.0
     assert cfg.use_differentiable_routing is True
+    assert cfg.routing_share == "uniform"
+    assert cfg.routing_temperature == 1.0
 
 
 def test_config_is_mutable():
@@ -63,3 +65,16 @@ def test_initial_wealth_outside_the_band_is_rejected(initial):
     """
     with pytest.raises(ValueError, match="must lie within"):
         MoBConfig(min_wealth=15.0, max_wealth=750.0, initial_wealth=initial)
+
+
+@pytest.mark.parametrize("temperature", [0.0, -0.5])
+def test_non_positive_routing_temperature_is_rejected(temperature):
+    """Sharpness is a dial, not a sign.
+
+    The proportional gate raises each bid to ``1 / routing_temperature``. Zero
+    divides, and a negative exponent inverts the ranking, so the gate would hand the
+    largest share of the output to the expert that bid least while the auction
+    charged the one that bid most.
+    """
+    with pytest.raises(ValueError, match="routing_temperature must be positive"):
+        MoBConfig(routing_temperature=temperature)

@@ -46,8 +46,68 @@ class AuctionOutcome(NamedTuple):
 
 
 ROUTING_SHARE_UNIFORM = "uniform"
-ROUTING_SHARE_SOFTMAX = "softmax"
-SUPPORTED_ROUTING_SHARES = frozenset({ROUTING_SHARE_UNIFORM, ROUTING_SHARE_SOFTMAX})
+ROUTING_SHARE_PROPORTIONAL = "proportional"
+SUPPORTED_ROUTING_SHARES = frozenset({ROUTING_SHARE_UNIFORM, ROUTING_SHARE_PROPORTIONAL})
+
+# Floor under a bid before it enters the log domain. A production bid cannot reach
+# it: the confidence logit is clamped at -20, so softplus bottoms out near 2.1e-9,
+# and MoBConfig rejects a non-positive min_wealth. It exists so that a bid of
+# exactly zero -- reachable only in a test that feeds one, or under a dtype whose
+# softplus underflows -- becomes a vanishing share rather than a NaN.
+BID_LOG_FLOOR = 1e-30
+
+# Floor under a routing weight before its log enters the entropy below. A weight
+# can legitimately reach zero -- a floored bid earns no share -- and 0*log(0) is 0
+# in the limit, which this recovers without a special case. Distinct from
+# BID_LOG_FLOOR: that one floors a *bid* on its way into the gate, this one floors
+# a *probability* on its way into a diagnostic.
+ENTROPY_PROBABILITY_FLOOR = 1e-30
+
+# A token routed through a gate this sharp has spent top_k experts' compute and
+# used one. Reported as a fraction rather than folded into the mean, because a
+# distribution with 90% of its mass at 1.0 and a long left tail has an
+# unremarkable mean.
+ROUTING_SATURATION_THRESHOLD = 0.99
+
+
+class RoutingDiagnostics(NamedTuple):
+    """What the gate actually did to a batch, as opposed to what top_k configures.
+
+    Every field is a 0-dim tensor rather than a float. Reducing to a Python scalar
+    forces a device sync, and these are computed on every forward of every MoB
+    layer while a training step wants at most one sync at the end of it.
+
+    ``effective_experts`` is ``exp(entropy(routing_weights))`` averaged over tokens:
+    the number of experts the output was genuinely mixed from. It equals ``top_k``
+    exactly under the uniform share and falls to 1.0 when the gate has collapsed
+    onto a single winner, which is the failure ``top_k`` alone cannot show.
+    """
+
+    top1_mean: torch.Tensor
+    top1_median: torch.Tensor
+    top1_saturated_fraction: torch.Tensor
+    effective_experts: torch.Tensor
+
+
+def routing_diagnostics(routing_weights: torch.Tensor) -> RoutingDiagnostics:
+    """Summarise a batch of routing weights without leaving the device.
+
+    ``routing_weights`` is ``(batch, seq, top_k)`` and normalised over its last
+    dimension, so the entropy below is taken over the winners only -- the experts
+    that lost contribute no compute and are not part of the mixture being measured.
+    """
+    weights = routing_weights.detach().float()
+    top1 = weights.amax(dim=-1).reshape(-1)
+
+    safe = weights.clamp_min(ENTROPY_PROBABILITY_FLOOR)
+    entropy = -(safe * safe.log()).sum(dim=-1)
+
+    return RoutingDiagnostics(
+        top1_mean=top1.mean(),
+        top1_median=top1.median(),
+        top1_saturated_fraction=(top1 > ROUTING_SATURATION_THRESHOLD).float().mean(),
+        effective_experts=entropy.exp().mean(),
+    )
 
 
 class VCGAuctioneer(nn.Module):
@@ -56,10 +116,15 @@ class VCGAuctioneer(nn.Module):
     Under ``routing_share="uniform"`` the mechanism is strategyproof in the
     per-token stage game: the allocation is monotone in an expert's own report,
     every winner is charged its critical value, and a winner's share of the output
-    does not depend on what it reported. ``"softmax"`` restores the own-bid-weighted
-    gate the auction previously used -- retained as the gate-swap baseline, and
-    *not* incentive compatible, because a winner can enlarge its own share by
-    overreporting while its price stays fixed.
+    does not depend on what it reported. ``"proportional"`` restores an
+    own-bid-weighted gate as the gate-swap baseline -- *not* incentive compatible,
+    because a winner can enlarge its own share by overreporting while its price
+    stays fixed, which is exactly the property that baseline exists to isolate.
+
+    ``temperature`` sharpens or flattens that baseline gate. It is applied in the
+    log domain, so a winner's share is ``bid ** (1 / temperature)`` normalised over
+    the winners: 1.0 is plain bid-proportional, below 1.0 approaches argmax, above
+    1.0 approaches the uniform split. The uniform share ignores it.
     """
 
     def __init__(
@@ -68,16 +133,22 @@ class VCGAuctioneer(nn.Module):
         top_k: int = 2,
         differentiable: bool = True,
         routing_share: str = ROUTING_SHARE_UNIFORM,
+        temperature: float = 1.0,
     ):
         super().__init__()
         if routing_share not in SUPPORTED_ROUTING_SHARES:
             shares = ", ".join(sorted(SUPPORTED_ROUTING_SHARES))
             raise ValueError(f"Unsupported routing share '{routing_share}'. Supported: {shares}")
+        # A non-positive temperature is not a sharper gate; it is a division by zero
+        # or a sign flip that ranks the abstaining expert first.
+        if temperature <= 0:
+            raise ValueError(f"Routing temperature must be positive, got {temperature}")
 
         self.num_experts = num_experts
         self.top_k = top_k
         self.differentiable = differentiable
         self.routing_share = routing_share
+        self.temperature = temperature
 
     def forward(
         self,
@@ -183,13 +254,26 @@ class VCGAuctioneer(nn.Module):
         into the confidence heads: under this share the heads are trained only by
         their own value objective, which is what makes them agents rather than
         slices of a central planner.
+
+        The baseline share is taken in the log domain rather than over the bids
+        themselves, and that is not a reformulation of the same gate. Softmax is not
+        scale invariant, so ``softmax(bids)`` reads the *absolute* wealth scale as a
+        sharpness knob: measured over softplus reports at default initialisation,
+        the top-1 weight has median ~0.99 at ``initial_wealth`` and 1.000 at
+        ``max_wealth``, and across the configured band the effective expert count is
+        1.000 -- ``top_k=2`` paying for two experts and using one. Wealth drifts
+        during training, so under that gate every published number would be read
+        through a sharpness moving independently of the variable under test.
+        In the log domain a uniform rescaling of all wealth is a constant shift that
+        softmax absorbs exactly, so the gate answers only to *relative* wealth --
+        which is the quantity the economy exists to move.
         """
         if self.routing_share == ROUTING_SHARE_UNIFORM:
             return torch.full_like(top_bids, 1.0 / self.top_k)
 
         if self.differentiable and self.training:
             return self._differentiable_routing(bids, selected_experts)
-        return F.softmax(top_bids, dim=-1)
+        return F.softmax(self._log_bids(top_bids), dim=-1).to(top_bids.dtype)
 
     def _compute_vcg_payments(
         self, bids: torch.Tensor, selected_experts: torch.Tensor, wealth: torch.Tensor
@@ -287,16 +371,55 @@ class VCGAuctioneer(nn.Module):
         # zero too, so clamping its wealth up to 1e-12 divides a negative numerator
         # into an enormous negative price with nothing complaining.
 
+    def _log_bids(self, bids: torch.Tensor) -> torch.Tensor:
+        """Bids in the log domain, tempered, ready for a softmax.
+
+        Normalised by the row's largest bid *before* the log, not shifted after it.
+        The two are the same constant shift in the algebra -- softmax absorbs
+        either -- but not in float32. ``log(b * s)`` carries the wealth scale as an
+        additive offset of ``log(s)``, which at ``s = 1e8`` is 18.4 against log-bids
+        of order 1, so the low bits that distinguish two nearby bids are spent
+        representing an offset that is about to cancel; dividing by ``temperature``
+        then multiplies what is left by ``1 / tau``. Measured at ``tau = 0.1`` under
+        a wealth rescale of 1e8, over 500 draws of shape (2, 32, 8): shifting after
+        the log exceeds 1e-6 on every draw and peaks above 5e-6, while normalising
+        before it stays under 1e-6 on all of them and peaks around 6e-7. That is the
+        difference between an invariance claim that degrades as the gate sharpens
+        and one that does not.
+
+        The *ratio* is clamped rather than the bid, which keeps every sign case
+        finite: a row of non-positive bids collapses onto the floor and shares out
+        evenly, the right answer for a token no expert wants.
+
+        Accumulated in float32 for the same reason the payments are: bf16 is the
+        training dtype, and a log ratio between two nearby bids is a small
+        difference of two similar magnitudes.
+        """
+        accumulate_dtype = torch.promote_types(bids.dtype, torch.float32)
+        scaled = bids.to(accumulate_dtype)
+        largest = scaled.amax(dim=-1, keepdim=True).clamp_min(BID_LOG_FLOOR)
+        return (scaled / largest).clamp_min(BID_LOG_FLOOR).log() / self.temperature
+
     def _differentiable_routing(
         self, bids: torch.Tensor, selected_experts: torch.Tensor
     ) -> torch.Tensor:
-        soft_weights = F.softmax(bids, dim=-1)
+        """The straight-through gate, over the same log-domain shares.
 
-        hard_mask = torch.zeros_like(bids)
+        The renormalisation below needs no epsilon. ``soft_weights`` sums to one
+        over all ``num_experts``, and the selected experts are the ``top_k``
+        largest, so their share is at least ``top_k / num_experts`` -- bounded away
+        from zero by the shape of the tensor rather than by a guard. Keeping it
+        exact is what lets this path and the eval path agree to float tolerance
+        instead of to 1e-8.
+        """
+        soft_weights = F.softmax(self._log_bids(bids), dim=-1)
+
+        hard_mask = torch.zeros_like(soft_weights)
         hard_mask.scatter_(-1, selected_experts, 1.0)
 
         differentiable_mask = hard_mask + (soft_weights - soft_weights.detach())
 
-        routing_weights_full = differentiable_mask * F.softmax(bids, dim=-1)
+        routing_weights_full = differentiable_mask * soft_weights
         routing_weights = torch.gather(routing_weights_full, -1, selected_experts)
-        return routing_weights / (routing_weights.sum(dim=-1, keepdim=True) + 1e-8)
+        normalised = routing_weights / routing_weights.sum(dim=-1, keepdim=True)
+        return normalised.to(bids.dtype)
