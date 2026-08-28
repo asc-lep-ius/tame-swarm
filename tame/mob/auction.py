@@ -141,19 +141,22 @@ class VCGAuctioneer(nn.Module):
             top_without_j, _ = torch.topk(masked_bids, k, dim=-1)
             payments[:, :, j] = top_without_j.sum(dim=-1) - other_winner_welfare[:, :, j]
 
+        winner_wealth = wealth.to(payments.dtype)[selected_experts]
+
         # Checked on the weighted welfare difference, before the division rescales
         # it: that is the quantity the accounting produces, and the tolerance below
         # is stated relative to the bid magnitudes it is differencing.
         if __debug__:
-            self._assert_payments_well_formed(payments, bids)
+            self._assert_payments_well_formed(payments, bids, winner_wealth)
 
-        winner_wealth = wealth.to(payments.dtype)[selected_experts]
         payments = payments / winner_wealth.clamp_min(WEALTH_EPSILON)
 
         return payments.to(out_dtype)
 
     @staticmethod
-    def _assert_payments_well_formed(payments: torch.Tensor, bids: torch.Tensor) -> None:
+    def _assert_payments_well_formed(
+        payments: torch.Tensor, bids: torch.Tensor, winner_wealth: torch.Tensor
+    ) -> None:
         """Fail loudly on a broken mechanism invariant rather than repairing it.
 
         Non-negativity holds whenever bids do (sigmoid confidence x positive wealth).
@@ -166,8 +169,13 @@ class VCGAuctioneer(nn.Module):
         in a method, the call itself is not an assert and -O would otherwise strip
         the checks while still paying for the sync.
         """
-        low, high, max_bid = torch.stack(
-            [payments.detach().min(), payments.detach().max(), bids.detach().abs().amax()]
+        low, high, max_bid, min_wealth = torch.stack(
+            [
+                payments.detach().min(),
+                payments.detach().max(),
+                bids.detach().abs().amax(),
+                winner_wealth.detach().min(),
+            ]
         ).tolist()
 
         assert math.isfinite(low) and math.isfinite(high), (
@@ -176,6 +184,13 @@ class VCGAuctioneer(nn.Module):
         tolerance = PAYMENT_NEGATIVITY_TOLERANCE * max(max_bid, 1.0)
         assert low >= -tolerance, (
             f"VCG payment is negative ({low:.3e}); the auction's welfare accounting is inconsistent"
+        )
+        # WEALTH_EPSILON exists to keep a zero-wealth winner from dividing by zero,
+        # not to absorb a negative one: clamping a negative wealth up to 1e-12 turns
+        # a valid numerator into an enormous positive price with nothing complaining.
+        assert min_wealth > 0.0, (
+            f"winner wealth is non-positive ({min_wealth:.3e}); "
+            f"the weighted price is undefined and the epsilon clamp would hide it"
         )
 
     def _differentiable_routing(

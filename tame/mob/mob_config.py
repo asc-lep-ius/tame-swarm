@@ -18,15 +18,12 @@ class MoBConfig:
     jitter_std: float = 0.08
     reward_scale: float = 2.0
     use_vcg_payments: bool = True
-    # Converts VCG payments into reward units for the quasi-linear wealth update.
-    # Prices are denominated in an expert's own value units -- the weighted
-    # externality divided by its own wealth -- so they are far smaller than the
-    # bid-unit prices the previous 0.02 was swept for. Re-swept over 400 steps x 3
-    # seeds: 0.3 charges ~8% of reward flow, matching the fraction the bid-unit
-    # sweep settled on, while >=1.5 collapses the wealth spread on every seed.
-    # Between 0.05 and 1.4 the seed-to-seed spread in Gini exceeds the difference
-    # between scales, so this is pinned by the charge fraction, not by Gini.
-    payment_scale: float = 0.3
+    # Dimensionless deviation from the balanced transfer, not a unit conversion.
+    # Reward and charge share one coefficient derived from reward_scale, the path's
+    # reward multiplier and top_k, so 1.0 is the quasi-linear point the VCG results
+    # require and anything else deliberately over- or under-prices the auction.
+    # scripts/sweep_payment_scale.py sweeps around it.
+    payment_scale: float = 1.0
     use_shared_base: bool = True
     adapter_rank: int = 64
     adapter_alpha: float = 16.0
@@ -46,6 +43,15 @@ class MoBConfig:
     inference_wealth_compression: float = 0.4
 
     def __post_init__(self) -> None:
+        # The auction divides each winner's externality by its own wealth to price
+        # it in the winner's own units. A non-positive wealth makes that division
+        # meaningless, and the clamp guarding it would turn a valid numerator into
+        # an astronomically large price with no invariant firing.
+        if self.min_wealth <= 0:
+            raise ValueError(f"min_wealth must be positive, got {self.min_wealth}")
+        if self.initial_wealth <= 0:
+            raise ValueError(f"initial_wealth must be positive, got {self.initial_wealth}")
+
         if self.routing_share not in SUPPORTED_ROUTING_SHARES:
             shares = ", ".join(sorted(SUPPORTED_ROUTING_SHARES))
             raise ValueError(

@@ -124,11 +124,27 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         """Forward pass through the MoB layer."""
         batch_size, seq_len, hidden_dim = hidden_states.shape
 
-        confidence_hidden_states = hidden_states
+        # Both caches belong to the forward pass that produced them. The value
+        # objective holds a live graph, so a stale one is not a harmless constant
+        # the way the old detached calibration loss was -- a training step that
+        # forwards without calling update_wealth_from_loss would backward through a
+        # graph the previous step already freed.
+        self._cached_calibration_loss = None
+        self._live_confidences = None
+
+        # The routing path observes the representation; it does not reshape it. Every
+        # head reads the same hidden states, so without this detach each expert's
+        # private value objective backpropagates into the backbone that every other
+        # expert reads -- a shared auxiliary loss, which is the central planner the
+        # auction exists to replace. Detaching the input rather than the coupling
+        # output keeps SteeringCoupling.projection trainable.
+        routing_hidden_states = hidden_states.detach()
+
+        confidence_hidden_states = routing_hidden_states
         coupling_metrics: CouplingMetrics | None = None
         coupling = self._get_coupling()
         if coupling is not None:
-            confidence_hidden_states = coupling(hidden_states)
+            confidence_hidden_states = coupling(routing_hidden_states)
             coupling_metrics = coupling.last_metrics
 
         confidence_logits = torch.stack(

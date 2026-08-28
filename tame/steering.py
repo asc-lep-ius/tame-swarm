@@ -67,6 +67,10 @@ def project_steering_direction(
     Returns the direction to inject and the share of the original norm that
     survived the projection.
 
+    ``vector`` is expected to be unit norm, as ``SteeringVector`` guarantees. The
+    success path returns a unit vector and the fallback returns ``vector``
+    unchanged, so the two agree on magnitude only under that precondition.
+
     ``base_strength`` is calibrated against a unit direction, so returning the
     shortened vector unnormalised would silently weaken steering in proportion to
     how much of it overlapped the capability subspace -- turning a projection into
