@@ -535,11 +535,13 @@ def test_negative_wealth_trips_the_negativity_assert():
     in the top k when the alternatives are worse. A negative-wealth winner sits in
     the top k, so b_(k+1) is at most its own negative bid, and the payment-negativity
     assert fires on the numerator before the division that the epsilon clamp guards
-    -- unless that bid is inside the assert's tolerance of zero, which needs a wealth
-    around -1e-7. MoBConfig rejects non-positive wealth bounds and every update path
-    clamps to min_wealth, so that residual case cannot arise in the pipeline. A
-    second assert here would be unreachable code documenting a protection that never
-    runs.
+    -- unless that bid is inside the assert's tolerance of zero. That tolerance is
+    `1e-5 * max(max_bid, 1.0)`, so the silent window scales with the largest bid
+    rather than sitting at a fixed wealth; `auction.py` records what it comes to at
+    the configured `max_wealth`. Four guards keep the pipeline out of it: MoBConfig
+    rejects non-positive bounds and an inverted band, the three update paths clamp,
+    and `load_mob_state` clamps what it restores. A second assert here would be
+    unreachable code documenting a protection that never runs.
     """
     auctioneer = _make_auction(num_experts=4, top_k=2)
     auctioneer.eval()
@@ -624,11 +626,13 @@ def test_rebate_never_exceeds_what_the_auction_collected():
         # The classical Cavallo bound, which does not depend on the divisor: every
         # reference is at most b_(k+1), so sum_i (k/n) * ref_i <= k * b_(k+1).
         # Measured slack, credit vs bid-unit: 16.6/2.5, 24.7/2.4, 2.0/2.0, 72.4/61.6.
-        # So this bound is the tight one on the two wide-spread fixtures, where a 3%
-        # reference inflation trips it and the credit assertion sleeps through; on
-        # n=5 k=1 they coincide, because a single winner collapses the harmonic mean
-        # onto w_max; and on n=4 k=2 both are slack, because k+2 == n leaves the
-        # reference at the bottom of the bid vector.
+        # So this bound is the tight one wherever k >= 2 and n > k + 2 -- a 3%
+        # reference inflation trips it while the credit assertion sleeps through.
+        # All four fixtures share one wealth spread, so that is what separates
+        # them, not the spread. On n=5 k=1 the two coincide, because a lone winner
+        # collapses the harmonic mean onto its own wealth and the tight token is
+        # one the richest expert takes; on n=4 k=2 both are slack, because
+        # k + 2 == n leaves the reference at the bottom of the bid vector.
         payout_in_bid_units = (outcome.rebates * wealth.max()).sum(dim=-1)
         displaced = torch.sort(_bids(confidences, wealth), dim=-1, descending=True)[0][..., top_k]
         # Relative, not absolute: these are bid-unit quantities of order 100, where

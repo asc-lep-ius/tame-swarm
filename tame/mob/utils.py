@@ -203,13 +203,25 @@ def load_mob_state(
                 # zero or negative entry -- truncated, hand-edited, or written by an
                 # older config with different bounds -- would reach that division
                 # rather than the boundary validation in MoBConfig.
+                # NaN is the reason this is not a bare clamp: clamp_ passes it
+                # through, and a diverged run's checkpoint is at least as likely as a
+                # hand-edited one. Under -O the finiteness assert in the auction is
+                # compiled out, so a NaN wealth would otherwise reach the bid
+                # silently. Non-finite entries reset to initial_wealth rather than to
+                # a bound, because their true value is unknown rather than extreme.
+                mob.expert_wealth.nan_to_num_(
+                    nan=mob.config.initial_wealth,
+                    posinf=mob.config.max_wealth,
+                    neginf=mob.config.min_wealth,
+                )
                 mob.expert_wealth.clamp_(min=mob.config.min_wealth, max=mob.config.max_wealth)
                 if not torch.equal(mob.expert_wealth, wealth):
                     logger.warning(
-                        f"{key}: restored wealth fell outside "
-                        f"[{mob.config.min_wealth}, {mob.config.max_wealth}] and was "
-                        f"clamped; a checkpoint from a different wealth band will "
-                        f"have its spread flattened onto the current bounds"
+                        f"{key}: restored wealth was not usable as saved and has been "
+                        f"repaired into [{mob.config.min_wealth}, "
+                        f"{mob.config.max_wealth}]; a checkpoint from a different "
+                        f"wealth band will have its spread flattened onto the current "
+                        f"bounds, and a non-finite entry reset to initial_wealth"
                     )
             else:
                 logger.warning(

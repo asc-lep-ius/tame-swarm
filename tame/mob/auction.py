@@ -131,12 +131,11 @@ class VCGAuctioneer(nn.Module):
 
         The cost is under-rebating, and it is regime-dependent rather than small.
         The returned fraction is at most ``harmonic_mean(winners' wealth) / w_max``
-        and runs a little under it -- measured 94% / 68% / 3.6% against a bound of
-        100% / 78% / 3.9%:
-        around 94% of the collection comes back on a flat wealth vector, 68% across
-        the configured band, and under 4% when one expert sits at ``max_wealth`` and
-        the rest at the floor -- which is the monopoly regime ``train.py`` already
-        warns about, so the rebate is weakest where the drain bites hardest. A
+        and runs a little under it: measured 94% on a flat wealth vector, 68% across
+        the configured band and 3.6% when one expert sits at ``max_wealth`` and the
+        rest at the floor, against a bound of 100% / 78% / 3.9%. That last regime is
+        the monopoly state ``train.py`` already warns about, so the rebate is weakest
+        where the drain bites hardest. A
         tighter safe divisor exists (the harmonic mean of the k richest wealths, also
         report-independent); choosing it is mechanism design, and the option is
         recorded on the #15 row of the roadmap in the top-level README.

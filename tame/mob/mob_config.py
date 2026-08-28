@@ -59,6 +59,14 @@ class MoBConfig:
             raise ValueError(
                 f"max_wealth ({self.max_wealth}) must be at least min_wealth ({self.min_wealth})"
             )
+        # Otherwise every expert starts outside the band and the first wealth update
+        # yanks them all to a bound -- a step-zero discontinuity that reads as a
+        # training artefact rather than a config error.
+        if not self.min_wealth <= self.initial_wealth <= self.max_wealth:
+            raise ValueError(
+                f"initial_wealth ({self.initial_wealth}) must lie within "
+                f"[{self.min_wealth}, {self.max_wealth}]"
+            )
 
         if self.routing_share not in SUPPORTED_ROUTING_SHARES:
             shares = ", ".join(sorted(SUPPORTED_ROUTING_SHARES))

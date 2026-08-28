@@ -51,3 +51,15 @@ def test_inverted_wealth_band_is_rejected():
     """
     with pytest.raises(ValueError, match="max_wealth"):
         MoBConfig(min_wealth=15.0, max_wealth=5.0)
+
+
+@pytest.mark.parametrize("initial", [5.0, 800.0])
+def test_initial_wealth_outside_the_band_is_rejected(initial):
+    """Seeding outside the band makes step zero a discontinuity, not a starting point.
+
+    Every expert would begin out of bounds and the first wealth update would yank
+    them all onto a bound at once — which reads as a training artefact rather than
+    the config error it is.
+    """
+    with pytest.raises(ValueError, match="initial_wealth"):
+        MoBConfig(min_wealth=15.0, max_wealth=750.0, initial_wealth=initial)
