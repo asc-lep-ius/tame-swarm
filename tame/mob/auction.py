@@ -14,12 +14,14 @@ PAYMENT_NEGATIVITY_TOLERANCE = 1e-5
 # when the displaced bid is also zero -- the numerator vanishes with the
 # denominator and the clamp returns a price of zero rather than an infinity.
 #
-# Negative wealth never reaches this clamp, though not because it cannot win: with
-# mixed signs a negative bid can still place in the top k. It cannot win *quietly* --
-# a negative-wealth winner sits in the top k, so b_(k+1) is at most its own negative
-# bid, and the payment-negativity assert below fires on the numerator before the
-# division happens. MoBConfig rejects non-positive wealth bounds at the boundary,
-# which is where the real guard lives; an assert here would be unreachable.
+# Negative wealth never reaches this clamp in production, though not because it
+# cannot win: with mixed signs a negative bid can still place in the top k. A
+# negative-wealth winner sits in the top k, so b_(k+1) is at most its own negative
+# bid, and the payment-negativity assert below fires on the numerator -- unless that
+# bid is within the assert's tolerance of zero, which a wealth of about -1e-7 would
+# be. MoBConfig rejects non-positive wealth bounds and all three update paths clamp
+# to min_wealth, so that residual case cannot arise; the boundary is where the real
+# guard lives, and an assert here would be unreachable.
 WEALTH_EPSILON = 1e-12
 
 
@@ -111,14 +113,27 @@ class VCGAuctioneer(nn.Module):
         over-rebates by up to 7.4x and turns the transfer into a money pump that
         flattens the very spread the economy exists to create.
 
-        Against ``w_max`` it is affordable by construction. Every rebate reference is
-        at most ``b_(k+1)``, so the payout is at most ``k * b_(k+1) / w_max``, while
-        the collection is ``sum_{j in winners} b_(k+1) / w_j`` and every ``w_j <=
-        w_max``. ``w_max`` is read from a detached wealth snapshot, so it is no more
-        influenced by a report than the exclusion rule is.
+        Against ``w_max`` it is affordable by construction, up to dtype epsilon.
+        Every rebate reference is at most ``b_(k+1)``, so the payout is at most
+        ``k * b_(k+1) / w_max``, while the collection is
+        ``sum_{j in winners} b_(k+1) / w_j`` and every ``w_j <= w_max``. The bound is
+        tight when the (k+1)-th and (k+2)-th bids coincide, so in bf16 rounding can
+        cross it by a fraction of a percent -- bounded noise, not a leak.
 
-        The cost is under-rebating when the wealth spread is wide, which is the
-        Green-Laffont residual made visible rather than hidden.
+        Unlike the exclusion rule, ``w_max`` does *include* the recipient's own
+        wealth. That is still report-independent, for a different reason: wealth is
+        accumulated state read from a detached snapshot, not something an expert
+        reports this token.
+
+        The cost is under-rebating, and it is regime-dependent rather than small.
+        The returned fraction is roughly ``harmonic_mean(winners' wealth) / w_max``:
+        around 93% of the collection comes back on a flat wealth vector, 68% across
+        the configured band, and under 4% when one expert sits at ``max_wealth`` and
+        the rest at the floor -- which is the monopoly regime ``train.py`` already
+        warns about, so the rebate is weakest where the drain bites hardest. A
+        tighter safe divisor exists (the harmonic mean of the k richest wealths, also
+        report-independent); choosing it is mechanism design and belongs with the
+        rest of the economy work in #15.
         """
         batch, seq_len, _ = bids.shape
         k, n = self.top_k, self.num_experts

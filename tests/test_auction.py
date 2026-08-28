@@ -532,11 +532,14 @@ def test_negative_wealth_trips_the_negativity_assert():
     """Why there is no wealth assert beside the epsilon clamp.
 
     A negative-wealth expert *can* win: with mixed signs a negative bid still places
-    in the top k when the alternatives are worse. What it cannot do is win quietly.
-    A negative-wealth winner sits in the top k, so b_(k+1) is at most its own
-    negative bid, and the payment-negativity assert fires on the numerator before
-    the division that the epsilon clamp guards. A second assert there would be
-    unreachable code documenting a protection that never runs.
+    in the top k when the alternatives are worse. A negative-wealth winner sits in
+    the top k, so b_(k+1) is at most its own negative bid, and the payment-negativity
+    assert fires on the numerator before the division that the epsilon clamp guards
+    -- unless that bid is inside the assert's tolerance of zero, which needs a wealth
+    around -1e-7. MoBConfig rejects non-positive wealth bounds and every update path
+    clamps to min_wealth, so that residual case cannot arise in the pipeline. A
+    second assert here would be unreachable code documenting a protection that never
+    runs.
     """
     auctioneer = _make_auction(num_experts=4, top_k=2)
     auctioneer.eval()
@@ -617,6 +620,16 @@ def test_rebate_never_exceeds_what_the_auction_collected():
             f"n={num_experts} k={top_k}: rebate exceeds revenue in credits"
         )
         assert (returned > 0).any(), "fixture returns nothing; feasibility is vacuous"
+
+        # The classical Cavallo bound, which does not depend on the divisor: every
+        # reference is at most b_(k+1), so sum_i (k/n) * ref_i <= k * b_(k+1). The
+        # credit assertion above cannot see a corrupted reference on its own — the
+        # w_max margin is wide enough to swallow one.
+        payout_in_bid_units = (outcome.rebates * wealth.max()).sum(dim=-1)
+        displaced = torch.sort(_bids(confidences, wealth), dim=-1, descending=True)[0][..., top_k]
+        assert (payout_in_bid_units <= top_k * displaced + PAYMENT_TOLERANCE).all(), (
+            f"n={num_experts} k={top_k}: exclusion rule returned too large a reference"
+        )
 
 
 def test_every_expert_is_rebated_not_only_winners():

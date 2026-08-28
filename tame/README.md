@@ -174,7 +174,7 @@ During training, the MoB economy learns from the *actual* loss signal. This is t
 2. For each MoB layer, **loss reduction vs expert baseline EMA** is computed for every expert.
 3. Experts that improve loss receive wealth proportional to `reward_scale × LOSS_REWARD_MULTIPLIER`.
 4. **VCG payments** are subtracted as a quasi-linear transfer — `wealth += reward − charge`, both at one derived coefficient — not as a proportional haircut on the reward.
-5. **Cavallo rebates** return most of what the auction collected. Each expert is rebated from the (k+1)-th highest bid *among the others*, divided by the pool's largest wealth, so the payout is report-independent and affordable in credits by construction.
+5. **Cavallo rebates** return part of what the auction collected — each expert is rebated from the (k+1)-th highest bid *among the others*, divided by the pool's largest wealth, so the payout is report-independent and affordable in credits. How much comes back depends on the wealth spread: ~93% when wealth is flat, ~68% across the configured band, under 4% in a `max_wealth` monopoly. See [#15](../README.md#phase-05--mechanism-correction).
 6. A `confidence_calibration_weight` auxiliary loss trains each confidence head on the loss reduction its own expert realised on the tokens it won (target: `clamp_min(baseline − loss, 0)`), and reaches that head alone — the routing path reads detached hidden states.
 
 ### Gradient Handling
