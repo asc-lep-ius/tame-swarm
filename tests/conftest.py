@@ -153,3 +153,28 @@ def tiny_mob_config():
         adapter_rank=4,
         adapter_alpha=4.0,
     )
+
+
+# A dataset with blank rows (about a third, as wikitext has) and a validation
+# split, so both held-out paths are exercised without touching the network.
+TRAIN_ROWS = [{"text": f"train document number {i}" if i % 3 else ""} for i in range(600)]
+VALIDATION_ROWS = [{"text": f"validation document number {i}"} for i in range(40)]
+
+
+def fake_load_dataset(*args, split="train", streaming=False):
+    """Stands in for ``datasets.load_dataset``. 'splitless' has no validation split."""
+    name = args[0]
+    if split == "validation":
+        if name == "splitless":
+            raise ValueError("Unknown split 'validation'")
+        return list(VALIDATION_ROWS)
+    return iter(TRAIN_ROWS)
+
+
+@pytest.fixture
+def held_out_split(fake_tokenizer):
+    from evaluation import build_held_out_split
+
+    return build_held_out_split(
+        "wikitext", "wikitext-2-raw-v1", fake_tokenizer, 16, fake_load_dataset, num_sequences=8
+    )
