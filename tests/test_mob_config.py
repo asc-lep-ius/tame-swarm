@@ -1,3 +1,5 @@
+import pytest
+
 from mob import MoBConfig
 
 
@@ -24,3 +26,17 @@ def test_config_is_mutable():
     assert cfg.top_k == 1
     assert cfg.hidden_dim == 512
     assert cfg.intermediate_dim == 1024
+
+
+def test_non_positive_wealth_bounds_are_rejected():
+    """The auction divides each price by the winner's own wealth.
+
+    A non-positive bound makes that division meaningless, and the epsilon clamp
+    guarding it would turn a valid numerator into an enormous price rather than
+    failing. Reject it where the value enters, not where it explodes.
+    """
+    with pytest.raises(ValueError, match="min_wealth must be positive"):
+        MoBConfig(min_wealth=0.0)
+
+    with pytest.raises(ValueError, match="initial_wealth must be positive"):
+        MoBConfig(initial_wealth=-1.0)

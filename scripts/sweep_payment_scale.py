@@ -1,10 +1,11 @@
-"""Re-derive MoBConfig.payment_scale by sweeping it against the wealth economy.
+"""Measure what deviating from the balanced VCG transfer costs the wealth economy.
 
-The VCG price is denominated in an expert's own value units and the reward in
-loss-reduction units; ``payment_scale`` is the bridge. It is an empirical constant,
-so the number in ``mob_config.py`` is only as good as the sweep behind it -- and a
-constant justified by a comment nobody can re-run is the kind of unbacked claim
-issue #10 exists to remove.
+``payment_scale`` is not fitted. Reports, prices and rewards share one unit --
+loss reduction -- and reward and charge share one coefficient, so 1.0 is the value
+that makes ``reward - charge`` a quasi-linear utility and puts wealth's break-even
+exactly at the auction's price. This script sweeps around that point to show what
+over- and under-pricing does to the charge fraction and the wealth distribution,
+so the choice is checkable rather than asserted in a comment nobody can re-run.
 
 Run:  uv run python scripts/sweep_payment_scale.py
 """

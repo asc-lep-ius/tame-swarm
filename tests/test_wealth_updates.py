@@ -368,18 +368,13 @@ def test_vcg_charge_is_zero_when_payments_disabled():
     assert (_charges_for(mob, payment_value=2.0) == 0).all()
 
 
-def test_payments_reduce_wealth_by_exactly_the_charge(monkeypatch):
+def test_payments_reduce_wealth_by_exactly_the_charge():
     """End-to-end quasi-linearity: enabling payments subtracts the charge, nothing else.
 
     Under the multiplicative haircut the gap between the two runs would scale with
     each expert's reward; under a transfer it is the charge on its own.
 
-    The competitive bonus is switched off because it is now computed on the net,
-    i.e. downstream of the charge, so enabling payments legitimately moves it too.
-    That coupling is the subject of test_wealth_is_flat_at_the_price; isolating the
-    transfer is the subject here.
     """
-    monkeypatch.setattr("mob.wealth.COMPETITIVE_BONUS_FACTOR", 0.0)
     hidden_states = torch.randn(1, 8, 32)
     per_token_loss = torch.randn(1, 8).abs()
 
@@ -394,6 +389,7 @@ def test_payments_reduce_wealth_by_exactly_the_charge(monkeypatch):
             mob._cached_selected_experts,
             num_tokens=hidden_states.size(0) * hidden_states.size(1),
             reward_multiplier=LOSS_REWARD_MULTIPLIER,
+            rebates=mob._cached_rebates,
         ).clone()
         mob.update_wealth_from_loss(per_token_loss)
         return mob.expert_wealth.clone(), charges
@@ -450,8 +446,8 @@ def _spy_on_charges(mob: MixtureOfBidders) -> list[SimpleNamespace]:
     calls = []
     original = mob._vcg_charges
 
-    def spy(payments, selected_experts, num_tokens, reward_multiplier):
-        charge = original(payments, selected_experts, num_tokens, reward_multiplier)
+    def spy(payments, selected_experts, num_tokens, reward_multiplier, rebates=None):
+        charge = original(payments, selected_experts, num_tokens, reward_multiplier, rebates)
         calls.append(
             SimpleNamespace(
                 num_tokens=num_tokens,
@@ -472,14 +468,12 @@ def _spy_on_charges(mob: MixtureOfBidders) -> list[SimpleNamespace]:
         ("participation", {"use_loss_feedback": False, "use_local_quality": False}),
     ],
 )
-def test_non_loss_paths_apply_the_transfer(path, overrides, monkeypatch):
+def test_non_loss_paths_apply_the_transfer(path, overrides):
     """The local-quality and participation paths must charge too, with right num_tokens.
 
     Both run inside forward() rather than update_wealth_from_loss, so neither is
-    reached by the loss-path tests above. The competitive bonus is disabled for the
-    same reason as in test_payments_reduce_wealth_by_exactly_the_charge.
+    reached by the loss-path tests above.
     """
-    monkeypatch.setattr("mob.wealth.COMPETITIVE_BONUS_FACTOR", 0.0)
     torch.manual_seed(23)
     hidden_states = torch.randn(2, 8, 32)
 
@@ -703,7 +697,10 @@ def test_value_objective_matches_its_definition():
     selected = mob.last_stats.selected_experts
     baselines = mob.expert_baseline_loss.clone()
 
-    per_token_loss = torch.full((1, 8), 4.0)
+    # A positive realised value: the old sigmoid target and the clamped one agree
+    # to well inside tolerance wherever the value is negative, so a fixture there
+    # cannot tell them apart and the test passes under either implementation.
+    per_token_loss = torch.full((1, 8), 0.4)
     mob.update_wealth_from_loss(per_token_loss)
 
     assert not torch.allclose(baselines, mob.expert_baseline_loss), (
@@ -715,7 +712,7 @@ def test_value_objective_matches_its_definition():
         won = (selected == expert_idx).any(dim=-1)
         if not won.any():
             continue
-        target = torch.sigmoid(5.0 * (baselines[expert_idx] - per_token_loss[won]))
+        target = (baselines[expert_idx] - per_token_loss[won]).clamp_min(0.0)
         terms.append(torch.nn.functional.mse_loss(confidences[:, :, expert_idx][won], target))
 
     expected = torch.stack(terms).mean() * mob.config.confidence_calibration_weight
@@ -771,11 +768,11 @@ def test_detached_routing_path_still_trains_the_coupling():
     assert grad is not None and grad.abs().sum().item() > 0.0
 
 
-def _net_wealth_change(value: float, price: float) -> float:
-    """Wealth moved by one expert that won every token, at a known value and price.
+def _wealth_change(value: float, price: float, rebate: float, wins: bool) -> float:
+    """Wealth moved by expert 0 at a known value, price and rebate.
 
-    Decay is switched off so the result is the transfer alone, and the baseline is
-    set explicitly so the realised loss reduction is exactly ``value``.
+    Decay is off so the result is the transfer alone, and the baseline is set
+    explicitly so the realised loss reduction is exactly ``value``.
     """
     config = replace(QUASI_LINEAR_CONFIG, wealth_decay=1.0, num_experts=4, top_k=2)
     mob = MixtureOfBidders(config)
@@ -783,51 +780,69 @@ def _net_wealth_change(value: float, price: float) -> float:
     mob(torch.randn(1, 4, 32))
 
     mob.expert_baseline_loss.fill_(1.0 + value)
-    mob._cached_selected_experts = _uniform_selection(1, 4)
+    selected = _uniform_selection(1, 4)
+    if not wins:
+        selected[:, :, 0] = 2  # experts 2 and 3 take the slots instead
+        selected[:, :, 1] = 3
+    mob._cached_selected_experts = selected
     mob._cached_routing_weights = torch.full((1, 4, 2), 0.5)
     mob._cached_payments = torch.full((1, 4, 2), price)
+    mob._cached_rebates = torch.full((1, 4, 4), rebate)
 
     before = mob.expert_wealth[0].item()
     mob.update_wealth_from_loss(torch.full((1, 4), 1.0))
     return mob.expert_wealth[0].item() - before
 
 
-def test_wealth_threshold_coincides_with_the_auction_threshold():
-    """The economy pays exactly when the auction would let a truthful expert win.
+def _win_premium(value: float, price: float, rebate: float = 0.0) -> float:
+    """What winning is worth to expert 0, over not winning.
 
-    This is what quasi-linearity buys and what a mismatched pair of scales destroys.
-    The auction lets an expert win when ``report > price``; with a truthful report
-    that is ``value > price``. Wealth must move the same way across that same
-    boundary, or an expert maximising wealth wants a different allocation than the
-    one the mechanism prices -- and overreporting pays.
-
-    Before reward and charge shared a coefficient the reward side outweighed the
-    charge side ~167x, so winning was profitable far below the price and the
-    strategyproofness result said nothing about the realised economy.
+    This is the quantity an expert's report actually moves. The Cavallo rebate is a
+    lump sum paid to winners and losers alike, so it shifts wealth without shifting
+    this difference -- which is exactly why it can be paid without disturbing the
+    mechanism.
     """
-    assert _net_wealth_change(value=2.0, price=1.0) > 0.0, (
-        "a truthful winner above its price must gain"
-    )
-    assert _net_wealth_change(value=0.5, price=2.0) < 0.0, (
-        "winning below the price must cost, or overreporting to win is free money"
+    return _wealth_change(value, price, rebate, wins=True) - _wealth_change(
+        value, price, rebate, wins=False
     )
 
 
-def test_wealth_is_flat_at_the_price():
-    """The boundary itself: value == price nets nothing but the competitive bonus.
+def test_winning_pays_exactly_when_value_exceeds_price():
+    """The economy's threshold is the auction's threshold.
 
-    Pinning the crossing point is what stops the test above from passing on any
-    monotone-but-misscaled pair of coefficients.
+    The auction lets an expert win when its report clears the price; truthfully,
+    when its value does. Wealth has to reward winning across that same boundary, or
+    an expert maximising wealth wants a different allocation than the mechanism
+    prices and overreporting pays. Before reward and charge shared a coefficient the
+    reward side outweighed the charge side ~167x, so winning paid far below price.
     """
-    below = _net_wealth_change(value=0.9, price=1.0)
-    at = _net_wealth_change(value=1.0, price=1.0)
-    above = _net_wealth_change(value=1.1, price=1.0)
+    assert _win_premium(value=2.0, price=1.0) > 0.0
+    assert _win_premium(value=0.5, price=1.0) < 0.0
+
+
+def test_the_win_premium_crosses_zero_at_the_price():
+    """Pin the crossing point, not just the sign either side of it."""
+    below = _win_premium(value=0.9, price=1.0)
+    at = _win_premium(value=1.0, price=1.0)
+    above = _win_premium(value=1.1, price=1.0)
 
     assert below < at < above
-    assert at == pytest.approx(0.0, abs=1e-4), (
-        "break-even must sit exactly at the price; a competitive bonus paid on "
-        "gross wins rather than surplus moves it below"
-    )
+    assert at == pytest.approx(0.0, abs=1e-4)
+
+
+def test_the_rebate_does_not_move_the_crossing():
+    """Cavallo's whole point: budget can be returned without touching incentives.
+
+    A rebate that depended on whether an expert won -- an even split of the pot, say
+    -- would shift this crossing, which is the Green-Laffont trade the exclusion
+    rule exists to avoid. Paid as a lump sum it cancels out of the difference.
+    """
+    for rebate in (0.0, 0.5, 5.0):
+        assert _win_premium(value=1.0, price=1.0, rebate=rebate) == pytest.approx(0.0, abs=1e-4)
+
+    unpaid = _wealth_change(1.0, 1.0, rebate=0.0, wins=True)
+    paid = _wealth_change(1.0, 1.0, rebate=5.0, wins=True)
+    assert paid > unpaid, "the rebate must actually reach wealth, or this proves nothing"
 
 
 def test_each_wealth_path_is_charged_at_its_own_reward_scale():
@@ -853,3 +868,40 @@ def test_each_wealth_path_is_charged_at_its_own_reward_scale():
     ):
         charges = _charges_for(mob, payment_value=2.0, reward_multiplier=multiplier)
         assert charges[0].item() == pytest.approx(2.0 * coefficient, abs=1e-6)
+
+
+def test_layer_report_is_the_softplus_of_the_logits():
+    """Pin the report function the *pipeline* uses, not the one ConfidenceHead offers.
+
+    MixtureOfBidders.forward calls forward_logits and applies the activation itself
+    so the z-loss can read pre-activation logits. That split means ConfidenceHead
+    can be changed to softplus while the model keeps applying a sigmoid, leaving the
+    bid bounded in (0, 1) against an unbounded value target -- the head then cannot
+    reach targets above 1.0 and is driven into the logit clamp, where the gradient
+    is exactly zero. Asserting on ConfidenceHead alone does not catch that.
+    """
+    mob = _build_training_mob()
+    mob(torch.randn(1, 8, 32))
+
+    stats = mob.last_stats
+    assert torch.allclose(
+        stats.confidences, torch.nn.functional.softplus(stats.confidence_logits), atol=1e-6
+    )
+
+
+def test_report_is_not_capped_below_the_value_it_must_predict():
+    """A report bounded in (0, 1) cannot equal a loss reduction larger than 1.
+
+    Truthful reporting means report == value. If the report saturates below the
+    value, the value objective has an unreachable target and the incentive claim
+    describes a mechanism the model cannot express.
+    """
+    mob = _build_training_mob()
+    with torch.no_grad():
+        for head in mob.confidence_heads:
+            head.proj.weight.zero_()
+            head.proj.bias.fill_(4.0)
+
+    mob(torch.randn(1, 8, 32))
+
+    assert mob.last_stats.confidences.max().item() > 1.0

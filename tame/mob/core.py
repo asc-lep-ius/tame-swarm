@@ -4,6 +4,7 @@ from typing import cast
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 try:
     from ..coupling import CouplingMetrics, SteeringCoupling, SteeringCouplingConfig
@@ -110,6 +111,7 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         # arithmetic reads. Cleared as soon as the objective is built.
         self._live_confidences: torch.Tensor | None = None
         self._cached_payments: torch.Tensor | None = None
+        self._cached_rebates: torch.Tensor | None = None
         self._cached_expert_token_masks: list[torch.Tensor] | None = None
         self._loss_feedback_pending: bool = False
         self._cached_calibration_loss: torch.Tensor | None = None
@@ -156,13 +158,20 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
             ],
             dim=-1,
         )
-        confidences = torch.sigmoid(confidence_logits)
+        # Must match ConfidenceHead.forward. The report is a loss-reduction estimate,
+        # not a probability: a sigmoid here caps it at 1.0 while the reward it is
+        # trained to predict is unbounded, so "win when report > price" and "profit
+        # when value > price" stop being the same threshold. forward_logits is used
+        # rather than forward only so the z-loss can read the pre-activation logits.
+        confidences = F.softplus(confidence_logits)
         router_z_loss = self._compute_router_z_loss(confidence_logits)
         self._cached_router_z_loss = router_z_loss
 
-        selected_experts, routing_weights, payments = self.auctioneer(
-            confidences, self.expert_wealth
-        )
+        outcome = self.auctioneer(confidences, self.expert_wealth)
+        selected_experts = outcome.selected_experts
+        routing_weights = outcome.routing_weights
+        payments = outcome.payments
+        rebates = outcome.rebates
 
         output = torch.zeros_like(hidden_states)
 
@@ -184,20 +193,21 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
             self._cached_confidences = confidences.detach()
             self._live_confidences = confidences
             self._cached_payments = payments.detach() if payments is not None else None
+            self._cached_rebates = rebates.detach() if rebates is not None else None
             self._loss_feedback_pending = True
 
         if update_wealth and self.config.use_local_quality and not self.config.use_loss_feedback:
             self._update_wealth_local_quality(
-                selected_experts, routing_weights, confidences, payments, output
+                selected_experts, routing_weights, confidences, payments, rebates, output
             )
         elif update_wealth and self.training:
             if self.config.use_local_quality and not self.config.use_loss_feedback:
                 self._update_wealth_local_quality(
-                    selected_experts, routing_weights, confidences, payments, output
+                    selected_experts, routing_weights, confidences, payments, rebates, output
                 )
             elif not self.config.use_local_quality:
                 self._update_wealth_participation(
-                    selected_experts, routing_weights, confidences, payments
+                    selected_experts, routing_weights, confidences, payments, rebates
                 )
 
         self.last_stats = MoBStats(

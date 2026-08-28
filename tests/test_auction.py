@@ -18,7 +18,7 @@ def test_vcg_top_k_selection():
     confidences = torch.tensor([[[0.1, 0.9, 0.5, 0.3]]])
     wealth = torch.tensor([1.0, 1.0, 1.0, 1.0])
 
-    selected, _, _ = auctioneer(confidences, wealth)
+    selected, _, _, _ = auctioneer(confidences, wealth)
     selected_set = set(selected[0, 0].tolist())
     assert 1 in selected_set
     assert 2 in selected_set
@@ -31,7 +31,7 @@ def test_vcg_routing_weights_sum_to_one():
     confidences = torch.randn(2, 8, 4).abs()
     wealth = torch.ones(4)
 
-    _, routing_weights, _ = auctioneer(confidences, wealth)
+    _, routing_weights, _, _ = auctioneer(confidences, wealth)
     weight_sums = routing_weights.sum(dim=-1)
     assert torch.allclose(weight_sums, torch.ones_like(weight_sums), atol=1e-5)
 
@@ -44,7 +44,7 @@ def test_vcg_output_shapes():
     confidences = torch.randn(batch, seq, num_experts).abs()
     wealth = torch.ones(num_experts)
 
-    selected, routing_weights, payments = auctioneer(confidences, wealth)
+    selected, routing_weights, payments, _ = auctioneer(confidences, wealth)
     assert selected.shape == (batch, seq, top_k)
     assert routing_weights.shape == (batch, seq, top_k)
     assert payments.shape == (batch, seq, top_k)
@@ -57,11 +57,11 @@ def test_vcg_higher_bid_wins():
     confidences = torch.tensor([[[0.1, 0.2, 0.8]]])
     wealth = torch.tensor([1.0, 1.0, 1.0])
 
-    selected, _, _ = auctioneer(confidences, wealth)
+    selected, _, _, _ = auctioneer(confidences, wealth)
     assert selected[0, 0, 0].item() == 2
 
     wealth_adjusted = torch.tensor([10.0, 1.0, 1.0])
-    selected_adj, _, _ = auctioneer(confidences, wealth_adjusted)
+    selected_adj, _, _, _ = auctioneer(confidences, wealth_adjusted)
     assert selected_adj[0, 0, 0].item() == 0
 
 
@@ -77,7 +77,7 @@ def test_vcg_differentiable_mode():
     confidences = torch.randn(1, 4, 4).abs().requires_grad_(True)
     wealth = torch.ones(4)
 
-    _, routing_weights, _ = auctioneer(confidences, wealth)
+    _, routing_weights, _, _ = auctioneer(confidences, wealth)
     objective_weights = torch.arange(
         1,
         routing_weights.numel() + 1,
@@ -112,7 +112,7 @@ def test_vcg_payment_equals_replacement_bid_hand_computed():
     confidences = torch.tensor([[[0.1, 0.9, 0.5, 0.3]]])
     wealth = torch.ones(4)
 
-    selected, _, payments = auctioneer(confidences, wealth)
+    selected, _, payments, _ = auctioneer(confidences, wealth)
 
     assert set(selected[0, 0].tolist()) == {1, 2}
     for j in range(2):
@@ -135,7 +135,7 @@ def test_vcg_payment_equals_replacement_bid_nonuniform_wealth():
     confidences = torch.tensor([[[0.5, 0.4, 0.3, 0.2]]])
     wealth = torch.tensor([1.0, 2.0, 3.0, 0.5])
 
-    selected, _, payments = auctioneer(confidences, wealth)
+    selected, _, payments, _ = auctioneer(confidences, wealth)
 
     assert selected[0, 0].tolist() == [2, 1]
     assert payments[0, 0, 0].item() == pytest.approx(0.5 / 3.0, abs=PAYMENT_TOLERANCE)
@@ -153,7 +153,7 @@ def test_vcg_payment_equals_replacement_bid_across_k(top_k):
     confidences = torch.rand(2, 6, num_experts)
     wealth = torch.rand(num_experts) * 10.0
 
-    selected, _, payments = auctioneer(confidences, wealth)
+    selected, _, payments, _ = auctioneer(confidences, wealth)
     bids = _bids(confidences, wealth)
 
     for b in range(bids.size(0)):
@@ -171,13 +171,13 @@ def test_vcg_payment_invariant_to_winners_own_bid():
 
     wealth = torch.ones(4)
     confidences = torch.tensor([[[0.1, 0.9, 0.5, 0.3]]])
-    selected, _, payments = auctioneer(confidences, wealth)
+    selected, _, payments, _ = auctioneer(confidences, wealth)
 
     # Raise the top winner's confidence well clear of the field; the winner set
     # is unchanged, so its payment must not move.
     perturbed = confidences.clone()
     perturbed[0, 0, 1] = 0.99
-    selected_perturbed, _, payments_perturbed = auctioneer(perturbed, wealth)
+    selected_perturbed, _, payments_perturbed, _ = auctioneer(perturbed, wealth)
 
     assert selected_perturbed[0, 0].tolist() == selected[0, 0].tolist()
     assert payments_perturbed[0, 0, 0].item() == pytest.approx(
@@ -199,7 +199,7 @@ def test_vcg_individual_rationality():
     confidences = torch.rand(2, 8, 6)
     wealth = torch.rand(6) * 10.0
 
-    selected, _, payments = auctioneer(confidences, wealth)
+    selected, _, payments, _ = auctioneer(confidences, wealth)
     winner_values = torch.gather(confidences, -1, selected)
 
     surplus = winner_values - payments
@@ -219,7 +219,7 @@ def test_vcg_payments_non_negative_and_non_vacuous():
     confidences = torch.rand(2, 8, 4)
     wealth = torch.rand(4) * 10.0
 
-    _, _, payments = auctioneer(confidences, wealth)
+    _, _, payments, _ = auctioneer(confidences, wealth)
 
     assert (payments >= 0).all()
     assert (payments > PAYMENT_TOLERANCE).any()
@@ -240,7 +240,7 @@ def test_vcg_zero_payment_regression():
     confidences = torch.tensor([[[0.80, 0.70, 0.60, 0.50, 0.40, 0.30, 0.20, 0.10]]])
     wealth = torch.ones(8)
 
-    _, _, payments = auctioneer(confidences, wealth)
+    _, _, payments, _ = auctioneer(confidences, wealth)
 
     assert (payments > 0.1).all(), "payments collapsed to zero: k-1 exclusion set is back"
     for j in range(2):
@@ -255,7 +255,7 @@ def test_vcg_top_k_equals_num_experts_zero_payments():
     confidences = torch.tensor([[[0.5, 0.3, 0.8]]])
     wealth = torch.ones(3)
 
-    _, _, payments = auctioneer(confidences, wealth)
+    _, _, payments, _ = auctioneer(confidences, wealth)
     assert (payments == 0).all()
 
 
@@ -295,8 +295,8 @@ def test_vcg_payment_survives_bfloat16_router_specialisation():
     confidences = torch.sigmoid(logits)
     wealth = torch.linspace(75.0, 300.0, 8)
 
-    _, _, payments_fp32 = auctioneer(confidences, wealth)
-    _, _, payments_bf16 = auctioneer(confidences.bfloat16(), wealth.bfloat16())
+    _, _, payments_fp32, _ = auctioneer(confidences, wealth)
+    _, _, payments_bf16, _ = auctioneer(confidences.bfloat16(), wealth.bfloat16())
 
     assert (payments_fp32 > 0).all(), "fixture prices nothing; the comparison is vacuous"
     assert payments_bf16.dtype == torch.bfloat16, "payments must return in the input dtype"
@@ -332,7 +332,7 @@ def test_vcg_payment_preserves_float64_precision():
     confidences = torch.rand(1, 4, 6, dtype=torch.float64)
     wealth = torch.rand(6, dtype=torch.float64) * 10.0
 
-    selected, _, payments = auctioneer(confidences, wealth)
+    selected, _, payments, _ = auctioneer(confidences, wealth)
     bids = _bids(confidences, wealth)
 
     # Guards the cast-back, not the accumulation dtype: `.to(out_dtype)` restores
@@ -364,13 +364,13 @@ def test_uniform_share_is_flat_and_ignores_own_bid():
 
     wealth = torch.ones(4)
     confidences = torch.tensor([[[0.1, 0.9, 0.5, 0.3]]])
-    selected, weights, _ = auctioneer(confidences, wealth)
+    selected, weights, _, _ = auctioneer(confidences, wealth)
 
     assert torch.allclose(weights, torch.full_like(weights, 0.5))
 
     perturbed = confidences.clone()
     perturbed[0, 0, 1] = 0.99
-    selected_perturbed, weights_perturbed, _ = auctioneer(perturbed, wealth)
+    selected_perturbed, weights_perturbed, _, _ = auctioneer(perturbed, wealth)
 
     assert selected_perturbed[0, 0].tolist() == selected[0, 0].tolist()
     assert torch.equal(weights_perturbed, weights)
@@ -387,7 +387,7 @@ def test_uniform_share_carries_no_gradient_into_confidences():
     auctioneer.train()
 
     confidences = torch.rand(1, 4, 4, requires_grad=True)
-    _, routing_weights, _ = auctioneer(confidences, torch.ones(4))
+    _, routing_weights, _, _ = auctioneer(confidences, torch.ones(4))
 
     assert not routing_weights.requires_grad
 
@@ -407,8 +407,8 @@ def test_softmax_share_lets_a_winner_buy_influence_for_free():
     overreported = truthful.clone()
     overreported[0, 0, 1] = 0.99
 
-    selected, weights, payments = auctioneer(truthful, wealth)
-    selected_over, weights_over, payments_over = auctioneer(overreported, wealth)
+    selected, weights, payments, _ = auctioneer(truthful, wealth)
+    selected_over, weights_over, payments_over, _ = auctioneer(overreported, wealth)
 
     assert selected_over[0, 0].tolist() == selected[0, 0].tolist()
     assert payments_over[0, 0, 0].item() == pytest.approx(
@@ -434,7 +434,7 @@ def test_payment_is_the_winners_critical_value():
     def outcome(report: float) -> tuple[bool, float]:
         confidences = field.clone()
         confidences[0] = report
-        selected, _, payments = auctioneer(confidences.view(1, 1, 5), wealth)
+        selected, _, payments, _ = auctioneer(confidences.view(1, 1, 5), wealth)
         slots = (selected[0, 0] == 0).nonzero()
         if slots.numel() == 0:
             return False, 0.0
@@ -467,7 +467,7 @@ def _expert_zero_utility(auctioneer, report: float, true_value: float) -> float:
     """
     confidences = _UTILITY_FIELD.clone()
     confidences[0] = report
-    selected, weights, payments = auctioneer(confidences.view(1, 1, -1), _UTILITY_WEALTH)
+    selected, weights, payments, _ = auctioneer(confidences.view(1, 1, -1), _UTILITY_WEALTH)
 
     slots = (selected[0, 0] == 0).nonzero()
     if slots.numel() == 0:
@@ -526,3 +526,124 @@ def test_softmax_baseline_rewards_overreporting():
     )
 
     assert best_lie > truthful + PAYMENT_TOLERANCE
+
+
+def test_negative_wealth_cannot_reach_a_winner_slot():
+    """Why there is no wealth assert beside the epsilon clamp.
+
+    Reports are non-negative, so a negative wealth is a negative bid, which loses to
+    any non-negative one. It can only win when every bid is negative -- and that
+    trips the payment-negativity assert first. A guard here would be unreachable
+    code documenting a protection that never runs.
+    """
+    auctioneer = _make_auction(num_experts=4, top_k=2)
+    auctioneer.eval()
+
+    confidences = torch.tensor([[[0.9, 0.7, 0.5, 0.3]]])
+    selected, _, payments, _ = auctioneer(confidences, torch.tensor([-0.5, 1.0, 2.0, 3.0]))
+
+    assert 0 not in selected[0, 0].tolist(), "a negative bid must not win a slot"
+    assert (payments >= 0).all()
+
+    with pytest.raises(AssertionError, match="negative"):
+        auctioneer(confidences, torch.tensor([-1.0, -2.0, -3.0, -4.0]))
+
+
+def test_zero_wealth_is_accepted_and_prices_at_zero():
+    """The case the epsilon clamp exists for: a bankrupt expert bids, and pays, zero."""
+    auctioneer = _make_auction(num_experts=4, top_k=2)
+    auctioneer.eval()
+
+    _, _, payments, _ = auctioneer(torch.zeros(1, 1, 4), torch.zeros(4))
+
+    assert torch.isfinite(payments).all()
+    assert (payments == 0).all()
+
+
+def test_rebate_is_independent_of_the_recipients_own_bid():
+    """The property the whole redistribution rests on.
+
+    Cavallo pays expert i out of a quantity computed from everyone *but* i, so no
+    report an expert can make moves the money it gets back. A rebate that did depend
+    on it — an even split of the collected pot, say — would shift that expert's
+    threshold away from its price, which is the Green–Laffont trade this rule exists
+    to avoid.
+    """
+    auctioneer = _make_auction(num_experts=6, top_k=2)
+    auctioneer.eval()
+
+    torch.manual_seed(31)
+    wealth = torch.rand(6) * 8.0 + 1.0
+    confidences = torch.rand(1, 1, 6)
+
+    baseline = auctioneer(confidences, wealth).rebates[0, 0, 0].item()
+
+    for own_bid in torch.linspace(0.0, 1.0, 21).tolist():
+        perturbed = confidences.clone()
+        perturbed[0, 0, 0] = own_bid
+        rebate = auctioneer(perturbed, wealth).rebates[0, 0, 0].item()
+        assert rebate == pytest.approx(baseline, abs=PAYMENT_TOLERANCE), (
+            f"reporting {own_bid:.2f} moved expert 0's own rebate"
+        )
+
+
+def test_rebate_never_exceeds_what_the_auction_collected():
+    """Budget feasibility: the mechanism cannot hand back money it did not take.
+
+    Checked in bid units, where the accounting closes: the collected total is
+    k * b_(k+1) and the rebate sums to at most that, with equality only when the
+    (k+1)-th and (k+2)-th bids coincide.
+    """
+    torch.manual_seed(37)
+    for num_experts, top_k in ((6, 2), (8, 3), (5, 1), (4, 2)):
+        auctioneer = _make_auction(num_experts=num_experts, top_k=top_k)
+        auctioneer.eval()
+
+        wealth = torch.rand(num_experts) * 10.0 + 1.0
+        confidences = torch.rand(2, 6, num_experts)
+        outcome = auctioneer(confidences, wealth)
+
+        collected = (outcome.payments * wealth[outcome.selected_experts]).sum(dim=-1)
+        returned = (outcome.rebates * wealth).sum(dim=-1)
+
+        assert (returned <= collected + PAYMENT_TOLERANCE).all(), (
+            f"n={num_experts} k={top_k}: rebate exceeds revenue"
+        )
+        assert (returned > 0).any(), "fixture returns nothing; feasibility is vacuous"
+
+
+def test_every_expert_is_rebated_not_only_winners():
+    """Losers must be paid too — that is what keeps the rebate report-independent."""
+    auctioneer = _make_auction(num_experts=5, top_k=2)
+    auctioneer.eval()
+
+    outcome = auctioneer(torch.rand(1, 3, 5), torch.rand(5) * 5.0 + 1.0)
+
+    assert outcome.rebates.shape == (1, 3, 5)
+    assert (outcome.rebates > 0).all()
+
+
+def test_no_rebate_when_there_is_no_displaced_bid():
+    """With fewer than k+2 experts there is no (k+2)-th bid to pay out of.
+
+    The same boundary that makes payments zero when everyone wins.
+    """
+    for num_experts, top_k in ((3, 3), (3, 2)):
+        auctioneer = _make_auction(num_experts=num_experts, top_k=top_k)
+        auctioneer.eval()
+
+        outcome = auctioneer(torch.rand(1, 2, num_experts), torch.ones(num_experts))
+        assert (outcome.rebates == 0).all(), f"n={num_experts} k={top_k} rebated from nothing"
+
+
+def test_rebate_leaves_the_deviation_sweep_intact():
+    """The incentive result must survive the redistribution, not merely coexist with it."""
+    auctioneer = _make_auction(num_experts=5, top_k=2)
+    auctioneer.eval()
+
+    for true_value in torch.linspace(0.05, 0.95, 10).tolist():
+        truthful = _expert_zero_utility(auctioneer, true_value, true_value)
+        for report in torch.linspace(0.0, 1.0, 41).tolist():
+            assert _expert_zero_utility(auctioneer, report, true_value) <= (
+                truthful + PAYMENT_TOLERANCE
+            )
