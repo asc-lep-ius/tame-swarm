@@ -1,11 +1,15 @@
 """One place every measured number leaves the training loop through.
 
-#12 asks for held-out loss and perplexity to be logged "as first-class metrics via
-#7". #7 -- MLflow tracking -- is not built, and blocking a held-out metric on a
-tracking backend would be the wrong order: the number is what has value, the
-backend is where it is filed. So metrics go through this sink instead, which
-writes newline-delimited JSON next to the checkpoints and is the seam #7 replaces
-with an MLflow run without touching a single call site.
+#12 asked for held-out loss and perplexity to be logged "as first-class metrics
+via #7" and, since #7 -- MLflow tracking -- wasn't built yet, routed everything
+through this sink instead: the number is what has value, the backend is where
+it is filed. #7 now exists, and it plugs in here rather than at each call site
+-- every ``log()`` forwards its metrics to ``tracking.log_step`` after writing
+the JSONL line, so nothing upstream of this file had to change to gain MLflow
+curves. ``tracking.log_step`` is a no-op with no active or pending run (no
+``mlflow`` installed, or nobody called ``tracking.init_tracking``), which is
+what keeps a bare ``MetricSink`` -- the shape every test below still
+constructs -- from starting a run of its own.
 
 Names are namespaced and the namespaces are load-bearing rather than tidy:
 ``train/`` is a statistic of the batch the model just fit, ``eval/`` is the
@@ -19,6 +23,8 @@ import json
 import logging
 from pathlib import Path
 from typing import Any
+
+from tracking import log_step
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +69,11 @@ class MetricSink:
         record = {"step": step, **self.run_tags, **metrics}
         self._handle.write(json.dumps(record) + "\n")
         self._handle.flush()
+
+        # run_tags (router, seed) are dimensions of the run, not metrics of it --
+        # MLflow already has them as params from tracking.init_tracking, so only
+        # the measurements themselves go to log_step.
+        log_step(step, metrics)
 
     def close(self) -> None:
         if self._handle is not None:

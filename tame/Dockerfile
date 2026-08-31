@@ -32,7 +32,8 @@ RUN pip install --no-cache-dir \
 RUN pip install --no-cache-dir \
     "datasets>=2.14.0" \
     "peft>=0.7.0" \
-    "tqdm>=4.66.0"
+    "tqdm>=4.66.0" \
+    "mlflow>=2.10.0"
 
 # Install API dependencies
 RUN pip install --no-cache-dir \

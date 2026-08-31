@@ -20,6 +20,7 @@ import argparse
 import logging
 import math
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -108,6 +109,7 @@ from mob import (
 )
 from parity import ArmFingerprint, data_order_fingerprint, fingerprint_arm
 from specialisation import SpecialisationReport, probe_specialisation
+from tracking import end_tracking, init_tracking, log_checkpoint, log_provenance
 
 _profile = get_active_profile()
 
@@ -202,9 +204,16 @@ class TrainingConfig:
     # MoB layer now uses dense computation for checkpointing compatibility
     gradient_checkpointing: bool = True
 
-    # Checkpointing
+    # Checkpointing. Retention always keeps the first checkpoint, the checkpoint
+    # nearest the best held-out eval/loss seen so far, and the final one; beyond
+    # that, only the most recent ``checkpoint_keep_last`` are kept -- at least
+    # the checkpoint just written always survives its own save, so 0 means
+    # "nothing but first/best/final/whatever was just written", with that last
+    # one typically evicted on the next save. The exact budget belongs to #13;
+    # this is the mechanism.
     save_steps: int = 1000
     eval_steps: int = 500
+    checkpoint_keep_last: int = 3
 
     # Experimental arm (#12). The gate is the only thing allowed to vary between
     # arms; parity.py refuses a comparison in which anything else did.
@@ -247,6 +256,9 @@ class TrainingConfig:
             if value < 1:
                 raise ValueError(f"{name} must be >= 1, got {value}")
 
+        if self.checkpoint_keep_last < 0:
+            raise ValueError(f"checkpoint_keep_last must be >= 0, got {self.checkpoint_keep_last}")
+
 
 class TAMETrainer:
     """
@@ -277,19 +289,20 @@ class TAMETrainer:
         self.optimizer = None
         self.scheduler = None
         self.train_dataloader = None
+        self.mob_config: MoBConfig | None = None
 
         # Training state
         self.global_step = 0
         self.best_loss = float("inf")
+        self.best_step: int | None = None
+        self._checkpoint_steps: list[int] = []
+        self._archived_checkpoint_steps: set[int] = set()
         self._last_avg_metrics = {
             "loss": 0.0,
             "calibration_loss": 0.0,
             "router_z_loss": 0.0,
             "perplexity": 0.0,
         }
-
-        # Wealth history for analysis
-        self.wealth_history: list[dict[str, Any]] = []
 
         # Held-out evaluation state, populated by setup()
         self.held_out_split: HeldOutSplit | None = None
@@ -299,6 +312,11 @@ class TAMETrainer:
             Path(config.output_dir) / METRICS_FILENAME,
             run_tags={"router": config.router, "seed": config.seed},
         )
+
+        # Records the config for a lazily-started MLflow run (#7): nothing is
+        # written until setup() calls log_provenance(), by which point the MoB
+        # config and arm fingerprint exist too. See tracking.init_tracking.
+        init_tracking(config)
 
         # Set seed
         torch.manual_seed(config.seed)
@@ -376,6 +394,12 @@ class TAMETrainer:
         # on, which needs the loader that was just built.
         self._record_fingerprint()
 
+        # Provenance after the fingerprint: this is the first point at which the
+        # MoB config, the dataset revision and everything else a comparison needs
+        # all exist, so the MLflow run opens with one complete write instead of a
+        # partial one from __init__.
+        log_provenance(self.mob_config, self.fingerprint)
+
         logger.info(
             f"Model loaded with {sum(p.numel() for p in self.model.parameters()):,} parameters"
         )
@@ -416,6 +440,7 @@ class TAMETrainer:
         layers_to_modify = list(range(self.config.mob_layers_start, self.config.mob_layers_end))
 
         self.model = apply_mob_to_model(self.model, mob_config, layers_to_modify=layers_to_modify)
+        self.mob_config = mob_config
 
     def _redispatch_model(self):
         """
@@ -856,6 +881,13 @@ class TAMETrainer:
         self.metrics.log(step, measurements)
         self.eval_history.append({"step": step, **measurements})
 
+        # The held-out loss, not the training-batch one, is what checkpoint
+        # retention protects as "best" -- see the module docstring on why #12
+        # treats train/ and eval/ as different numbers.
+        if result.loss < self.best_loss:
+            self.best_loss = result.loss
+            self.best_step = step
+
         logger.info(
             f"  eval @ {step}: loss {result.loss:.4f} | ppl {result.perplexity:.2f} "
             f"| {result.num_tokens} tokens | split {result.fingerprint}"
@@ -1166,6 +1198,7 @@ class TAMETrainer:
             self._save_checkpoint(self.config.max_steps, final=True)
         finally:
             self.metrics.close()
+            end_tracking()
 
         logger.info("=" * 118)
         logger.info("Training complete!")
@@ -1226,25 +1259,7 @@ class TAMETrainer:
             top1 = _scalar(stats.get("routing_top1_mean"))
             effective_experts = _scalar(stats.get("routing_effective_experts"))
             saturated = _scalar(stats.get("routing_top1_saturated_fraction"))
-
-            # Store for analysis
-            self.wealth_history.append(
-                {
-                    "step": step,
-                    "progress": progress,
-                    "loss": loss,
-                    "perplexity": ppl,
-                    "calibration_loss": cal,
-                    "router_z_loss": router_z,
-                    "mean_wealth": mean_wealth,
-                    "wealth_std": std_wealth,
-                    "wealth_gini": gini,
-                    "mean_performance": perf_ema,
-                    "routing_top1_mean": top1,
-                    "routing_top1_saturated_fraction": saturated,
-                    "routing_effective_experts": effective_experts,
-                }
-            )
+            mean_payment = stats.get("mean_payment")
 
             measurements.update(
                 {
@@ -1257,6 +1272,10 @@ class TAMETrainer:
                     "routing/effective_experts": effective_experts,
                 }
             )
+            # Absent under softmax/dense (no economy, no payment to report) rather
+            # than logged as zero -- see get_mob_statistics.
+            if mean_payment is not None:
+                measurements["auction/mean_payment"] = _scalar(mean_payment)
 
             # Format performance EMA with sign
             perf_sign = "+" if perf_ema >= 0 else ""
@@ -1342,13 +1361,11 @@ class TAMETrainer:
 
         save_mob_state(cast(nn.Module, self.model), str(checkpoint_dir / "mob_state.pt"))
 
-        # Save wealth history
-        if self.wealth_history:
-            torch.save(self.wealth_history, checkpoint_dir / "wealth_history.pt")
-
         # Save training state. The fingerprint and the eval history travel with the
         # checkpoint because a comparison assembled later needs to prove parity from
-        # the artefacts, not from whatever the shell history says was run.
+        # the artefacts, not from whatever the shell history says was run. Wealth
+        # history no longer gets a separate .pt here -- it lives in MLflow metric
+        # curves (wealth/*) via log_checkpoint below and the per-step log_step call.
         training_state = {
             "global_step": self.global_step,
             "optimizer_state": self.optimizer.state_dict(),
@@ -1358,8 +1375,61 @@ class TAMETrainer:
             "eval_history": self.eval_history,
         }
         torch.save(training_state, checkpoint_dir / "training_state.pt")
-
         logger.info(f"Saved checkpoint to {checkpoint_dir}")
+
+        self._checkpoint_steps.append(step)
+        self._prune_checkpoints(final)
+
+    def _prune_checkpoints(self, final: bool) -> None:
+        """Archive what retention permanently keeps, then drop everything else.
+
+        Archived to MLflow, exactly once each, the first time they qualify: the
+        first checkpoint, the one nearest the best held-out eval/loss seen so
+        far (evaluation and checkpoint cadences are independent, so "nearest"
+        rather than "exact match" is what makes best-checkpoint retention
+        actually protect something), and the final one. This "permanent" set
+        can still shrink on disk -- the checkpoint nearest an earlier, since-
+        superseded best is dropped locally once a later one is nearer, same as
+        any other unprotected checkpoint -- but its MLflow copy is unaffected;
+        the archive is a record of every checkpoint that was ever the best or
+        boundary, not a mirror of what retention currently keeps. Archiving
+        every checkpoint unconditionally, by contrast, would make the MLflow
+        artifact store grow without bound regardless of local retention,
+        defeating the retention this method exists to do.
+
+        Transiently kept, on disk only: the most recent
+        ``checkpoint_keep_last``, or at least the one just written (so a fresh
+        checkpoint is never deleted in the same call that created it) even when
+        ``checkpoint_keep_last`` is 0. These are never archived -- they are
+        exactly the checkpoints retention intends to drop soon, usually on the
+        very next save.
+        """
+        permanent = {self._checkpoint_steps[0]}
+        if self.best_step is not None:
+            permanent.add(self._nearest_checkpoint_step(self.best_step))
+        if final:
+            permanent.add(self._checkpoint_steps[-1])
+
+        for step in permanent - self._archived_checkpoint_steps:
+            checkpoint_dir = Path(self.config.output_dir) / f"checkpoint-{step}"
+            if checkpoint_dir.exists():
+                log_checkpoint(checkpoint_dir)
+                self._archived_checkpoint_steps.add(step)
+
+        recent_count = max(self.config.checkpoint_keep_last, 1)
+        protected = permanent | set(self._checkpoint_steps[-recent_count:])
+
+        for step in list(self._checkpoint_steps):
+            if step in protected:
+                continue
+            checkpoint_dir = Path(self.config.output_dir) / f"checkpoint-{step}"
+            if checkpoint_dir.exists():
+                shutil.rmtree(checkpoint_dir)
+                logger.info(f"Pruned checkpoint {checkpoint_dir} (outside retention)")
+            self._checkpoint_steps.remove(step)
+
+    def _nearest_checkpoint_step(self, target: int) -> int:
+        return min(self._checkpoint_steps, key=lambda step: abs(step - target))
 
 
 def main():
@@ -1451,6 +1521,17 @@ def main():
     )
     parser.add_argument("--seed", type=int, default=42, help="Seed; must match across arms")
 
+    # Checkpoint retention (#7)
+    parser.add_argument(
+        "--checkpoint_keep_last",
+        type=int,
+        default=3,
+        help=(
+            "Intermediate checkpoints to keep beyond first/best/final. "
+            "0 evicts each on its next save"
+        ),
+    )
+
     # Hardware
     parser.add_argument(
         "--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"]
@@ -1481,6 +1562,7 @@ def main():
         held_out_sequences=args.held_out_sequences,
         probe_tokens=args.probe_tokens,
         seed=args.seed,
+        checkpoint_keep_last=args.checkpoint_keep_last,
     )
 
     # Create trainer and run

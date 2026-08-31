@@ -2,6 +2,7 @@
 
 import json
 
+import metrics
 from metrics import MetricSink
 
 
@@ -45,3 +46,25 @@ def test_non_finite_values_survive_the_round_trip(tmp_path):
     record = json.loads(path.read_text())
 
     assert record["train/loss"] != record["train/loss"]
+
+
+def test_log_forwards_metrics_but_not_run_tags_to_tracking(tmp_path, monkeypatch):
+    """#7's whole design rests on this one forwarding call -- MetricSink is the
+    seam tracking.py plugs into rather than train.py gaining new call sites.
+    Without this test, deleting the forward leaves every other test green."""
+    calls = []
+    monkeypatch.setattr(metrics, "log_step", lambda step, m: calls.append((step, m)))
+
+    with MetricSink(tmp_path / "metrics.jsonl", run_tags={"router": "mob", "seed": 42}) as sink:
+        sink.log(7, {"train/loss": 1.0})
+
+    assert calls == [(7, {"train/loss": 1.0})]
+
+
+def test_log_step_is_called_even_with_no_tracking_backend(tmp_path):
+    """The real tracking.log_step, unmocked: a bare MetricSink with no MLflow
+    run ever started must not raise -- it has to be a true no-op downstream."""
+    with MetricSink(tmp_path / "metrics.jsonl") as sink:
+        sink.log(1, {"train/loss": 1.0})  # must not raise
+
+    assert (tmp_path / "metrics.jsonl").exists()

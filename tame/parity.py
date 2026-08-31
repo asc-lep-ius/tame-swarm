@@ -67,6 +67,9 @@ NOT_A_CONFOUND = {
     "eval_steps": "evaluation cadence; evaluation runs under no_grad with the economy frozen",
     # Subsumed by a stronger check: the split's own fingerprint changes if its size does.
     "held_out_sequences": "subsumed by eval_split, which hashes the split itself",
+    # Disk retention only (#7): how many checkpoints survive on disk, not what
+    # training computes or what any checkpoint contains.
+    "checkpoint_keep_last": "checkpoint retention only, does not affect training",
 }
 
 
