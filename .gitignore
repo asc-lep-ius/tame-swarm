@@ -50,3 +50,6 @@ Implementing_Multi-Scale_Competency_in_Large_Language_Models-A_Bio-Inspired_Arch
 *.log
 *.tmp
 *.bak
+
+# mutmut working tree
+mutants/
