@@ -1,6 +1,9 @@
+from dataclasses import fields as dc_fields
+
 import pytest
 
-from mob import MoBConfig
+from mob import ROUTER_AUCTION, ROUTER_SOFTMAX, MoBConfig
+from mob.mob_config import AUCTION_ONLY_FIELDS
 
 
 def test_default_values_match_expected():
@@ -78,3 +81,70 @@ def test_non_positive_routing_temperature_is_rejected(temperature):
     """
     with pytest.raises(ValueError, match="routing_temperature must be positive"):
         MoBConfig(routing_temperature=temperature)
+
+
+def test_auction_only_settings_warn_under_the_softmax_gate(caplog):
+    """A tuned field that nothing reads is the defect class #12 was opened over."""
+    with caplog.at_level("WARNING"):
+        MoBConfig(router=ROUTER_SOFTMAX, payment_scale=2.5, wealth_decay=0.5)
+
+    assert "payment_scale" in caplog.text
+    assert "wealth_decay" in caplog.text
+    assert "does not run the auction" in caplog.text
+    assert "none of them affect this arm" in caplog.text
+
+
+def test_auction_gate_parameters_warn_under_the_softmax_gate(caplog):
+    """The share and sharpness go to VCGAuctioneer; SoftmaxRouter takes neither."""
+    with caplog.at_level("WARNING"):
+        MoBConfig(router=ROUTER_SOFTMAX, routing_temperature=0.1, use_differentiable_routing=False)
+
+    assert "routing_temperature" in caplog.text
+    assert "use_differentiable_routing" in caplog.text
+
+
+def test_the_calibration_weight_warns_under_the_softmax_gate(caplog):
+    """Its only reader sits below the has_economy early return, so it is a no-op here.
+
+    Reachable from the harness: the trainer threads TrainingConfig.calibration_loss_weight
+    straight into it and parity fingerprints that field, so a sweep over it would
+    otherwise get a silent no-op on the control arm.
+    """
+    with caplog.at_level("WARNING"):
+        MoBConfig(router=ROUTER_SOFTMAX, confidence_calibration_weight=0.9)
+
+    assert "confidence_calibration_weight" in caplog.text
+
+
+def test_jitter_is_not_reported_as_ignored_under_the_softmax_gate(caplog):
+    """``jitter_std`` perturbs the adapters in from_pretrained_ffn, which every arm runs.
+
+    Calling a live field dead is the mirror of the defect this warning exists to
+    catch, and worse: it invites someone to stop setting something that does steer
+    the control arm.
+    """
+    with caplog.at_level("WARNING"):
+        MoBConfig(router=ROUTER_SOFTMAX, jitter_std=0.5)
+
+    assert caplog.text == ""
+
+
+def test_default_settings_are_silent_under_the_softmax_gate(caplog):
+    """The control arm shares the auction's config object, so defaults must not warn."""
+    with caplog.at_level("WARNING"):
+        MoBConfig(router=ROUTER_SOFTMAX)
+
+    assert caplog.text == ""
+
+
+def test_auction_only_settings_do_not_warn_under_the_auction(caplog):
+    with caplog.at_level("WARNING"):
+        MoBConfig(router=ROUTER_AUCTION, payment_scale=2.5, routing_temperature=0.1)
+
+    assert caplog.text == ""
+
+
+def test_every_auction_only_field_exists_on_the_config():
+    """A renamed field would otherwise turn the warning into a KeyError at import."""
+    names = {spec.name for spec in dc_fields(MoBConfig)}
+    assert set(AUCTION_ONLY_FIELDS) <= names

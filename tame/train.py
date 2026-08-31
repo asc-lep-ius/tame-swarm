@@ -84,7 +84,18 @@ except ImportError:
     logger.warning("'accelerate' library not installed. Model re-dispatch disabled.")
 
 from config import get_active_profile
+from evaluation import (
+    DEFAULT_HELD_OUT_SEQUENCES,
+    SOURCE_TRAIN_HOLDOUT,
+    HeldOutSplit,
+    build_held_out_split,
+    evaluate,
+    is_held_out_position,
+)
+from metrics import MetricSink
 from mob import (
+    ROUTER_AUCTION,
+    ROUTER_SOFTMAX,
     ROUTING_SATURATION_THRESHOLD,
     MoBConfig,
     apply_mob_to_model,
@@ -95,8 +106,26 @@ from mob import (
     save_mob_state,
     update_all_mob_from_loss,
 )
+from parity import ArmFingerprint, data_order_fingerprint, fingerprint_arm
+from specialisation import SpecialisationReport, probe_specialisation
 
 _profile = get_active_profile()
+
+# The three arms of #12. ``mob`` and ``softmax`` are gates over the same upcycled
+# experts and differ only in how reports become an allocation; ``dense`` is the
+# absence of routing -- the original FFN, untouched -- and is the
+# capability-preservation floor rather than a third gate.
+ARM_MOB = "mob"
+ARM_SOFTMAX = "softmax"
+ARM_DENSE = "dense"
+ARMS = (ARM_MOB, ARM_SOFTMAX, ARM_DENSE)
+
+# Which MoB gate each routed arm configures. ``dense`` is absent because it builds
+# no MoB layer at all.
+ARM_ROUTERS = {ARM_MOB: ROUTER_AUCTION, ARM_SOFTMAX: ROUTER_SOFTMAX}
+
+HELD_OUT_SPLIT_FILENAME = "held_out_split.pt"
+METRICS_FILENAME = "metrics.jsonl"
 
 
 # Below this, top_k slots are buying less than one extra expert's worth of mixing.
@@ -177,8 +206,46 @@ class TrainingConfig:
     save_steps: int = 1000
     eval_steps: int = 500
 
+    # Experimental arm (#12). The gate is the only thing allowed to vary between
+    # arms; parity.py refuses a comparison in which anything else did.
+    router: str = ARM_MOB
+
+    # Held-out evaluation. ``held_out_sequences`` fixes the split size so it is a
+    # property of the experiment rather than of whichever run built the cache
+    # first; ``probe_tokens`` is the specialisation probe, floored at 4096 because
+    # below roughly a thousand tokens report decisiveness carries several points of
+    # noise -- the same order as the effect being resolved between arms.
+    held_out_sequences: int = DEFAULT_HELD_OUT_SEQUENCES
+    probe_tokens: int = 4096
+
     # Misc
     seed: int = 42
+
+    def __post_init__(self) -> None:
+        """Reject a config that would fail deep inside a run rather than at the boundary.
+
+        argparse ``choices`` covers the CLI, but a config assembled in code -- which is
+        how the comparison harness builds its arms -- reaches ``ARM_ROUTERS[router]``
+        as a bare ``KeyError`` and ``step % eval_steps`` as a ``ZeroDivisionError``
+        several minutes in, with the model loaded and the split already built.
+        """
+        if self.router not in ARMS:
+            raise ValueError(f"Unsupported router '{self.router}'. Supported: {sorted(ARMS)}")
+
+        positive_fields = (
+            "max_steps",
+            "gradient_accumulation_steps",
+            "eval_steps",
+            "save_steps",
+            "log_frequency",
+            "probe_tokens",
+            "held_out_sequences",
+            "wealth_update_frequency",
+        )
+        for name in positive_fields:
+            value = getattr(self, name)
+            if value < 1:
+                raise ValueError(f"{name} must be >= 1, got {value}")
 
 
 class TAMETrainer:
@@ -224,6 +291,15 @@ class TAMETrainer:
         # Wealth history for analysis
         self.wealth_history: list[dict[str, Any]] = []
 
+        # Held-out evaluation state, populated by setup()
+        self.held_out_split: HeldOutSplit | None = None
+        self.fingerprint: ArmFingerprint | None = None
+        self.eval_history: list[dict[str, Any]] = []
+        self.metrics = MetricSink(
+            Path(config.output_dir) / METRICS_FILENAME,
+            run_tags={"router": config.router, "seed": config.seed},
+        )
+
         # Set seed
         torch.manual_seed(config.seed)
         if torch.cuda.is_available():
@@ -232,6 +308,12 @@ class TAMETrainer:
     def setup(self):
         """Initialize model, tokenizer, optimizer, and data."""
         logger.info(f"Loading model: {self.config.model_id}")
+        logger.info(f"Arm: --router {self.config.router}")
+
+        # Created before anything writes into it: the held-out split is frozen here
+        # so that later runs and sibling arms read the same file rather than
+        # rebuilding one each and hoping they agree.
+        os.makedirs(self.config.output_dir, exist_ok=True)
 
         # Load tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -254,8 +336,13 @@ class TAMETrainer:
         if self.config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
 
-        # Apply MoB transformation
-        self._apply_mob()
+        # Apply MoB transformation. The dense arm skips it entirely -- it is the
+        # unrouted floor, so "convert nothing" is the arm rather than a degenerate
+        # configuration of one.
+        if self.config.router != ARM_DENSE:
+            self._apply_mob()
+        else:
+            logger.info("Dense arm: leaving the original FFN in place, no MoB layers")
 
         # Apply LoRA if requested (before re-dispatch so all new modules are included)
         if self.config.use_lora:
@@ -274,14 +361,20 @@ class TAMETrainer:
         # Setup optimizer
         self._setup_optimizer()
 
+        # Held-out split before the training data: when the dataset ships no
+        # validation split, the training stream has to skip exactly the rows the
+        # evaluation set took, so the split has to exist before the loader is built.
+        self._setup_held_out_split()
+
         # Setup data
         self._setup_data()
 
         # Setup scheduler
         self._setup_scheduler()
 
-        # Create output directory
-        os.makedirs(self.config.output_dir, exist_ok=True)
+        # Parity fingerprint last: it hashes the data this arm will actually train
+        # on, which needs the loader that was just built.
+        self._record_fingerprint()
 
         logger.info(
             f"Model loaded with {sum(p.numel() for p in self.model.parameters()):,} parameters"
@@ -316,6 +409,7 @@ class TAMETrainer:
             use_local_quality=True,
             use_differentiable_routing=True,
             confidence_calibration_weight=self.config.calibration_loss_weight,
+            router=ARM_ROUTERS[self.config.router],
         )
 
         # Determine which layers to modify
@@ -623,6 +717,158 @@ class TAMETrainer:
             num_training_steps=num_training_steps,
         )
 
+    def _setup_held_out_split(self):
+        """Build or restore the frozen held-out split for this experiment.
+
+        Restored from ``output_dir`` when it is already there, which is what makes
+        the number comparable across runs rather than merely across arms: a split
+        rebuilt from a dataset that has since been revised is a different
+        measurement wearing the same name.
+        """
+        assert self.tokenizer is not None
+        if not HAS_DATASETS:
+            raise ImportError("Install datasets: pip install datasets")
+
+        cache_path = Path(self.config.output_dir) / HELD_OUT_SPLIT_FILENAME
+        if cache_path.exists():
+            self.held_out_split = HeldOutSplit.load(cache_path)
+            self._assert_cache_matches_config(self.held_out_split, cache_path)
+            logger.info(
+                f"Held-out split restored from {cache_path} "
+                f"(fingerprint {self.held_out_split.fingerprint}, "
+                f"{self.held_out_split.leakage_risk})"
+            )
+            return
+
+        self.held_out_split = build_held_out_split(
+            dataset_name=self.config.dataset_name,
+            dataset_config=self._dataset_config(),
+            tokenizer=self.tokenizer,
+            max_seq_length=self.config.max_seq_length,
+            load_dataset=load_dataset,
+            num_sequences=self.config.held_out_sequences,
+        )
+        self.held_out_split.save(cache_path)
+
+    def _assert_cache_matches_config(self, split: HeldOutSplit, cache_path: Path) -> None:
+        """Refuse a cached split built for a different corpus, length or size.
+
+        ``HeldOutSplit.load`` proves the file is internally consistent; it cannot
+        know what this run asked for. Parity will not catch the difference either --
+        every arm reads the same stale cache, so the arms agree and the comparison
+        is a comparison on the wrong data.
+        """
+        expected_dataset = self._dataset_config()
+        expected_dataset = (
+            f"{self.config.dataset_name}/{expected_dataset}"
+            if expected_dataset
+            else self.config.dataset_name
+        )
+        cached_length = int(split.input_ids.shape[1])
+        mismatches = []
+        if split.dataset != expected_dataset:
+            mismatches.append(
+                f"dataset: cached {split.dataset!r} vs configured {expected_dataset!r}"
+            )
+        if cached_length != self.config.max_seq_length:
+            mismatches.append(
+                f"max_seq_length: cached {cached_length} vs configured {self.config.max_seq_length}"
+            )
+        # Asymmetric on purpose: a cache larger than the config was built for a
+        # different experiment, while a smaller one is also what a source that ran
+        # out of usable rows legitimately produces -- collect_documents already warns
+        # about that, and refusing it would make a short corpus unusable.
+        if split.num_sequences > self.config.held_out_sequences:
+            mismatches.append(
+                f"held_out_sequences: cached {split.num_sequences} vs configured "
+                f"{self.config.held_out_sequences}"
+            )
+        elif split.num_sequences < self.config.held_out_sequences:
+            logger.warning(
+                f"Held-out split cached at {cache_path} has {split.num_sequences} sequences "
+                f"against the configured {self.config.held_out_sequences}; the source may have "
+                "run short, but delete the cache to be sure it is not stale"
+            )
+        if mismatches:
+            raise ValueError(
+                f"The held-out split cached at {cache_path} was not built for this run "
+                "(" + "; ".join(mismatches) + "). Delete it and let the run rebuild it."
+            )
+
+    def _dataset_config(self) -> str | None:
+        """The dataset config actually in force, by one rule rather than two.
+
+        ``dataset_config`` names a wikitext variant and means nothing for any other
+        dataset. The split builder and the parity fingerprint both need this, and
+        computing it twice is how a fingerprint ends up recording a configuration
+        the run did not use -- which is worse than recording nothing, because it
+        looks like evidence.
+        """
+        return self.config.dataset_config if self.config.dataset_name == "wikitext" else None
+
+    def _record_fingerprint(self):
+        """Hash what this arm will train on, so a comparison can refuse a confound."""
+        assert self.train_dataloader is not None
+        assert self.held_out_split is not None
+        assert self.model is not None
+
+        # A fresh iterator over a streaming dataset restarts it, so this reads the
+        # same rows the training iterator is about to read. Every arm pays the same
+        # cost in the same order, which is what keeps the check from perturbing the
+        # thing it is checking.
+        order = data_order_fingerprint(iter(self.train_dataloader))
+
+        self.fingerprint = fingerprint_arm(
+            self.config,
+            dataset_config=self._dataset_config(),
+            eval_split_fingerprint=self.held_out_split.fingerprint,
+            data_order=order,
+            converted_layers=len(get_mob_layers(self.model)),
+        )
+        logger.info(f"Arm fingerprint: {self.fingerprint.as_dict()}")
+
+    def evaluate_held_out(self, step: int) -> dict[str, float]:
+        """Held-out loss, perplexity and the functional specialisation probe.
+
+        The economy is frozen for the duration (``mob.frozen_economy``): no wealth
+        moves, no usage count advances, no coupling step is set, and the training
+        statistics the next log line reads are restored on the way out. That is the
+        difference between an evaluation and an unlogged training step.
+        """
+        assert self.model is not None
+        assert self.tokenizer is not None
+        assert self.held_out_split is not None
+
+        result = evaluate(self.model, self.held_out_split, self.config.batch_size, self.device)
+        measurements = dict(result.as_metrics())
+
+        report: SpecialisationReport | None = probe_specialisation(
+            self.model,
+            self.held_out_split,
+            self.tokenizer,
+            self.device,
+            batch_size=self.config.batch_size,
+            probe_tokens=self.config.probe_tokens,
+        )
+        if report is not None:
+            measurements.update(report.as_metrics())
+
+        self.metrics.log(step, measurements)
+        self.eval_history.append({"step": step, **measurements})
+
+        logger.info(
+            f"  eval @ {step}: loss {result.loss:.4f} | ppl {result.perplexity:.2f} "
+            f"| {result.num_tokens} tokens | split {result.fingerprint}"
+        )
+        if report is not None:
+            logger.info(
+                f"  spec @ {step}: expert cos-dist {report.divergence.mean_cosine_distance:.4f}"
+                f" | routing JS vs corpus {report.profile.mean_js_from_corpus:.4f}"
+                f" | report-decisive {report.report_decisiveness:.1%}"
+                f" over {report.probe_tokens} tokens"
+            )
+        return measurements
+
     def _setup_data(self):
         """Setup training data loader."""
         assert self.tokenizer is not None
@@ -652,6 +898,17 @@ class TAMETrainer:
                 streaming=True,
             )
             text_column = "text"
+
+        # The fallback holdout carved the evaluation set out of *this* stream, so
+        # the same rows have to leave it here. Filtering on the raw row index is
+        # what makes the two sides provably the same set rather than two filters
+        # that happen to agree -- see evaluation.is_held_out_position.
+        if self.held_out_split is not None and self.held_out_split.source == SOURCE_TRAIN_HOLDOUT:
+            dataset = dataset.filter(
+                lambda _example, index: not is_held_out_position(index),
+                with_indices=True,
+            )
+            logger.info("Training stream filtered: held-out row positions removed")
 
         # Tokenize — capture tokenizer locally for pyright closure narrowing
         tokenizer = self.tokenizer
@@ -848,54 +1105,67 @@ class TAMETrainer:
             else range(self.config.max_steps)
         )
 
-        for step in progress_bar:
-            self.global_step = step
+        # The sink is closed however the loop leaves: an interrupted or failed
+        # run still owns a metrics file, and a half-written one is easier to read
+        # than one whose handle was never released.
+        try:
+            for step in progress_bar:
+                self.global_step = step
 
-            # Get batch (handle iterator exhaustion)
-            try:
-                batch = next(data_iter)
-            except StopIteration:
-                data_iter = iter(self.train_dataloader)
-                batch = next(data_iter)
+                # Get batch (handle iterator exhaustion)
+                try:
+                    batch = next(data_iter)
+                except StopIteration:
+                    data_iter = iter(self.train_dataloader)
+                    batch = next(data_iter)
 
-            # Training step
-            metrics = self.train_step(batch)
+                # Training step
+                metrics = self.train_step(batch)
 
-            # Accumulate metrics
-            for key in accumulated_metrics:
-                if key in metrics:
-                    accumulated_metrics[key] += metrics[key]
+                # Accumulate metrics
+                for key in accumulated_metrics:
+                    if key in metrics:
+                        accumulated_metrics[key] += metrics[key]
 
-            # Gradient accumulation step
-            if (step + 1) % self.config.gradient_accumulation_steps == 0:
-                # Clip gradients
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+                # Gradient accumulation step
+                if (step + 1) % self.config.gradient_accumulation_steps == 0:
+                    # Clip gradients
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
-                # Optimizer step
-                self.optimizer.step()
-                self.scheduler.step()
-                self.optimizer.zero_grad()
+                    # Optimizer step
+                    self.optimizer.step()
+                    self.scheduler.step()
+                    self.optimizer.zero_grad()
 
-                # Compute averaged metrics for this accumulation window (stored for next log)
-                self._last_avg_metrics = {
-                    k: v / self.config.gradient_accumulation_steps
-                    for k, v in accumulated_metrics.items()
-                }
+                    # Compute averaged metrics for this accumulation window (stored for next log)
+                    self._last_avg_metrics = {
+                        k: v / self.config.gradient_accumulation_steps
+                        for k, v in accumulated_metrics.items()
+                    }
 
-                # Reset accumulated metrics
-                accumulated_metrics = {k: 0.0 for k in accumulated_metrics}
+                    # Reset accumulated metrics
+                    accumulated_metrics = {k: 0.0 for k in accumulated_metrics}
 
-            # Log comprehensive training statistics
-            if step > 0 and step % self.config.log_frequency == 0:
-                self._log_training_step(step)
+                # Log comprehensive training statistics
+                if step > 0 and step % self.config.log_frequency == 0:
+                    self._log_training_step(step)
 
-            # Save checkpoint
-            if step > 0 and step % self.config.save_steps == 0:
-                self._save_checkpoint(step)
+                # Held-out evaluation. This is what ``eval_steps`` has always claimed
+                # to do and never did; every number the project reports as evidence of
+                # capability comes from here rather than from the training batch above.
+                if step > 0 and step % self.config.eval_steps == 0:
+                    self.evaluate_held_out(step)
 
-        # Final save and log
-        self._log_training_step(self.config.max_steps)
-        self._save_checkpoint(self.config.max_steps, final=True)
+                # Save checkpoint
+                if step > 0 and step % self.config.save_steps == 0:
+                    self._save_checkpoint(step)
+
+            # Final save and log
+            self._log_training_step(self.config.max_steps)
+            self.evaluate_held_out(self.config.max_steps)
+            self._save_checkpoint(self.config.max_steps, final=True)
+        finally:
+            self.metrics.close()
 
         logger.info("=" * 118)
         logger.info("Training complete!")
@@ -921,6 +1191,16 @@ class TAMETrainer:
         ppl = metrics.get("perplexity", float("nan"))
         cal = metrics.get("calibration_loss", 0.0)
         router_z = metrics.get("router_z_loss", 0.0)
+
+        # Recorded before the MoB branch: the dense arm has no wealth statistics and
+        # would otherwise contribute no training curve at all, which is exactly the
+        # arm a capability-preservation claim is read against.
+        measurements = {
+            "train/loss": loss,
+            "train/perplexity": ppl,
+            "train/calibration_loss": cal,
+            "train/router_z_loss": router_z,
+        }
 
         if stats:
             _mw = stats["mean_wealth"]
@@ -966,6 +1246,18 @@ class TAMETrainer:
                 }
             )
 
+            measurements.update(
+                {
+                    "wealth/mean": mean_wealth,
+                    "wealth/std": std_wealth,
+                    "wealth/gini": gini,
+                    "wealth/mean_performance": perf_ema,
+                    "routing/top1_mean": top1,
+                    "routing/saturated_fraction": saturated,
+                    "routing/effective_experts": effective_experts,
+                }
+            )
+
             # Format performance EMA with sign
             perf_sign = "+" if perf_ema >= 0 else ""
 
@@ -990,34 +1282,44 @@ class TAMETrainer:
                     "is paying for experts it is not mixing."
                 )
 
-            # Warnings for unhealthy dynamics
-            if gini < 0.10:
-                logger.warning(
-                    f"  ⚠ Low Gini ({gini:.4f}) - experts converging, "
-                    "not specializing. Consider: ↑reward_scale, ↓wealth_decay"
-                )
-            elif gini > 0.60:
-                logger.warning(
-                    f"  ⚠ High Gini ({gini:.4f}) - wealth monopoly risk. "
-                    "Consider: ↑min_wealth, ↓max_wealth"
-                )
+            # Economy diagnostics, and only that. Gini measures dispersion of a
+            # wealth vector produced by an EMA with a tuned decay and a hard clamp;
+            # it says nothing about whether two experts compute the same function,
+            # and its direction is the wrong way round for a specialisation reading
+            # -- higher Gini means *more* of the routing decided by the wealth
+            # scalar and less by what an expert reports about the token. The
+            # specialisation numbers are the spec/ metrics from the held-out probe.
+            if self.config.router == ARM_MOB:
+                if gini < 0.10:
+                    logger.warning(
+                        f"  ⚠ Low Gini ({gini:.4f}) - wealth is near-flat, so the "
+                        "auction is allocating almost entirely on reports. Not a "
+                        "specialisation measure. Consider: ↑reward_scale, ↓wealth_decay"
+                    )
+                elif gini > 0.60:
+                    logger.warning(
+                        f"  ⚠ High Gini ({gini:.4f}) - wealth monopoly risk. "
+                        "Consider: ↑min_wealth, ↓max_wealth"
+                    )
 
-            if mean_wealth > 0.9 * 750:
-                logger.warning(
-                    f"  ⚠ Wealth near ceiling ({mean_wealth:.0f}/750) - consider ↑max_wealth"
-                )
+                if mean_wealth > 0.9 * 750:
+                    logger.warning(
+                        f"  ⚠ Wealth near ceiling ({mean_wealth:.0f}/750) - consider ↑max_wealth"
+                    )
 
-            if perf_ema < -0.3:
-                logger.warning(
-                    f"  ⚠ Negative performance EMA ({perf_ema:.4f}) "
-                    "- experts underperforming vs baseline"
-                )
+                if perf_ema < -0.3:
+                    logger.warning(
+                        f"  ⚠ Negative performance EMA ({perf_ema:.4f}) "
+                        "- experts underperforming vs baseline"
+                    )
         else:
             # No MoB stats available
             logger.info(
                 f"{step:>6} | {progress:>4.0f}% | {loss:>7.4f} | {ppl:>10.2f} | {cal:>6.4f} | "
                 f"{'N/A':>12} | {'N/A':>8} | {'N/A':>6} | {'N/A':>9}"
             )
+
+        self.metrics.log(step, measurements)
 
     def _save_checkpoint(self, step: int, final: bool = False):
         """Save model checkpoint and wealth state."""
@@ -1044,12 +1346,16 @@ class TAMETrainer:
         if self.wealth_history:
             torch.save(self.wealth_history, checkpoint_dir / "wealth_history.pt")
 
-        # Save training state
+        # Save training state. The fingerprint and the eval history travel with the
+        # checkpoint because a comparison assembled later needs to prove parity from
+        # the artefacts, not from whatever the shell history says was run.
         training_state = {
             "global_step": self.global_step,
             "optimizer_state": self.optimizer.state_dict(),
             "scheduler_state": self.scheduler.state_dict(),
             "config": self.config.__dict__,
+            "arm_fingerprint": self.fingerprint.as_dict() if self.fingerprint else None,
+            "eval_history": self.eval_history,
         }
         torch.save(training_state, checkpoint_dir / "training_state.pt")
 
@@ -1111,6 +1417,40 @@ def main():
         help="Dataset name (wikitext, c4, or HuggingFace dataset)",
     )
 
+    # Experimental arm (#12)
+    parser.add_argument(
+        "--router",
+        type=str,
+        default=ARM_MOB,
+        choices=list(ARMS),
+        help=(
+            "Routing arm: 'mob' is the auction, 'softmax' is the learned-gate control "
+            "over the same experts, 'dense' is the original FFN with no routing. "
+            "Everything else is held identical and parity is asserted."
+        ),
+    )
+
+    # Held-out evaluation (#12)
+    parser.add_argument(
+        "--eval_steps", type=int, default=500, help="Run the held-out evaluation every N steps"
+    )
+    parser.add_argument(
+        "--held_out_sequences",
+        type=int,
+        default=DEFAULT_HELD_OUT_SEQUENCES,
+        help="Sequences in the frozen held-out split",
+    )
+    parser.add_argument(
+        "--probe_tokens",
+        type=int,
+        default=4096,
+        help=(
+            "Tokens for the functional specialisation probe. Below ~1000 a single "
+            "arm carries several points of noise on report decisiveness"
+        ),
+    )
+    parser.add_argument("--seed", type=int, default=42, help="Seed; must match across arms")
+
     # Hardware
     parser.add_argument(
         "--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"]
@@ -1136,6 +1476,11 @@ def main():
         lora_rank=args.lora_rank,
         dataset_name=args.dataset,
         dtype=args.dtype,
+        router=args.router,
+        eval_steps=args.eval_steps,
+        held_out_sequences=args.held_out_sequences,
+        probe_tokens=args.probe_tokens,
+        seed=args.seed,
     )
 
     # Create trainer and run

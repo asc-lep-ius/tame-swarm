@@ -74,8 +74,9 @@ The substantive difference from a learned router is *where the training signal c
 - **Truthful bidding** — for a single token, an expert cannot raise its own payoff by misreporting. The allocation is monotone in an expert's report, each winner is charged its critical value `b₍ₖ₊₁₎ / wᵢ`, and every winner receives the same `1/k` share regardless of what it reported. That is the standard strategyproofness argument for a single-parameter mechanism, and `tests/test_auction.py` checks it by exhaustive deviation rather than by assertion.
   The property also survives into the economy, which is the part that is easy to get wrong. Report, price, reward and charge are all denominated in loss reduction, and reward and charge share one coefficient, so wealth moves by `A·(value − price)` and its break-even sits **exactly** at the price — the same threshold the auction allocates on. An earlier revision scaled rewards ×100 against charges ×0.3; the mechanism was still strategyproof about a payoff nothing optimised, and an expert maximising *wealth* profited by overreporting. `test_wealth_threshold_coincides_with_the_auction_threshold` pins the crossing.
   **Scope:** this is a property of the per-token stage game. Wealth persists across tokens, so an expert's reports shape its future bids and prices; the repeated game is *not* covered, and no claim is made that a head's report is a *correct* estimate of its value — only that it has no incentive to distort whatever estimate it holds.
-- **Emergent specialisation (not demonstrated)** — the intent is that experts reducing loss earn credits and reinforce a niche, with the Gini coefficient of the wealth distribution as the differentiation measure. No measurement supports this yet. In the only synthetic setting tried, wealth tracked the `ConfidenceHead` bias initialisation rather than expert competence: `r(wealth, expert index) ≈ −0.93` held across seeds regardless of which expert was actually the strongest, and the apparent competence correlation vanished once the competence vector was shuffled away from index order. Treat Gini figures produced today as measuring initialisation, not specialisation, until [#12](#phase-05--mechanism-correction) and [#13](#phase-05--mechanism-correction) provide baselines and a noise floor.
-- **No router collapse (untested)** — the argument is that a market with per-expert wealth has no single gating network to collapse. It is an argument, not a result: nothing here has been measured against a learned-router baseline. The gate-swap baseline that would evidence it is [#12](#phase-05--mechanism-correction); until then treat this as motivation.
+- **Emergent specialisation (not demonstrated)** — the intent is that experts reducing loss earn credits and reinforce a niche. No measurement supports this yet. In the only synthetic setting tried, wealth tracked the `ConfidenceHead` bias initialisation rather than expert competence: `r(wealth, expert index) ≈ −0.93` held across seeds regardless of which expert was actually the strongest, and the apparent competence correlation vanished once the competence vector was shuffled away from index order.
+  **The Gini coefficient is not the measure of this and never was.** It measures dispersion of a wealth vector produced by an EMA with a tuned decay and a hard clamp to `[15, 750]`, so its value is largely a property of that update rule's fixed point, and a Gini of 0.12–0.35 is entirely consistent with every expert computing the same function. Its *direction* is wrong too: wealth multiplies the report inside the bid, so a rising Gini mechanically increases wealth's share of the routing decision and decreases the report's. Gini remains a reasonable economy-health diagnostic and is logged as `wealth/gini`; the specialisation measures are the `spec/` metrics from the held-out probe ([#12](#phase-05--mechanism-correction), shipped) — pairwise expert output divergence on identical hidden states, per-expert token-category routing profiles, and report decisiveness. A capability claim additionally needs the noise floor from [#13](#phase-05--mechanism-correction).
+- **No router collapse (untested)** — the argument is that a market with per-expert wealth has no single gating network to collapse. It is an argument, not a result. The learned-router control that would evidence it now exists — `--router softmax`, the same confidence heads with the economy switched off ([#12](#phase-05--mechanism-correction)) — but no comparison has been run at a scale or seed count that would support a claim either way; the noise floor is [#13](#phase-05--mechanism-correction). Until then treat this as motivation. Note also that a wealth monopoly is a collapse mode of its own: `spec/routing_js_from_corpus` reads 0 both when routing ignores the token and when one expert wins everything, so it is read beside `expert_token_share`.
 - **Memory-efficient** — shared base weights + LoRA-rank adapters keep VRAM overhead to ~3 MB per expert per layer at rank 32.
 
 **Implementation details:**
@@ -163,7 +164,7 @@ curl http://localhost:8000/swarm/status
 
 <a name="training"></a>
 
-Training develops expert specialisation within the MoB layers. Without it, all experts start with identical weights and a Gini coefficient of ≈ 0 (no differentiation).
+Training is what differentiates the experts within a MoB layer. Upcycling starts them identical by construction — copied FFN weights with LoRA-B zeroed — so at step zero pairwise expert output divergence is exactly zero and the wealth vector is flat.
 
 ### Supported Base Models
 
@@ -200,6 +201,54 @@ docker compose -f docker-compose.train.yml run --rm train --mode train --steps 5
 docker compose -f docker-compose.train.yml run --rm train --mode full --steps 5000
 ```
 
+### Held-out Evaluation and Baseline Arms
+
+Every capability claim rests on the held-out split, never on the training batch.
+`--eval_steps` runs the evaluation loop with the economy frozen — no wealth
+updates, no usage counts, no coupling step — and logs `eval/loss`,
+`eval/perplexity` and the `spec/` specialisation probe to `metrics.jsonl`,
+namespaced so they can never be confused with the `train/` statistics of the
+batch just fitted.
+
+The split is built once and frozen. It prefers the dataset's own `validation`
+split, which is disjoint from training at *article* level; for a dataset that
+ships none, it falls back to a stride-97 holdout of the training stream that the
+training loader then skips. The fallback is disjoint by index but may share
+articles with training data, so it warns and records which path produced it.
+
+Three arms, identical in everything but the gate:
+
+```bash
+# The auction (default)
+python train.py --router mob --max_steps 1000 --seed 42
+
+# The learned-gate control: the same confidence heads, softmaxed, economy off
+python train.py --router softmax --max_steps 1000 --seed 42
+
+# The capability-preservation floor: original FFN, no routing
+python train.py --router dense --max_steps 1000 --seed 42
+```
+
+Or all three plus the parity check and a comparison table:
+
+```bash
+# Smoke run: a local tiny model and synthetic corpus, CPU, no network
+uv run python scripts/compare_routers.py
+
+# A real comparison
+uv run python scripts/compare_routers.py \
+    --model_id google/gemma-2-2b-it --dataset wikitext \
+    --steps 1000 --device cuda --use_lora
+```
+
+Parity is asserted, not assumed: each arm records a fingerprint over seed, data
+order (a hash of the tokens it will actually train on), requested layer range,
+adapter rank, step budget and held-out split, and the comparison raises rather
+than print a table whose arms differ in anything but the router. One seed is not
+a result — the between-seed spread measured on report decisiveness was ~46 points
+— so repeat over seeds, and read them against the noise floor from
+[#13](#phase-05--mechanism-correction).
+
 ### What Happens During Training
 
 | Phase | Description |
@@ -213,10 +262,12 @@ docker compose -f docker-compose.train.yml run --rm train --mode full --steps 50
 
 ```
 tame_checkpoints/
+├── held_out_split.pt         # Frozen, fingerprinted evaluation set (built once)
+├── metrics.jsonl             # train/ eval/ spec/ wealth/ routing/ metrics per step
 ├── checkpoint-1000/
 │   ├── model.safetensors     # Model weights
 │   ├── mob_state.pt          # Expert wealth & auction state
-│   └── training_state.pt     # Optimizer state (for resume)
+│   └── training_state.pt     # Optimizer state, arm fingerprint, eval history
 └── checkpoint-5000/
     └── ...
 
@@ -270,9 +321,14 @@ tame-swarm/
     │   ├── auction.py           ← VCGAuctioneer
     │   ├── experts.py           ← Expert, LightweightExpert, ConfidenceHead
     │   ├── wealth.py            ← Wealth update paths (loss, quality, participation)
-    │   ├── utils.py             ← Gini coefficient, serialisation helpers
+    │   ├── softmax_router.py    ← Learned-gate control arm (same heads, no economy)
+    │   ├── utils.py             ← Gini coefficient, frozen_economy, serialisation helpers
     │   └── mob_config.py        ← MoBConfig dataclass
     ├── steering.py              ← Cognitive Homeostasis: steering vectors, P-controller
+    ├── evaluation.py            ← Frozen held-out split + evaluation loop
+    ├── specialisation.py        ← Functional specialisation metrics (not Gini)
+    ├── parity.py                ← Arm fingerprints; refuses an unmatched comparison
+    ├── metrics.py               ← JSONL metric sink (the seam #7 replaces with MLflow)
     ├── train.py                 ← Training loop with MoB economic dynamics
     ├── setup_tame.py            ← End-to-end train → export workflow
     ├── chat_ui.py               ← Gradio chat interface with live wealth visualisation
@@ -318,7 +374,10 @@ docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
 | Concept | File(s) | What to Know |
 |---------|---------|--------------|
 | **VCG Auction** | `mob/auction.py` | Externality-priced top-*k* auction. Each winner pays `b₍ₖ₊₁₎ / wᵢ` — the displaced welfare, divided by its own weight so the price is in the units it reports — and receives a `1/k` share that ignores its own bid. Strategyproof per token, and the wealth update shares the auction's break-even; see the scope note under Module 1. `ConfidenceHead` reports each expert's estimated loss reduction and is trained only on that expert's own outcomes. |
-| **Wealth Economy** | `mob/wealth.py` | `expert_wealth` buffers persist across batches. Three update paths exist (loss-based, quality-proxy, participation); `wealth_decay` and `reward_scale` control dynamics. The Gini coefficient is the primary health metric — too low (< 0.1) means experts aren't specialising, too high (> 0.6) means monopoly risk. |
+| **Wealth Economy** | `mob/wealth.py` | `expert_wealth` buffers persist across batches. Three update paths exist (loss-based, quality-proxy, participation); `wealth_decay` and `reward_scale` control dynamics. Gini is an economy-health diagnostic — too low (< 0.1) means near-flat wealth, too high (> 0.6) means monopoly risk — and is **not** a specialisation measure; see `specialisation.py`. |
+| **Held-out evaluation** | `evaluation.py` | The frozen, fingerprinted validation split and the eval loop that reads it with the economy frozen (no wealth updates, no usage counts, no coupling step). Prefers the dataset's own `validation` split; falls back to a stride-97 holdout of the training stream, which the training loader then skips. |
+| **Specialisation metrics** | `specialisation.py` | What experts *do*: pairwise expert output divergence on identical held-out hidden states, per-expert token-category routing profiles against the corpus marginal, and report decisiveness (how often the top-1 winner is the top-1 report). Probe ≥ 4096 *unpadded* tokens — padding is excluded from every statistic, because a pad carries an id, takes a category and is routed like any other position. |
+| **Baseline arms** | `train.py`, `mob/softmax_router.py` | `--router {mob,softmax,dense}`. `softmax` is the same confidence heads with the economy switched off; `dense` is the unrouted FFN. `parity.py` refuses a comparison whose arms differ in anything but the gate. |
 | **Steering Vectors** | `steering.py` | Extracted via Difference-in-Means on contrastive prompt pairs; injected as residual-stream additions. Currently uses 4 contrastive pairs (thin). Orthogonal projection removes the leading principal components of general-corpus activations before injection; capability preservation is not yet measured. |
 | **Adaptive Control** | `steering.py` | P-controller (not PID yet) with `kp`, `target_alignment`, and `max_strength`. Adjusts injection strength at each forward pass based on cosine alignment with the goal direction. |
 | **Model Profiles** | `config.py` | `MODEL_PROFILES` dict maps model names to hidden dimensions and layer ranges. Change `ACTIVE_MODEL` to switch. |
@@ -366,14 +425,20 @@ The training loop logs comprehensive statistics every `log_frequency` steps. Her
 | **Calibration Loss** | 0.01–0.1 | Per-expert value objective; should decrease as heads learn to report the value they realise. A flat line at a constant means no gradient is reaching the heads |
 | **Mean Wealth** | 50–500 | Average expert credits; should be stable, not pinned at floor or ceiling |
 | **Wealth Std Dev** | > 10 | Divergence between experts; low std = no specialisation |
-| **Gini Coefficient** | 0.10–0.50 | Wealth inequality. < 0.10 = experts converging (increase `reward_scale` or `jitter_std`). > 0.60 = monopoly risk (increase `min_wealth` or decrease `max_wealth`). |
+| **Gini Coefficient** | 0.10–0.50 | Wealth inequality, an economy diagnostic. < 0.10 = near-flat wealth (increase `reward_scale` or `jitter_std`). > 0.60 = monopoly risk (increase `min_wealth` or decrease `max_wealth`). Not a specialisation measure — a high Gini means *less* of the routing is decided by what experts report |
 | **Performance EMA** | Positive | Mean loss reduction vs baseline; negative = experts underperforming |
+| **`eval/perplexity`** | Decreasing | Held-out perplexity on the frozen split. The only perplexity that supports a capability claim; `train/perplexity` is a statistic of the batch just fitted |
+| **`spec/expert_cosine_distance`** | > 0, rising | Pairwise divergence of expert outputs on identical hidden states. Exactly 0 at upcycling; stays ~0 if experts compute the same function however unequal their wealth |
+| **`spec/routing_js_from_corpus`** | > 0 | How far each expert's intake diverges from the corpus token-category marginal. 0 means routing is blind to the token — including when one expert wins everything |
+| **`spec/report_decisiveness`** | Context | Fraction of tokens whose top-1 winner is the top-1 report. 1.0 for the `softmax` arm by construction; below 1 for `mob` is wealth overturning reports. Measured at 31–33% on the synthetic economy at a wealth spread of only 2.0× |
 
 **Common failure modes:**
 
 | Symptom | Diagnosis | Fix |
 |---------|-----------|-----|
-| Gini stays near 0 | Experts not differentiating | Increase `jitter_std` (0.08 → 0.15), increase `reward_scale`, or train longer |
+| Gini stays near 0 | Wealth is near-flat, so the auction allocates almost entirely on reports (not by itself a fault) | Increase `jitter_std` (0.08 → 0.15), increase `reward_scale`, or train longer |
+| `spec/expert_cosine_distance` stays ~0 | Experts genuinely are computing the same function, whatever the wealth spread says | Increase `jitter_std` or `adapter_rank`, or train longer — this is the real "not specialising" symptom |
+| `spec/report_decisiveness` far below 1 | Wealth is overturning the reports; the auction's incentive machinery governs less of the routing than it appears to | Narrow the wealth band ([#16](#phase-05--mechanism-correction)) |
 | Gini > 0.6, one expert dominates | Wealth monopoly | Increase `min_wealth`, decrease `max_wealth`, or increase `wealth_decay` |
 | Mean wealth pinned at ceiling | Rewards too generous | Decrease `reward_scale` or increase `wealth_decay` |
 | Mean wealth pinned at floor | Decay too aggressive | Decrease `wealth_decay` (0.997 → 0.999) or increase `reward_scale` |
@@ -519,11 +584,11 @@ An audit of the mechanism claims against the implementation. The auction the arc
 | **#9. VCG payments** | Exclusion set took `k-1`, so every payment was identically zero and the `clamp(min=0)` hid it. Fixed, and payments made quasi-linear transfers rather than a multiplicative haircut on rewards | Done |
 | **#10. Mechanism claims** | Weighted price divided by the winner's own weight; routing share made independent of own bids; confidence heads given a per-expert value objective; capability subspace estimated and wired through to injection; README reconciled | Done |
 | **#11. Routing temperature** | Gate moved to the log domain, so a uniform wealth rescaling leaves routing weights unchanged and `routing_temperature` becomes a deliberate sharpness dial. Realised top-1 weight and effective expert count now logged per step. Re-deriving the wealth bounds and decay is deliberately deferred to [#16](#phase-05--mechanism-correction) — wealth no longer sets gate sharpness, so what those constants shape is selection, price magnitude and rebate size, and judging them needs a held-out metric | Done |
-| **#12. Held-out eval & baselines** | The gate-swap baseline and held-out benchmark that every "better than a learned router" and "preserves capability" claim above is waiting on | Not started |
-| **#13. Reproducibility** | Determinism, seed control and a measured noise floor, so an ablation's effect can be told apart from its variance | Not started |
+| **#12. Held-out eval & baselines** | `eval_steps` was declared and never read; the reported perplexity was `exp(loss)` on the *training* batch of a stream with no split. Now: a frozen, fingerprinted held-out split (the dataset's own `validation` shard where one exists, else a stride-97 train holdout the loader skips), an evaluation loop with the economy frozen, `--router {mob,softmax,dense}` with parity asserted programmatically, and functional specialisation metrics replacing Gini — expert output divergence, routing profiles, report decisiveness. A test fails if any `TrainingConfig` field is never read. **Not** closed: the three-arm comparison is shipped as a harness with a CPU smoke run, and a real multi-seed run needs [#13](#phase-05--mechanism-correction)'s noise floor before its numbers mean anything | Done (harness); results pending #13 |
+| **#13. Reproducibility** | Determinism, seed control and a measured noise floor, so an ablation's effect can be told apart from its variance. Now the immediate blocker on every #12 number: the harness runs, one seed is not a result | Not started |
 | **#14. Coupling activation** | Warmup default and non-vacuous tests for the `coupling.py` path that nothing currently attaches | Not started |
-| **#16. Wealth bounds** | Deferred from #11: `[15, 750]` and `decay=0.997` were tuned against a gate that no longer exists and before #9 corrected the payments. Measured on the synthetic economy, the ceiling is inert (the run settles a factor of three *below* `initial_wealth`) while the floor holds up the mean — the opposite of a band chosen for the dynamics it now has. Blocked by #12 for a metric and #15 for the transfer leak | Not started |
-| **#15. Abstention pays** | Surfaced by #10: trained reports overestimate value because the target is clamped at zero, and loss reduction against an expert's own EMA baseline is zero-mean by construction, so winning is a loss-making trade. Also carries the **choice of rebate divisor** — `w_max` is safe but under-rebates by over 96% in a `max_wealth` monopoly; the harmonic mean of the *k* richest wealths is report-independent, feasible and tighter. Routed to [Phase 2](#phase-2--economy-stabilisation); blocked by #12 and #13 | Not started |
+| **#16. Wealth bounds** | Deferred from #11: `[15, 750]` and `decay=0.997` were tuned against a gate that no longer exists and before #9 corrected the payments. The held-out metric it was blocked on now exists, and `spec/report_decisiveness` gives it a direct objective — the band is what sets how far wealth can overturn reports. Measured on the synthetic economy, the ceiling is inert (the run settles a factor of three *below* `initial_wealth`) while the floor holds up the mean — the opposite of a band chosen for the dynamics it now has. No longer blocked by #12 for the metric; still blocked by #15 for the transfer leak | Not started |
+| **#15. Abstention pays** | Surfaced by #10: trained reports overestimate value because the target is clamped at zero, and loss reduction against an expert's own EMA baseline is zero-mean by construction, so winning is a loss-making trade. Also carries the **choice of rebate divisor** — `w_max` is safe but under-rebates by over 96% in a `max_wealth` monopoly; the harmonic mean of the *k* richest wealths is report-independent, feasible and tighter. Routed to [Phase 2](#phase-2--economy-stabilisation); #12's harness is in place, so the remaining block is #13 | Not started |
 
 **Why before Phase 1:** every Phase 1 ablation is measured on top of the routing this phase prices and the baselines it establishes. Correcting the mechanism afterwards invalidates whatever was collected in between.
 

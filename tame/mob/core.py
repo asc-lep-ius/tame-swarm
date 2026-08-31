@@ -13,9 +13,10 @@ except ImportError:
         raise
     from coupling import CouplingMetrics, SteeringCoupling, SteeringCouplingConfig
 
-from .auction import RoutingDiagnostics, VCGAuctioneer, routing_diagnostics
+from .auction import AuctionOutcome, RoutingDiagnostics, VCGAuctioneer, routing_diagnostics
 from .experts import ConfidenceHead, Expert, LightweightExpert
 from .mob_config import MoBConfig
+from .softmax_router import SoftmaxRouter
 from .wealth import WealthUpdateMixin
 
 logger = logging.getLogger(__name__)
@@ -72,12 +73,18 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
             ]
         )
 
-        self.auctioneer = VCGAuctioneer(
-            config.num_experts,
-            config.top_k,
-            differentiable=config.use_differentiable_routing,
-            routing_share=config.routing_share,
-            temperature=config.routing_temperature,
+        # One attribute for whichever gate this arm runs, so nothing downstream
+        # branches on which one it is except the code that has to.
+        self.gate: nn.Module = (
+            VCGAuctioneer(
+                config.num_experts,
+                config.top_k,
+                differentiable=config.use_differentiable_routing,
+                routing_share=config.routing_share,
+                temperature=config.routing_temperature,
+            )
+            if config.has_economy
+            else SoftmaxRouter(config.num_experts, config.top_k)
         )
 
         self.register_buffer(
@@ -119,6 +126,9 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         self._cached_calibration_loss: torch.Tensor | None = None
         self._cached_router_z_loss: torch.Tensor | None = None
         self._last_coupling_metrics: CouplingMetrics | None = None
+        # Held-out evaluation reads the model without paying it. See
+        # ``mob.utils.frozen_economy``, which is the only thing that sets this.
+        self._economy_frozen: bool = False
 
     def forward(
         self,
@@ -169,11 +179,17 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         router_z_loss = self._compute_router_z_loss(confidence_logits)
         self._cached_router_z_loss = router_z_loss
 
-        outcome = self.auctioneer(confidences, self.expert_wealth)
+        outcome = self._route(confidence_logits, confidences)
         selected_experts = outcome.selected_experts
         routing_weights = outcome.routing_weights
         payments = outcome.payments
         rebates = outcome.rebates
+
+        # A frozen economy still routes and still computes an output -- it is an
+        # evaluation, not an ablation -- but it must not move any state the next
+        # training step reads. That is wealth, the usage counts the exploration
+        # bonus reads, and the loss-feedback cache.
+        update_wealth = update_wealth and not self._economy_frozen
 
         output = torch.zeros_like(hidden_states)
 
@@ -189,7 +205,7 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         if output.dtype == torch.bfloat16 or output.dtype == torch.float16:
             output = torch.nan_to_num(output, nan=0.0, posinf=65000.0, neginf=-65000.0)
 
-        if self.training and self.config.use_loss_feedback:
+        if self.training and self.config.use_loss_feedback and self._economy_live():
             self._cached_selected_experts = selected_experts.detach()
             self._cached_routing_weights = routing_weights.detach()
             self._cached_confidences = confidences.detach()
@@ -198,11 +214,16 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
             self._cached_rebates = rebates.detach() if rebates is not None else None
             self._loss_feedback_pending = True
 
-        if update_wealth and self.config.use_local_quality and not self.config.use_loss_feedback:
+        if (
+            update_wealth
+            and self._economy_live()
+            and self.config.use_local_quality
+            and not self.config.use_loss_feedback
+        ):
             self._update_wealth_local_quality(
                 selected_experts, routing_weights, confidences, payments, rebates, output
             )
-        elif update_wealth and self.training:
+        elif update_wealth and self.training and self._economy_live():
             if self.config.use_local_quality and not self.config.use_loss_feedback:
                 self._update_wealth_local_quality(
                     selected_experts, routing_weights, confidences, payments, rebates, output
@@ -229,10 +250,34 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         )
         self._last_coupling_metrics = coupling_metrics
 
-        if self._track_wealth:
+        # A frozen forward contributes no row: the wealth history is a training
+        # trace, and an evaluation pass interleaved into it would read as the
+        # economy having done something on a step where it did not.
+        if self._track_wealth and not self._economy_frozen:
             self.wealth_history.append(self.expert_wealth.cpu().tolist())
 
         return output
+
+    def _route(self, confidence_logits: torch.Tensor, confidences: torch.Tensor) -> AuctionOutcome:
+        """Turn reports into an allocation, by whichever gate this arm configures.
+
+        The auction bids ``softplus(logits) x wealth``; the #12 control arm gates on
+        the logits themselves. The two take different inputs because they mean
+        different things by a report -- a bid is a value in loss-reduction units,
+        a router logit is an unnormalised score -- so this dispatches rather than
+        forcing one signature onto both.
+        """
+        if self.config.has_economy:
+            return cast(VCGAuctioneer, self.gate)(confidences, self.expert_wealth)
+        return cast(SoftmaxRouter, self.gate)(confidence_logits)
+
+    def _economy_live(self) -> bool:
+        """Whether this forward may move economic state.
+
+        Two independent reasons it may not: the arm has no economy at all
+        (``router="softmax"``), or a held-out evaluation has frozen it.
+        """
+        return self.config.has_economy and not self._economy_frozen
 
     def attach_coupling(
         self,

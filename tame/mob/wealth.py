@@ -192,6 +192,13 @@ class WealthUpdateMixin:
         per_token_loss: torch.Tensor,
         token_mask: torch.Tensor | None = None,
     ):
+        # The #12 control arm has no economy to pay. Returning quietly rather than
+        # warning is deliberate: the trainer calls this on every arm so the two call
+        # sites stay identical, and a warning per step would train the reader to
+        # ignore the one that means a real dropped forward pass.
+        if not self.config.has_economy:
+            return
+
         if not self._loss_feedback_pending or self._cached_selected_experts is None:
             logger.warning("update_wealth_from_loss called without pending forward pass")
             self._live_confidences = None

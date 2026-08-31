@@ -1,4 +1,6 @@
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
@@ -19,6 +21,42 @@ def get_mob_layers(model: nn.Module) -> list[MixtureOfBidders]:
         List of MixtureOfBidders modules
     """
     return [module for module in model.modules() if isinstance(module, MixtureOfBidders)]
+
+
+@contextmanager
+def frozen_economy(model: nn.Module) -> Iterator[None]:
+    """Read the model without paying it, then leave the economy exactly as found.
+
+    A held-out evaluation must not be a training step in disguise. ``model.eval()``
+    alone is not enough: the inference forward still increments
+    ``expert_usage_count`` (which the inference exploration bonus reads), still
+    appends to the wealth history when tracking is on, and still overwrites
+    ``last_stats`` -- so the training statistics logged after an eval would describe
+    the eval batches instead. #12's acceptance criterion is "no wealth updates and
+    no steering adaptation", and this is what makes that true rather than assumed.
+
+    Steering needs nothing suppressed, only nothing driven: ``SteeringCoupling``
+    keeps no state its forward pass mutates, and its one mutable buffer
+    ``_coupling_step`` moves only when ``set_coupling_step`` is called. The
+    contract is therefore that the caller does not advance it inside this block --
+    the eval loop does not -- and the metrics it caches are restored below.
+
+    Restoring rather than clearing matters: an eval at step N runs between the
+    training step that produced ``last_stats`` and the log line that reads them.
+    """
+    mob_layers = get_mob_layers(model)
+    saved = [
+        (mob, mob._economy_frozen, mob.last_stats, mob._last_coupling_metrics) for mob in mob_layers
+    ]
+    for mob in mob_layers:
+        mob._economy_frozen = True
+    try:
+        yield
+    finally:
+        for mob, was_frozen, stats, coupling_metrics in saved:
+            mob._economy_frozen = was_frozen
+            mob.last_stats = stats
+            mob._last_coupling_metrics = coupling_metrics
 
 
 def update_all_mob_from_loss(
