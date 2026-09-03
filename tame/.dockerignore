@@ -1,6 +1,7 @@
 model_cache/
 tame_checkpoints/
 tame_inference/
+mlruns/
 __pycache__/
 *.pyc
 *.pt

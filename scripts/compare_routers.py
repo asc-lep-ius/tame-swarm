@@ -29,6 +29,7 @@ here is quoted.
 import argparse
 import json
 import logging
+import os
 import sys
 import tempfile
 from dataclasses import replace
@@ -232,6 +233,13 @@ def main() -> None:
         use_lora=args.use_lora,
         seed=args.seed,
     )
+
+    # Each arm gets its own output_dir (run_arm appends /<arm>), and #7's tracking
+    # store defaults to output_dir-relative -- so without this, the three arms
+    # write into three separate MLflow stores and can never be compared in one
+    # `mlflow ui`, which defeats the point of a comparison harness. One shared
+    # store, keyed off the workspace all three arms already write under.
+    os.environ.setdefault("MLFLOW_TRACKING_URI", f"file:{workspace / 'mlruns'}")
 
     results = [run_arm(arm, config) for arm in ARMS]
     assert_parity([result["fingerprint"] for result in results])  # pyright: ignore[reportArgumentType]

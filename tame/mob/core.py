@@ -34,6 +34,9 @@ class MoBStats:
     router_z_loss: torch.Tensor
     routing: RoutingDiagnostics
     coupling_metrics: CouplingMetrics | None = None
+    # None under a gate with no economy (softmax, dense): there is no payment to
+    # report, as opposed to a payment that happens to be zero. See #9.
+    mean_payment: torch.Tensor | None = None
 
 
 class MixtureOfBidders(WealthUpdateMixin, nn.Module):
@@ -247,6 +250,7 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
             # result looks wrong. Left as device tensors; the training loop syncs.
             routing=routing_diagnostics(routing_weights),
             coupling_metrics=coupling_metrics,
+            mean_payment=payments.detach().mean() if payments is not None else None,
         )
         self._last_coupling_metrics = coupling_metrics
 

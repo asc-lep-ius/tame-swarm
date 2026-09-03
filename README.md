@@ -264,6 +264,7 @@ a result — the between-seed spread measured on report decisiveness was ~46 poi
 tame_checkpoints/
 ├── held_out_split.pt         # Frozen, fingerprinted evaluation set (built once)
 ├── metrics.jsonl             # train/ eval/ spec/ wealth/ routing/ metrics per step
+├── mlruns/                   # MLflow local tracking store — params, metrics, artifacts
 ├── checkpoint-1000/
 │   ├── model.safetensors     # Model weights
 │   ├── mob_state.pt          # Expert wealth & auction state
@@ -276,6 +277,18 @@ tame_inference/               # Automatically exported for the API server
 ├── inference_config.json
 └── loader_snippet.py
 ```
+
+Retention keeps the first, best (by held-out `eval/loss`) and final checkpoint
+on disk permanently, plus `--checkpoint_keep_last` most recent transiently
+(evicted as newer checkpoints arrive). Only the permanent set — first/best/final
+— is ever archived to `mlruns/`; the `--checkpoint_keep_last` window is a local
+disk convenience and is never uploaded, so archiving never outgrows what
+retention permanently keeps. `mlflow ui --backend-store-uri
+file:./tame_checkpoints/mlruns` opens the run comparison view. Comparing
+several runs (e.g. `scripts/compare_routers.py`'s three arms, or several seeds
+of one config) needs them writing into one store: either set
+`MLFLOW_TRACKING_URI` to a shared location before training, or point
+`--output_dir` at a common parent so a per-run default lines up.
 
 ### VRAM Requirements
 
@@ -328,7 +341,8 @@ tame-swarm/
     ├── evaluation.py            ← Frozen held-out split + evaluation loop
     ├── specialisation.py        ← Functional specialisation metrics (not Gini)
     ├── parity.py                ← Arm fingerprints; refuses an unmatched comparison
-    ├── metrics.py               ← JSONL metric sink (the seam #7 replaces with MLflow)
+    ├── metrics.py               ← JSONL metric sink, forwards to tracking.py
+    ├── tracking.py              ← MLflow wrapper — the only file that imports mlflow
     ├── train.py                 ← Training loop with MoB economic dynamics
     ├── setup_tame.py            ← End-to-end train → export workflow
     ├── chat_ui.py               ← Gradio chat interface with live wealth visualisation
