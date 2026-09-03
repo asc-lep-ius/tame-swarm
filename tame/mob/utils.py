@@ -171,6 +171,20 @@ def get_mob_statistics(model: nn.Module) -> dict[str, torch.Tensor | list[torch.
         statistics["layer_routing_top1_median"] = [r.top1_median for r in routing]
         statistics["layer_routing_effective_experts"] = [r.effective_experts for r in routing]
 
+    # Absent under a gate with no economy (softmax, dense) -- there is no payment
+    # to report -- and, same rule as routing above, absent until every layer has
+    # forwarded: a partial average would be worse than no number at all. Present
+    # and legitimately able to read 0.0 under the auction gate once complete,
+    # which is the case #9 existed to make visible: a broken VCG computation
+    # reads as a flat zero line instead of an absent metric.
+    payments = [
+        mob.last_stats.mean_payment
+        for mob in mob_layers
+        if mob.last_stats is not None and mob.last_stats.mean_payment is not None
+    ]
+    if len(payments) == len(mob_layers):
+        statistics["mean_payment"] = torch.stack(payments).mean()
+
     return statistics
 
 

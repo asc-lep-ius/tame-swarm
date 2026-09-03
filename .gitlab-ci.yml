@@ -7,6 +7,17 @@
 variables:
   LOCAL_REGISTRY: "gitlab.hephaestus:5050/mipkovich/tame-swarm"
 
+# Without this, every push to a branch with an open MR spawns both a `push`
+# pipeline and a `merge_request_event` pipeline for the same commit, and
+# both race to rebuild the same CI image on the single privileged runner.
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+
 stages:
   - rebuild-ci
   - check

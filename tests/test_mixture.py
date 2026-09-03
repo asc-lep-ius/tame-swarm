@@ -16,6 +16,15 @@ from mob import (
 )
 
 
+class _LayerListModel(nn.Module):
+    """A model that is nothing but a list of MoB layers -- get_mob_statistics
+    needs a module to walk, not a real forward pass through anything else."""
+
+    def __init__(self, layers):
+        super().__init__()
+        self.layers = nn.ModuleList(layers)
+
+
 def test_forward_output_shape(mob_layer, random_hidden_states):
     out = mob_layer(random_hidden_states)
     assert out.shape == random_hidden_states.shape
@@ -375,14 +384,8 @@ def test_routing_diagnostics_reach_the_aggregate_statistics():
     ``get_mob_statistics`` is the surface #5 reads, so the gate's realised sharpness
     belongs in it beside the wealth figures it is meant to be interpreted against.
     """
-
-    class FakeModel(nn.Module):
-        def __init__(self, layers):
-            super().__init__()
-            self.layers = nn.ModuleList(layers)
-
     config = _default_shaped_config(routing_share="proportional")
-    model = FakeModel([MixtureOfBidders(config) for _ in range(2)])
+    model = _LayerListModel([MixtureOfBidders(config) for _ in range(2)])
 
     assert "routing_effective_experts" not in get_mob_statistics(model), (
         "a gate statistic must not be reported before every layer has produced one"
@@ -398,6 +401,45 @@ def test_routing_diagnostics_reach_the_aggregate_statistics():
     assert statistics["routing_top1_mean"].item() < 0.9
     assert statistics["routing_top1_saturated_fraction"].item() < 0.1
     assert len(statistics["layer_routing_top1_median"]) == len(model.layers)
+
+
+def test_mean_payment_reaches_the_aggregate_statistics_under_the_auction():
+    """#7's ``auction/mean_payment`` needs a real number to log, not an absent key.
+
+    #9 was a broken VCG computation that returned identically zero payments and
+    went unnoticed because nothing surfaced the number. This is the statistic
+    that would have made it visible on day one -- a flat line at zero rather
+    than a metric nobody was looking at.
+    """
+    torch.manual_seed(0)
+    config = _default_shaped_config()  # default router: the auction, VCG payments on
+    model = _LayerListModel([MixtureOfBidders(config) for _ in range(2)])
+
+    assert "mean_payment" not in get_mob_statistics(model), (
+        "no forward has run yet, so there is no payment to report"
+    )
+
+    hidden = torch.randn(2, 16, config.hidden_dim)
+    for layer in model.layers:
+        layer.eval()
+        layer(hidden, update_wealth=False)
+
+    statistics = get_mob_statistics(model)
+    assert statistics["mean_payment"].item() > 0.0
+
+
+def test_mean_payment_absent_without_an_economy():
+    """The softmax control arm has no auction, so there is no payment to report --
+    absent, not a misleading zero. See MoBConfig.has_economy."""
+    config = _default_shaped_config(router="softmax")
+    model = _LayerListModel([MixtureOfBidders(config) for _ in range(2)])
+
+    hidden = torch.randn(2, 16, config.hidden_dim)
+    for layer in model.layers:
+        layer.eval()
+        layer(hidden, update_wealth=False)
+
+    assert "mean_payment" not in get_mob_statistics(model)
 
 
 # A nonconstant routing objective. Without genuine competence differences the
