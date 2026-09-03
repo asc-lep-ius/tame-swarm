@@ -85,6 +85,7 @@ except ImportError:
     logger.warning("'accelerate' library not installed. Model re-dispatch disabled.")
 
 from config import get_active_profile
+from determinism import configure_determinism, seed_worker
 from evaluation import (
     DEFAULT_HELD_OUT_SEQUENCES,
     SOURCE_TRAIN_HOLDOUT,
@@ -209,11 +210,18 @@ class TrainingConfig:
     # that, only the most recent ``checkpoint_keep_last`` are kept -- at least
     # the checkpoint just written always survives its own save, so 0 means
     # "nothing but first/best/final/whatever was just written", with that last
-    # one typically evicted on the next save. The exact budget belongs to #13;
-    # this is the mechanism.
+    # one typically evicted on the next save.
     save_steps: int = 1000
     eval_steps: int = 500
     checkpoint_keep_last: int = 3
+    # Free space, on the filesystem backing output_dir, that must remain after a
+    # checkpoint write or the run refuses the next one (#13). Retention prunes
+    # *after* a save, so on its own it cannot stop a single checkpoint from
+    # landing on an already-full disk; this is the loud failure that stops it
+    # instead of the run silently filling a shared runner's disk. 50GB is a
+    # placeholder pending a real number from the Hephaestus disk budget --
+    # tune with this one flag once that's known.
+    checkpoint_min_free_gb: float = 50.0
 
     # Experimental arm (#12). The gate is the only thing allowed to vary between
     # arms; parity.py refuses a comparison in which anything else did.
@@ -227,8 +235,15 @@ class TrainingConfig:
     held_out_sequences: int = DEFAULT_HELD_OUT_SEQUENCES
     probe_tokens: int = 4096
 
-    # Misc
+    # Reproducibility (#13). ``deterministic`` forces deterministic kernels
+    # (torch.use_deterministic_algorithms, cuDNN, cuBLAS workspace) wherever one
+    # exists and logs the rest as a known variance source rather than silently
+    # accepting it -- see determinism.py. ``shuffle_buffer_size`` seeds a bounded
+    # shuffle of the streaming dataset; 0 keeps the current unshuffled, already
+    # order-deterministic stream.
     seed: int = 42
+    deterministic: bool = True
+    shuffle_buffer_size: int = 0
 
     def __post_init__(self) -> None:
         """Reject a config that would fail deep inside a run rather than at the boundary.
@@ -258,6 +273,14 @@ class TrainingConfig:
 
         if self.checkpoint_keep_last < 0:
             raise ValueError(f"checkpoint_keep_last must be >= 0, got {self.checkpoint_keep_last}")
+
+        if self.checkpoint_min_free_gb < 0:
+            raise ValueError(
+                f"checkpoint_min_free_gb must be >= 0, got {self.checkpoint_min_free_gb}"
+            )
+
+        if self.shuffle_buffer_size < 0:
+            raise ValueError(f"shuffle_buffer_size must be >= 0, got {self.shuffle_buffer_size}")
 
 
 class TAMETrainer:
@@ -318,10 +341,10 @@ class TAMETrainer:
         # config and arm fingerprint exist too. See tracking.init_tracking.
         init_tracking(config)
 
-        # Set seed
-        torch.manual_seed(config.seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(config.seed)
+        # Seeds every RNG source (torch, numpy, random, CUDA) and, if
+        # config.deterministic, forces deterministic kernels before setup()
+        # touches a device -- see determinism.py for why this has to happen here.
+        configure_determinism(config.seed, config.deterministic)
 
     def setup(self):
         """Initialize model, tokenizer, optimizer, and data."""
@@ -942,6 +965,24 @@ class TAMETrainer:
             )
             logger.info("Training stream filtered: held-out row positions removed")
 
+        # Seeded buffer shuffle, applied *after* the held-out filter above: that
+        # filter trusts the raw source row index (see is_held_out_position), and
+        # shuffling first would make "index" mean a shuffled position instead --
+        # silently reintroducing held-out rows into training. 0 (the default)
+        # keeps the stream in source order, which is already order-deterministic;
+        # a nonzero buffer trades some randomisation quality (only this many rows
+        # are ever reordered against each other) for staying compatible with
+        # streaming=True, which cannot shuffle the whole stream without
+        # materialising it.
+        if self.config.shuffle_buffer_size > 0:
+            dataset = dataset.shuffle(
+                seed=self.config.seed, buffer_size=self.config.shuffle_buffer_size
+            )
+            logger.info(
+                f"Training stream shuffled: seed={self.config.seed}, "
+                f"buffer_size={self.config.shuffle_buffer_size}"
+            )
+
         # Tokenize — capture tokenizer locally for pyright closure narrowing
         tokenizer = self.tokenizer
 
@@ -976,7 +1017,12 @@ class TAMETrainer:
             mlm=False,  # Causal LM
         )
 
-        # Create dataloader
+        # Create dataloader. worker_init_fn matters only once num_workers > 0 (it
+        # is 0 today), but wiring it up here rather than when that changes is what
+        # keeps a future bump from silently reintroducing unseeded per-worker RNGs
+        # -- see determinism.seed_worker. The generator is what makes the
+        # map-style shuffle path below reproducible from config.seed alone,
+        # rather than from wherever the global torch RNG happens to be.
         self.train_dataloader = DataLoader(
             tokenized_dataset,  # pyright: ignore[reportArgumentType] # DataLoader stubs don't accept IterableDataset
             batch_size=self.config.batch_size,
@@ -984,6 +1030,8 @@ class TAMETrainer:
             collate_fn=data_collator,
             num_workers=0,
             pin_memory=self.device.type == "cuda",
+            worker_init_fn=seed_worker,
+            generator=torch.Generator().manual_seed(self.config.seed),
         )
 
     def train_step(self, batch: dict[str, torch.Tensor]) -> dict[str, float]:
@@ -1340,12 +1388,36 @@ class TAMETrainer:
 
         self.metrics.log(step, measurements)
 
+    def _check_disk_budget(self) -> None:
+        """Refuse to start a checkpoint write the disk cannot afford (#13).
+
+        Retention (``_prune_checkpoints``) only runs *after* a save completes, so
+        on its own it cannot stop a single multi-GB checkpoint from being the
+        write that fills a shared runner's disk -- by the time pruning would free
+        space, the write has already failed partway or taken the disk down with
+        it. Checked against ``output_dir``'s filesystem, since that is what every
+        checkpoint, the held-out split cache and ``mlruns/`` all share.
+        """
+        free_gb = shutil.disk_usage(self.config.output_dir).free / (1024**3)
+        if free_gb < self.config.checkpoint_min_free_gb:
+            raise RuntimeError(
+                f"Only {free_gb:.1f}GB free on the filesystem backing "
+                f"{self.config.output_dir!r}, below the configured "
+                f"checkpoint_min_free_gb={self.config.checkpoint_min_free_gb}. "
+                "Refusing to write a checkpoint that could fill the disk; free "
+                "space (e.g. by lowering checkpoint_keep_last on a sibling run) "
+                "or raise --checkpoint_min_free_gb if this floor is wrong for "
+                "this machine."
+            )
+
     def _save_checkpoint(self, step: int, final: bool = False):
         """Save model checkpoint and wealth state."""
         assert self.model is not None
         assert self.tokenizer is not None
         assert self.optimizer is not None
         assert self.scheduler is not None
+
+        self._check_disk_budget()
 
         checkpoint_dir = Path(self.config.output_dir) / f"checkpoint-{step}"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -1521,7 +1593,21 @@ def main():
     )
     parser.add_argument("--seed", type=int, default=42, help="Seed; must match across arms")
 
-    # Checkpoint retention (#7)
+    # Reproducibility (#13)
+    parser.add_argument(
+        "--deterministic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Force deterministic kernels where one exists; log the rest (default: on)",
+    )
+    parser.add_argument(
+        "--shuffle_buffer_size",
+        type=int,
+        default=0,
+        help="Seeded shuffle buffer for the streaming dataset; 0 keeps source order",
+    )
+
+    # Checkpoint retention (#7, disk budget #13)
     parser.add_argument(
         "--checkpoint_keep_last",
         type=int,
@@ -1530,6 +1616,12 @@ def main():
             "Intermediate checkpoints to keep beyond first/best/final. "
             "0 evicts each on its next save"
         ),
+    )
+    parser.add_argument(
+        "--checkpoint_min_free_gb",
+        type=float,
+        default=50.0,
+        help="Refuse to write a checkpoint below this much free disk on output_dir",
     )
 
     # Hardware
@@ -1562,7 +1654,10 @@ def main():
         held_out_sequences=args.held_out_sequences,
         probe_tokens=args.probe_tokens,
         seed=args.seed,
+        deterministic=args.deterministic,
+        shuffle_buffer_size=args.shuffle_buffer_size,
         checkpoint_keep_last=args.checkpoint_keep_last,
+        checkpoint_min_free_gb=args.checkpoint_min_free_gb,
     )
 
     # Create trainer and run
