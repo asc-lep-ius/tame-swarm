@@ -28,10 +28,51 @@ STABILITY_CONFIG = MoBConfig(
 )
 
 
-def _build_training_mob():
-    mob = MixtureOfBidders(STABILITY_CONFIG)
+def _build_training_mob(config: MoBConfig = STABILITY_CONFIG) -> MixtureOfBidders:
+    mob = MixtureOfBidders(config)
     mob.train()
+    _give_experts_something_to_sell(mob)
     return mob
+
+
+def _give_experts_something_to_sell(mob: MixtureOfBidders) -> None:
+    """Upcycled experts contribute nothing until trained, and realise value of exactly zero.
+
+    That is correct, and it makes a fresh layer a degenerate economy: nothing is
+    paid, nothing moves, and a test of the wealth dynamics passes because nothing
+    happened. A small random adapter delta gives every expert a contribution to
+    be paid for.
+    """
+    with torch.no_grad():
+        for name, param in mob.experts.named_parameters():
+            if name.endswith("_B.weight"):
+                param.normal_(std=0.1)
+
+
+def _settle(
+    mob: MixtureOfBidders,
+    hidden: torch.Tensor,
+    per_token_loss: torch.Tensor | None = None,
+    token_mask: torch.Tensor | None = None,
+    loss_scale: float = 1.0,
+) -> torch.Tensor:
+    """Forward, backward a synthetic per-token loss on the output, then settle.
+
+    The economy settles after the backward: a winner's value is its contribution
+    against the loss gradient at the layer output, which exists only once a loss
+    has been backwarded through it. The target is random, so the gradient -- and
+    with it every realised value -- is token-dependent and of either sign.
+    """
+    output = mob(hidden)
+    target = torch.randn_like(output)
+    per_token = ((output - target) ** 2).sum(dim=-1) * loss_scale
+    per_token.mean().backward()
+    mob.update_wealth_from_loss(
+        per_token.detach() if per_token_loss is None else per_token_loss,
+        token_mask,
+        loss_gradient_scale=float(per_token.numel()),
+    )
+    return output
 
 
 def test_wealth_stays_bounded_after_many_updates():
@@ -39,35 +80,27 @@ def test_wealth_stays_bounded_after_many_updates():
     x = torch.randn(1, 8, 32)
 
     for _ in range(1000):
-        mob(x)
-        per_token_loss = torch.randn(1, 8).abs()
-        mob.update_wealth_from_loss(per_token_loss)
+        _settle(mob, x)
 
     assert (mob.expert_wealth >= STABILITY_CONFIG.min_wealth).all()
     assert (mob.expert_wealth <= STABILITY_CONFIG.max_wealth).all()
 
 
-@pytest.mark.parametrize("loss_value", [0.0])
-def test_wealth_no_nan_on_zero_loss(loss_value):
+@pytest.mark.parametrize("loss_scale", [0.0])
+def test_wealth_no_nan_on_zero_loss(loss_scale):
     mob = _build_training_mob()
-    x = torch.randn(1, 8, 32)
 
-    mob(x)
-    per_token_loss = torch.full((1, 8), loss_value)
-    mob.update_wealth_from_loss(per_token_loss)
+    _settle(mob, torch.randn(1, 8, 32), loss_scale=loss_scale)
 
     assert not torch.isnan(mob.expert_wealth).any()
     assert not torch.isinf(mob.expert_wealth).any()
 
 
-@pytest.mark.parametrize("loss_value", [1e6, 1e8])
-def test_wealth_no_nan_on_large_loss(loss_value):
+@pytest.mark.parametrize("loss_scale", [1e6, 1e8])
+def test_wealth_no_nan_on_large_loss(loss_scale):
     mob = _build_training_mob()
-    x = torch.randn(1, 8, 32)
 
-    mob(x)
-    per_token_loss = torch.full((1, 8), loss_value)
-    mob.update_wealth_from_loss(per_token_loss)
+    _settle(mob, torch.randn(1, 8, 32), loss_scale=loss_scale)
 
     assert not torch.isnan(mob.expert_wealth).any()
     assert not torch.isinf(mob.expert_wealth).any()
@@ -125,13 +158,9 @@ def test_usage_count_increments(training_mob_layer, random_hidden_states):
 
 def test_performance_ema_updates():
     mob = _build_training_mob()
-    x = torch.randn(1, 8, 32)
-
     initial_ema = mob.expert_performance_ema.clone()
 
-    mob(x)
-    per_token_loss = torch.randn(1, 8).abs() + 0.5
-    mob.update_wealth_from_loss(per_token_loss)
+    _settle(mob, torch.randn(1, 8, 32))
 
     changed = (mob.expert_performance_ema != initial_ema).any()
     assert changed, "Performance EMA should change after update_wealth_from_loss"
@@ -139,11 +168,8 @@ def test_performance_ema_updates():
 
 def test_calibration_loss_finite():
     mob = _build_training_mob()
-    x = torch.randn(1, 8, 32)
 
-    mob(x)
-    per_token_loss = torch.randn(1, 8).abs()
-    mob.update_wealth_from_loss(per_token_loss)
+    _settle(mob, torch.randn(1, 8, 32))
 
     cal_loss = mob.get_confidence_calibration_loss()
     assert torch.isfinite(cal_loss).all(), f"Calibration loss should be finite, got {cal_loss}"
@@ -376,14 +402,16 @@ def test_payments_reduce_wealth_by_exactly_the_charge():
 
     """
     hidden_states = torch.randn(1, 8, 32)
-    per_token_loss = torch.randn(1, 8).abs()
+    target = torch.randn(1, 8, 32)
 
     def run(use_payments: bool) -> tuple[torch.Tensor, torch.Tensor]:
         torch.manual_seed(11)
         config = replace(QUASI_LINEAR_CONFIG, use_vcg_payments=use_payments)
         mob = MixtureOfBidders(config)
         mob.train()
-        mob(hidden_states)
+        output = mob(hidden_states)
+        per_token = ((output - target) ** 2).sum(dim=-1)
+        per_token.mean().backward()
         charges = mob._vcg_charges(
             mob._cached_payments,
             mob._cached_selected_experts,
@@ -391,7 +419,9 @@ def test_payments_reduce_wealth_by_exactly_the_charge():
             reward_multiplier=LOSS_REWARD_MULTIPLIER,
             rebates=mob._cached_rebates,
         ).clone()
-        mob.update_wealth_from_loss(per_token_loss)
+        mob.update_wealth_from_loss(
+            per_token.detach(), loss_gradient_scale=float(per_token.numel())
+        )
         return mob.expert_wealth.clone(), charges
 
     # This computes its expectation by calling _vcg_charges, so it pins the wiring
@@ -446,8 +476,12 @@ def _spy_on_charges(mob: MixtureOfBidders) -> list[SimpleNamespace]:
     calls = []
     original = mob._vcg_charges
 
-    def spy(payments, selected_experts, num_tokens, reward_multiplier, rebates=None):
-        charge = original(payments, selected_experts, num_tokens, reward_multiplier, rebates)
+    def spy(
+        payments, selected_experts, num_tokens, reward_multiplier, rebates=None, valid_mask=None
+    ):
+        charge = original(
+            payments, selected_experts, num_tokens, reward_multiplier, rebates, valid_mask
+        )
         calls.append(
             SimpleNamespace(
                 num_tokens=num_tokens,
@@ -517,8 +551,7 @@ def test_value_objective_carries_gradient():
     and trained nothing. A finiteness check passed the whole time.
     """
     mob = _build_training_mob()
-    mob(torch.randn(1, 8, 32))
-    mob.update_wealth_from_loss(torch.randn(1, 8).abs())
+    _settle(mob, torch.randn(1, 8, 32))
 
     objective = mob.get_confidence_calibration_loss()
 
@@ -554,16 +587,16 @@ def test_value_objective_is_local_to_each_expert():
     value and must receive no gradient. If it does, the objective is reading
     outcomes that belong to other experts.
     """
-    config = replace(STABILITY_CONFIG, num_experts=4, top_k=1)
-    mob = MixtureOfBidders(config)
-    mob.train()
+    # Exploration off: it exists precisely to hand a bankrupt expert a slot.
+    mob = _build_training_mob(
+        replace(STABILITY_CONFIG, num_experts=4, top_k=1, exploration_rate=0.0)
+    )
     mob.expert_wealth[3] = 0.0
 
-    mob(torch.randn(2, 8, 32))
+    _settle(mob, torch.randn(2, 8, 32))
     winners = set(mob.last_stats.selected_experts.flatten().tolist())
     assert 3 not in winners, "a bankrupt expert cannot win a slot"
 
-    mob.update_wealth_from_loss(torch.randn(2, 8).abs())
     mob.get_confidence_calibration_loss().backward()
 
     for expert_idx, grad in enumerate(_confidence_head_grads(mob)):
@@ -574,11 +607,11 @@ def test_value_objective_is_local_to_each_expert():
 
 
 def test_value_objective_excludes_masked_tokens():
-    """Padding is dropped, not scored as a token of zero loss.
+    """Padding is dropped, not scored.
 
-    The reward path multiplies masked positions by zero, which as a *target* reads
-    as the largest loss reduction an expert can achieve -- so padding would teach
-    every winner to report maximum confidence.
+    A masked position scored as a token of zero loss would read as the largest
+    loss reduction an expert can achieve -- so padding would teach every winner to
+    report maximum confidence.
 
     Asserted positively against the definition on one module, and paired with the
     mask-ignoring value it must not equal. Comparing two separately built modules
@@ -586,27 +619,25 @@ def test_value_objective_excludes_masked_tokens():
     or not masking is implemented.
     """
     mob = _build_training_mob()
-    mob(torch.randn(1, 8, 32))
+    token_mask = torch.ones(1, 8)
+    token_mask[0, 4:] = 0.0
+    _settle(mob, torch.randn(1, 8, 32), token_mask=token_mask)
 
     confidences = mob.last_stats.confidences
     selected = mob.last_stats.selected_experts
-    baselines = mob.expert_baseline_loss.clone()
-
-    per_token_loss = torch.randn(1, 8).abs() + 0.5
-    token_mask = torch.ones(1, 8)
-    token_mask[0, 4:] = 0.0
-    mob.update_wealth_from_loss(per_token_loss, token_mask)
+    values = mob.last_realised_values
 
     def expected(valid: torch.Tensor | None) -> float:
         terms = []
         for expert_idx in range(mob.config.num_experts):
-            won = (selected == expert_idx).any(dim=-1)
+            held_slots = selected == expert_idx
+            held = held_slots.any(dim=-1)
             if valid is not None:
-                won = won & valid
-            if not won.any():
+                held = held & valid
+            if not held.any():
                 continue
-            target = (baselines[expert_idx] - per_token_loss[won]).clamp_min(0.0)
-            terms.append(torch.nn.functional.mse_loss(confidences[:, :, expert_idx][won], target))
+            target = (values * held_slots).sum(dim=-1)[held]
+            terms.append(torch.nn.functional.mse_loss(confidences[:, :, expert_idx][held], target))
         return (torch.stack(terms).mean() * mob.config.confidence_calibration_weight).item()
 
     masked = expected(token_mask > 0)
@@ -619,33 +650,34 @@ def test_value_objective_excludes_masked_tokens():
 
 
 def test_stale_value_objective_is_not_backwarded_twice():
-    """A forward without a wealth update must not reuse the previous step's graph.
+    """A forward without a settlement must not reuse the previous step's graph.
 
     `train.py` calls update_all_mob_from_loss only every
-    `wealth_update_frequency` steps but adds get_total_calibration_loss into the
-    training loss on every step. The old calibration loss was a detached constant,
-    so a stale one was harmless; the value objective holds a live graph, and
-    backwarding last step's graph raises "backward through the graph a second time".
+    `wealth_update_frequency` steps but backwards get_total_calibration_loss on
+    every step. The old calibration loss was a detached constant, so a stale one
+    was harmless; the value objective holds a live graph, and backwarding last
+    step's graph raises "backward through the graph a second time".
     """
     mob = _build_training_mob()
 
     for step in range(4):
         output = mob(torch.randn(1, 8, 32))
+        output.sum().backward()
         if step % 2 == 0:
             mob.update_wealth_from_loss(torch.randn(1, 8).abs())
 
-        # Mirror train.py: the objective is summed into a loss that always carries
-        # a graph, so a stale cached objective is backwarded rather than skipped.
-        total = output.sum() + mob.get_confidence_calibration_loss()
-        total.backward()
+        # Mirror train.py: the objective is backwarded on its own after the
+        # settlement, on every step, whether or not this step settled.
+        objective = mob.get_confidence_calibration_loss()
+        if objective.requires_grad:
+            objective.backward()
 
     assert mob.get_confidence_calibration_loss().item() == 0.0
 
 
 def test_value_objective_is_zero_when_no_update_ran():
     mob = _build_training_mob()
-    mob(torch.randn(1, 8, 32))
-    mob.update_wealth_from_loss(torch.randn(1, 8).abs())
+    _settle(mob, torch.randn(1, 8, 32))
     assert mob.get_confidence_calibration_loss().item() > 0.0
 
     mob(torch.randn(1, 8, 32))
@@ -653,11 +685,12 @@ def test_value_objective_is_zero_when_no_update_ran():
 
 
 def test_value_objective_releases_the_graph_after_use():
-    """The live confidence cache pins a graph; it must not survive the update."""
+    """The live confidence cache pins a graph; it must not survive the settlement."""
     mob = _build_training_mob()
-    mob(torch.randn(1, 8, 32))
+    output = mob(torch.randn(1, 8, 32))
     assert mob._live_confidences is not None
 
+    output.sum().backward()
     mob.update_wealth_from_loss(torch.randn(1, 8).abs())
     assert mob._live_confidences is None
 
@@ -672,6 +705,10 @@ def test_value_objective_releases_the_graph_on_every_exit_path():
     assert mob._live_confidences is None, "leaked on the not-pending return"
 
     mob(torch.randn(1, 8, 32))
+    mob.update_wealth_from_loss(torch.randn(1, 8).abs())
+    assert mob._live_confidences is None, "leaked on the no-backward return"
+
+    mob(torch.randn(1, 8, 32)).sum().backward()
     mob.update_wealth_from_loss(torch.randn(1, 32).abs())
     assert mob._live_confidences is None, "leaked on the seq-len mismatch return"
 
@@ -684,39 +721,38 @@ def test_value_objective_releases_the_graph_on_every_exit_path():
 def test_value_objective_matches_its_definition():
     """Rebuild the objective from the mechanism statement rather than the code.
 
-    Each winner's target is ``clamp_min(baseline - loss, 0)`` on the tokens it
-    won, where ``baseline`` is the value it held when it bid -- not the one the
-    reward loop leaves behind, which has already absorbed the very batch the expert
-    is being judged on.
+    Each expert's target is the value it realised on the tokens it held -- its
+    contribution against the loss gradient -- as measured, negative included. The
+    clamped target this replaced trained a head onto the positive part of that
+    value, so the fixture has to realise values of both signs or the two
+    definitions agree and the test passes under either.
     """
     mob = _build_training_mob()
-    hidden = torch.randn(1, 8, 32)
-    mob(hidden)
+    _settle(mob, torch.randn(1, 8, 32))
 
     confidences = mob.last_stats.confidences
     selected = mob.last_stats.selected_experts
-    baselines = mob.expert_baseline_loss.clone()
-
-    # A positive realised value: the old sigmoid target and the clamped one agree
-    # to well inside tolerance wherever the value is negative, so a fixture there
-    # cannot tell them apart and the test passes under either implementation.
-    per_token_loss = torch.full((1, 8), 0.4)
-    mob.update_wealth_from_loss(per_token_loss)
-
-    assert not torch.allclose(baselines, mob.expert_baseline_loss), (
-        "fixture must actually move the baseline, or the snapshot is untested"
+    values = mob.last_realised_values
+    assert (values < 0).any() and (values > 0).any(), (
+        "fixture must realise values of both signs, or the clamp is untested"
     )
 
-    terms = []
-    for expert_idx in range(mob.config.num_experts):
-        won = (selected == expert_idx).any(dim=-1)
-        if not won.any():
-            continue
-        target = (baselines[expert_idx] - per_token_loss[won]).clamp_min(0.0)
-        terms.append(torch.nn.functional.mse_loss(confidences[:, :, expert_idx][won], target))
+    def objective(clamp: bool) -> float:
+        terms = []
+        for expert_idx in range(mob.config.num_experts):
+            held_slots = selected == expert_idx
+            held = held_slots.any(dim=-1)
+            if not held.any():
+                continue
+            target = (values * held_slots).sum(dim=-1)[held]
+            if clamp:
+                target = target.clamp_min(0.0)
+            terms.append(torch.nn.functional.mse_loss(confidences[:, :, expert_idx][held], target))
+        return (torch.stack(terms).mean() * mob.config.confidence_calibration_weight).item()
 
-    expected = torch.stack(terms).mean() * mob.config.confidence_calibration_weight
-    assert mob.get_confidence_calibration_loss().item() == pytest.approx(expected.item(), abs=1e-6)
+    unclamped = objective(clamp=False)
+    assert objective(clamp=True) != pytest.approx(unclamped, abs=1e-6)
+    assert mob.get_confidence_calibration_loss().item() == pytest.approx(unclamped, abs=1e-6)
 
 
 def test_value_objective_does_not_train_the_backbone():
@@ -726,12 +762,15 @@ def test_value_objective_does_not_train_the_backbone():
     each expert's private objective into a shared auxiliary loss on everything
     below the layer — weighted 0.15 and summed over every MoB layer. That is the
     central planner the auction exists to replace, arriving through the back door.
+
+    The language-modelling backward inside ``_settle`` legitimately trains the
+    trunk; that gradient is cleared so only the value objective's is measured.
     """
     trunk = torch.nn.Linear(32, 32)
     mob = _build_training_mob()
 
-    mob(trunk(torch.randn(1, 8, 32)))
-    mob.update_wealth_from_loss(torch.randn(1, 8).abs())
+    _settle(mob, trunk(torch.randn(1, 8, 32)))
+    trunk.weight.grad = None
     mob.get_confidence_calibration_loss().backward()
 
     assert trunk.weight.grad is None or trunk.weight.grad.abs().sum().item() == 0.0
@@ -760,8 +799,7 @@ def test_detached_routing_path_still_trains_the_coupling():
     torch.nn.init.normal_(mob.coupling.projection.weight, std=0.05)
     mob.set_coupling_step(10)
 
-    mob(torch.randn(1, 8, 32))
-    mob.update_wealth_from_loss(torch.randn(1, 8).abs())
+    _settle(mob, torch.randn(1, 8, 32))
     mob.get_confidence_calibration_loss().backward()
 
     grad = mob.coupling.projection.weight.grad
@@ -771,15 +809,16 @@ def test_detached_routing_path_still_trains_the_coupling():
 def _wealth_change(value: float, price: float, rebate: float, wins: bool) -> float:
     """Wealth moved by expert 0 at a known value, price and rebate.
 
-    Decay is off so the result is the transfer alone, and the baseline is set
-    explicitly so the realised loss reduction is exactly ``value``.
+    Decay is off so the result is the transfer alone, and the realised values are
+    planted in place of the ones the loss backward would have captured, so every
+    win is worth exactly ``value``.
     """
     config = replace(QUASI_LINEAR_CONFIG, wealth_decay=1.0, num_experts=4, top_k=2)
     mob = MixtureOfBidders(config)
     mob.train()
     mob(torch.randn(1, 4, 32))
 
-    mob.expert_baseline_loss.fill_(1.0 + value)
+    mob._cached_values = torch.full((1, 4, 2), value)
     selected = _uniform_selection(1, 4)
     if not wins:
         selected[:, :, 0] = 2  # experts 2 and 3 take the slots instead

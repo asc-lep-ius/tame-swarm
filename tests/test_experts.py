@@ -108,3 +108,26 @@ def test_lightweight_expert_zero_init():
 
     delta = (adapted - base_only).abs().max().item()
     assert delta < 1e-4, f"Fresh LightweightExpert should produce near-zero delta, got {delta}"
+
+
+def test_lightweight_expert_reference_is_the_base_and_the_output_is_unchanged():
+    """One call returns both; neither may differ from computing them separately."""
+    torch.manual_seed(5)
+    base_gate = nn.Linear(32, 64, bias=False)
+    base_up = nn.Linear(32, 64, bias=False)
+    base_down = nn.Linear(64, 32, bias=False)
+    lw_expert = LightweightExpert(hidden_dim=32, intermediate_dim=64, rank=4, alpha=4.0)
+    with torch.no_grad():
+        for name, param in lw_expert.named_parameters():
+            if name.endswith("_B.weight"):
+                param.normal_(std=0.1)
+
+    x = torch.randn(3, 32)
+    output, reference = lw_expert.forward_with_reference(x, base_gate, base_up, base_down)
+
+    base_only = base_down(torch.nn.functional.silu(base_gate(x)) * base_up(x))
+    assert torch.allclose(reference, base_only, atol=1e-6)
+    assert torch.allclose(output, lw_expert(x, base_gate, base_up, base_down), atol=1e-6)
+    assert not torch.allclose(output, reference), "fixture adapters must actually contribute"
+    assert output.requires_grad
+    assert not reference.requires_grad, "the reference is subtracted from a detached output"
