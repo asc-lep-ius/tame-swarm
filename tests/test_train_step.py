@@ -192,3 +192,78 @@ def test_confidence_heads_train_at_their_own_learning_rate(smoke_fixture, tmp_pa
     for group in trainer.optimizer.param_groups:
         if group is not head_groups[0]:
             assert not head_ids & {id(p) for p in group["params"]}
+
+
+@pytest.mark.parametrize("accumulation_steps", [1, 4])
+def test_the_loss_gradient_scale_is_the_valid_token_count_times_accumulation(
+    smoke_fixture, tmp_path, accumulation_steps, monkeypatch
+):
+    """The one expression that sets the economy's magnitude, pinned against the batch.
+
+    The trainer backwards ``mean over N valid tokens / accumulation steps``, so
+    the gradient the value hook captures is ``N x accumulation`` times smaller
+    than the gradient of the summed per-token loss the reward constants were
+    derived on. Every layer-level test passes a hand-written scale, so nothing
+    else would fail if this drifted -- a silently mis-scaled economy is the defect
+    class #15 was opened over.
+    """
+    import train as train_module
+
+    trainer = TAMETrainer(
+        _config(
+            smoke_fixture,
+            tmp_path / f"scale_{accumulation_steps}",
+            gradient_accumulation_steps=accumulation_steps,
+        )
+    )
+    trainer.setup()
+    batch = next(iter(trainer.train_dataloader))
+    # The smoke corpus is short lines at max_seq_length 32, so the batch carries
+    # padding; the scale must count valid *shifted* positions only.
+    assert (batch["attention_mask"] == 0).any(), "fixture must carry padding"
+
+    seen: list[float] = []
+    original = train_module.update_all_mob_from_loss
+
+    def spy(model, per_token_loss, token_mask=None, loss_gradient_scale=1.0):
+        seen.append(loss_gradient_scale)
+        original(model, per_token_loss, token_mask, loss_gradient_scale)
+
+    monkeypatch.setattr(train_module, "update_all_mob_from_loss", spy)
+    trainer.global_step = 0
+    trainer.train_step(batch)
+
+    shift_labels = batch["labels"][..., 1:]
+    shift_mask = batch["attention_mask"][..., 1:]
+    valid = int(((shift_labels != -100) & (shift_mask == 1)).sum())
+    assert seen == [float(valid * accumulation_steps)]
+
+
+def test_realised_values_do_not_depend_on_the_accumulation_setting(smoke_fixture, tmp_path):
+    """The /accumulation in the backward and the x accumulation in the scale cancel exactly."""
+
+    def realised(accumulation_steps: int) -> list[torch.Tensor]:
+        trainer = TAMETrainer(
+            _config(
+                smoke_fixture,
+                tmp_path / f"acc_{accumulation_steps}",
+                gradient_accumulation_steps=accumulation_steps,
+            )
+        )
+        trainer.setup()
+        # Upcycled adapters are zero and contribute nothing; give every expert
+        # the same small planted delta in both runs so there is a value to compare.
+        generator = torch.Generator().manual_seed(9)
+        with torch.no_grad():
+            for mob in get_mob_layers(trainer.model):
+                for name, param in mob.experts.named_parameters():
+                    if name.endswith("_B.weight"):
+                        param.copy_(torch.randn(param.shape, generator=generator) * 0.05)
+        trainer.global_step = 0
+        trainer.train_step(next(iter(trainer.train_dataloader)))
+        return [mob.last_realised_values for mob in get_mob_layers(trainer.model)]
+
+    for one, four in zip(realised(1), realised(4), strict=True):
+        assert one is not None and four is not None
+        assert (one != 0).any(), "fixture experts must contribute, or the check is vacuous"
+        assert torch.allclose(one, four, atol=1e-6)

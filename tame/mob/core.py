@@ -251,7 +251,10 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         # Under a gate that is differentiable in the reports -- the softmax control
         # arm, the proportional baseline share -- the LM backward runs through the
         # routing reports, and the auxiliary objectives read a second, separate
-        # pass over the same heads: one more linear per head, no more.
+        # pass over the same heads: one more linear per head, no more. The second
+        # pass cannot be skipped on those arms even though the first carries a
+        # graph: the LM backward frees that graph, and the z-loss is backwarded
+        # after it.
         needs_auxiliary = self.training and torch.is_grad_enabled() and not recomputing
         live_confidences: torch.Tensor | None = None
         with _saved_outside_checkpointing():
@@ -429,7 +432,10 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         layer's output. Against each winner's contribution that is the first-order
         change in loss the winner caused -- see ``realised_values``. The
         contributions are held only by this closure, so they are released the
-        moment the backward has read them.
+        moment the backward has read them -- and until then they are held in
+        full, ``(batch, seq, top_k, hidden)`` in the model dtype per layer, which
+        gradient checkpointing cannot drop because nothing saved them: about 16 MB
+        per layer at batch 2, sequence 1024, hidden 2048, top-2 in bf16.
         """
         if not output.requires_grad:
             self._warn_once(

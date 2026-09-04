@@ -25,13 +25,16 @@ class ValueSummary(NamedTuple):
     the training loop wants one host sync at the end of a step rather than one
     per statistic.
 
-    ``mean_surplus`` is ``value - price`` per win. It is the quantity #15 was opened
-    over: negative means winning is a loss-making trade and the economy rewards
-    abstention. ``mean_report`` beside ``mean_realised_value`` is the calibration
-    check -- a trained head's report should sit at the mean of the value it
-    realises, not above it, which the clamped target this replaced could not
-    deliver. Slots handed out by exploration are excluded from all four: they were
-    not traded, so they say nothing about the market.
+    ``mean_surplus`` is ``value - price`` per win, the sign of the wealth transfer
+    under the uniform share (where every winner's share is the ``1/top_k`` the
+    charge coefficient assumes; under the proportional baseline the two diverge).
+    It is the quantity #15 was opened over: negative means winning is a
+    loss-making trade and the economy rewards abstention. ``mean_report`` beside
+    ``mean_realised_value`` is the calibration check -- a trained head's report
+    should sit at the mean of the value it realises, not above it, which the
+    clamped target this replaced could not deliver. Slots handed out by
+    exploration are excluded from all four: they were not traded, so they say
+    nothing about the market.
     """
 
     mean_realised_value: torch.Tensor

@@ -137,19 +137,32 @@ class VCGAuctioneer(nn.Module):
     the winners: 1.0 is plain bid-proportional, below 1.0 approaches argmax, above
     1.0 approaches the uniform split. The uniform share ignores it.
 
-    ``exploration_rate`` is the fraction of tokens on which, in training, the last
-    slot is handed to a uniformly random loser instead of sold. A head is trained
-    only on the value its expert realises on the tokens it holds, so an expert
-    that has fallen to a truthful report of zero would otherwise never hold
-    another token, never see another target, and never come back however much its
-    adapter later learns -- measured on the planted-competence fixture as a market
-    that collapsed to two of eight experts with the other six at the wealth floor.
-    The slot is a gift from the tissue rather than a trade: the explorer pays
-    nothing, and whether a token is explored is drawn before any report is read,
-    so no report can change an expert's chance of being handed one. Its threshold
-    for *winning* is untouched, which is what keeps the stage game strategyproof.
-    The bid is the truthful value estimate; the noise that keeps every cell
-    sampling its environment lives here, in the allocation.
+    ``exploration_rate`` is the fraction of tokens on which, in training, one
+    slot -- drawn uniformly over the *k* -- is handed to a uniformly random loser
+    instead of sold. A head is trained only on the value its expert realises on
+    the tokens it holds, so an expert that has fallen to a truthful report of zero
+    would otherwise never hold another token, never see another target, and never
+    come back however much its adapter later learns -- measured on the
+    planted-competence fixture as a market that collapsed to two of eight experts
+    with the other six at the wealth floor. The slot is a gift from the tissue
+    rather than a trade: the explorer pays nothing, and the token's rebate is
+    scaled down so the gift is funded from the payments that remain (see
+    ``_compute_rebates``).
+
+    What this does to the incentive claim, exactly. Whether a token is explored,
+    and which slot, is drawn before any report is read; which loser receives it is
+    uniform over the losers. A loser therefore cannot raise its chance of the
+    gift by any report, and a winner can only reach the lottery by giving up its
+    win. Drawing the slot uniformly is what removes the deviation a fixed last
+    slot would create -- a marginal winner overreporting into a slot that is never
+    displaced, at an unchanged price. What remains is that a winner faces a
+    ``rate / k`` chance of displacement it cannot bid away, and a loser an
+    expected ``rate / (n - k)`` share of the gift: the stage game is strategyproof
+    up to ``O(exploration_rate)``, with any deviation worth at most
+    ``exploration_rate x value`` to the deviator, and exactly strategyproof at a
+    rate of zero. ``test_deviation_gain_is_bounded_by_the_exploration_rate``
+    pins the bound. The bid stays the truthful value estimate; the noise that
+    keeps every cell sampling its environment lives here, in the allocation.
     """
 
     def __init__(
@@ -197,6 +210,7 @@ class VCGAuctioneer(nn.Module):
         explored: torch.Tensor | None = None
         if self.training and self.exploration_rate > 0.0:
             selected_experts, payments, explored = self._explore(bids, selected_experts, payments)
+            rebates = self._fund_exploration(rebates, explored, wealth_snapshot)
             top_bids = torch.gather(bids, -1, selected_experts)
 
         routing_weights = self._compute_routing_weights(bids, top_bids, selected_experts)
@@ -206,43 +220,65 @@ class VCGAuctioneer(nn.Module):
     def _explore(
         self, bids: torch.Tensor, selected_experts: torch.Tensor, payments: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Hand the last slot to a random loser on an ``exploration_rate`` fraction of tokens.
+        """Hand one slot to a random loser on an ``exploration_rate`` fraction of tokens.
 
-        The draw of *which tokens* is made before the losers are known, so it is
-        independent of every report; the draw of *which loser* is uniform over the
-        experts that did not win, which is the argmax of independent uniforms
-        masked to them. The displaced winner is not charged for a slot it no
-        longer holds, and the explorer is not charged for one it did not bid for.
-        The other winners' prices are the auction's prices: their externality was
-        computed on the bids, and the bids have not changed.
+        Three draws, in this order and before any report is consulted: which
+        tokens, which of the *k* slots, and -- masked to the experts that did not
+        win -- which loser, as the argmax of independent uniforms. The displaced
+        winner is not charged for a slot it no longer holds, and the explorer is
+        not charged for one it did not bid for. The other winners' prices are the
+        auction's prices: their externality was computed on the bids, and the bids
+        have not changed.
 
         With ``top_k >= num_experts`` there is no loser to hand a slot to.
         """
         batch, seq_len, num_experts = bids.shape
-        last = self.top_k - 1
-        if self.top_k >= num_experts:
+        k = self.top_k
+        if k >= num_experts:
             return selected_experts, payments, torch.zeros_like(selected_experts, dtype=torch.bool)
 
         explore_token = torch.rand(batch, seq_len, device=bids.device) < self.exploration_rate
+        slot = torch.randint(0, k, (batch, seq_len), device=bids.device)
+        explored = torch.zeros_like(selected_experts, dtype=torch.bool)
+        explored.scatter_(-1, slot.unsqueeze(-1), explore_token.unsqueeze(-1))
 
         is_winner = torch.zeros_like(bids, dtype=torch.bool).scatter_(-1, selected_experts, True)
         draw = torch.rand(batch, seq_len, num_experts, device=bids.device).masked_fill(
             is_winner, -1.0
         )
-        explorer = draw.argmax(dim=-1)
+        explorer = draw.argmax(dim=-1, keepdim=True).expand_as(selected_experts)
 
-        selected_experts = selected_experts.clone()
-        selected_experts[..., last] = torch.where(
-            explore_token, explorer, selected_experts[..., last]
-        )
-        payments = payments.clone()
-        payments[..., last] = torch.where(
-            explore_token, torch.zeros_like(payments[..., last]), payments[..., last]
-        )
-
-        explored = torch.zeros_like(selected_experts, dtype=torch.bool)
-        explored[..., last] = explore_token
+        selected_experts = torch.where(explored, explorer, selected_experts)
+        payments = payments.masked_fill(explored, 0.0)
         return selected_experts, payments, explored
+
+    def _fund_exploration(
+        self, rebates: torch.Tensor, explored: torch.Tensor, wealth: torch.Tensor
+    ) -> torch.Tensor:
+        """Shrink the rebate on an explored token to what the remaining payments cover.
+
+        An explored slot collects nothing, so the token's rebate -- computed
+        against a full collection -- would otherwise return more than came in,
+        and at a large enough rate the transfer would become a money pump.
+        Scaling the row by ``sum_{richest k-1} 1/w / sum_{richest k} 1/w`` keeps
+        the feasibility argument in ``_compute_rebates`` intact with one slot
+        fewer: the payout is then at most ``b_(k+1) * sum_{richest k-1} 1/w_i``,
+        and no ``k-1`` sold winners have a smaller sum of reciprocals. At
+        ``top_k == 1`` the numerator is empty and the explored token rebates
+        nothing, which is what a token with no collection can afford.
+
+        The factor reads wealth and the exploration draw, neither of which any
+        report can move, so the rebate stays independent of every recipient's own
+        report.
+        """
+        k = self.top_k
+        accumulate_dtype = torch.promote_types(rebates.dtype, torch.float32)
+        reciprocals = 1.0 / torch.topk(wealth.to(accumulate_dtype), k).values.clamp_min(
+            WEALTH_EPSILON
+        )
+        factor = reciprocals[: k - 1].sum() / reciprocals.sum()
+        explored_token = explored.any(dim=-1, keepdim=True)
+        return torch.where(explored_token, rebates * factor.to(rebates.dtype), rebates)
 
     def _compute_rebates(self, bids: torch.Tensor, wealth: torch.Tensor) -> torch.Tensor:
         """Return part of the collected payment without touching anyone's incentives.
@@ -285,6 +321,10 @@ class VCGAuctioneer(nn.Module):
         richest. That is still report-independent, for a different reason than the
         exclusion rule: wealth is accumulated state read from a detached snapshot,
         not something an expert reports this token.
+
+        Exploration takes one payment out of a token's collection; the rebate on
+        such a token is scaled down by ``_fund_exploration`` so the same argument
+        holds with one slot fewer.
 
         This replaced the pool's largest wealth, which was also safe and simpler
         but under-rebated by whatever the richest expert stood above the rest:
