@@ -63,17 +63,21 @@ def update_all_mob_from_loss(
     model: nn.Module,
     per_token_loss: torch.Tensor,
     token_mask: torch.Tensor | None = None,
+    loss_gradient_scale: float = 1.0,
 ):
-    """
-    Update all MoB layers in a model with loss feedback.
+    """Settle every MoB layer's economy for the step. Call *after* the loss backward.
 
     Args:
         model: Model containing MoB layers
         per_token_loss: Loss per token, shape (batch, seq_len)
         token_mask: Optional mask for valid tokens
+        loss_gradient_scale: What the backwarded loss's gradient must be multiplied
+            by to be the gradient of the summed per-token loss -- ``N x
+            accumulation steps`` for a mean over ``N`` valid tokens. See
+            ``WealthUpdateMixin.update_wealth_from_loss``.
     """
     for mob in get_mob_layers(model):
-        mob.update_wealth_from_loss(per_token_loss, token_mask)
+        mob.update_wealth_from_loss(per_token_loss, token_mask, loss_gradient_scale)
 
 
 def get_total_calibration_loss(model: nn.Module) -> torch.Tensor:
@@ -184,6 +188,18 @@ def get_mob_statistics(model: nn.Module) -> dict[str, torch.Tensor | list[torch.
     ]
     if len(payments) == len(mob_layers):
         statistics["mean_payment"] = torch.stack(payments).mean()
+
+    # What the last settlement actually paid for. Absent until every layer has
+    # settled once, and absent under a gate with no economy. ``mean_win_surplus``
+    # is the #15 symptom made visible on every step: below zero, winning is a
+    # loss-making trade and the economy is rewarding abstention.
+    summaries = [mob.last_value_summary for mob in mob_layers if mob.last_value_summary is not None]
+    if len(summaries) == len(mob_layers):
+        statistics["mean_realised_value"] = torch.stack(
+            [s.mean_realised_value for s in summaries]
+        ).mean()
+        statistics["mean_report"] = torch.stack([s.mean_report for s in summaries]).mean()
+        statistics["mean_win_surplus"] = torch.stack([s.mean_surplus for s in summaries]).mean()
 
     return statistics
 

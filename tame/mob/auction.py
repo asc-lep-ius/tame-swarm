@@ -43,12 +43,17 @@ class AuctionOutcome(NamedTuple):
     says *no transfer was computed*, which the wealth paths must not confuse with
     an auction that computed zeros -- the defect #9 fixed looked exactly like the
     latter.
+
+    ``explored`` marks, per winner slot, the slots the auction handed out rather
+    than sold -- see ``VCGAuctioneer.exploration_rate``. ``None`` means no slot
+    was, which is every gate but a training auction with exploration switched on.
     """
 
     selected_experts: torch.Tensor
     routing_weights: torch.Tensor
     payments: torch.Tensor | None
     rebates: torch.Tensor | None
+    explored: torch.Tensor | None = None
 
 
 ROUTING_SHARE_UNIFORM = "uniform"
@@ -131,6 +136,20 @@ class VCGAuctioneer(nn.Module):
     log domain, so a winner's share is ``bid ** (1 / temperature)`` normalised over
     the winners: 1.0 is plain bid-proportional, below 1.0 approaches argmax, above
     1.0 approaches the uniform split. The uniform share ignores it.
+
+    ``exploration_rate`` is the fraction of tokens on which, in training, the last
+    slot is handed to a uniformly random loser instead of sold. A head is trained
+    only on the value its expert realises on the tokens it holds, so an expert
+    that has fallen to a truthful report of zero would otherwise never hold
+    another token, never see another target, and never come back however much its
+    adapter later learns -- measured on the planted-competence fixture as a market
+    that collapsed to two of eight experts with the other six at the wealth floor.
+    The slot is a gift from the tissue rather than a trade: the explorer pays
+    nothing, and whether a token is explored is drawn before any report is read,
+    so no report can change an expert's chance of being handed one. Its threshold
+    for *winning* is untouched, which is what keeps the stage game strategyproof.
+    The bid is the truthful value estimate; the noise that keeps every cell
+    sampling its environment lives here, in the allocation.
     """
 
     def __init__(
@@ -140,6 +159,7 @@ class VCGAuctioneer(nn.Module):
         differentiable: bool = True,
         routing_share: str = ROUTING_SHARE_UNIFORM,
         temperature: float = 1.0,
+        exploration_rate: float = 0.0,
     ):
         super().__init__()
         if routing_share not in SUPPORTED_ROUTING_SHARES:
@@ -149,12 +169,17 @@ class VCGAuctioneer(nn.Module):
         # or a sign flip that ranks the abstaining expert first.
         if temperature <= 0:
             raise ValueError(f"Routing temperature must be positive, got {temperature}")
+        # 1.0 would hand every last slot to chance and leave nothing for the
+        # auction to decide there.
+        if not 0.0 <= exploration_rate < 1.0:
+            raise ValueError(f"exploration_rate must lie in [0, 1), got {exploration_rate}")
 
         self.num_experts = num_experts
         self.top_k = top_k
         self.differentiable = differentiable
         self.routing_share = routing_share
         self.temperature = temperature
+        self.exploration_rate = exploration_rate
 
     def forward(
         self,
@@ -166,9 +191,56 @@ class VCGAuctioneer(nn.Module):
         top_bids, selected_experts = torch.topk(bids, self.top_k, dim=-1)
         payments = self._compute_vcg_payments(bids, selected_experts, wealth_snapshot)
         rebates = self._compute_rebates(bids, wealth_snapshot)
+
+        explored: torch.Tensor | None = None
+        if self.training and self.exploration_rate > 0.0:
+            selected_experts, payments, explored = self._explore(bids, selected_experts, payments)
+            top_bids = torch.gather(bids, -1, selected_experts)
+
         routing_weights = self._compute_routing_weights(bids, top_bids, selected_experts)
 
-        return AuctionOutcome(selected_experts, routing_weights, payments, rebates)
+        return AuctionOutcome(selected_experts, routing_weights, payments, rebates, explored)
+
+    def _explore(
+        self, bids: torch.Tensor, selected_experts: torch.Tensor, payments: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Hand the last slot to a random loser on an ``exploration_rate`` fraction of tokens.
+
+        The draw of *which tokens* is made before the losers are known, so it is
+        independent of every report; the draw of *which loser* is uniform over the
+        experts that did not win, which is the argmax of independent uniforms
+        masked to them. The displaced winner is not charged for a slot it no
+        longer holds, and the explorer is not charged for one it did not bid for.
+        The other winners' prices are the auction's prices: their externality was
+        computed on the bids, and the bids have not changed.
+
+        With ``top_k >= num_experts`` there is no loser to hand a slot to.
+        """
+        batch, seq_len, num_experts = bids.shape
+        last = self.top_k - 1
+        if self.top_k >= num_experts:
+            return selected_experts, payments, torch.zeros_like(selected_experts, dtype=torch.bool)
+
+        explore_token = torch.rand(batch, seq_len, device=bids.device) < self.exploration_rate
+
+        is_winner = torch.zeros_like(bids, dtype=torch.bool).scatter_(-1, selected_experts, True)
+        draw = torch.rand(batch, seq_len, num_experts, device=bids.device).masked_fill(
+            is_winner, -1.0
+        )
+        explorer = draw.argmax(dim=-1)
+
+        selected_experts = selected_experts.clone()
+        selected_experts[..., last] = torch.where(
+            explore_token, explorer, selected_experts[..., last]
+        )
+        payments = payments.clone()
+        payments[..., last] = torch.where(
+            explore_token, torch.zeros_like(payments[..., last]), payments[..., last]
+        )
+
+        explored = torch.zeros_like(selected_experts, dtype=torch.bool)
+        explored[..., last] = explore_token
+        return selected_experts, payments, explored
 
     def _compute_rebates(self, bids: torch.Tensor, wealth: torch.Tensor) -> torch.Tensor:
         """Return part of the collected payment without touching anyone's incentives.

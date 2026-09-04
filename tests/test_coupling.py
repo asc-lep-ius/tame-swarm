@@ -212,6 +212,7 @@ def test_active_coupling_preserves_vcg_auction_inputs() -> None:
         use_differentiable_routing=False,
         use_loss_feedback=True,
         use_local_quality=False,
+        exploration_rate=0.0,  # the assertion below is on the auction's own allocation
     )
     baseline = MixtureOfBidders(config)
     coupled = MixtureOfBidders(config)
@@ -255,10 +256,10 @@ def test_active_coupling_preserves_vcg_auction_inputs() -> None:
 
     bids = coupled.last_stats.confidences * coupled.expert_wealth.view(1, 1, -1)
     expected_selected = torch.topk(bids, config.top_k, dim=-1).indices
-    _, _, expected_payments, _ = coupled.gate(
+    expected_payments = coupled.gate(
         coupled.last_stats.confidences,
         coupled.expert_wealth,
-    )
+    ).payments
 
     assert torch.equal(coupled.last_stats.selected_experts, expected_selected)
     assert coupled._cached_payments is not None

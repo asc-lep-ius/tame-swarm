@@ -31,6 +31,7 @@ AUCTION_ONLY_FIELDS = (
     "routing_share",
     "routing_temperature",
     "use_differentiable_routing",
+    "exploration_rate",
     # Reached only below the has_economy early return in update_wealth_from_loss, so
     # under the softmax gate the cached loss stays None and the trainer adds zero.
     "confidence_calibration_weight",
@@ -89,6 +90,14 @@ class MoBConfig:
     # log precisely so that bound does not degrade as the gate sharpens. Ignored
     # under the uniform share.
     routing_temperature: float = 1.0
+    # Fraction of training tokens whose last slot goes to a random loser instead
+    # of being sold -- see VCGAuctioneer. A head learns only from the tokens its
+    # expert holds, so without this an expert whose truthful report has fallen to
+    # zero never holds another token and never recovers. 0.02 is a floor, not a
+    # tuning: at eight experts and top-2 it hands each loser about one token in
+    # 300, enough for every head to keep a target every step at a real batch
+    # size, while displacing the marginal winner on 2% of tokens.
+    exploration_rate: float = 0.02
     # Which gate turns reports into an allocation. "auction" is MoB. "softmax" is
     # the #12 control arm: the same confidence heads, softmaxed, with the whole
     # economy switched off -- no wealth read, no payment, no rebate, no value
@@ -135,6 +144,9 @@ class MoBConfig:
             raise ValueError(
                 f"routing_temperature must be positive, got {self.routing_temperature}"
             )
+
+        if not 0.0 <= self.exploration_rate < 1.0:
+            raise ValueError(f"exploration_rate must lie in [0, 1), got {self.exploration_rate}")
 
         if self.routing_share not in SUPPORTED_ROUTING_SHARES:
             shares = ", ".join(sorted(SUPPORTED_ROUTING_SHARES))

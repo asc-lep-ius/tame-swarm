@@ -17,21 +17,10 @@ from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tame"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from mob import MixtureOfBidders, MoBConfig  # noqa: E402
+from synthetic_economy import BASE_CONFIG, DEFAULT_COMPETENCE, SyntheticEconomy  # noqa: E402
 
-BASE = MoBConfig(
-    num_experts=8,
-    top_k=2,
-    hidden_dim=64,
-    intermediate_dim=128,
-    adapter_rank=8,
-    adapter_alpha=8.0,
-)
-# A nonconstant routing objective: without genuine competence differences there is
-# nothing for the economy to specialise on and every scale looks the same.
-COMPETENCE = torch.tensor([0.9, 0.7, 0.55, 0.5, 0.45, 0.4, 0.3, 0.1])
 # 1.0 is the quasi-linear point; the sweep brackets it to show what deviating costs.
 SCALES = [0.0, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0]
 SEEDS = (0, 1, 2)
@@ -46,30 +35,29 @@ def gini(wealth: torch.Tensor) -> float:
 
 
 def run(payment_scale: float, seed: int) -> dict[str, float]:
-    torch.manual_seed(seed)
-    mob = MixtureOfBidders(replace(BASE, payment_scale=payment_scale))
-    mob.train()
+    # The planted-competence fixture: a nonconstant routing objective, because
+    # without genuine competence differences there is nothing for the economy to
+    # specialise on and every scale looks the same.
+    economy = SyntheticEconomy(
+        DEFAULT_COMPETENCE, seed=seed, config=replace(BASE_CONFIG, payment_scale=payment_scale)
+    )
+    mob = economy.mob
 
     charges: list[float] = []
     rewards: list[float] = []
     original = mob._vcg_charges
 
-    def spy(payments, selected, num_tokens, reward_multiplier, rebates=None):
-        charge = original(payments, selected, num_tokens, reward_multiplier, rebates)
+    def spy(payments, selected, num_tokens, reward_multiplier, rebates=None, valid_mask=None):
+        charge = original(payments, selected, num_tokens, reward_multiplier, rebates, valid_mask)
         charges.append(charge.sum().item())
         return charge
 
     mob._vcg_charges = spy
 
     for _ in range(STEPS):
-        mob(torch.randn(2, 16, 64))
-        selected = mob._cached_selected_experts
-        quality = COMPETENCE[selected].mean(dim=-1)
-        loss = ((2.0 - quality) + 0.05 * torch.randn(2, 16)).abs()
-
         before = mob.expert_wealth.clone()
-        mob.update_wealth_from_loss(loss)
-        gross = (mob.expert_wealth - before * BASE.wealth_decay).sum().item() + charges[-1]
+        economy.step()
+        gross = (mob.expert_wealth - before * BASE_CONFIG.wealth_decay).sum().item() + charges[-1]
         rewards.append(gross)
 
     wealth = mob.expert_wealth
@@ -77,7 +65,7 @@ def run(payment_scale: float, seed: int) -> dict[str, float]:
         "charge_pct": 100 * sum(charges) / max(sum(abs(r) for r in rewards), 1e-9),
         "gini": gini(wealth),
         "spread": (wealth.max() - wealth.min()).item(),
-        "floored": float((wealth <= BASE.min_wealth + 1e-4).sum().item()),
+        "floored": float((wealth <= BASE_CONFIG.min_wealth + 1e-4).sum().item()),
     }
 
 

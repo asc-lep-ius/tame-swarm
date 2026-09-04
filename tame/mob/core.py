@@ -1,4 +1,6 @@
 import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import cast
 
@@ -13,13 +15,55 @@ except ImportError:
         raise
     from coupling import CouplingMetrics, SteeringCoupling, SteeringCouplingConfig
 
-from .auction import AuctionOutcome, RoutingDiagnostics, VCGAuctioneer, routing_diagnostics
+from .auction import (
+    ROUTING_SHARE_PROPORTIONAL,
+    AuctionOutcome,
+    RoutingDiagnostics,
+    VCGAuctioneer,
+    routing_diagnostics,
+)
 from .experts import ConfidenceHead, Expert, LightweightExpert
 from .mob_config import MoBConfig
 from .softmax_router import SoftmaxRouter
-from .wealth import WealthUpdateMixin
+from .wealth import ValueSummary, WealthUpdateMixin, realised_values
 
 logger = logging.getLogger(__name__)
+
+
+def _is_recomputing() -> bool:
+    """Whether this forward is a gradient-checkpoint recompute, not the real one.
+
+    ``torch.utils.checkpoint`` drops a checkpointed region's activations and runs
+    the region's forward a second time, inside the backward, to rebuild them. The
+    autograd engine reports a current graph task only while a backward is
+    executing, so a forward that finds one is that second run. The private
+    accessor is the one the checkpoint implementation itself keys its recompute
+    bookkeeping on.
+    """
+    return torch._C._current_graph_task_id() != -1  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def _keep(tensor: torch.Tensor) -> torch.Tensor:
+    return tensor
+
+
+@contextmanager
+def _saved_outside_checkpointing() -> Iterator[None]:
+    """Keep the routing path's saved tensors out of gradient checkpointing.
+
+    The value objective and the router z-loss are backwarded on their own, after
+    the language-modelling backward has run and the economy has settled -- they
+    cannot join the first backward, because the value they regress onto is the
+    gradient that backward delivers. Under non-reentrant checkpointing every tensor
+    saved inside the decoder layer is a placeholder that recomputes the *whole*
+    layer on unpack, so that second backward would cost an attention pass per MoB
+    layer to recover one detached activation. ``saved_tensors_hooks`` nests and the
+    innermost pair wins, so an identity pair here saves the routing path's few
+    activations eagerly. The cost is one ``(batch, seq, hidden)`` activation per
+    layer held until the auxiliary backward.
+    """
+    with torch.autograd.graph.saved_tensors_hooks(_keep, _keep):
+        yield
 
 
 @dataclass(frozen=True)
@@ -70,10 +114,7 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
             )
 
         self.confidence_heads = nn.ModuleList(
-            [
-                ConfidenceHead(config.hidden_dim, expert_id=i, num_experts=config.num_experts)
-                for i in range(config.num_experts)
-            ]
+            [ConfidenceHead(config.hidden_dim, expert_id=i) for i in range(config.num_experts)]
         )
 
         # One attribute for whichever gate this arm runs, so nothing downstream
@@ -85,6 +126,7 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
                 differentiable=config.use_differentiable_routing,
                 routing_share=config.routing_share,
                 temperature=config.routing_temperature,
+                exploration_rate=config.exploration_rate,
             )
             if config.has_economy
             else SoftmaxRouter(config.num_experts, config.top_k)
@@ -124,10 +166,17 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         self._live_confidences: torch.Tensor | None = None
         self._cached_payments: torch.Tensor | None = None
         self._cached_rebates: torch.Tensor | None = None
-        self._cached_expert_token_masks: list[torch.Tensor] | None = None
+        self._cached_explored: torch.Tensor | None = None
+        # Written by the hook the loss backward fires at this layer's output: the
+        # value every winner realised on every token. Read by the wealth update,
+        # which therefore has to run after the backward.
+        self._cached_values: torch.Tensor | None = None
         self._loss_feedback_pending: bool = False
         self._cached_calibration_loss: torch.Tensor | None = None
         self._cached_router_z_loss: torch.Tensor | None = None
+        self.last_value_summary: ValueSummary | None = None
+        self.last_realised_values: torch.Tensor | None = None
+        self._warned: set[str] = set()
         self._last_coupling_metrics: CouplingMetrics | None = None
         # Held-out evaluation reads the model without paying it. See
         # ``mob.utils.frozen_economy``, which is the only thing that sets this.
@@ -139,15 +188,24 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         update_wealth: bool = True,
     ) -> torch.Tensor:
         """Forward pass through the MoB layer."""
-        batch_size, seq_len, hidden_dim = hidden_states.shape
+        # Under gradient checkpointing this forward runs a second time inside the
+        # backward, to rebuild the activations the first run dropped. That pass
+        # must reproduce the first one's tensors and otherwise leave no trace: the
+        # caches below belong to the real forward, the usage counts would double,
+        # and an auction re-run against wealth the economy had moved in between is
+        # what raised a checkpoint metadata mismatch at step 0 of every 8-expert
+        # run while the wealth update sat between forward and backward.
+        recomputing = _is_recomputing()
 
-        # Both caches belong to the forward pass that produced them. The value
-        # objective holds a live graph, so a stale one is not a harmless constant
-        # the way the old detached calibration loss was -- a training step that
-        # forwards without calling update_wealth_from_loss would backward through a
-        # graph the previous step already freed.
-        self._cached_calibration_loss = None
-        self._live_confidences = None
+        if not recomputing:
+            # Every cache belongs to the forward pass that produced it. The value
+            # objective holds a live graph, so a stale one is not a harmless
+            # constant the way the old detached calibration loss was -- a training
+            # step that forwards without settling would backward through a graph
+            # the previous step already freed.
+            self._cached_calibration_loss = None
+            self._live_confidences = None
+            self._cached_values = None
 
         # The routing path observes the representation; it does not reshape it. Every
         # head reads the same hidden states, so without this detach each expert's
@@ -157,6 +215,142 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         # output keeps SteeringCoupling.projection trainable.
         routing_hidden_states = hidden_states.detach()
 
+        # The auxiliary objectives -- each head's value objective and the router
+        # z-loss -- are backwarded on their own after the economy has settled, so
+        # they need a graph the language-modelling backward does not free. Under
+        # the uniform auction share the LM loss cannot reach the heads at all, so
+        # the routing reports carry no graph and the one graph built is theirs.
+        # Under a gate that is differentiable in the reports -- the softmax control
+        # arm, the proportional baseline share -- the LM backward runs through the
+        # routing reports, and the auxiliary objectives read a second, separate
+        # pass over the same heads: one more linear per head, no more.
+        needs_auxiliary = self.training and torch.is_grad_enabled() and not recomputing
+        live_confidences: torch.Tensor | None = None
+        with _saved_outside_checkpointing():
+            with torch.set_grad_enabled(torch.is_grad_enabled() and self._gate_trains_heads()):
+                confidence_logits, confidences, coupling_metrics = self._report(
+                    routing_hidden_states
+                )
+            if needs_auxiliary:
+                live_logits, live_confidences, _ = self._report(routing_hidden_states)
+                router_z_loss = self._compute_router_z_loss(live_logits)
+            else:
+                router_z_loss = self._compute_router_z_loss(confidence_logits).detach()
+        if not recomputing:
+            self._cached_router_z_loss = router_z_loss
+
+        outcome = self._route(confidence_logits, confidences)
+        selected_experts = outcome.selected_experts
+        routing_weights = outcome.routing_weights
+
+        # A frozen economy still routes and still computes an output -- it is an
+        # evaluation, not an ablation -- but it must not move any state the next
+        # training step reads. That is wealth, the usage counts the exploration
+        # bonus reads, and the loss-feedback cache.
+        update_wealth = update_wealth and not self._economy_frozen and not recomputing
+
+        expects_feedback = (
+            self.training
+            and self.config.use_loss_feedback
+            and self._economy_live()
+            and not recomputing
+        )
+        collect_contributions = expects_feedback and torch.is_grad_enabled()
+
+        output = torch.zeros_like(hidden_states)
+        contributions: torch.Tensor | None = None
+        if self.training:
+            output, contributions = self._forward_training(
+                hidden_states,
+                output,
+                selected_experts,
+                routing_weights,
+                update_wealth,
+                collect_contributions,
+            )
+        else:
+            output = self._forward_inference(
+                hidden_states, output, selected_experts, routing_weights, update_wealth
+            )
+
+        if output.dtype == torch.bfloat16 or output.dtype == torch.float16:
+            output = torch.nan_to_num(output, nan=0.0, posinf=65000.0, neginf=-65000.0)
+
+        if collect_contributions:
+            assert contributions is not None and live_confidences is not None
+            self._cache_loss_feedback(outcome, confidences, live_confidences)
+            self._register_value_hook(output, contributions)
+        elif expects_feedback:
+            self._warn_once(
+                "no_gradient",
+                "training forward ran with gradients disabled, so the loss backward "
+                "cannot reach this layer and no value can be realised; loss feedback "
+                "is skipped for this step. Reentrant gradient checkpointing runs its "
+                "first pass this way and is not supported",
+            )
+
+        # The loss path settles in update_wealth_from_loss. The other two paths
+        # are fallbacks for when no loss reaches the layer, and settle here.
+        if update_wealth and self._economy_live() and not self.config.use_loss_feedback:
+            if self.config.use_local_quality:
+                self._update_wealth_local_quality(
+                    selected_experts,
+                    routing_weights,
+                    confidences,
+                    outcome.payments,
+                    outcome.rebates,
+                    output,
+                )
+            elif self.training:
+                self._update_wealth_participation(
+                    selected_experts,
+                    routing_weights,
+                    confidences,
+                    outcome.payments,
+                    outcome.rebates,
+                )
+
+        if not recomputing:
+            self.last_stats = MoBStats(
+                confidence_logits=confidence_logits.detach(),
+                confidences=confidences.detach(),
+                selected_experts=selected_experts.detach(),
+                routing_weights=routing_weights.detach(),
+                expert_wealth=self.expert_wealth.detach().clone(),
+                expert_usage=self.expert_usage_count.detach().clone(),
+                expert_performance=self.expert_performance_ema.detach().clone(),
+                router_z_loss=router_z_loss.detach(),
+                # The statistic that would have surfaced a gate saturating on the
+                # wealth scale, so it is recorded on every step rather than reached
+                # for after a result looks wrong. Left as device tensors; the
+                # training loop syncs.
+                routing=routing_diagnostics(routing_weights),
+                coupling_metrics=coupling_metrics,
+                mean_payment=(
+                    outcome.payments.detach().mean() if outcome.payments is not None else None
+                ),
+            )
+            self._last_coupling_metrics = coupling_metrics
+
+            # A frozen forward contributes no row: the wealth history is a training
+            # trace, and an evaluation pass interleaved into it would read as the
+            # economy having done something on a step where it did not.
+            if self._track_wealth and not self._economy_frozen:
+                self.wealth_history.append(self.expert_wealth.cpu().tolist())
+
+        return output
+
+    def _report(
+        self, routing_hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, CouplingMetrics | None]:
+        """Every head's logit and report for every token.
+
+        Must match ConfidenceHead.forward. The report is a loss-reduction estimate,
+        not a probability: a sigmoid here caps it at 1.0 while the reward it is
+        trained to predict is unbounded, so "win when report > price" and "profit
+        when value > price" stop being the same threshold. forward_logits is used
+        rather than forward only so the z-loss can read the pre-activation logits.
+        """
         confidence_hidden_states = routing_hidden_states
         coupling_metrics: CouplingMetrics | None = None
         coupling = self._get_coupling()
@@ -173,94 +367,62 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
             ],
             dim=-1,
         )
-        # Must match ConfidenceHead.forward. The report is a loss-reduction estimate,
-        # not a probability: a sigmoid here caps it at 1.0 while the reward it is
-        # trained to predict is unbounded, so "win when report > price" and "profit
-        # when value > price" stop being the same threshold. forward_logits is used
-        # rather than forward only so the z-loss can read the pre-activation logits.
-        confidences = F.softplus(confidence_logits)
-        router_z_loss = self._compute_router_z_loss(confidence_logits)
-        self._cached_router_z_loss = router_z_loss
+        return confidence_logits, F.softplus(confidence_logits), coupling_metrics
 
-        outcome = self._route(confidence_logits, confidences)
-        selected_experts = outcome.selected_experts
-        routing_weights = outcome.routing_weights
-        payments = outcome.payments
-        rebates = outcome.rebates
+    def _gate_trains_heads(self) -> bool:
+        """Whether the language-modelling loss reaches the heads through the gate.
 
-        # A frozen economy still routes and still computes an output -- it is an
-        # evaluation, not an ablation -- but it must not move any state the next
-        # training step reads. That is wealth, the usage counts the exploration
-        # bonus reads, and the loss-feedback cache.
-        update_wealth = update_wealth and not self._economy_frozen
+        The softmax control arm and the proportional baseline share are
+        differentiable in the reports, so the LM loss trains their heads -- the
+        documented asymmetry those baselines exist to isolate. The uniform auction
+        share is a constant, and its reports are computed without a graph so that
+        no route, however indirect, lets the global loss into a head.
+        """
+        if not self.config.has_economy:
+            return True
+        return self.config.routing_share == ROUTING_SHARE_PROPORTIONAL
 
-        output = torch.zeros_like(hidden_states)
+    def _cache_loss_feedback(
+        self, outcome: AuctionOutcome, confidences: torch.Tensor, live_confidences: torch.Tensor
+    ) -> None:
+        self._cached_selected_experts = outcome.selected_experts.detach()
+        self._cached_routing_weights = outcome.routing_weights.detach()
+        self._cached_confidences = confidences.detach()
+        self._live_confidences = live_confidences
+        self._cached_payments = outcome.payments.detach() if outcome.payments is not None else None
+        self._cached_rebates = outcome.rebates.detach() if outcome.rebates is not None else None
+        self._cached_explored = outcome.explored
+        self._loss_feedback_pending = True
 
-        if self.training:
-            output = self._forward_training(
-                hidden_states, output, selected_experts, routing_weights, update_wealth
+    def _register_value_hook(self, output: torch.Tensor, contributions: torch.Tensor) -> None:
+        """Arrange for the loss backward to tell this layer what each winner was worth.
+
+        The hook fires with the gradient of whatever loss was backwarded, at this
+        layer's output. Against each winner's contribution that is the first-order
+        change in loss the winner caused -- see ``realised_values``. The
+        contributions are held only by this closure, so they are released the
+        moment the backward has read them.
+        """
+        if not output.requires_grad:
+            self._warn_once(
+                "frozen",
+                "no trainable parameter reaches this layer's output, so the loss "
+                "gradient never arrives here and no expert can realise a value; the "
+                "economy will not move",
             )
-        else:
-            output = self._forward_inference(
-                hidden_states, output, selected_experts, routing_weights, update_wealth
-            )
+            return
 
-        if output.dtype == torch.bfloat16 or output.dtype == torch.float16:
-            output = torch.nan_to_num(output, nan=0.0, posinf=65000.0, neginf=-65000.0)
+        def capture(output_gradient: torch.Tensor) -> None:
+            with torch.no_grad():
+                self._cached_values = realised_values(contributions, output_gradient)
 
-        if self.training and self.config.use_loss_feedback and self._economy_live():
-            self._cached_selected_experts = selected_experts.detach()
-            self._cached_routing_weights = routing_weights.detach()
-            self._cached_confidences = confidences.detach()
-            self._live_confidences = confidences
-            self._cached_payments = payments.detach() if payments is not None else None
-            self._cached_rebates = rebates.detach() if rebates is not None else None
-            self._loss_feedback_pending = True
+        output.register_hook(capture)
 
-        if (
-            update_wealth
-            and self._economy_live()
-            and self.config.use_local_quality
-            and not self.config.use_loss_feedback
-        ):
-            self._update_wealth_local_quality(
-                selected_experts, routing_weights, confidences, payments, rebates, output
-            )
-        elif update_wealth and self.training and self._economy_live():
-            if self.config.use_local_quality and not self.config.use_loss_feedback:
-                self._update_wealth_local_quality(
-                    selected_experts, routing_weights, confidences, payments, rebates, output
-                )
-            elif not self.config.use_local_quality:
-                self._update_wealth_participation(
-                    selected_experts, routing_weights, confidences, payments, rebates
-                )
-
-        self.last_stats = MoBStats(
-            confidence_logits=confidence_logits.detach(),
-            confidences=confidences.detach(),
-            selected_experts=selected_experts.detach(),
-            routing_weights=routing_weights.detach(),
-            expert_wealth=self.expert_wealth.detach().clone(),
-            expert_usage=self.expert_usage_count.detach().clone(),
-            expert_performance=self.expert_performance_ema.detach().clone(),
-            router_z_loss=router_z_loss.detach(),
-            # The statistic that would have surfaced a gate saturating on the wealth
-            # scale, so it is recorded on every step rather than reached for after a
-            # result looks wrong. Left as device tensors; the training loop syncs.
-            routing=routing_diagnostics(routing_weights),
-            coupling_metrics=coupling_metrics,
-            mean_payment=payments.detach().mean() if payments is not None else None,
-        )
-        self._last_coupling_metrics = coupling_metrics
-
-        # A frozen forward contributes no row: the wealth history is a training
-        # trace, and an evaluation pass interleaved into it would read as the
-        # economy having done something on a step where it did not.
-        if self._track_wealth and not self._economy_frozen:
-            self.wealth_history.append(self.expert_wealth.cpu().tolist())
-
-        return output
+    def _warn_once(self, key: str, message: str) -> None:
+        if key in self._warned:
+            return
+        self._warned.add(key)
+        logger.warning(message)
 
     def _route(self, confidence_logits: torch.Tensor, confidences: torch.Tensor) -> AuctionOutcome:
         """Turn reports into an allocation, by whichever gate this arm configures.
@@ -332,6 +494,34 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         log_z = torch.logsumexp(confidence_logits.float(), dim=-1)
         return log_z.square().mean() * self.config.confidence_z_loss_weight
 
+    def _expert_forward(
+        self, expert_idx: int, expert_input: torch.Tensor, with_contribution: bool
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Run one expert on its tokens, optionally beside its contribution.
+
+        The contribution is what the expert's output differs from the tissue
+        default by, and it is what the economy prices. Under the shared base the
+        default is the base FFN, so the contribution is exactly what the adapters
+        add -- small, which is what makes the first-order value estimate accurate.
+        A full expert has no base to fall back to: the empty slot is its reference,
+        so its whole output is its contribution, a far larger perturbation for
+        which the same estimate is correspondingly coarser.
+        """
+        if self.use_shared_base:
+            expert = cast(LightweightExpert, self.experts[expert_idx])
+            if with_contribution:
+                expert_output, reference = expert.forward_with_reference(
+                    expert_input, self.base_gate_proj, self.base_up_proj, self.base_down_proj
+                )
+                return expert_output, expert_output.detach() - reference
+            expert_output = expert(
+                expert_input, self.base_gate_proj, self.base_up_proj, self.base_down_proj
+            )
+            return expert_output, None
+
+        expert_output = self.experts[expert_idx](expert_input)
+        return expert_output, expert_output.detach() if with_contribution else None
+
     def _forward_training(
         self,
         hidden_states: torch.Tensor,
@@ -339,10 +529,22 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         selected_experts: torch.Tensor,
         routing_weights: torch.Tensor,
         update_wealth: bool,
-    ) -> torch.Tensor:
-        hidden_dim = hidden_states.shape[-1]
+        collect_contributions: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        batch_size, seq_len, hidden_dim = hidden_states.shape
         flat_hidden = hidden_states.reshape(-1, hidden_dim)
         flat_output = output.reshape(-1, hidden_dim)
+        flat_contributions = (
+            torch.zeros(
+                flat_hidden.shape[0],
+                self.config.top_k,
+                hidden_dim,
+                device=output.device,
+                dtype=output.dtype,
+            )
+            if collect_contributions
+            else None
+        )
 
         for k in range(self.config.top_k):
             flat_expert_indices = selected_experts[:, :, k].reshape(-1)
@@ -353,26 +555,26 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
                 if not mask.any():
                     continue
 
-                expert_input = flat_hidden[mask]
-
-                if self.use_shared_base:
-                    expert_output = self.experts[expert_idx](
-                        expert_input,
-                        self.base_gate_proj,
-                        self.base_up_proj,
-                        self.base_down_proj,
-                    )
-                else:
-                    expert_output = self.experts[expert_idx](expert_input)
-
+                expert_output, contribution = self._expert_forward(
+                    expert_idx, flat_hidden[mask], collect_contributions
+                )
                 weighted = expert_output * flat_weights[mask].unsqueeze(-1)
                 token_indices = mask.nonzero(as_tuple=False).squeeze(-1)
                 flat_output.index_add_(0, token_indices, weighted)
 
+                if flat_contributions is not None:
+                    assert contribution is not None
+                    flat_contributions[token_indices, k] = contribution.to(flat_contributions.dtype)
+
                 if update_wealth:
                     self.expert_usage_count[expert_idx] += mask.sum().float()
 
-        return flat_output.reshape_as(hidden_states)
+        contributions = (
+            None
+            if flat_contributions is None
+            else flat_contributions.reshape(batch_size, seq_len, self.config.top_k, hidden_dim)
+        )
+        return flat_output.reshape_as(hidden_states), contributions
 
     def _forward_inference(
         self,
@@ -394,17 +596,7 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
                 if not mask.any():
                     continue
 
-                expert_input = hidden_states[mask]
-
-                if self.use_shared_base:
-                    expert_output = self.experts[expert_idx](
-                        expert_input,
-                        self.base_gate_proj,
-                        self.base_up_proj,
-                        self.base_down_proj,
-                    )
-                else:
-                    expert_output = self.experts[expert_idx](expert_input)
+                expert_output, _ = self._expert_forward(expert_idx, hidden_states[mask], False)
 
                 weight_vals = weights.squeeze(-1)[mask]
                 weighted_expert_output = expert_output * weight_vals.unsqueeze(-1)
