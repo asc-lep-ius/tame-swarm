@@ -110,9 +110,15 @@ test:
   script:
     - uv run pytest tests/ -x --tb=short -m "not gpu"
 
+# On the workstation, not the hephaestus box: the locked torch is the CUDA 12.8
+# build, whose wheels ship kernels for sm_70 and up, and hephaestus carries a
+# GTX 1070 (sm_61) -- every CUDA call there fails with "no kernel image is
+# available". The workstation's GPU is what the lock was resolved against.
+# Shares the train jobs' resource group so two GPU jobs never overlap there.
 test-gpu:
   stage: check
-  tags: [hephaestus, gpu]
+  tags: [workstation, cuda]
+  resource_group: gpu
   image: "${LOCAL_REGISTRY}/ci-gpu:latest"
   variables:
     UV_LINK_MODE: copy
