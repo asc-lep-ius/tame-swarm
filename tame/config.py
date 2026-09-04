@@ -35,6 +35,19 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
         "mob_layers_start": 8,
         "mob_layers_end": 24,
     },
+    # Apache-2.0, ungated on HuggingFace -- unlike the three profiles above,
+    # which all require accepting a license before the weights download. That
+    # makes it the only profile a CI runner or a fresh machine without an HF
+    # token can actually pull, which is why #13's noise-floor measurement uses
+    # it rather than ACTIVE_MODEL.
+    "qwen3-1.7b": {
+        "model_id": "Qwen/Qwen3-1.7B",
+        "hidden_dim": 2048,
+        "intermediate_dim": 6144,
+        "num_layers": 28,
+        "mob_layers_start": 6,
+        "mob_layers_end": 22,
+    },
 }
 
 ACTIVE_MODEL = "gemma-2-2b"

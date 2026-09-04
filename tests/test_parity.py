@@ -18,6 +18,7 @@ from train import TrainingConfig
 BASE = ArmFingerprint(
     router="mob",
     seed=42,
+    deterministic=True,
     model_id="tiny",
     dtype="float32",
     dataset="wikitext/wikitext-2-raw-v1",
@@ -90,6 +91,7 @@ def test_dense_arm_may_convert_nothing():
     ("field", "value"),
     [
         ("seed", 43),
+        ("deterministic", False),
         ("max_steps", 401),
         ("adapter_rank", 16),
         ("requested_layers", (5, 6)),
@@ -175,6 +177,7 @@ def test_fingerprint_arm_reads_the_training_config():
 
     assert arm.router == "softmax"
     assert arm.seed == 7
+    assert arm.deterministic is True
     assert arm.model_id == "tiny-model"
     assert arm.dtype == "float32"
     assert arm.dataset == "wikitext/wikitext-2-raw-v1"

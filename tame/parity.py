@@ -70,6 +70,13 @@ NOT_A_CONFOUND = {
     # Disk retention only (#7): how many checkpoints survive on disk, not what
     # training computes or what any checkpoint contains.
     "checkpoint_keep_last": "checkpoint retention only, does not affect training",
+    # Disk failure threshold only (#13): when a run refuses to write, not what it
+    # computes up to that point.
+    "checkpoint_min_free_gb": "disk budget failure threshold only, does not affect training",
+    # (#13) Effect on training data is already captured by data_order, which
+    # hashes the actual token stream an arm trains on -- a field-level check here
+    # would be redundant with that hash, not a stronger guarantee than it.
+    "shuffle_buffer_size": "subsumed by data_order, which hashes the actual token stream",
 }
 
 
@@ -103,6 +110,7 @@ class ArmFingerprint:
 
     router: str
     seed: int
+    deterministic: bool
     model_id: str
     dtype: str
     dataset: str
@@ -163,6 +171,7 @@ def fingerprint_arm(
     return ArmFingerprint(
         router=config.router,
         seed=config.seed,
+        deterministic=config.deterministic,
         model_id=config.model_id,
         dtype=config.dtype,
         dataset=f"{config.dataset_name}/{dataset_config}"
