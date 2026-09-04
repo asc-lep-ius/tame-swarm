@@ -305,48 +305,57 @@ same configuration.
 
 **Noise floor.** Measured by running one configuration three times at a fixed
 step budget and reading the spread `run_seeds.py` reports. Current number —
-`mob`, Qwen3-1.7B, 500 steps, LoRA rank 32, 16 converted layers, wikitext-2,
-seeds 0/1/2, `n=3`:
+`mob`, Qwen3-1.7B, 500 steps, adapter rank 32, 16 converted layers, wikitext-2,
+seeds 0/1/2, `n=3`, re-measured on the economy as corrected by
+[#15](#phase-05--mechanism-correction):
 
 | metric | mean | std | relative |
 |---|---|---|---|
-| `eval/loss` | 2.7315 | 0.0004 | 0.02% |
-| `eval/perplexity` | 15.355 | 0.006 | 0.04% |
-| `spec/expert_cosine_distance` | ≈0 | ≈0 | — (no specialisation at this budget; expected — see the Module 1 design-limitations note above) |
-| `spec/routing_js_from_corpus` | 0.0183 | 0.0020 | 11% |
-| `spec/report_decisiveness` | 0.4291 | 0.0495 | 12% (±4.9 points absolute) |
+| `eval/loss` | 2.7947 | 0.0062 | 0.22% |
+| `eval/perplexity` | 16.357 | 0.101 | 0.62% |
+| `spec/expert_cosine_distance` | 0.00043 | 0.00005 | 12% (no longer exactly zero: the adapters now train) |
+| `spec/routing_js_from_corpus` | 0.0349 | 0.0043 | 12% |
+| `spec/report_decisiveness` | 0.923 | 0.018 | 1.9% (±1.8 points absolute) |
+
+Read beside the `dense` floor at the same flags and seed 0, `eval/loss` 2.8649:
+the auction arm sits 0.07 nats *below* the unrouted FFN, ten times the mob
+spread, on one dense seed. It is the first real-model reading in which the
+economy is live, and it is a reading rather than a result — one dense seed, 500
+steps, the warmup spanning the whole run. The economy over those 500 steps:
+mean wealth fell from 75 to 53 with Gini 0.12, and surplus per win hovered
+around zero (−0.007 to +0.017 between logs), so at these value magnitudes decay
+dominates the transfers — the wealth-band question
+[#16](#phase-05--mechanism-correction) owns.
+
+The table this replaced (`eval/loss` 2.7315 ± 0.0004, `spec/report_decisiveness`
+0.43 ± 0.05) was measured with every expert adapter and confidence head frozen by
+the `--use_lora` defect [#15](#phase-05--mechanism-correction) found, and with a
+bf16 ledger that could not accumulate a transfer: it described an inert economy,
+and its ±0.0004 was the spread of a model in which only the attention LoRA
+moved. Neither arm reproduces its 2.73 under the same flags today — the dense
+floor reads 2.86 — and that difference is unexplained, so the old number is not
+quoted as comparable.
 
 This is a real 3-seed measurement, not a placeholder — but 500 steps on an
 ungated Qwen3-1.7B substitute, run to keep the harness itself honest, not the
-number Phase 1 ablations should be read against. **It also predates two
-[#15](#phase-05--mechanism-correction) findings that make its economy inert:**
-under `--use_lora` PEFT froze every expert adapter and every confidence head
-(the `spec/expert_cosine_distance` of exactly zero above is that defect, not a
-budget effect), and the wealth ledger was stored in bf16, where a step's transfer
-is below resolution. Both are fixed; the table stands as a harness check and
-should be re-measured before it is read as a noise floor.
+number Phase 1 ablations should be read against. Held-out loss and perplexity
+are tight enough to detect small effects; `report_decisiveness`'s ±1.8 points
+is the bar an ablation on *that* metric has to clear before it's a result
+rather than seed noise, and it should be re-measured at whatever step budget
+and model the first real ablation actually uses — `scripts/run_seeds.py` is the
+one-command way to do that.
 
-**Real-model reading of the economy.** One run of the corrected economy on a
-language model, made to check the pipeline end to end rather than to measure
-anything: Qwen3-1.7B, LoRA, bf16, gradient checkpointing, 16 converted layers,
-200 micro-steps (25 optimizer steps), seed 0. Everything the fixture predicts is
-visible at this budget and nothing is settled: `auction/mean_realised_value`
-rises from exactly 0 at upcycling to 0.02–0.035 in the last 20 steps, the
-winners' mean report moves off its 0.02 initialisation to track it,
-`auction/mean_win_surplus` crosses from −0.02 to positive readings (+0.013,
-+0.028) in those last steps with negative micro-batches still interleaved,
-wealth spreads from a standard deviation of 0.4 to 6.1, held-out loss falls from
-3.12 to 2.94, and `spec/expert_cosine_distance` leaves zero. One seed at a tiny
-budget; a result needs this harness over seeds at Phase 1's budget. Held-out loss and perplexity
-are already tight enough to detect small effects; `report_decisiveness`'s ±4.9
-points is the bar an ablation on *that* metric has to clear before it's a
-result rather than seed noise, and it should be re-measured at whatever step
-budget and model the first real ablation actually uses — `scripts/run_seeds.py`
-is the one-command way to do that. (The issue that opened #13 named "Gini and
-mean alignment" as the metrics to publish here; both predate #12's mechanism
-correction, which replaced Gini as a specialisation measure with the `spec/`
-probe above and never introduced a "mean alignment" metric, so the table
-reports the project's current headline metrics instead.)
+**Real-model reading of the economy.** One earlier run of the corrected economy,
+made to check the pipeline end to end: Qwen3-1.7B, LoRA, bf16, gradient
+checkpointing, 16 converted layers, 200 micro-steps (25 optimizer steps), seed 0.
+Everything the fixture predicts is visible at that budget and nothing is settled:
+`auction/mean_realised_value` rises from exactly 0 at upcycling to 0.02–0.035
+in the last 20 steps, the winners' mean report moves off its 0.02
+initialisation to track it, `auction/mean_win_surplus` crosses from −0.02 to
+positive readings (+0.013, +0.028) in those last steps with negative
+micro-batches still interleaved, wealth spreads from a standard deviation of
+0.4 to 6.1, held-out loss falls from 3.12 to 2.94, and
+`spec/expert_cosine_distance` leaves zero.
 
 **Disk budget.** `--checkpoint_min_free_gb` (default 50) refuses to write a
 checkpoint — raising rather than filling the disk — when free space on the
@@ -492,7 +501,7 @@ Run the full test suite inside the same CUDA container used by the app — no lo
 docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
 ```
 
-About 350 tests across 20 modules covering auction properties, the value definition and exploration slot, wealth dynamics, gradient checkpointing, steering, API endpoints, config, and experts. `-m slow` adds the 5000-step gate-stationarity run; `-m gpu` the bitwise-determinism check.
+About 370 tests across 20 modules covering auction properties, the value definition and exploration slot, wealth dynamics, gradient checkpointing, steering, API endpoints, config, and experts. `-m slow` adds the 5000-step gate-stationarity run; `-m gpu` the bitwise-determinism check.
 
 ### Key Concepts for Contributors
 
