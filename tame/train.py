@@ -725,6 +725,19 @@ class TAMETrainer:
 
         assert self.model is not None
         self.model = get_peft_model(cast(PreTrainedModel, self.model), lora_config)
+
+        # PEFT freezes every parameter it did not inject, and that includes the
+        # expert adapters and confidence heads MoB added a moment earlier. LoRA
+        # here is a memory measure for the attention projections; the MoB adapters
+        # are the parameters the run exists to train, and a head that cannot move
+        # never reports anything but its initialisation. Measured on the smoke
+        # fixture before this loop: under --use_lora both reported
+        # requires_grad=False, so every LoRA run trained no expert and no head.
+        # The shared base FFN stays frozen, which is the memory-constrained intent.
+        for mob in get_mob_layers(self.model):
+            for name, parameter in mob.named_parameters():
+                if not name.startswith("base_"):
+                    parameter.requires_grad_(True)
         self.model.print_trainable_parameters()
 
     def _setup_optimizer(self):
