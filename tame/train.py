@@ -189,6 +189,13 @@ class TrainingConfig:
     # loser rather than sells, so a head that has fallen to a truthful zero keeps
     # seeing targets. See MoBConfig.exploration_rate.
     exploration_rate: float = 0.02
+    # The confidence heads are single linear layers regressing onto values of
+    # order 1e-2, and at the backbone's 2e-5 a head's logit moves by that much per
+    # step: measured on Qwen3-1.7B over 120 steps, every report stayed within
+    # 1e-3 of its initialisation while the value it should have tracked grew from
+    # 0 to 0.012. The planted-competence fixture calibrates its heads at 1e-2.
+    # 5e-3 is a placeholder between the two, not a measured choice.
+    confidence_head_learning_rate: float = 5e-3
     wealth_update_frequency: int = 1  # How often to update wealth (every N steps)
     log_frequency: int = 10  # How often to log comprehensive training statistics (every N steps)
 
@@ -752,8 +759,18 @@ class TAMETrainer:
         decay_params = []
         no_decay_params = []
 
+        # The heads are trained by nothing but their own value objective, at their
+        # own rate. The scheduler scales every group by the same factor, so the
+        # heads warm up and decay with the backbone; only the base rate differs.
+        head_params = [
+            param
+            for mob in get_mob_layers(self.model)
+            for param in mob.confidence_heads.parameters()
+        ]
+        head_ids = {id(param) for param in head_params}
+
         for name, param in self.model.named_parameters():
-            if not param.requires_grad:
+            if not param.requires_grad or id(param) in head_ids:
                 continue
             if "bias" in name or "LayerNorm" in name or "layernorm" in name:
                 no_decay_params.append(param)
@@ -764,6 +781,14 @@ class TAMETrainer:
             {"params": decay_params, "weight_decay": self.config.weight_decay},
             {"params": no_decay_params, "weight_decay": 0.0},
         ]
+        if head_params:
+            optimizer_groups.append(
+                {
+                    "params": head_params,
+                    "weight_decay": 0.0,
+                    "lr": self.config.confidence_head_learning_rate,
+                }
+            )
 
         self.optimizer = AdamW(
             optimizer_groups,
@@ -1617,6 +1642,12 @@ def main():
     )
     parser.add_argument("--seed", type=int, default=42, help="Seed; must match across arms")
     parser.add_argument(
+        "--confidence_head_learning_rate",
+        type=float,
+        default=5e-3,
+        help="Learning rate for the confidence heads' value objective (#15)",
+    )
+    parser.add_argument(
         "--exploration_rate",
         type=float,
         default=0.02,
@@ -1688,6 +1719,7 @@ def main():
         probe_tokens=args.probe_tokens,
         seed=args.seed,
         exploration_rate=args.exploration_rate,
+        confidence_head_learning_rate=args.confidence_head_learning_rate,
         deterministic=args.deterministic,
         shuffle_buffer_size=args.shuffle_buffer_size,
         checkpoint_keep_last=args.checkpoint_keep_last,

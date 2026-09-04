@@ -171,3 +171,24 @@ def test_the_auxiliary_objectives_backward_on_their_own_graph(smoke_fixture, tmp
             head.proj.weight.grad is not None and torch.isfinite(head.proj.weight.grad).all()
             for head in mob.confidence_heads
         )
+
+
+def test_confidence_heads_train_at_their_own_learning_rate(smoke_fixture, tmp_path):
+    """Measured on Qwen3-1.7B at the backbone's 2e-5: 120 steps moved no report by 1e-3."""
+    trainer = TAMETrainer(
+        _config(smoke_fixture, tmp_path / "head_lr", confidence_head_learning_rate=0.0123)
+    )
+    trainer.setup()
+
+    head_ids = {
+        id(p) for mob in get_mob_layers(trainer.model) for p in mob.confidence_heads.parameters()
+    }
+    assert head_ids
+    # The warmup scheduler has already rewritten every group's live ``lr`` for
+    # step 0; the configured rate survives as ``initial_lr``.
+    head_groups = [g for g in trainer.optimizer.param_groups if g["initial_lr"] == 0.0123]
+    assert len(head_groups) == 1
+    assert {id(p) for p in head_groups[0]["params"]} == head_ids
+    for group in trainer.optimizer.param_groups:
+        if group is not head_groups[0]:
+            assert not head_ids & {id(p) for p in group["params"]}
