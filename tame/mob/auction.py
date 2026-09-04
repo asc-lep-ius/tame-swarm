@@ -187,7 +187,9 @@ class VCGAuctioneer(nn.Module):
         wealth: torch.Tensor,
     ) -> "AuctionOutcome":
         wealth_snapshot = wealth.detach().clone()
-        bids = confidences * wealth_snapshot.unsqueeze(0).unsqueeze(0)
+        # The ledger is float32 whatever the model runs in; the bid takes the
+        # report's dtype so the routing weights match the expert outputs they scale.
+        bids = confidences * wealth_snapshot.to(confidences.dtype).unsqueeze(0).unsqueeze(0)
         top_bids, selected_experts = torch.topk(bids, self.top_k, dim=-1)
         payments = self._compute_vcg_payments(bids, selected_experts, wealth_snapshot)
         rebates = self._compute_rebates(bids, wealth_snapshot)

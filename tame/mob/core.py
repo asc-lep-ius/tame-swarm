@@ -83,7 +83,35 @@ class MoBStats:
     mean_payment: torch.Tensor | None = None
 
 
+# Accumulated economic state. A transfer is of order 1e-2 credits against a
+# wealth of order 1e2, which is below bfloat16's resolution there (0.5 at 83.5):
+# measured on Qwen3-1.7B under bf16 over 120 steps, the wealth vector never moved
+# and its standard deviation read exactly 0.0. These stay float32 whatever dtype
+# the rest of the layer runs in; the auction reads them into the bid dtype itself.
+LEDGER_BUFFERS = (
+    "expert_wealth",
+    "expert_usage_count",
+    "expert_baseline_loss",
+    "expert_performance_ema",
+)
+
+
 class MixtureOfBidders(WealthUpdateMixin, nn.Module):
+    def _apply(self, fn, recurse=True):  # type: ignore[override]
+        """Move the layer as usual, then put the ledgers back in float32.
+
+        ``to(dtype)`` converts every floating buffer along with the parameters,
+        and nothing in the public API distinguishes a buffer that holds
+        activations-scale state from one that holds a running total. Recasting
+        after the fact is the one place that distinction can be made.
+        """
+        module = super()._apply(fn, recurse)
+        for name in LEDGER_BUFFERS:
+            ledger = getattr(self, name)
+            if ledger.dtype != torch.float32:
+                setattr(self, name, ledger.float())
+        return module
+
     def __init__(self, config: MoBConfig):
         super().__init__()
         self.config = config

@@ -516,3 +516,37 @@ def test_gate_sharpness_is_stationary_across_a_training_run():
     assert abs(late[1] - early[1]) < 0.05, (
         f"effective expert count drifted from {early[1]:.4f} to {late[1]:.4f}"
     )
+
+
+def test_the_ledgers_stay_float32_under_a_half_precision_model():
+    """A bf16 wealth of 83.5 cannot move by a step's transfer of order 1e-2.
+
+    Measured on Qwen3-1.7B under bf16: over 120 steps the wealth vector never
+    moved and ``wealth/std`` read exactly 0.0. The layer runs in bf16; the running
+    totals do not.
+    """
+    config = _default_shaped_config(wealth_decay=1.0, exploration_rate=0.0)
+    mob = MixtureOfBidders(config).to(torch.bfloat16)
+    mob.train()
+
+    for name in ("expert_wealth", "expert_usage_count", "expert_baseline_loss"):
+        assert getattr(mob, name).dtype == torch.float32, name
+    assert mob.expert_performance_ema.dtype == torch.float32
+    assert mob.base_gate_proj.weight.dtype == torch.bfloat16
+
+    with torch.no_grad():
+        mob.expert_wealth.fill_(83.5)
+    output = mob(torch.randn(1, 8, config.hidden_dim, dtype=torch.bfloat16))
+    assert output.dtype == torch.bfloat16
+    output.float().sum().backward()
+
+    # A planted realised value worth 0.005 credits per expert: below bf16's
+    # resolution at 83.5, well inside float32's.
+    mob._cached_values = torch.full((1, 8, config.top_k), 1e-4)
+    mob._cached_payments = torch.zeros(1, 8, config.top_k)
+    mob._cached_rebates = None
+    mob.update_wealth_from_loss(torch.ones(1, 8))
+
+    assert mob.expert_wealth.dtype == torch.float32
+    moved = (mob.expert_wealth - 83.5).abs()
+    assert (moved > 0).any() and (moved < 0.1).all(), moved
