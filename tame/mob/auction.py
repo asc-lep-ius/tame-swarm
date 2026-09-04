@@ -261,37 +261,38 @@ class VCGAuctioneer(nn.Module):
         Excluding *i* lifts the ranking by one place precisely when *i* sits in the
         top k+1, which is what the two branches below are.
 
-        The divisor is the **largest** wealth in the pool, not the recipient's own.
-        Dividing by ``w_i`` is right for a *price* -- it restates an externality in
-        the winner's own units, which is why ``_compute_vcg_payments`` does it -- and
-        wrong for a lump-sum rebate: it pays the poorest expert the most, and
-        feasibility then holds only in bid units rather than in the credits the
-        wealth ledger is denominated in. Measured at the configured wealth band that
-        over-rebates by up to 7.4x and turns the transfer into a money pump that
-        flattens the very spread the economy exists to create.
+        The divisor is the **harmonic mean of the k largest wealths**, not the
+        recipient's own. Dividing by ``w_i`` is right for a *price* -- it restates
+        an externality in the winner's own units, which is why
+        ``_compute_vcg_payments`` does it -- and wrong for a lump-sum rebate: it
+        pays the poorest expert the most, and feasibility then holds only in bid
+        units rather than in the credits the wealth ledger is denominated in.
+        Measured at the configured wealth band that over-rebates by up to 7.4x and
+        turns the transfer into a money pump that flattens the very spread the
+        economy exists to create.
 
-        Against ``w_max`` it is affordable by construction, up to dtype epsilon.
-        Every rebate reference is at most ``b_(k+1)``, so the payout is at most
-        ``k * b_(k+1) / w_max``, while the collection is
-        ``sum_{j in winners} b_(k+1) / w_j`` and every ``w_j <= w_max``. The bound is
-        tight when the (k+1)-th and (k+2)-th bids coincide, so in bf16 rounding can
-        cross it by a fraction of a percent -- bounded noise, not a leak.
+        Against the harmonic mean ``H`` of the k richest it is affordable by
+        construction, up to dtype epsilon. Every rebate reference is at most
+        ``b_(k+1)``, so the payout is at most ``k * b_(k+1) / H``, which is
+        ``b_(k+1) * sum_{i in richest k} 1/w_i``; the collection is
+        ``b_(k+1) * sum_{j in winners} 1/w_j``, and no k experts have a smaller sum
+        of reciprocals than the k richest. The bound is tight when the winners are
+        the k richest and the (k+1)-th and (k+2)-th bids coincide, so in bf16
+        rounding can cross it by a fraction of a percent -- bounded noise, not a
+        leak.
 
-        Unlike the exclusion rule, ``w_max`` does *include* the recipient's own
-        wealth. That is still report-independent, for a different reason: wealth is
-        accumulated state read from a detached snapshot, not something an expert
-        reports this token.
+        The divisor reads the recipient's own wealth whenever it is among the k
+        richest. That is still report-independent, for a different reason than the
+        exclusion rule: wealth is accumulated state read from a detached snapshot,
+        not something an expert reports this token.
 
-        The cost is under-rebating, and it is regime-dependent rather than small.
-        The returned fraction is at most ``harmonic_mean(winners' wealth) / w_max``
-        and runs a little under it: measured 94% on a flat wealth vector, 68% across
-        the configured band and 3.6% when one expert sits at ``max_wealth`` and the
-        rest at the floor, against a bound of 100% / 78% / 3.9%. That last regime is
-        the monopoly state ``train.py`` already warns about, so the rebate is weakest
-        where the drain bites hardest. A tighter safe divisor exists -- the harmonic
-        mean of the k richest wealths, also report-independent -- but choosing it is
-        mechanism design, and the option is recorded on the #15 row of the roadmap in
-        the top-level README.
+        This replaced the pool's largest wealth, which was also safe and simpler
+        but under-rebated by whatever the richest expert stood above the rest:
+        against ``w_max`` the returned fraction was 94% on a flat wealth vector,
+        68% across the configured band and 3.6% with one expert at ``max_wealth``
+        and the rest at the floor -- weakest in exactly the monopoly regime where
+        the drain bites hardest. The regimes test in ``tests/test_auction.py``
+        pins the fractions this divisor returns.
         """
         batch, seq_len, _ = bids.shape
         k, n = self.top_k, self.num_experts
@@ -311,8 +312,9 @@ class VCGAuctioneer(nn.Module):
         in_top_k_plus_one.scatter_(-1, ranked_idx[..., : k + 1], True)
 
         reference = torch.where(in_top_k_plus_one, displaced_without_self, displaced)
-        largest_wealth = wealth.to(accumulate_dtype).max().clamp_min(WEALTH_EPSILON)
-        rebates = (k / n) * reference / largest_wealth
+        richest = torch.topk(wealth.to(accumulate_dtype), k).values.clamp_min(WEALTH_EPSILON)
+        harmonic_mean = k / (1.0 / richest).sum()
+        rebates = (k / n) * reference / harmonic_mean
 
         return rebates.to(bids.dtype)
 

@@ -611,10 +611,10 @@ def test_rebate_never_exceeds_what_the_auction_collected():
     """Budget feasibility, in the currency the wealth ledger actually uses.
 
     Both sides are the per-expert quantities the wealth update consumes: payments
-    already divided by each winner's own wealth, rebates divided by the pool's
-    largest. Checking this in bid units instead — multiplying wealth back in — tests
-    an inequality that holds even when the ledger's does not, which is exactly how a
-    rebate that over-paid by 7.4x passed a feasibility test.
+    already divided by each winner's own wealth, rebates divided by the harmonic
+    mean of the k richest. Checking this in bid units instead — multiplying wealth
+    back in — tests an inequality that holds even when the ledger's does not, which
+    is exactly how a rebate that over-paid by 7.4x passed a feasibility test.
     """
     torch.manual_seed(37)
     for num_experts, top_k in ((6, 2), (8, 3), (5, 1), (4, 2)):
@@ -646,7 +646,8 @@ def test_rebate_never_exceeds_what_the_auction_collected():
         # collapses the harmonic mean onto its own wealth and the tight token is
         # one the richest expert takes; on n=4 k=2 both are slack, because
         # k + 2 == n leaves the reference at the bottom of the bid vector.
-        payout_in_bid_units = (outcome.rebates * wealth.max()).sum(dim=-1)
+        richest = torch.topk(wealth, top_k).values
+        payout_in_bid_units = (outcome.rebates * (top_k / (1.0 / richest).sum())).sum(dim=-1)
         displaced = torch.sort(_bids(confidences, wealth), dim=-1, descending=True)[0][..., top_k]
         # Relative, not absolute: these are bid-unit quantities of order 100, where
         # a 1e-5 absolute tolerance is really no tolerance at all.
@@ -697,20 +698,21 @@ def test_rebate_leaves_the_deviation_sweep_intact():
     ("regime", "wealth", "expected_return"),
     [
         ("flat", torch.full((8,), 100.0), 0.94),
-        ("configured band", torch.linspace(15.0, 750.0, 8), 0.68),
-        ("max_wealth monopoly", torch.tensor([750.0] + [15.0] * 7), 0.04),
+        ("configured band", torch.linspace(15.0, 750.0, 8), 0.74),
+        ("max_wealth monopoly", torch.tensor([750.0] + [15.0] * 7), 0.92),
     ],
 )
 def test_returned_fraction_matches_the_documented_regimes(regime, wealth, expected_return):
     """Pin the numbers both READMEs quote, and pin them from below.
 
     Feasibility only bounds the rebate from above, so a divisor returning 1% of
-    Cavallo passes every other test here while making the documented 94/68/4%
-    figures wrong. This is the test that fails when the divisor changes — which it
-    is expected to, under #15 — and it should fail, because the prose changes with
-    it.
+    Cavallo passes every other test here while making the documented 94/74/92%
+    figures wrong. This is the test that failed when #15 replaced the largest
+    wealth with the harmonic mean of the k richest -- the monopoly regime went
+    from 4% returned to 92% -- and it should fail, because the prose changes with
+    the divisor.
 
-    Robust across 200 seeds: standard deviations of 0.0016 / 0.0040 / 0.0001 against
+    Robust across 50 seeds: standard deviations of 0.0014 / 0.0047 / 0.0036 against
     a 0.02 window.
     """
     torch.manual_seed(11)
@@ -741,7 +743,8 @@ def test_rebate_is_bounded_from_below_by_the_cavallo_reference():
 
     bids = _bids(confidences, wealth)
     ranked = torch.sort(bids, dim=-1, descending=True)[0]
-    # Every reference is at least b_(k+2), so the payout is at least (k/n)*n*b_(k+2).
+    # Every reference is at least b_(k+2), so the payout is at least (k/n)*n*b_(k+2)
+    # over the divisor, and the divisor is at most the largest wealth.
     floor = (2 / 6) * 6 * ranked[..., 3] / wealth.max()
 
     assert (outcome.rebates.sum(dim=-1) >= floor - PAYMENT_TOLERANCE).all()
