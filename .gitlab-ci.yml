@@ -2,7 +2,7 @@
 #
 # Docker builds use BuildKit (docker buildx) via DinD on the privileged runner.
 # Registry: gitlab.hephaestus:5050 (HTTP, insecure).
-# Tags: hephaestus (check), privileged (docker builds), workstation (training).
+# Tags: hephaestus (lint, CPU tests), privileged (docker builds), workstation (GPU tests, training).
 
 variables:
   LOCAL_REGISTRY: "gitlab.hephaestus:5050/mipkovich/tame-swarm"
@@ -50,49 +50,41 @@ stages:
   tags: [privileged]
 
 # --- CI image rebuild ---
-rebuild-ci-cpu:
+# One image for lint, the CPU tests and the GPU tests; see ci/Dockerfile for why.
+# The wheel cache is a BuildKit mount on the per-job builder, so a rebuild
+# downloads the lock's wheels once per job; the registry cache covers the layers.
+rebuild-ci:
   stage: rebuild-ci
   extends: .docker-build
+  timeout: 1h
   script:
-    - CPU_HASH=$(cat ci/Dockerfile.cpu pyproject.toml uv.lock | sha256sum | cut -c1-16)
+    - CI_HASH=$(cat ci/Dockerfile pyproject.toml uv.lock | sha256sum | cut -c1-16)
     - docker buildx build
-        --file ci/Dockerfile.cpu
-        --cache-from type=registry,ref=${LOCAL_REGISTRY}/ci-cpu-cache
-        --cache-to type=registry,ref=${LOCAL_REGISTRY}/ci-cpu-cache,mode=max
-        --tag ${LOCAL_REGISTRY}/ci-cpu:${CPU_HASH}
-        --tag ${LOCAL_REGISTRY}/ci-cpu:latest
+        --file ci/Dockerfile
+        --cache-from type=registry,ref=${LOCAL_REGISTRY}/ci-cache
+        --cache-to type=registry,ref=${LOCAL_REGISTRY}/ci-cache,mode=max
+        --tag ${LOCAL_REGISTRY}/ci:${CI_HASH}
+        --tag ${LOCAL_REGISTRY}/ci:latest
         --push .
   rules:
-    - changes: [ci/Dockerfile.cpu, pyproject.toml, uv.lock]
-    - when: manual
-      allow_failure: true
-
-rebuild-ci-gpu:
-  stage: rebuild-ci
-  extends: .docker-build
-  timeout: 3h
-  script:
-    - GPU_HASH=$(cat ci/Dockerfile.gpu pyproject.toml uv.lock | sha256sum | cut -c1-16)
-    - docker buildx build
-        --file ci/Dockerfile.gpu
-        --cache-from type=registry,ref=${LOCAL_REGISTRY}/ci-gpu-cache
-        --cache-to type=registry,ref=${LOCAL_REGISTRY}/ci-gpu-cache,mode=max
-        --tag ${LOCAL_REGISTRY}/ci-gpu:${GPU_HASH}
-        --tag ${LOCAL_REGISTRY}/ci-gpu:latest
-        --push .
-  rules:
-    - changes: [ci/Dockerfile.gpu, pyproject.toml, uv.lock]
+    - changes: [ci/Dockerfile, pyproject.toml, uv.lock]
     - when: manual
       allow_failure: true
 
 # --- Python job template (pre-built CI image) ---
 .python-job:
-  image: "${LOCAL_REGISTRY}/ci-cpu:latest"
+  image:
+    name: "${LOCAL_REGISTRY}/ci:latest"
+    # `latest` moves whenever rebuild-ci runs. The runners' default is
+    # if-not-present, which would keep serving whatever they pulled first.
+    pull_policy: [always, if-not-present]
   variables:
     UV_LINK_MODE: copy
     UV_PROJECT_ENVIRONMENT: /app/.venv
   before_script:
-    - uv sync --extra dev
+    # The image's venv is the lock, so this is an audit plus the project itself.
+    # --locked fails loudly when pyproject.toml has moved without `uv lock`.
+    - uv sync --locked --extra dev
 
 # --- Check stage ---
 lint:
@@ -119,12 +111,7 @@ test-gpu:
   stage: check
   tags: [workstation, cuda]
   resource_group: gpu
-  image: "${LOCAL_REGISTRY}/ci-gpu:latest"
-  variables:
-    UV_LINK_MODE: copy
-    UV_PROJECT_ENVIRONMENT: /app/.venv
-  before_script:
-    - uv sync --extra dev
+  extends: .python-job
   script:
     - nvidia-smi
     - uv run pytest tests/ -x --tb=short -m gpu
@@ -134,6 +121,9 @@ docker-build:
   stage: build
   extends: .docker-build
   timeout: 3h
+  # Starts once the CPU checks pass rather than after the whole stage: the GPU
+  # job runs on another runner and has nothing to say about the app image.
+  needs: [lint, test]
   script:
     - docker buildx build
         --file tame/Dockerfile
