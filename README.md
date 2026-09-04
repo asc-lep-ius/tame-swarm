@@ -249,6 +249,83 @@ a result — the between-seed spread measured on report decisiveness was ~46 poi
 — so repeat over seeds, and read them against the noise floor from
 [#13](#phase-05--mechanism-correction).
 
+### Reproducibility
+
+<a name="reproducibility"></a>
+
+Every number above this line is one sample. [#13](#phase-05--mechanism-correction)
+is the harness that turns "one sample" into "measured, with a spread":
+
+**Determinism.** `--deterministic` (on by default) seeds `torch`, `numpy`,
+`random` and CUDA from one field, sets `CUBLAS_WORKSPACE_CONFIG` before the
+first CUDA context exists, and calls `torch.use_deterministic_algorithms(True,
+warn_only=True)` — forcing a deterministic kernel wherever one exists and
+logging the rest as a known variance source rather than accepting it silently.
+Two runs of an identical config produce bitwise-identical `train/loss` traces;
+this is asserted by `tests/test_determinism.py` (`gpu`-marked) in CI, which no
+longer allows `test-gpu` to fail silently. `--shuffle_buffer_size` seeds a
+bounded shuffle of the streaming dataset (0, the default, keeps the current
+unshuffled — and therefore already order-deterministic — stream).
+
+**Multi-seed harness.** `scripts/run_seeds.py` runs one configuration over
+several seeds and reports mean ± std for every headline metric:
+
+```bash
+uv run python scripts/run_seeds.py \
+    --model_id Qwen/Qwen3-1.7B --dataset wikitext \
+    --router mob --steps 500 --device cuda --use_lora \
+    --adapter_rank 32 --layers 6:22 --max_seq_length 512 --seeds 0,1,2
+```
+
+Each seed writes to its own `<output_dir>/seed<N>/`, and a `seed_summary.json`
+at the workspace root carries every per-seed value plus the aggregate — the
+input `scripts/compare_runs.py` reads to answer "is this effect real" in one
+command:
+
+```bash
+uv run python scripts/compare_runs.py --group_a runs/mob --group_b runs/softmax
+```
+
+For each metric both groups measured on ≥2 seeds, it reports the delta, the
+pooled replicate spread (the noise floor), and the delta in units of that
+spread — a `delta/std` well under 1 is not distinguishable from re-running the
+same configuration.
+
+**Noise floor.** Measured by running one configuration three times at a fixed
+step budget and reading the spread `run_seeds.py` reports. Current number —
+`mob`, Qwen3-1.7B, 500 steps, LoRA rank 32, 16 converted layers, wikitext-2,
+seeds 0/1/2, `n=3`:
+
+| metric | mean | std | relative |
+|---|---|---|---|
+| `eval/loss` | 2.7315 | 0.0004 | 0.02% |
+| `eval/perplexity` | 15.355 | 0.006 | 0.04% |
+| `spec/expert_cosine_distance` | ≈0 | ≈0 | — (no specialisation at this budget; expected — see the Module 1 design-limitations note above) |
+| `spec/routing_js_from_corpus` | 0.0183 | 0.0020 | 11% |
+| `spec/report_decisiveness` | 0.4291 | 0.0495 | 12% (±4.9 points absolute) |
+
+This is a real 3-seed measurement, not a placeholder — but 500 steps on an
+ungated Qwen3-1.7B substitute, run to keep the harness itself honest, not the
+number Phase 1 ablations should be read against. Held-out loss and perplexity
+are already tight enough to detect small effects; `report_decisiveness`'s ±4.9
+points is the bar an ablation on *that* metric has to clear before it's a
+result rather than seed noise, and it should be re-measured at whatever step
+budget and model the first real ablation actually uses — `scripts/run_seeds.py`
+is the one-command way to do that. (The issue that opened #13 named "Gini and
+mean alignment" as the metrics to publish here; both predate #12's mechanism
+correction, which replaced Gini as a specialisation measure with the `spec/`
+probe above and never introduced a "mean alignment" metric, so the table
+reports the project's current headline metrics instead.)
+
+**Disk budget.** `--checkpoint_min_free_gb` (default 50) refuses to write a
+checkpoint — raising rather than filling the disk — when free space on the
+filesystem backing `output_dir` drops below the threshold. Retention
+(first/best/final/`checkpoint_keep_last`, above) prunes *after* a save
+completes, so on its own it cannot stop a single checkpoint from being the
+write that fills a shared runner's disk; this is the check in front of it. 50GB
+is a placeholder default, not a measured Hephaestus budget — tune it with this
+one flag once that number is known.
+
 ### What Happens During Training
 
 | Phase | Description |
@@ -280,7 +357,10 @@ tame_inference/               # Automatically exported for the API server
 
 Retention keeps the first, best (by held-out `eval/loss`) and final checkpoint
 on disk permanently, plus `--checkpoint_keep_last` most recent transiently
-(evicted as newer checkpoints arrive). Only the permanent set — first/best/final
+(evicted as newer checkpoints arrive), and `--checkpoint_min_free_gb` refuses
+to write a checkpoint at all below a configured free-space floor — see
+[Reproducibility](#reproducibility) for why retention alone can't be that
+guarantee. Only the permanent set — first/best/final
 — is ever archived to `mlruns/`; the `--checkpoint_keep_last` window is a local
 disk convenience and is never uploaded, so archiving never outgrows what
 retention permanently keeps. `mlflow ui --backend-store-uri
@@ -599,7 +679,7 @@ An audit of the mechanism claims against the implementation. The auction the arc
 | **#10. Mechanism claims** | Weighted price divided by the winner's own weight; routing share made independent of own bids; confidence heads given a per-expert value objective; capability subspace estimated and wired through to injection; README reconciled | Done |
 | **#11. Routing temperature** | Gate moved to the log domain, so a uniform wealth rescaling leaves routing weights unchanged and `routing_temperature` becomes a deliberate sharpness dial. Realised top-1 weight and effective expert count now logged per step. Re-deriving the wealth bounds and decay is deliberately deferred to [#16](#phase-05--mechanism-correction) — wealth no longer sets gate sharpness, so what those constants shape is selection, price magnitude and rebate size, and judging them needs a held-out metric | Done |
 | **#12. Held-out eval & baselines** | `eval_steps` was declared and never read; the reported perplexity was `exp(loss)` on the *training* batch of a stream with no split. Now: a frozen, fingerprinted held-out split (the dataset's own `validation` shard where one exists, else a stride-97 train holdout the loader skips), an evaluation loop with the economy frozen, `--router {mob,softmax,dense}` with parity asserted programmatically, and functional specialisation metrics replacing Gini — expert output divergence, routing profiles, report decisiveness. A test fails if any `TrainingConfig` field is never read. **Not** closed: the three-arm comparison is shipped as a harness with a CPU smoke run, and a real multi-seed run needs [#13](#phase-05--mechanism-correction)'s noise floor before its numbers mean anything | Done (harness); results pending #13 |
-| **#13. Reproducibility** | Determinism, seed control and a measured noise floor, so an ablation's effect can be told apart from its variance. Now the immediate blocker on every #12 number: the harness runs, one seed is not a result | Not started |
+| **#13. Reproducibility** | Determinism (`torch`/`numpy`/`random`/CUDA seeded from one field, `CUBLAS_WORKSPACE_CONFIG`, `use_deterministic_algorithms(warn_only=True)`) verified bitwise-identical on GPU CI, which no longer allows `test-gpu` to fail silently; `scripts/run_seeds.py` (multi-seed mean±std) and `scripts/compare_runs.py` (delta vs. pooled noise floor); a checkpoint disk-budget floor that raises instead of filling the disk. Noise floor measured — see [Reproducibility](#reproducibility) — but at a reduced, ungated-model scale to fit this measurement session, not Phase 1's actual budget; disk-budget default is a placeholder pending a real Hephaestus number | Done (provisional-scale noise floor; disk budget placeholder) |
 | **#14. Coupling activation** | Warmup default and non-vacuous tests for the `coupling.py` path that nothing currently attaches | Not started |
 | **#16. Wealth bounds** | Deferred from #11: `[15, 750]` and `decay=0.997` were tuned against a gate that no longer exists and before #9 corrected the payments. The held-out metric it was blocked on now exists, and `spec/report_decisiveness` gives it a direct objective — the band is what sets how far wealth can overturn reports. Measured on the synthetic economy, the ceiling is inert (the run settles a factor of three *below* `initial_wealth`) while the floor holds up the mean — the opposite of a band chosen for the dynamics it now has. No longer blocked by #12 for the metric; still blocked by #15 for the transfer leak | Not started |
 | **#15. Abstention pays** | Surfaced by #10: trained reports overestimate value because the target is clamped at zero, and loss reduction against an expert's own EMA baseline is zero-mean by construction, so winning is a loss-making trade. Also carries the **choice of rebate divisor** — `w_max` is safe but under-rebates by over 96% in a `max_wealth` monopoly; the harmonic mean of the *k* richest wealths is report-independent, feasible and tighter. Routed to [Phase 2](#phase-2--economy-stabilisation); #12's harness is in place, so the remaining block is #13 | Not started |
