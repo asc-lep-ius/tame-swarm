@@ -18,7 +18,7 @@ def test_vcg_top_k_selection():
     confidences = torch.tensor([[[0.1, 0.9, 0.5, 0.3]]])
     wealth = torch.tensor([1.0, 1.0, 1.0, 1.0])
 
-    selected, _, _, _ = auctioneer(confidences, wealth)
+    selected, _, _, _, _ = auctioneer(confidences, wealth)
     selected_set = set(selected[0, 0].tolist())
     assert 1 in selected_set
     assert 2 in selected_set
@@ -31,7 +31,7 @@ def test_vcg_routing_weights_sum_to_one():
     confidences = torch.randn(2, 8, 4).abs()
     wealth = torch.ones(4)
 
-    _, routing_weights, _, _ = auctioneer(confidences, wealth)
+    _, routing_weights, _, _, _ = auctioneer(confidences, wealth)
     weight_sums = routing_weights.sum(dim=-1)
     assert torch.allclose(weight_sums, torch.ones_like(weight_sums), atol=1e-5)
 
@@ -44,7 +44,7 @@ def test_vcg_output_shapes():
     confidences = torch.randn(batch, seq, num_experts).abs()
     wealth = torch.ones(num_experts)
 
-    selected, routing_weights, payments, _ = auctioneer(confidences, wealth)
+    selected, routing_weights, payments, _, _ = auctioneer(confidences, wealth)
     assert selected.shape == (batch, seq, top_k)
     assert routing_weights.shape == (batch, seq, top_k)
     assert payments.shape == (batch, seq, top_k)
@@ -57,11 +57,11 @@ def test_vcg_higher_bid_wins():
     confidences = torch.tensor([[[0.1, 0.2, 0.8]]])
     wealth = torch.tensor([1.0, 1.0, 1.0])
 
-    selected, _, _, _ = auctioneer(confidences, wealth)
+    selected, _, _, _, _ = auctioneer(confidences, wealth)
     assert selected[0, 0, 0].item() == 2
 
     wealth_adjusted = torch.tensor([10.0, 1.0, 1.0])
-    selected_adj, _, _, _ = auctioneer(confidences, wealth_adjusted)
+    selected_adj, _, _, _, _ = auctioneer(confidences, wealth_adjusted)
     assert selected_adj[0, 0, 0].item() == 0
 
 
@@ -79,7 +79,7 @@ def test_vcg_differentiable_mode():
     confidences = torch.randn(1, 4, 4).abs().requires_grad_(True)
     wealth = torch.ones(4)
 
-    _, routing_weights, _, _ = auctioneer(confidences, wealth)
+    _, routing_weights, _, _, _ = auctioneer(confidences, wealth)
     objective_weights = torch.arange(
         1,
         routing_weights.numel() + 1,
@@ -114,7 +114,7 @@ def test_vcg_payment_equals_replacement_bid_hand_computed():
     confidences = torch.tensor([[[0.1, 0.9, 0.5, 0.3]]])
     wealth = torch.ones(4)
 
-    selected, _, payments, _ = auctioneer(confidences, wealth)
+    selected, _, payments, _, _ = auctioneer(confidences, wealth)
 
     assert set(selected[0, 0].tolist()) == {1, 2}
     for j in range(2):
@@ -137,7 +137,7 @@ def test_vcg_payment_equals_replacement_bid_nonuniform_wealth():
     confidences = torch.tensor([[[0.5, 0.4, 0.3, 0.2]]])
     wealth = torch.tensor([1.0, 2.0, 3.0, 0.5])
 
-    selected, _, payments, _ = auctioneer(confidences, wealth)
+    selected, _, payments, _, _ = auctioneer(confidences, wealth)
 
     assert selected[0, 0].tolist() == [2, 1]
     assert payments[0, 0, 0].item() == pytest.approx(0.5 / 3.0, abs=PAYMENT_TOLERANCE)
@@ -155,7 +155,7 @@ def test_vcg_payment_equals_replacement_bid_across_k(top_k):
     confidences = torch.rand(2, 6, num_experts)
     wealth = torch.rand(num_experts) * 10.0
 
-    selected, _, payments, _ = auctioneer(confidences, wealth)
+    selected, _, payments, _, _ = auctioneer(confidences, wealth)
     bids = _bids(confidences, wealth)
 
     for b in range(bids.size(0)):
@@ -173,13 +173,13 @@ def test_vcg_payment_invariant_to_winners_own_bid():
 
     wealth = torch.ones(4)
     confidences = torch.tensor([[[0.1, 0.9, 0.5, 0.3]]])
-    selected, _, payments, _ = auctioneer(confidences, wealth)
+    selected, _, payments, _, _ = auctioneer(confidences, wealth)
 
     # Raise the top winner's confidence well clear of the field; the winner set
     # is unchanged, so its payment must not move.
     perturbed = confidences.clone()
     perturbed[0, 0, 1] = 0.99
-    selected_perturbed, _, payments_perturbed, _ = auctioneer(perturbed, wealth)
+    selected_perturbed, _, payments_perturbed, _, _ = auctioneer(perturbed, wealth)
 
     assert selected_perturbed[0, 0].tolist() == selected[0, 0].tolist()
     assert payments_perturbed[0, 0, 0].item() == pytest.approx(
@@ -201,7 +201,7 @@ def test_vcg_individual_rationality():
     confidences = torch.rand(2, 8, 6)
     wealth = torch.rand(6) * 10.0
 
-    selected, _, payments, _ = auctioneer(confidences, wealth)
+    selected, _, payments, _, _ = auctioneer(confidences, wealth)
     winner_values = torch.gather(confidences, -1, selected)
 
     surplus = winner_values - payments
@@ -221,7 +221,7 @@ def test_vcg_payments_non_negative_and_non_vacuous():
     confidences = torch.rand(2, 8, 4)
     wealth = torch.rand(4) * 10.0
 
-    _, _, payments, _ = auctioneer(confidences, wealth)
+    _, _, payments, _, _ = auctioneer(confidences, wealth)
 
     assert (payments >= 0).all()
     assert (payments > PAYMENT_TOLERANCE).any()
@@ -242,7 +242,7 @@ def test_vcg_zero_payment_regression():
     confidences = torch.tensor([[[0.80, 0.70, 0.60, 0.50, 0.40, 0.30, 0.20, 0.10]]])
     wealth = torch.ones(8)
 
-    _, _, payments, _ = auctioneer(confidences, wealth)
+    _, _, payments, _, _ = auctioneer(confidences, wealth)
 
     assert (payments > 0.1).all(), "payments collapsed to zero: k-1 exclusion set is back"
     for j in range(2):
@@ -257,7 +257,7 @@ def test_vcg_top_k_equals_num_experts_zero_payments():
     confidences = torch.tensor([[[0.5, 0.3, 0.8]]])
     wealth = torch.ones(3)
 
-    _, _, payments, _ = auctioneer(confidences, wealth)
+    _, _, payments, _, _ = auctioneer(confidences, wealth)
     assert (payments == 0).all()
 
 
@@ -297,8 +297,8 @@ def test_vcg_payment_survives_bfloat16_router_specialisation():
     confidences = torch.sigmoid(logits)
     wealth = torch.linspace(75.0, 300.0, 8)
 
-    _, _, payments_fp32, _ = auctioneer(confidences, wealth)
-    _, _, payments_bf16, _ = auctioneer(confidences.bfloat16(), wealth.bfloat16())
+    _, _, payments_fp32, _, _ = auctioneer(confidences, wealth)
+    _, _, payments_bf16, _, _ = auctioneer(confidences.bfloat16(), wealth.bfloat16())
 
     assert (payments_fp32 > 0).all(), "fixture prices nothing; the comparison is vacuous"
     assert payments_bf16.dtype == torch.bfloat16, "payments must return in the input dtype"
@@ -334,7 +334,7 @@ def test_vcg_payment_preserves_float64_precision():
     confidences = torch.rand(1, 4, 6, dtype=torch.float64)
     wealth = torch.rand(6, dtype=torch.float64) * 10.0
 
-    selected, _, payments, _ = auctioneer(confidences, wealth)
+    selected, _, payments, _, _ = auctioneer(confidences, wealth)
     bids = _bids(confidences, wealth)
 
     # Guards the cast-back, not the accumulation dtype: `.to(out_dtype)` restores
@@ -372,13 +372,13 @@ def test_uniform_share_is_flat_and_ignores_own_bid():
 
     wealth = torch.ones(4)
     confidences = torch.tensor([[[0.1, 0.9, 0.5, 0.3]]])
-    selected, weights, _, _ = auctioneer(confidences, wealth)
+    selected, weights, _, _, _ = auctioneer(confidences, wealth)
 
     assert torch.allclose(weights, torch.full_like(weights, 0.5))
 
     perturbed = confidences.clone()
     perturbed[0, 0, 1] = 0.99
-    selected_perturbed, weights_perturbed, _, _ = auctioneer(perturbed, wealth)
+    selected_perturbed, weights_perturbed, _, _, _ = auctioneer(perturbed, wealth)
 
     assert selected_perturbed[0, 0].tolist() == selected[0, 0].tolist()
     assert torch.equal(weights_perturbed, weights)
@@ -395,7 +395,7 @@ def test_uniform_share_carries_no_gradient_into_confidences():
     auctioneer.train()
 
     confidences = torch.rand(1, 4, 4, requires_grad=True)
-    _, routing_weights, _, _ = auctioneer(confidences, torch.ones(4))
+    _, routing_weights, _, _, _ = auctioneer(confidences, torch.ones(4))
 
     assert not routing_weights.requires_grad
 
@@ -415,8 +415,8 @@ def test_proportional_share_lets_a_winner_buy_influence_for_free():
     overreported = truthful.clone()
     overreported[0, 0, 1] = 0.99
 
-    selected, weights, payments, _ = auctioneer(truthful, wealth)
-    selected_over, weights_over, payments_over, _ = auctioneer(overreported, wealth)
+    selected, weights, payments, _, _ = auctioneer(truthful, wealth)
+    selected_over, weights_over, payments_over, _, _ = auctioneer(overreported, wealth)
 
     assert selected_over[0, 0].tolist() == selected[0, 0].tolist()
     assert payments_over[0, 0, 0].item() == pytest.approx(
@@ -442,7 +442,7 @@ def test_payment_is_the_winners_critical_value():
     def outcome(report: float) -> tuple[bool, float]:
         confidences = field.clone()
         confidences[0] = report
-        selected, _, payments, _ = auctioneer(confidences.view(1, 1, 5), wealth)
+        selected, _, payments, _, _ = auctioneer(confidences.view(1, 1, 5), wealth)
         slots = (selected[0, 0] == 0).nonzero()
         if slots.numel() == 0:
             return False, 0.0
@@ -475,7 +475,7 @@ def _expert_zero_utility(auctioneer, report: float, true_value: float) -> float:
     """
     confidences = _UTILITY_FIELD.clone()
     confidences[0] = report
-    selected, weights, payments, _ = auctioneer(confidences.view(1, 1, -1), _UTILITY_WEALTH)
+    selected, weights, payments, _, _ = auctioneer(confidences.view(1, 1, -1), _UTILITY_WEALTH)
 
     slots = (selected[0, 0] == 0).nonzero()
     if slots.numel() == 0:
@@ -574,7 +574,7 @@ def test_zero_wealth_is_accepted_and_prices_at_zero():
     auctioneer = _make_auction(num_experts=4, top_k=2)
     auctioneer.eval()
 
-    _, _, payments, _ = auctioneer(torch.zeros(1, 1, 4), torch.zeros(4))
+    _, _, payments, _, _ = auctioneer(torch.zeros(1, 1, 4), torch.zeros(4))
 
     assert torch.isfinite(payments).all()
     assert (payments == 0).all()
@@ -611,10 +611,10 @@ def test_rebate_never_exceeds_what_the_auction_collected():
     """Budget feasibility, in the currency the wealth ledger actually uses.
 
     Both sides are the per-expert quantities the wealth update consumes: payments
-    already divided by each winner's own wealth, rebates divided by the pool's
-    largest. Checking this in bid units instead — multiplying wealth back in — tests
-    an inequality that holds even when the ledger's does not, which is exactly how a
-    rebate that over-paid by 7.4x passed a feasibility test.
+    already divided by each winner's own wealth, rebates divided by the harmonic
+    mean of the k richest. Checking this in bid units instead — multiplying wealth
+    back in — tests an inequality that holds even when the ledger's does not, which
+    is exactly how a rebate that over-paid by 7.4x passed a feasibility test.
     """
     torch.manual_seed(37)
     for num_experts, top_k in ((6, 2), (8, 3), (5, 1), (4, 2)):
@@ -646,7 +646,8 @@ def test_rebate_never_exceeds_what_the_auction_collected():
         # collapses the harmonic mean onto its own wealth and the tight token is
         # one the richest expert takes; on n=4 k=2 both are slack, because
         # k + 2 == n leaves the reference at the bottom of the bid vector.
-        payout_in_bid_units = (outcome.rebates * wealth.max()).sum(dim=-1)
+        richest = torch.topk(wealth, top_k).values
+        payout_in_bid_units = (outcome.rebates * (top_k / (1.0 / richest).sum())).sum(dim=-1)
         displaced = torch.sort(_bids(confidences, wealth), dim=-1, descending=True)[0][..., top_k]
         # Relative, not absolute: these are bid-unit quantities of order 100, where
         # a 1e-5 absolute tolerance is really no tolerance at all.
@@ -697,20 +698,21 @@ def test_rebate_leaves_the_deviation_sweep_intact():
     ("regime", "wealth", "expected_return"),
     [
         ("flat", torch.full((8,), 100.0), 0.94),
-        ("configured band", torch.linspace(15.0, 750.0, 8), 0.68),
-        ("max_wealth monopoly", torch.tensor([750.0] + [15.0] * 7), 0.04),
+        ("configured band", torch.linspace(15.0, 750.0, 8), 0.74),
+        ("max_wealth monopoly", torch.tensor([750.0] + [15.0] * 7), 0.92),
     ],
 )
 def test_returned_fraction_matches_the_documented_regimes(regime, wealth, expected_return):
     """Pin the numbers both READMEs quote, and pin them from below.
 
     Feasibility only bounds the rebate from above, so a divisor returning 1% of
-    Cavallo passes every other test here while making the documented 94/68/4%
-    figures wrong. This is the test that fails when the divisor changes — which it
-    is expected to, under #15 — and it should fail, because the prose changes with
-    it.
+    Cavallo passes every other test here while making the documented 94/74/92%
+    figures wrong. This is the test that failed when #15 replaced the largest
+    wealth with the harmonic mean of the k richest -- the monopoly regime went
+    from 4% returned to 92% -- and it should fail, because the prose changes with
+    the divisor.
 
-    Robust across 200 seeds: standard deviations of 0.0016 / 0.0040 / 0.0001 against
+    Robust across 50 seeds: standard deviations of 0.0014 / 0.0047 / 0.0036 against
     a 0.02 window.
     """
     torch.manual_seed(11)
@@ -741,7 +743,8 @@ def test_rebate_is_bounded_from_below_by_the_cavallo_reference():
 
     bids = _bids(confidences, wealth)
     ranked = torch.sort(bids, dim=-1, descending=True)[0]
-    # Every reference is at least b_(k+2), so the payout is at least (k/n)*n*b_(k+2).
+    # Every reference is at least b_(k+2), so the payout is at least (k/n)*n*b_(k+2)
+    # over the divisor, and the divisor is at most the largest wealth.
     floor = (2 / 6) * 6 * ranked[..., 3] / wealth.max()
 
     assert (outcome.rebates.sum(dim=-1) >= floor - PAYMENT_TOLERANCE).all()
@@ -770,10 +773,10 @@ def test_routing_weights_are_invariant_to_a_uniform_wealth_rescale():
 
     confidences = torch.rand(4, 64, 8) + 0.05
     wealth = torch.tensor([15.0, 25.0, 45.0, 75.0, 130.0, 230.0, 420.0, 750.0])
-    _, baseline, _, _ = auctioneer(confidences, wealth)
+    _, baseline, _, _, _ = auctioneer(confidences, wealth)
 
     for scale in (1e-8, 1e-2, 0.1, 10.0, 1e2, 1e8):
-        _, rescaled, _, _ = auctioneer(confidences, wealth * scale)
+        _, rescaled, _, _, _ = auctioneer(confidences, wealth * scale)
         assert torch.allclose(rescaled, baseline, rtol=0, atol=1e-6), (
             f"routing weights moved under a uniform wealth rescale of {scale:g}"
         )
@@ -795,7 +798,7 @@ def test_routing_weights_are_invariant_to_a_uniform_wealth_rescale():
 
     invariant_top1 = []
     for level in (15.0, 750.0):
-        _, flat_weights, _, _ = auctioneer(confidences, torch.full((8,), level))
+        _, flat_weights, _, _, _ = auctioneer(confidences, torch.full((8,), level))
         invariant_top1.append(flat_weights.amax(dim=-1).median().item())
     assert invariant_top1[1] == pytest.approx(invariant_top1[0], abs=1e-6)
 
@@ -822,9 +825,9 @@ def test_train_and_eval_routing_paths_produce_identical_weights():
     wealth = torch.tensor([15.0, 25.0, 45.0, 75.0, 130.0, 230.0, 420.0, 750.0])
 
     auctioneer.train()
-    _, train_weights, _, _ = auctioneer(confidences, wealth)
+    _, train_weights, _, _, _ = auctioneer(confidences, wealth)
     auctioneer.eval()
-    _, eval_weights, _, _ = auctioneer(confidences, wealth)
+    _, eval_weights, _, _, _ = auctioneer(confidences, wealth)
 
     # rtol=0 for the reason given in the rescale test: the default rtol would widen
     # this by two orders of magnitude. Measured max deviation is 1.19e-7 in float32
@@ -863,8 +866,8 @@ def test_routing_temperature_stays_invariant_at_every_setting(temperature):
     confidences = torch.rand(2, 32, 8) + 0.05
     wealth = torch.tensor([15.0, 25.0, 45.0, 75.0, 130.0, 230.0, 420.0, 750.0])
 
-    _, weights, _, _ = auctioneer(confidences, wealth)
-    _, rescaled, _, _ = auctioneer(confidences, wealth * 1e8)
+    _, weights, _, _, _ = auctioneer(confidences, wealth)
+    _, rescaled, _, _, _ = auctioneer(confidences, wealth * 1e8)
     assert torch.allclose(weights, rescaled, rtol=0, atol=1e-6)
 
 
@@ -877,7 +880,7 @@ def test_routing_temperature_orders_sharpness():
     for temperature in (0.25, 1.0, 4.0):
         auctioneer = VCGAuctioneer(8, 2, routing_share="proportional", temperature=temperature)
         auctioneer.eval()
-        _, weights, _, _ = auctioneer(confidences, wealth)
+        _, weights, _, _, _ = auctioneer(confidences, wealth)
         top1_by_temperature.append(weights.amax(dim=-1).mean().item())
 
     sharp, plain, flat = top1_by_temperature
@@ -902,7 +905,7 @@ def test_zero_bids_share_out_rather_than_producing_nan():
     auctioneer = _make_auction(num_experts=4, top_k=2, routing_share="proportional")
     auctioneer.eval()
 
-    _, weights, _, _ = auctioneer(torch.zeros(1, 1, 4), torch.ones(4))
+    _, weights, _, _, _ = auctioneer(torch.zeros(1, 1, 4), torch.ones(4))
 
     assert torch.isfinite(weights).all()
     assert torch.allclose(weights, torch.full_like(weights, 0.5))
@@ -955,7 +958,7 @@ def test_proportional_share_is_the_bid_ratio_at_unit_temperature():
     confidences = torch.rand(2, 32, 6) + 0.05
     wealth = torch.tensor([15.0, 40.0, 75.0, 130.0, 300.0, 750.0])
 
-    selected, weights, _, _ = auctioneer(confidences, wealth)
+    selected, weights, _, _, _ = auctioneer(confidences, wealth)
     winning_bids = torch.gather(confidences * wealth, -1, selected)
 
     assert torch.allclose(

@@ -185,6 +185,17 @@ class TrainingConfig:
     calibration_loss_weight: float = (
         0.15  # Weight for confidence calibration loss (increased for stronger training)
     )
+    # Fraction of training tokens whose last slot the auction hands to a random
+    # loser rather than sells, so a head that has fallen to a truthful zero keeps
+    # seeing targets. See MoBConfig.exploration_rate.
+    exploration_rate: float = 0.02
+    # The confidence heads are single linear layers regressing onto values of
+    # order 1e-2, and at the backbone's 2e-5 a head's logit moves by that much per
+    # step: measured on Qwen3-1.7B over 120 steps, every report stayed within
+    # 1e-3 of its initialisation while the value it should have tracked grew from
+    # 0 to 0.012. The planted-competence fixture calibrates its heads at 1e-2.
+    # 5e-3 is a placeholder between the two, not a measured choice.
+    confidence_head_learning_rate: float = 5e-3
     wealth_update_frequency: int = 1  # How often to update wealth (every N steps)
     log_frequency: int = 10  # How often to log comprehensive training statistics (every N steps)
 
@@ -456,6 +467,7 @@ class TAMETrainer:
             use_local_quality=True,
             use_differentiable_routing=True,
             confidence_calibration_weight=self.config.calibration_loss_weight,
+            exploration_rate=self.config.exploration_rate,
             router=ARM_ROUTERS[self.config.router],
         )
 
@@ -725,6 +737,19 @@ class TAMETrainer:
 
         assert self.model is not None
         self.model = get_peft_model(cast(PreTrainedModel, self.model), lora_config)
+
+        # PEFT freezes every parameter it did not inject, and that includes the
+        # expert adapters and confidence heads MoB added a moment earlier. LoRA
+        # here is a memory measure for the attention projections; the MoB adapters
+        # are the parameters the run exists to train, and a head that cannot move
+        # never reports anything but its initialisation. Measured on the smoke
+        # fixture before this loop: under --use_lora both reported
+        # requires_grad=False, so every LoRA run trained no expert and no head.
+        # The shared base FFN stays frozen, which is the memory-constrained intent.
+        for mob in get_mob_layers(self.model):
+            for name, parameter in mob.named_parameters():
+                if not name.startswith("base_"):
+                    parameter.requires_grad_(True)
         self.model.print_trainable_parameters()
 
     def _setup_optimizer(self):
@@ -734,8 +759,18 @@ class TAMETrainer:
         decay_params = []
         no_decay_params = []
 
+        # The heads are trained by nothing but their own value objective, at their
+        # own rate. The scheduler scales every group by the same factor, so the
+        # heads warm up and decay with the backbone; only the base rate differs.
+        head_params = [
+            param
+            for mob in get_mob_layers(self.model)
+            for param in mob.confidence_heads.parameters()
+        ]
+        head_ids = {id(param) for param in head_params}
+
         for name, param in self.model.named_parameters():
-            if not param.requires_grad:
+            if not param.requires_grad or id(param) in head_ids:
                 continue
             if "bias" in name or "LayerNorm" in name or "layernorm" in name:
                 no_decay_params.append(param)
@@ -746,6 +781,14 @@ class TAMETrainer:
             {"params": decay_params, "weight_decay": self.config.weight_decay},
             {"params": no_decay_params, "weight_decay": 0.0},
         ]
+        if head_params:
+            optimizer_groups.append(
+                {
+                    "params": head_params,
+                    "weight_decay": 0.0,
+                    "lr": self.config.confidence_head_learning_rate,
+                }
+            )
 
         self.optimizer = AdamW(
             optimizer_groups,
@@ -1087,39 +1130,15 @@ class TAMETrainer:
         # Reshape back to (batch, seq_len-1)
         per_token_loss = per_token_loss.view(batch_size, seq_len - 1)
 
-        # =========================================================
-        # KEY: Update MoB wealth based on loss (SPECIALIZATION!)
-        # =========================================================
-        # This is what makes experts actually specialize!
-        # Experts that reduce loss get rewarded, others decay
-        if self.global_step % self.config.wealth_update_frequency == 0:
-            update_all_mob_from_loss(
-                self.model,
-                per_token_loss.detach(),  # Detach to prevent double gradients
-                shift_mask,
-            )
-
         # Compute mean loss for backprop
         valid_mask = (shift_labels != -100) & (shift_mask == 1)
-        main_loss = (per_token_loss * valid_mask).sum() / valid_mask.sum().clamp(min=1)
-
-        # =========================================================
-        # Add calibration loss for confidence head training
-        # =========================================================
-        # This teaches confidence heads to predict when they'll do well
-        calibration_loss = get_total_calibration_loss(self.model)
-        router_z_loss = get_total_router_z_loss(self.model)
-
-        # Total loss
-        total_loss = main_loss + calibration_loss + router_z_loss
+        valid_count = valid_mask.sum().clamp(min=1)
+        main_loss = (per_token_loss * valid_mask).sum() / valid_count
 
         # NaN guard: skip backprop if loss is NaN to prevent gradient corruption
-        if torch.isnan(total_loss) or torch.isinf(total_loss):
-            cal_val = calibration_loss.item() if isinstance(calibration_loss, torch.Tensor) else 0
-            router_val = router_z_loss.item() if isinstance(router_z_loss, torch.Tensor) else 0
+        if not torch.isfinite(main_loss):
             logger.warning(
-                f"Step {self.global_step}: NaN/Inf loss detected "
-                f"(main={main_loss.item()}, cal={cal_val}, router_z={router_val}), "
+                f"Step {self.global_step}: NaN/Inf loss detected (main={main_loss.item()}), "
                 "skipping backward"
             )
             return {
@@ -1130,21 +1149,45 @@ class TAMETrainer:
                 "perplexity": float("nan"),
             }
 
-        # Scale for gradient accumulation
-        scaled_loss = total_loss / self.config.gradient_accumulation_steps
+        accumulation_steps = self.config.gradient_accumulation_steps
+        (main_loss / accumulation_steps).backward()
 
-        # Backward pass
-        scaled_loss.backward()
+        # =========================================================
+        # Settle the economy -- after the backward, never before it
+        # =========================================================
+        # A winner's value is its contribution against the loss gradient at its
+        # layer, which the backward above has just delivered; before it there is
+        # nothing to pay. Settling first also moved the wealth the checkpoint
+        # recompute then re-ran the auction against, which raised a metadata
+        # mismatch at step 0 of every 8-expert run.
+        if self.global_step % self.config.wealth_update_frequency == 0:
+            update_all_mob_from_loss(
+                self.model,
+                per_token_loss.detach(),
+                shift_mask,
+                loss_gradient_scale=float(valid_count.item()) * accumulation_steps,
+            )
+
+        # The heads' own objectives, on their own graph. The routing path reads
+        # detached hidden states, so this backward reaches the confidence heads
+        # and the coupling and nothing below them.
+        calibration_loss = get_total_calibration_loss(self.model)
+        router_z_loss = get_total_router_z_loss(self.model)
+        auxiliary_loss = calibration_loss + router_z_loss
+        if not torch.isfinite(auxiliary_loss):
+            logger.warning(
+                f"Step {self.global_step}: NaN/Inf auxiliary loss "
+                f"(cal={calibration_loss.item()}, router_z={router_z_loss.item()}), "
+                "skipping the auxiliary backward"
+            )
+        elif auxiliary_loss.requires_grad:
+            (auxiliary_loss / accumulation_steps).backward()
 
         return {
             "loss": main_loss.item(),
-            "calibration_loss": calibration_loss.item()
-            if isinstance(calibration_loss, torch.Tensor)
-            else 0.0,
-            "router_z_loss": router_z_loss.item()
-            if isinstance(router_z_loss, torch.Tensor)
-            else 0.0,
-            "total_loss": total_loss.item(),
+            "calibration_loss": calibration_loss.item(),
+            "router_z_loss": router_z_loss.item(),
+            "total_loss": main_loss.item() + auxiliary_loss.item(),
             "perplexity": math.exp(min(main_loss.item(), 20)),  # Cap to prevent overflow
         }
 
@@ -1324,6 +1367,12 @@ class TAMETrainer:
             # than logged as zero -- see get_mob_statistics.
             if mean_payment is not None:
                 measurements["auction/mean_payment"] = _scalar(mean_payment)
+            # Absent until every layer has settled once. Surplus below zero is
+            # the #15 symptom -- winning as a loss-making trade -- on every line.
+            if "mean_win_surplus" in stats:
+                measurements["auction/mean_realised_value"] = _scalar(stats["mean_realised_value"])
+                measurements["auction/mean_report"] = _scalar(stats["mean_report"])
+                measurements["auction/mean_win_surplus"] = _scalar(stats["mean_win_surplus"])
 
             # Format performance EMA with sign
             perf_sign = "+" if perf_ema >= 0 else ""
@@ -1592,6 +1641,21 @@ def main():
         ),
     )
     parser.add_argument("--seed", type=int, default=42, help="Seed; must match across arms")
+    parser.add_argument(
+        "--confidence_head_learning_rate",
+        type=float,
+        default=5e-3,
+        help="Learning rate for the confidence heads' value objective (#15)",
+    )
+    parser.add_argument(
+        "--exploration_rate",
+        type=float,
+        default=0.02,
+        help=(
+            "Fraction of training tokens whose last auction slot goes to a random "
+            "loser, so every confidence head keeps seeing targets (#15)"
+        ),
+    )
 
     # Reproducibility (#13)
     parser.add_argument(
@@ -1654,6 +1718,8 @@ def main():
         held_out_sequences=args.held_out_sequences,
         probe_tokens=args.probe_tokens,
         seed=args.seed,
+        exploration_rate=args.exploration_rate,
+        confidence_head_learning_rate=args.confidence_head_learning_rate,
         deterministic=args.deterministic,
         shuffle_buffer_size=args.shuffle_buffer_size,
         checkpoint_keep_last=args.checkpoint_keep_last,

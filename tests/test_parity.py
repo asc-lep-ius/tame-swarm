@@ -38,6 +38,8 @@ BASE = ArmFingerprint(
     lora_alpha=32,
     lora_dropout=0.05,
     calibration_loss_weight=0.15,
+    exploration_rate=0.02,
+    confidence_head_learning_rate=5e-3,
     wealth_update_frequency=1,
     gradient_checkpointing=True,
     device="cpu",
@@ -161,6 +163,8 @@ def test_fingerprint_arm_reads_the_training_config():
         lora_alpha=17,
         lora_dropout=0.11,
         calibration_loss_weight=0.23,
+        exploration_rate=0.07,
+        confidence_head_learning_rate=0.011,
         wealth_update_frequency=19,
         gradient_checkpointing=False,
         device="cpu",
@@ -197,6 +201,8 @@ def test_fingerprint_arm_reads_the_training_config():
     assert arm.lora_alpha == 17
     assert arm.lora_dropout == 0.11
     assert arm.calibration_loss_weight == 0.23
+    assert arm.exploration_rate == 0.07
+    assert arm.confidence_head_learning_rate == 0.011
     assert arm.wealth_update_frequency == 19
     assert arm.gradient_checkpointing is False
     assert arm.device == "cpu"
