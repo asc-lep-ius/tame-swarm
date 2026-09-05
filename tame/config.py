@@ -38,8 +38,8 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
     # Apache-2.0, ungated on HuggingFace -- unlike the three profiles above,
     # which all require accepting a license before the weights download. That
     # makes it the only profile a CI runner or a fresh machine without an HF
-    # token can actually pull, which is why #13's noise-floor measurement uses
-    # it rather than ACTIVE_MODEL.
+    # token can actually pull, and it is the model every measurement in the
+    # README was taken on (#13 noise floor, #3/#17 steering gates, #4 plant).
     "qwen3-1.7b": {
         "model_id": "Qwen/Qwen3-1.7B",
         "hidden_dim": 2048,
@@ -50,7 +50,10 @@ MODEL_PROFILES: dict[str, ModelProfile] = {
     },
 }
 
-ACTIVE_MODEL = "gemma-2-2b"
+# The profile the server and trainer default to. It is the model the steering
+# certifications (contrastive_data.CERTIFIED) and the homeostat's plant were
+# measured on; serving another profile gets those numbers with a warning.
+ACTIVE_MODEL = "qwen3-1.7b"
 
 
 def get_active_profile() -> ModelProfile:

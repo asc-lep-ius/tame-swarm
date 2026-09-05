@@ -3,25 +3,127 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import torch
+import torch.nn as nn
 from fastapi import FastAPI
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from config import get_active_profile
+from homeostat import CognitiveHomeostat
 from mob import MixtureOfBidders, MoBConfig, apply_mob_to_model, load_mob_state
-from steering import (
-    CognitiveHomeostat,
-    SteeringConfig,
+from steering import SteeringConfig
+from steering_pipeline import (
+    SteeringExtraction,
+    calibration_texts,
+    extract_steering_vectors,
+    serving_config,
 )
-from steering_pipeline import extract_steering_vectors
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
 logger = logging.getLogger(__name__)
+
+# The goal a server starts on. Its layers, reference strength and strength band come
+# from the certification record (``contrastive_data.CERTIFIED``), not from here.
+DEFAULT_GOAL = "truthful"
+# Whether the served tissue adapts the strength or holds the certified constant.
+# #4's value test (``scripts/characterise_plant.py``, adaptive vs constant on 100
+# held-out letter choices after a generated rationale) found no significant
+# difference (-0.18 +/- 0.29 log-odds; accuracy 0.71 -> 0.69), so the loop ships
+# calibrated and switchable (``PUT /steering/gains`` with ``adaptive``) but off by
+# default: the served system is exactly the constant-strength configuration the
+# gate certified.
+ADAPTIVE_STEERING = False
+
+
+def build_homeostat(
+    model: nn.Module,
+    tokenizer,
+    template: SteeringConfig,
+    goal: str,
+    model_id: str | None = None,
+    strength: float | None = None,
+) -> tuple[CognitiveHomeostat, SteeringExtraction, SteeringConfig]:
+    """Extract, calibrate and attach the loop for ``goal``; startup and the API share this path.
+
+    The config is derived from the goal's certification (layers, reference
+    strength, band); ``strength`` overrides the reference strength -- and so the
+    setpoint the calibration measures -- but only inside the certified band.
+    ``template`` must be the pristine template, never a previously served config:
+    gains pinned through the API and a certified goal's layers would otherwise
+    leak into the next goal. Calibration failures degrade to the legacy cosine
+    loop with a warning rather than leaving the server unsteered.
+    """
+    config = serving_config(goal, template, model_id=model_id)
+    if strength is not None:
+        if strength <= 0:
+            raise ValueError(f"strength must be positive, got {strength}")
+        if not config.min_strength <= strength <= config.max_strength:
+            raise ValueError(
+                f"strength {strength} is outside the certified band "
+                f"[{config.min_strength}, {config.max_strength}] for goal {goal!r}"
+            )
+        config.base_strength = strength
+
+    extraction = extract_steering_vectors(model, tokenizer, goal=goal, config=config)
+    logger.info(
+        "[HOMEOSTASIS] Extracted %r from %d %s pairs (%s, %s), tiers %s; layers %s, readout %s, "
+        "strength %.2f in [%.2f, %.2f]",
+        goal,
+        extraction.pair_count,
+        extraction.pair_format,
+        extraction.source,
+        "certified" if extraction.certified else "UNCERTIFIED",
+        extraction.tier_counts,
+        config.steering_layers,
+        config.readout_layer,
+        config.base_strength,
+        config.min_strength,
+        config.max_strength,
+    )
+    if not extraction.certified:
+        logger.warning(
+            "[HOMEOSTASIS] Steering on an uncertified '%s' vector: %s",
+            extraction.goal,
+            extraction.fallback_reason or "source/format is not the certified pair",
+        )
+
+    homeostat = CognitiveHomeostat(config)
+    homeostat.add_steering_vectors(extraction.vectors)
+
+    if config.orthogonal_projection:
+        homeostat.estimate_capability_subspaces(model, tokenizer)
+        retention = homeostat.get_capability_retention()
+        if retention:
+            logger.info(
+                "[HOMEOSTASIS] Capability projection retains %.0f%%-%.0f%% "
+                "of the steering vector across layers",
+                100 * min(retention.values()),
+                100 * max(retention.values()),
+            )
+
+    try:
+        texts = calibration_texts(model, tokenizer, goal)
+        homeostat.calibrate(model, tokenizer, texts=texts)
+    except (ValueError, RuntimeError) as exc:
+        logger.warning(
+            "[HOMEOSTASIS] Alignment calibration failed (%s); the loop runs uncalibrated "
+            "on the legacy cosine setpoint",
+            exc,
+        )
+
+    homeostat.attach_to_model(model)
+    logger.info(
+        "[HOMEOSTASIS] Steering attached: actuators %s, readout %d, %s",
+        homeostat.actuator_layers,
+        homeostat.readout_layer,
+        "adaptive" if config.adaptive else "constant strength",
+    )
+    return homeostat, extraction, config
 
 
 @dataclass
@@ -32,6 +134,9 @@ class TAMEApplication:
     mob_config: MoBConfig
     steering_config: SteeringConfig
     model_id: str
+    # The pristine loop settings every goal install starts from; ``steering_config``
+    # is the config of the goal currently served, and carries its pinned gains.
+    steering_template: SteeringConfig | None = None
 
     @classmethod
     def from_profile(cls) -> TAMEApplication:
@@ -61,13 +166,14 @@ class TAMEApplication:
             inference_wealth_compression=0.4,
         )
 
-        steering_config = SteeringConfig(
+        # A template: the served goal's layers, reference strength and band come
+        # from its certification record (see build_homeostat). The MoB layer range
+        # here is only what an uncertified goal falls back to.
+        steering_template = SteeringConfig(
             steering_layers=list(range(profile["mob_layers_start"], profile["mob_layers_end"])),
-            base_strength=0.3,
-            adaptive=True,
-            target_alignment=0.7,
-            kp=0.5,
+            adaptive=ADAPTIVE_STEERING,
         )
+        steering_config = replace(steering_template)
 
         logger.info("=" * 60)
         logger.info("TAME SWARM: Initializing Agential Architecture")
@@ -169,44 +275,9 @@ class TAMEApplication:
 
         homeostat: CognitiveHomeostat | None = None
         try:
-            extraction = extract_steering_vectors(
-                model,
-                tokenizer,
-                goal="truthful",
-                config=steering_config,
+            homeostat, _, steering_config = build_homeostat(
+                model, tokenizer, steering_template, DEFAULT_GOAL, model_id=model_id
             )
-            logger.info(
-                "[HOMEOSTASIS] Extracted from %d %s pairs (%s, %s), tiers %s",
-                extraction.pair_count,
-                extraction.pair_format,
-                extraction.source,
-                "certified" if extraction.certified else "UNCERTIFIED",
-                extraction.tier_counts,
-            )
-            if not extraction.certified:
-                logger.warning(
-                    "[HOMEOSTASIS] Steering on an uncertified '%s' vector: %s",
-                    extraction.goal,
-                    extraction.fallback_reason or "source/format is not the certified pair",
-                )
-
-            homeostat = CognitiveHomeostat(steering_config)
-            homeostat.add_steering_vectors(extraction.vectors)
-
-            if steering_config.orthogonal_projection:
-                homeostat.estimate_capability_subspaces(model, tokenizer)
-                retention = homeostat.get_capability_retention()
-                if retention:
-                    logger.info(
-                        "[HOMEOSTASIS] Capability projection retains %.0f%%-%.0f%% "
-                        "of the steering vector across layers",
-                        100 * min(retention.values()),
-                        100 * max(retention.values()),
-                    )
-
-            homeostat.attach_to_model(model)
-
-            logger.info("[HOMEOSTASIS] Steering attached to %d layers", len(extraction.vectors))
         except Exception as e:
             logger.warning("[HOMEOSTASIS] Steering extraction failed: %s", e)
             logger.warning("[HOMEOSTASIS] Continuing without steering (degraded mode)")
@@ -223,7 +294,35 @@ class TAMEApplication:
             mob_config=mob_config,
             steering_config=steering_config,
             model_id=model_id,
+            steering_template=steering_template,
         )
+
+    def install_goal(self, goal: str, strength: float | None = None) -> SteeringExtraction:
+        """Swap the served goal at runtime: detach, re-extract, re-calibrate, re-attach.
+
+        The old hooks come off first because a calibration measured under them
+        would not be a resting stream; if the new goal cannot be built they go
+        straight back, so the server never silently serves an unsteered model.
+        """
+        template = self.steering_template or self.steering_config
+        previous = self.homeostat
+        if previous is not None:
+            previous.detach_from_model()
+        try:
+            homeostat, extraction, config = build_homeostat(
+                self.model,  # pyright: ignore[reportArgumentType] # AutoModelForCausalLM is an nn.Module at runtime
+                self.tokenizer,
+                template,
+                goal,
+                model_id=self.model_id,
+                strength=strength,
+            )
+        except Exception:
+            if previous is not None:
+                previous.attach_to_model(self.model)  # pyright: ignore[reportArgumentType] # as above
+            raise
+        self.homeostat, self.steering_config = homeostat, config
+        return extraction
 
     def start_mob_tracking(self) -> None:
         for layer in self.model.model.layers:  # pyright: ignore[reportAttributeAccessIssue] # HuggingFace Auto* stubs lack runtime model internals

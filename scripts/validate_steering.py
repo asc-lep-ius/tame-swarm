@@ -49,6 +49,7 @@ from contrastive_data import (  # noqa: E402
     Certification,
     ContrastivePair,
     certification_for,
+    interleaved_split,
     letter_counts,
     letter_imbalance,
     load_contrastive_dataset,
@@ -91,20 +92,12 @@ def split_by_tier(pairs, held_out_per_tier):
     return list(reversed(extract)), list(reversed(held_out))
 
 
-def split_interleaved(pairs, held_out_n):
-    """Every k-th pair held out so topics interleave; the rest extract."""
-    k = max(2, len(pairs) // max(1, held_out_n))
-    held_out = [pair for index, pair in enumerate(pairs) if index % k == 0][:held_out_n]
-    extract = [pair for index, pair in enumerate(pairs) if index % k != 0]
-    return extract, held_out
-
-
 def load_split(goal, source, args):
     """Content-format extraction and held-out sets for ``goal`` from ``source``."""
     pairs = list(load_contrastive_dataset(goal, source=source, pair_format=COMPLETION_FORMAT))
     if source == BUILTIN_SOURCE:
         return split_by_tier(pairs, args.held_out_per_tier)
-    return split_interleaved(pairs, args.held_out)
+    return interleaved_split(pairs, args.held_out)
 
 
 def in_format(pairs, pair_format, seed):
@@ -139,7 +132,7 @@ def load_model(model_id: str):
     model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.float32)
     model.eval()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
+    model.to(device)  # pyright: ignore[reportArgumentType] # HF stubs
     return model, tokenizer, device
 
 
@@ -332,6 +325,8 @@ def main() -> None:
 
     print_summary(gate_rows)
 
+    if len(vectors_by_goal) < 2:
+        return
     mid_layer = layers[len(layers) // 2]
     print(f"\nGoal cosine similarity at layer {mid_layer} (for the #4 orthogonalisation decision):")
     pairwise = log_goal_similarity(vectors_by_goal, mid_layer)

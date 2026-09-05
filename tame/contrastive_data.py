@@ -488,10 +488,22 @@ def available_goals(source: str = "builtin") -> list[str]:
 
 @dataclass(frozen=True)
 class Certification:
-    """The (source, format) pair the behavioural gate certified for a goal."""
+    """What the behavioural gate certified for a goal: the pairs, and where they act.
+
+    ``layers`` and ``strength`` are the injection the gate was measured at;
+    ``strength_band`` is the range of strengths that still pass it, when that was
+    swept (#4), and ``readout_layer`` is where the homeostat's sensor reads. A goal
+    without a measured band is served at its certified strength, held constant:
+    the loop may only move within a band the gate has actually passed.
+    """
 
     source: str
     pair_format: str
+    layers: tuple[int, ...] | None = None
+    strength: float | None = None
+    strength_band: tuple[float, float] | None = None
+    readout_layer: int | None = None
+    model: str | None = None
 
 
 # What each goal is extracted from by default: the (source, format) the gate in
@@ -504,10 +516,36 @@ class Certification:
 # no direction can be told from noise there, while TruthfulQA's misconceptions are
 # adversarial by construction and 817 rows deep.
 BUILTIN_SOURCE = "builtin"
+# #17 measured every goal at layers 14/18/22, strength 4.0. #4 swept ``truthful``
+# layer by layer on Qwen3-1.7B (``scripts/sweep_steering_layers.py``): the direction
+# steers the *wrong* way below layer 13,
+# reads prompt wording at 12 (the prefix control outscores it), passes alone at 13
+# and 16-21, and is null from 22 up. As a set, 13 + 16-21 passes the gate at every
+# strength from 2 to 8 with the prefix control below zero; the band stops at 6
+# because the log-probability drift on natural continuations doubles again at 8.
+# Dropping 13 halves the effect; adding 24 changes nothing.
+TRUTHFUL_LAYERS = (13, 16, 17, 18, 19, 20, 21)
+CERTIFIED_MODEL = "Qwen/Qwen3-1.7B"
 CERTIFIED: dict[str, Certification] = {
-    "truthful": Certification("truthful_qa", MULTIPLE_CHOICE_FORMAT),
-    "reasoning": Certification(BUILTIN_SOURCE, MULTIPLE_CHOICE_FORMAT),
-    "safe": Certification(BUILTIN_SOURCE, COMPLETION_FORMAT),
+    "truthful": Certification(
+        "truthful_qa",
+        MULTIPLE_CHOICE_FORMAT,
+        layers=TRUTHFUL_LAYERS,
+        strength=4.0,
+        strength_band=(2.0, 6.0),
+        readout_layer=22,
+        model=CERTIFIED_MODEL,
+    ),
+    "reasoning": Certification(
+        BUILTIN_SOURCE,
+        MULTIPLE_CHOICE_FORMAT,
+        layers=(14, 18, 22),
+        strength=4.0,
+        model=CERTIFIED_MODEL,
+    ),
+    "safe": Certification(
+        BUILTIN_SOURCE, COMPLETION_FORMAT, layers=(14, 18, 22), strength=4.0, model=CERTIFIED_MODEL
+    ),
 }
 _UNCERTIFIED = Certification(BUILTIN_SOURCE, COMPLETION_FORMAT)
 
@@ -657,6 +695,27 @@ def load_instruction_prefix_control(goal: str) -> ContrastivePairSet:
         _pairs_from_records(INSTRUCTION_PREFIX_CONTROL[goal], "instruction-prefix"),
         source="instruction-prefix-control",
     )
+
+
+def certified_source(goal: str) -> str:
+    """The source a goal is certified on, or the built-in templates."""
+    certification = certification_for(goal)
+    return certification.source if certification else BUILTIN_SOURCE
+
+
+def interleaved_split(
+    pairs: Sequence[ContrastivePair], held_out: int
+) -> tuple[list[ContrastivePair], list[ContrastivePair]]:
+    """Every k-th pair held out so topics interleave; the rest extract.
+
+    The split the gate certifies on. Every script that measures against the
+    certified held-out set takes it from here, so a change to the split cannot
+    silently desynchronise a measurement from the certification.
+    """
+    k = max(2, len(pairs) // max(1, held_out))
+    kept = [pair for index, pair in enumerate(pairs) if index % k == 0][:held_out]
+    rest = [pair for index, pair in enumerate(pairs) if index % k != 0]
+    return rest, kept
 
 
 def replace_read_position(pair: ContrastivePair, read_position: int) -> ContrastivePair:

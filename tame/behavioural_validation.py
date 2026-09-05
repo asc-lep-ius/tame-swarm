@@ -41,7 +41,8 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 from contrastive_data import ContrastivePair
-from steering import SteeringConfig, SteeringHook, SteeringVector
+from homeostat import SteeringHook
+from steering import SteeringConfig, SteeringVector
 
 logger = logging.getLogger(__name__)
 
@@ -160,6 +161,26 @@ def mean_log_odds(
     if not finite:
         raise ValueError("no held-out pair produced a finite log-odds")
     return float(sum(finite) / len(finite))
+
+
+def held_out_accuracy(
+    model: nn.Module,
+    tokenizer,
+    pairs: Sequence[ContrastivePair],
+    device: torch.device,
+    max_length: int = 128,
+) -> float:
+    """Share of held-out pairs on which the model prefers the positive completion.
+
+    The discrete companion of :func:`mean_log_odds`: a steering effect that raises
+    the mean log-odds while flipping preferences toward the negative arm shows up
+    here and not there.
+    """
+    values = [_pair_log_odds(model, tokenizer, pair, device, max_length) for pair in pairs]
+    finite = [value for value in values if value == value]
+    if not finite:
+        raise ValueError("no held-out pair produced a finite log-odds")
+    return sum(value > 0 for value in finite) / len(finite)
 
 
 def attach_steering_hooks(
