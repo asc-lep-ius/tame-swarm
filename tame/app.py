@@ -30,12 +30,13 @@ logger = logging.getLogger(__name__)
 # The goal a server starts on. Its layers, reference strength and strength band come
 # from the certification record (``contrastive_data.CERTIFIED``), not from here.
 DEFAULT_GOAL = "truthful"
-# Whether the served loop adapts the strength or holds the certified constant. #4's
-# value test (``scripts/characterise_plant.py``, adaptive vs constant on 100 held-out
-# letter choices after a generated rationale) found no significant difference
-# (+0.12 +/- 0.17 log-odds; accuracy 0.71 -> 0.72), so the loop ships calibrated and
-# switchable (``PUT /steering/gains`` with ``adaptive``) but off by default: the
-# served system is exactly the constant-strength configuration the gate certified.
+# Whether the served tissue adapts the strength or holds the certified constant.
+# #4's value test (``scripts/characterise_plant.py``, adaptive vs constant on 100
+# held-out letter choices after a generated rationale) found no significant
+# difference (-0.18 +/- 0.29 log-odds; accuracy 0.71 -> 0.69), so the loop ships
+# calibrated and switchable (``PUT /steering/gains`` with ``adaptive``) but off by
+# default: the served system is exactly the constant-strength configuration the
+# gate certified.
 ADAPTIVE_STEERING = False
 
 
