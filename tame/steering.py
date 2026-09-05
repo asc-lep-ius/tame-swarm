@@ -1,13 +1,16 @@
 import logging
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+if TYPE_CHECKING:
+    from contrastive_data import ContrastivePair
 
 logger = logging.getLogger(__name__)
 
@@ -261,6 +264,123 @@ class SteeringVectorExtractor:
 
         finally:
             self._remove_hooks()
+
+    def extract_from_pairs(
+        self, pairs: "Sequence[ContrastivePair]", max_length: int = 128
+    ) -> dict[int, SteeringVector]:
+        """Difference-in-means read at each pair's completion position.
+
+        This is the behavioural extraction #3 exists to provide, and it differs
+        from :meth:`extract` in *where it reads*. ``extract`` mean-pools every
+        position of an instruction prefix, recovering the direction that separates
+        two sentences about a behaviour. This reads the single token at which the
+        model is *producing* the behaviour -- the answer token of a shared prompt's
+        A/B completions -- so the difference is a behaviour direction (CAA; Rimsky
+        et al., 2024).
+
+        For each pair the positive and negative completions are read at their own
+        recorded positions, and the per-layer means are differenced across pairs.
+        A pair whose completion is entirely truncated away is skipped with a
+        warning rather than read at a prompt token.
+        """
+        self._register_hooks()
+        try:
+            input_device = self._input_device()
+            positives: dict[int, list[torch.Tensor]] = {layer: [] for layer in self.layers}
+            negatives: dict[int, list[torch.Tensor]] = {layer: [] for layer in self.layers}
+            used = 0
+
+            for pair in pairs:
+                pos = self._read_completion_activations(
+                    pair.prompt,
+                    pair.positive_completion,
+                    pair.read_position,
+                    max_length,
+                    input_device,
+                )
+                neg = self._read_completion_activations(
+                    pair.prompt,
+                    pair.negative_completion,
+                    pair.read_position,
+                    max_length,
+                    input_device,
+                )
+                if pos is None or neg is None:
+                    continue
+                for layer_idx in self.layers:
+                    positives[layer_idx].append(pos[layer_idx])
+                    negatives[layer_idx].append(neg[layer_idx])
+                used += 1
+
+            if used == 0:
+                raise ValueError("no usable pairs: every completion was empty or truncated away")
+
+            steering_vectors = {}
+            for layer_idx in self.layers:
+                pos_mean = torch.stack(positives[layer_idx]).mean(dim=0)
+                neg_mean = torch.stack(negatives[layer_idx]).mean(dim=0)
+                steering_vectors[layer_idx] = SteeringVector(
+                    name="extracted",
+                    vector=pos_mean - neg_mean,
+                    layer=layer_idx,
+                    description=f"Behavioural diff-in-means from {used} completion pairs",
+                )
+
+            logger.info(
+                "Behavioural extraction: %d/%d pairs used, layers %s",
+                used,
+                len(list(pairs)) if hasattr(pairs, "__len__") else used,
+                self.layers,
+            )
+            return steering_vectors
+        finally:
+            self._remove_hooks()
+
+    def _read_completion_activations(
+        self,
+        prompt: str,
+        completion: str,
+        read_position: int,
+        max_length: int,
+        input_device: torch.device,
+    ) -> dict[int, torch.Tensor] | None:
+        """Per-layer activation at the completion's read position, or None if unusable.
+
+        The read position indexes the *completion*, so its absolute position is
+        resolved against the token boundary tokenisation actually produced for
+        ``prompt`` -- never a character offset, which would land mid-token on a
+        subword vocabulary.
+        """
+        prompt_ids = self.tokenizer(
+            prompt, return_tensors="pt", max_length=max_length, truncation=True
+        )["input_ids"]
+        inputs = self.tokenizer(
+            prompt + completion, return_tensors="pt", max_length=max_length, truncation=True
+        ).to(input_device)
+
+        seq_len = int(inputs["input_ids"].shape[1])
+        completion_start = min(int(prompt_ids.shape[1]), seq_len)
+        if completion_start >= seq_len:
+            logger.warning("Completion truncated away for prompt %r; skipping pair", prompt[:40])
+            return None
+
+        if read_position >= 0:
+            position = completion_start + read_position
+        else:
+            position = seq_len + read_position
+        position = max(completion_start, min(position, seq_len - 1))
+
+        with torch.no_grad():
+            self.model(**inputs, output_hidden_states=False)
+
+        result: dict[int, torch.Tensor] = {}
+        for layer_idx in self.layers:
+            if layer_idx not in self.activations:
+                logger.warning(f"No activation captured for layer {layer_idx}")
+                return None
+            hidden = self.activations[layer_idx].float().cpu()
+            result[layer_idx] = hidden[0, position]
+        return result
 
 
 class AdaptiveHomeostat:
@@ -517,53 +637,6 @@ class CognitiveHomeostat(nn.Module):
         self.homeostat.reset()
 
 
-# Predefined steering templates for common goals
-STEERING_TEMPLATES = {
-    "truthful": {
-        "positive": [
-            "Answer the following question accurately and truthfully:",
-            "Provide a factual, honest response to:",
-            "Give a correct, verified answer:",
-            "Respond with accurate information:",
-        ],
-        "negative": [
-            "Make up a plausible-sounding but false answer to:",
-            "Provide an inaccurate, hallucinated response to:",
-            "Give a convincing but incorrect answer:",
-            "Respond with fabricated information:",
-        ],
-    },
-    "reasoning": {
-        "positive": [
-            "Think step by step to solve this problem:",
-            "Break down this problem into logical steps:",
-            "Reason carefully through this question:",
-            "Analyze this methodically:",
-        ],
-        "negative": [
-            "Give a quick intuitive answer without thinking:",
-            "Respond immediately without analysis:",
-            "Answer based on first impression only:",
-            "Skip reasoning and just guess:",
-        ],
-    },
-    "safe": {
-        "positive": [
-            "Provide a helpful and safe response:",
-            "Answer in a way that is beneficial and harmless:",
-            "Give a constructive, appropriate response:",
-            "Respond helpfully while avoiding harm:",
-        ],
-        "negative": [
-            "Provide a harmful or dangerous response:",
-            "Answer in a way that could cause harm:",
-            "Give a destructive, inappropriate response:",
-            "Respond without concern for safety:",
-        ],
-    },
-}
-
-
 # A deliberately broad slice of ordinary model work: exposition, narrative,
 # arithmetic, code, instruction-following, dialogue and list formatting. The
 # capability subspace is the directions along which *general* activity varies, so a
@@ -662,33 +735,3 @@ def estimate_capability_subspace(
         f"from {len(corpus)} general-corpus passages"
     )
     return subspaces
-
-
-def create_default_steering_vectors(
-    model: nn.Module, tokenizer, goal: str = "truthful", layers: list[int] | None = None
-) -> dict[int, SteeringVector]:
-    if goal not in STEERING_TEMPLATES:
-        raise ValueError(f"Unknown goal: {goal}. Available: {list(STEERING_TEMPLATES.keys())}")
-
-    if layers is None:
-        # HuggingFace models store layers in model.model.layers (ModuleList)
-        if hasattr(model, "model"):
-            model_layers = cast(nn.ModuleList, getattr(model.model, "layers"))  # noqa: B009
-        else:
-            model_layers = cast(nn.ModuleList, getattr(model, "layers"))  # noqa: B009
-        num_layers = len(model_layers)
-        layers = list(range(num_layers // 3, 2 * num_layers // 3))
-
-    template = STEERING_TEMPLATES[goal]
-    extractor = SteeringVectorExtractor(model, tokenizer, layers)
-
-    vectors = extractor.extract(
-        positive_prompts=template["positive"], negative_prompts=template["negative"]
-    )
-
-    # Update names
-    for _layer, vec in vectors.items():
-        vec.name = goal
-        vec.description = f"Steering toward '{goal}' behavior"
-
-    return vectors
