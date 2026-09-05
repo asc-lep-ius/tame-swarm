@@ -162,7 +162,9 @@ def mean_log_odds(
     return float(sum(finite) / len(finite))
 
 
-def _attach(model: nn.Module, directions: dict[int, torch.Tensor], config: SteeringConfig) -> list:
+def attach_steering_hooks(
+    model: nn.Module, directions: dict[int, torch.Tensor], config: SteeringConfig
+) -> list:
     """Attach non-adaptive steering hooks injecting fixed directions, return handles."""
     inner = getattr(model, "model", model)
     layers = getattr(inner, "layers")  # noqa: B009  # model internals absent on nn.Module stubs
@@ -202,7 +204,7 @@ def measure_direction_effect(
     if baseline_log_odds is None:
         baseline_log_odds = mean_log_odds(model, tokenizer, pairs, device, max_length)
 
-    handles = _attach(model, directions, config)
+    handles = attach_steering_hooks(model, directions, config)
     try:
         steered = mean_log_odds(model, tokenizer, pairs, device, max_length)
     finally:

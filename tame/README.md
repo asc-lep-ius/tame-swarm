@@ -22,10 +22,12 @@ This directory contains the full implementation of the TAME multi-scale competen
 | [`mob/utils.py`](mob/utils.py) | Gini coefficient, serialisation helpers | `compute_gini()` |
 | [`mob/mob_config.py`](mob/mob_config.py) | MoBConfig dataclass | `MoBConfig` |
 | [`steering.py`](steering.py) | **Cognitive Homeostasis** — steering vector extraction (prefix + completion-position), P-controller, orthogonal projection | `CognitiveHomeostat`, `SteeringVectorExtractor`, `AdaptiveHomeostat` |
-| [`contrastive_data.py`](contrastive_data.py) | Behavioural pair format, dataset loaders, quality checks | `ContrastivePair`, `ContrastivePairSet`, `HFContrastiveLoader`, `load_contrastive_dataset()` |
-| [`contrastive_templates.py`](contrastive_templates.py) | Built-in behavioural pairs (60/goal, 3 tiers) and the retained instruction-prefix control | `BUILTIN_PAIRS`, `INSTRUCTION_PREFIX_CONTROL` |
-| [`steering_pipeline.py`](steering_pipeline.py) | Load → extract → normalise → goal-similarity report | `extract_steering_vectors()`, `log_goal_similarity()` |
+| [`contrastive_data.py`](contrastive_data.py) | Behavioural pair formats (completion, CAA multiple-choice letter), per-goal certified sources with fallback, quality checks | `ContrastivePair`, `ContrastivePairSet`, `CERTIFIED`, `to_multiple_choice()`, `load_certified_dataset()` |
+| [`contrastive_sources.py`](contrastive_sources.py) | Converters from published datasets (TruthfulQA, hh-rlhf, Geometry of Truth) | `HFContrastiveLoader` |
+| [`contrastive_templates.py`](contrastive_templates.py) | Built-in behavioural pairs (60/goal, 3 tiers), the `deliberation` reasoning proxy, and the retained instruction-prefix control | `BUILTIN_PAIRS`, `INSTRUCTION_PREFIX_CONTROL` |
+| [`steering_pipeline.py`](steering_pipeline.py) | Load (certified source) → extract → normalise → goal-similarity report | `extract_steering_vectors()`, `log_goal_similarity()` |
 | [`behavioural_validation.py`](behavioural_validation.py) | Held-out log-odds gate vs. random and instruction-prefix controls | `validate_steering_vector()`, `mean_log_odds()` |
+| [`outcome_check.py`](outcome_check.py) | Greedy-generation outcome check (length and accuracy deltas) beside the gate | `measure_outcome()`, `greedy_continue()` |
 | [`train.py`](train.py) | Training loop — loss-based wealth updates, confidence calibration, checkpointing | `TAMETrainer`, `TrainingConfig` |
 | [`setup_tame.py`](setup_tame.py) | End-to-end workflow orchestrator (check → train → export) | `run_training()`, `export_for_inference()` |
 | [`chat_ui.py`](chat_ui.py) | Gradio interface with live VCG auction & steering trace visualisation | `create_wealth_distribution_plot()`, `create_steering_trace_plot()` |
@@ -98,24 +100,25 @@ If `orthogonal_projection` is enabled, `v_steer` is first projected to be orthog
 
 Vectors are a difference-in-means, but read at the position where the model *exhibits* the behaviour ([#3](../README.md#phase-1--steering-economy-coupling)):
 
-1. Load behavioural pairs for the goal — shared prompts with contrasting A/B **completions** (`contrastive_data.load_contrastive_dataset`)
-2. For each pair, run `prompt + positive` and `prompt + negative`, reading the activation at the recorded completion position (the answer token, default `-1`)
+1. Load behavioural pairs for the goal from its **certified source and format** (`contrastive_data.CERTIFIED`, via `load_certified_dataset`) — shared prompts with contrasting A/B arms. In the *completion* format the arms are the answers; in the *multiple-choice* format ([#17](../README.md#phase-1--steering-economy-coupling), CAA's own) both answers are `(A)`/`(B)` options in the prompt and the arms are the two letters, balanced within each tier
+2. For each pair, run `prompt + positive` and `prompt + negative`, reading the activation at the recorded completion position (the answer token or the letter, default `-1`)
 3. $v_{\text{steer}} = \text{mean}(h^+) - \text{mean}(h^-)$ over pairs, per layer
 4. L2-normalise, so magnitudes are comparable across goals
 
-`steering_pipeline.extract_steering_vectors` is the default the server uses; `SteeringVectorExtractor.extract` (mean-pooled instruction prefixes) is retained for the negative control. The former instruction-prefix templates now live in `contrastive_templates.INSTRUCTION_PREFIX_CONTROL`.
+`steering_pipeline.extract_steering_vectors` is the default the server uses; it falls back to the built-in templates (in the certified format) when the certified source needs the `train` extra or the HF cache, and marks the result `certified=False`. `SteeringVectorExtractor.extract` (mean-pooled instruction prefixes) is retained for the negative control. The former instruction-prefix templates now live in `contrastive_templates.INSTRUCTION_PREFIX_CONTROL`.
 
 **Available steering goals:**
 
 | Goal | Positive Direction | Negative Direction |
 |------|-------------------|-------------------|
-| `truthful` | Accurate, factual, honest | Fabricated, hallucinated, false |
-| `reasoning` | Step-by-step, analytical, methodical | Quick intuition, no analysis, guessing |
+| `truthful` | Chooses the true answer over the plausible misconception (TruthfulQA, letter format) | Chooses the misconception |
+| `reasoning` | Chooses the worked-out answer over the tempting guess (letter format) | Chooses the intuitive error |
+| `deliberation` | Commits to working the problem out before answering (letter format; the #17 process proxy for reasoning) | Blurts the immediate answer |
 | `safe` | Helpful, beneficial, constructive | Harmful, dangerous, destructive |
 
 **Current limitations:**
 
-- **Goal-dependent vector quality ([#3](../README.md#phase-1--steering-economy-coupling), measured):** the behavioural pipeline is in place (60 pairs/goal, answer-token read, held-out log-odds gate), but the vectors are only as good as the direction is linear. On Qwen3-1.7B `safe` validates robustly, `reasoning` is marginal, and `truthful` fails — a diff-in-means over heterogeneous facts does not yield a transferable truthfulness direction. See [Steering validation](../README.md#steering-validation-3). `truthful` quality is the open item [#4](../README.md#phase-1--steering-economy-coupling) inherits.
+- **Certified scope of each vector ([#3](../README.md#phase-1--steering-economy-coupling), [#17](../README.md#steering-validation-3), measured):** on Qwen3-1.7B `safe` (completion format), `truthful` (TruthfulQA, letter format) and `reasoning` (letter format) clear the held-out log-odds gate against both controls. What the gate certifies is what it measured: `truthful` is a *truthful-choice* direction — it transfers across question sets when the model chooses between stated options, moves free-text answer preference only slightly, and does not reach declarative statements read after the content; `reasoning` is a *correct-choice* direction whose generation outcome check moves accuracy, not length. The `deliberation` process proxy clears the letter gate but not the generation outcome check, so it is uncertified. See [Steering validation](../README.md#steering-validation-3). The certified (source, format) per goal lives in `contrastive_data.CERTIFIED`; a fallback extraction is labelled uncertified.
 - **P-controller only:** The current controller uses proportional control only. Under stochastic sampling (temperature > 0), this produces oscillation around the target without convergence. [Phase 1c](../README.md#phase-1--steering-economy-coupling) upgrades to full PID with anti-windup.
 - **Decoupled from routing:** Steering corrects the output *after* MoB has already routed. The goal state should shape *which experts activate*, not just correct the result. [Phase 1a](../README.md#phase-1--steering-economy-coupling) couples steering alignment into expert confidence computation.
 
@@ -167,7 +170,7 @@ Homeostatic steering traces. Returns alignment history and steering strength (α
 
 ### `POST /steering/update`
 
-Modify steering goals at runtime without restarting the server. Accepts `goal` (string) and `strength` (float). Extracts new steering vectors on-the-fly from contrastive templates.
+Modify steering goals at runtime without restarting the server. Accepts `goal` (string) and `strength` (float). Extracts new steering vectors on-the-fly from the goal's certified source; the response carries `source`, `pair_format` and `certified`, the last being `false` when the server had to fall back to the built-in templates.
 
 ---
 

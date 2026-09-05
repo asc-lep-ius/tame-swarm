@@ -29,9 +29,15 @@ class SimpleCharTokenizer:
 
     all_special_tokens = ["<pad>"]
     pad_token_id = 0
+    eos_token_id = None
 
     def __init__(self, vocab_size: int = 32):
         self.vocab_size = vocab_size
+
+    def decode(self, ids) -> str:
+        # Exact inverse only when vocab_size covers ASCII (>=128); enough for the
+        # greedy-decode tests, which use a 128-token vocabulary.
+        return "".join(chr(int(i)) for i in ids)
 
     def __call__(self, text, return_tensors=None, max_length=None, truncation=False, **_):
         if isinstance(text, list):

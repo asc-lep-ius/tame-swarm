@@ -19,8 +19,15 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 from contrastive_data import (
+    MAX_LETTER_IMBALANCE,
+    Certification,
     ContrastivePairSet,
+    certification_for,
+    letter_counts,
+    letter_imbalance,
+    load_certified_dataset,
     load_contrastive_dataset,
+    resolve_pair_format,
 )
 from steering import SteeringConfig, SteeringVector, SteeringVectorExtractor
 
@@ -44,6 +51,29 @@ class SteeringExtraction:
     source: str
     layers: list[int]
     tier_counts: dict[str, int]
+    pair_format: str
+    # True only when (source, pair_format) is the pair the behavioural gate
+    # certified for this goal (``contrastive_data.CERTIFIED``); a fallback or an
+    # explicit override is measured by nobody and is labelled as such.
+    certified: bool
+    fallback_reason: str | None = None
+
+
+def _load_pairs(
+    goal: str,
+    source: str | None,
+    pair_format: str | None,
+    load_dataset: Callable[..., Iterable[dict]] | None,
+) -> tuple[ContrastivePairSet, bool, str | None]:
+    if source is None:
+        loaded = load_certified_dataset(goal, load_dataset=load_dataset)
+        return loaded.pair_set, loaded.certified, loaded.fallback_reason
+    resolved_format = resolve_pair_format(goal, pair_format)
+    pair_set = load_contrastive_dataset(
+        goal, source=source, load_dataset=load_dataset, pair_format=resolved_format
+    )
+    certified = certification_for(goal) == Certification(source, resolved_format)
+    return pair_set, certified, None
 
 
 def _resolve_layers(model: nn.Module, layers: Sequence[int] | None) -> list[int]:
@@ -62,41 +92,61 @@ def extract_steering_vectors(
     tokenizer,
     goal: str = "truthful",
     config: SteeringConfig | None = None,
-    source: str = "builtin",
+    source: str | None = None,
     layers: Sequence[int] | None = None,
     load_dataset: Callable[..., Iterable[dict]] | None = None,
     max_pairs: int | None = None,
+    pair_format: str | None = None,
 ) -> SteeringExtraction:
     """Extract an L2-normalised behaviour direction for ``goal`` at each layer.
 
-    Loads the pairs (built-in templates, custom registrations, or a HuggingFace
-    dataset), reads each pair at its recorded completion position, differences the
-    means and normalises. ``config.steering_layers`` selects the layers when
-    ``layers`` is not given and a config is supplied; otherwise the middle third
-    of the model is used, matching the former default.
+    With ``source=None`` the pairs come from the goal's *certified* source and
+    format (``contrastive_data.CERTIFIED``), falling back to the built-in set --
+    flagged uncertified -- when that source needs a package or cache this
+    environment lacks. An explicit ``source``/``pair_format`` overrides both, and
+    counts as certified only if it happens to name the certified pair. Each pair
+    is read at its recorded position, the means differenced and normalised.
+    ``config.steering_layers`` selects the layers when ``layers`` is not given and
+    a config is supplied; otherwise the middle third of the model is used.
     """
     if config is not None and layers is None and config.steering_layers:
         layers = list(config.steering_layers)
     resolved = _resolve_layers(model, layers)
 
-    pair_set: ContrastivePairSet = load_contrastive_dataset(
-        goal, source=source, load_dataset=load_dataset
-    )
+    pair_set, certified, fallback_reason = _load_pairs(goal, source, pair_format, load_dataset)
     pairs = pair_set.pairs if max_pairs is None else pair_set.pairs[:max_pairs]
+    if not pairs:
+        raise ValueError(f"goal {goal!r}: no pairs to extract from (max_pairs={max_pairs})")
+    if pair_set.is_multiple_choice and letter_imbalance(pairs) > MAX_LETTER_IMBALANCE:
+        logger.warning(
+            "Goal %r: correct letters are unbalanced over the %d pairs being averaged "
+            "(%s); the vector carries some of the bare A-minus-B direction",
+            goal,
+            len(pairs),
+            letter_counts(pairs),
+        )
 
     extractor = SteeringVectorExtractor(model, tokenizer, resolved)
     vectors = extractor.extract_from_pairs(pairs)
+    resolved_format = pairs[0].pair_format
+    status = "certified" if certified else "UNCERTIFIED"
     for vector in vectors.values():
         vector.name = goal
-        vector.description = f"Behavioural steering toward '{goal}' ({len(pairs)} pairs, {source})"
+        vector.description = (
+            f"Behavioural steering toward '{goal}' ({len(pairs)} {resolved_format} pairs, "
+            f"{pair_set.source}, {status})"
+        )
 
     return SteeringExtraction(
         goal=goal,
         vectors=vectors,
         pair_count=len(pairs),
-        source=source,
+        source=pair_set.source,
         layers=resolved,
         tier_counts=pair_set.tier_counts(),
+        pair_format=resolved_format,
+        certified=certified,
+        fallback_reason=fallback_reason,
     )
 
 
