@@ -50,6 +50,12 @@ from steering_pipeline import (  # noqa: E402
     extract_steering_vectors,
     serving_config,
 )
+from steering_probe import (  # noqa: E402
+    ProjectionProbe,
+    chat_prompt,
+    greedy_forced_sequences,
+    step_schedule,
+)
 
 LEGACY_LAYERS = list(range(6, 22))  # the MoB range the server reused for steering before #4
 LEGACY = dict(base_strength=0.3, kp=0.5, target_alignment=0.7, max_strength=1.5, min_strength=0.0)
@@ -76,68 +82,6 @@ def held_out_pairs(goal: str, count: int):
     return [pair for index, pair in enumerate(pairs) if index % k == 0][:count]
 
 
-def chat_prompt(tokenizer, question: str) -> str:
-    return tokenizer.apply_chat_template(
-        [{"role": "user", "content": question}],
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=False,
-    )
-
-
-class Recorder:
-    """Per-position projections onto a direction per layer, with a per-position injection."""
-
-    def __init__(self, model, directions: dict[int, torch.Tensor]):
-        self.model = model
-        self.directions = directions
-        self.records: dict[int, torch.Tensor] = {}
-        self.inject: dict[int, torch.Tensor] = {}
-        self.inject_dirs: dict[int, torch.Tensor] = {}
-
-    def _hook(self, layer):
-        def hook(module, inputs, output):
-            hidden = output[0] if isinstance(output, tuple) else output
-            if layer in self.inject:
-                schedule = self.inject[layer].to(hidden.device, hidden.dtype)
-                hidden = hidden + schedule[None, :, None] * self.inject_dirs[layer].to(
-                    hidden.device, hidden.dtype
-                )
-            if layer in self.directions:
-                direction = self.directions[layer].to(hidden.device, hidden.dtype)
-                self.records[layer] = (hidden[0] @ direction).detach().float().cpu()
-            if layer in self.inject:
-                return (hidden,) + tuple(output[1:]) if isinstance(output, tuple) else hidden
-            return output
-
-        return hook
-
-    def run(self, input_ids: torch.Tensor):
-        self.records = {}
-        layers = self.model.model.layers
-        handles = [
-            layers[layer].register_forward_hook(self._hook(layer))
-            for layer in sorted(set(self.directions) | set(self.inject))
-        ]
-        try:
-            with torch.no_grad():
-                logits = self.model(input_ids=input_ids).logits
-        finally:
-            for handle in handles:
-                handle.remove()
-        return dict(self.records), logits
-
-
-def forced_sequences(model, tokenizer, device, questions, tokens):
-    out = []
-    for question in questions:
-        ids = tokenizer(chat_prompt(tokenizer, question), return_tensors="pt").to(device)
-        with torch.no_grad():
-            generated = model.generate(**ids, max_new_tokens=tokens, do_sample=False)
-        out.append((generated, int(ids.input_ids.shape[1])))
-    return out
-
-
 def first_index(mask: torch.Tensor, default: int) -> int:
     hits = mask.nonzero()
     return int(hits.min().item()) if len(hits) else default
@@ -145,18 +89,18 @@ def first_index(mask: torch.Tensor, default: int) -> int:
 
 def step_response(model, config, directions, forced, strengths, readout):
     """Teacher-forced step at the first generated token: gain, dead time, tau63 at the readout."""
-    recorder = Recorder(model, {readout: directions[readout]})
+    probe = ProjectionProbe(model, {readout: directions[readout]})
     rows = []
     for strength in strengths:
         deltas = []
         for ids, plen in forced:
-            recorder.inject, recorder.inject_dirs = {}, {}
-            base, _ = recorder.run(ids)
-            schedule = torch.zeros(ids.shape[1])
-            schedule[plen:] = strength
-            recorder.inject = dict.fromkeys(config.steering_layers, schedule)
-            recorder.inject_dirs = {layer: directions[layer] for layer in config.steering_layers}
-            stepped, _ = recorder.run(ids)
+            base, _ = probe.forward(ids)
+            schedule = step_schedule(ids.shape[1], plen, strength)
+            stepped, _ = probe.forward(
+                ids,
+                inject=dict.fromkeys(config.steering_layers, schedule),
+                inject_directions={layer: directions[layer] for layer in config.steering_layers},
+            )
             deltas.append(stepped[readout][plen:] - base[readout][plen:])
         # A continuation that hit end-of-text early is shorter; compare on the common span.
         horizon = min(len(delta) for delta in deltas)
@@ -215,7 +159,8 @@ def trace_stats(values: Sequence[float], low: float, high: float) -> dict:
 
 def sample(model, tokenizer, device, question, tokens, seed):
     torch.manual_seed(seed)
-    ids = tokenizer(chat_prompt(tokenizer, question), return_tensors="pt").to(device)
+    prompt = chat_prompt(tokenizer, question, enable_thinking=False)
+    ids = tokenizer(prompt, return_tensors="pt").to(device)
     with torch.no_grad():
         model.generate(**ids, max_new_tokens=tokens, **SAMPLING)
 
@@ -314,15 +259,13 @@ def cross_goal(model, tokenizer, device, config, forced, goals, strength):
     for goal in goals:
         pairs = list(load_contrastive_dataset(goal, source=serving_source(goal)))
         readouts[goal] = extractor.extract_from_pairs(pairs[:200])[readout].vector
-    recorder = Recorder(model, {})
     # resting sigma of each goal at the readout (slow), unsteered
     sigma, resting = {}, {}
     for goal in goals:
-        recorder.directions = {readout: readouts[goal]}
-        recorder.inject, recorder.inject_dirs = {}, {}
+        probe = ProjectionProbe(model, {readout: readouts[goal]})
         means = []
         for ids, plen in forced:
-            rec, _ = recorder.run(ids)
+            rec, _ = probe.forward(ids)
             means.append(rec[readout][plen:].mean())
         resting[goal] = torch.stack(means)
         sigma[goal] = resting[goal].std().item()
@@ -335,16 +278,17 @@ def cross_goal(model, tokenizer, device, config, forced, goals, strength):
         goal_config, goal_vectors = vectors[source_goal]
         matrix[source_goal] = {}
         for target_goal in goals:
-            recorder.directions = {readout: readouts[target_goal]}
+            probe = ProjectionProbe(model, {readout: readouts[target_goal]})
             lifts = []
             for index, (ids, plen) in enumerate(forced):
-                schedule = torch.zeros(ids.shape[1])
-                schedule[plen:] = strength
-                recorder.inject = dict.fromkeys(goal_config.steering_layers, schedule)
-                recorder.inject_dirs = {
-                    layer: goal_vectors[layer].vector for layer in goal_config.steering_layers
-                }
-                rec, _ = recorder.run(ids)
+                schedule = step_schedule(ids.shape[1], plen, strength)
+                rec, _ = probe.forward(
+                    ids,
+                    inject=dict.fromkeys(goal_config.steering_layers, schedule),
+                    inject_directions={
+                        layer: goal_vectors[layer].vector for layer in goal_config.steering_layers
+                    },
+                )
                 lifts.append(rec[readout][plen:].mean() - resting[target_goal][index])
             matrix[source_goal][target_goal] = torch.stack(lifts).mean().item() / sigma[target_goal]
         print(
@@ -384,12 +328,12 @@ def value_test(model, tokenizer, device, homeostat, config, pairs, rationale_tok
     """Adaptive vs constant strength on the letter choice, split by resting alignment."""
     readout = config.readout_layer
     direction = homeostat.steering_vectors[readout].vector
-    recorder = Recorder(model, {readout: direction})
+    probe = ProjectionProbe(model, {readout: direction})
     resting = []
     for pair in pairs:
         prompt = pair.prompt.rsplit("Answer:", 1)[0] + RATIONALE_CUE
         ids = tokenizer(prompt, return_tensors="pt").to(device)
-        rec, _ = recorder.run(ids.input_ids)
+        rec, _ = probe.forward(ids.input_ids)
         resting.append(homeostat.calibration.z(readout, rec[readout][-1].item()))
     resting_t = torch.tensor(resting)
     low = resting_t <= resting_t.median()
@@ -503,7 +447,9 @@ def main() -> None:
 
     pairs = held_out_pairs(args.goal, 200)
     questions = [pair.prompt for pair in pairs[:: max(1, 200 // args.prompts)]][: args.prompts]
-    forced = forced_sequences(model, tokenizer, device, questions, args.tokens)
+    forced = greedy_forced_sequences(
+        model, tokenizer, device, questions, args.tokens, enable_thinking=False
+    )
     directions = {layer: vector.vector for layer, vector in extraction.vectors.items()}
     strengths = [float(value) for value in args.strengths.split(",")]
 

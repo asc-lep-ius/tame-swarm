@@ -517,7 +517,8 @@ class Certification:
 # adversarial by construction and 817 rows deep.
 BUILTIN_SOURCE = "builtin"
 # #17 measured every goal at layers 14/18/22, strength 4.0. #4 swept ``truthful``
-# layer by layer on Qwen3-1.7B: the direction steers the *wrong* way below layer 13,
+# layer by layer on Qwen3-1.7B (``scripts/sweep_steering_layers.py``): the direction
+# steers the *wrong* way below layer 13,
 # reads prompt wording at 12 (the prefix control outscores it), passes alone at 13
 # and 16-21, and is null from 22 up. As a set, 13 + 16-21 passes the gate at every
 # strength from 2 to 8 with the prefix control below zero; the band stops at 6

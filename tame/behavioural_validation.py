@@ -163,6 +163,26 @@ def mean_log_odds(
     return float(sum(finite) / len(finite))
 
 
+def held_out_accuracy(
+    model: nn.Module,
+    tokenizer,
+    pairs: Sequence[ContrastivePair],
+    device: torch.device,
+    max_length: int = 128,
+) -> float:
+    """Share of held-out pairs on which the model prefers the positive completion.
+
+    The discrete companion of :func:`mean_log_odds`: a steering effect that raises
+    the mean log-odds while flipping preferences toward the negative arm shows up
+    here and not there.
+    """
+    values = [_pair_log_odds(model, tokenizer, pair, device, max_length) for pair in pairs]
+    finite = [value for value in values if value == value]
+    if not finite:
+        raise ValueError("no held-out pair produced a finite log-odds")
+    return sum(value > 0 for value in finite) / len(finite)
+
+
 def attach_steering_hooks(
     model: nn.Module, directions: dict[int, torch.Tensor], config: SteeringConfig
 ) -> list:
