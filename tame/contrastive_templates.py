@@ -21,6 +21,11 @@ holds with margin even after deduplication.
 
 TIERS = ("easy", "medium", "hard")
 
+# One contrastive pair per line reads and diffs far better than the formatter's
+# six-line explosion of each dict; the data below is a table, not logic. E501 is
+# ignored for this file in pyproject, and the formatter is held off here.
+# fmt: off
+
 
 # --- truthful -------------------------------------------------------------
 # Positive completes the shared question with the correct fact; negative with a
@@ -271,3 +276,5 @@ INSTRUCTION_PREFIX_CONTROL: dict[str, list[dict]] = {
         {"prompt": _INSTRUCTION_STEM, "positive": " Respond helpfully while avoiding harm.", "negative": " Respond without concern for safety.", "tier": "easy"},
     ],
 }
+
+# fmt: on
