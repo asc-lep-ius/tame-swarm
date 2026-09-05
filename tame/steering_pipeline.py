@@ -12,7 +12,7 @@ this is the seam where the two meet.
 
 import logging
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import torch.nn as nn
@@ -20,7 +20,6 @@ from torch.nn import functional as F
 
 from contrastive_data import (
     MAX_LETTER_IMBALANCE,
-    Certification,
     ContrastivePairSet,
     certification_for,
     letter_counts,
@@ -72,7 +71,11 @@ def _load_pairs(
     pair_set = load_contrastive_dataset(
         goal, source=source, load_dataset=load_dataset, pair_format=resolved_format
     )
-    certified = certification_for(goal) == Certification(source, resolved_format)
+    certification = certification_for(goal)
+    certified = certification is not None and (certification.source, certification.pair_format) == (
+        source,
+        resolved_format,
+    )
     return pair_set, certified, None
 
 
@@ -106,11 +109,16 @@ def extract_steering_vectors(
     environment lacks. An explicit ``source``/``pair_format`` overrides both, and
     counts as certified only if it happens to name the certified pair. Each pair
     is read at its recorded position, the means differenced and normalised.
-    ``config.steering_layers`` selects the layers when ``layers`` is not given and
-    a config is supplied; otherwise the middle third of the model is used.
+    ``config.steering_layers`` (plus ``config.readout_layer``) selects the layers
+    when ``layers`` is not given and a config is supplied; otherwise the middle
+    third of the model is used.
     """
     if config is not None and layers is None and config.steering_layers:
         layers = list(config.steering_layers)
+        # The sensor reads a layer above the actuators; it needs the goal direction
+        # there too, or the homeostat would have to fall back to the top actuator.
+        if config.readout_layer is not None and config.readout_layer not in layers:
+            layers.append(config.readout_layer)
     resolved = _resolve_layers(model, layers)
 
     pair_set, certified, fallback_reason = _load_pairs(goal, source, pair_format, load_dataset)
@@ -183,3 +191,89 @@ def log_goal_similarity(
         for j in range(i + 1, len(goals)):
             pairwise[(row_goal, goals[j])] = float(matrix[i, j].item())
     return pairwise
+
+
+def serving_config(
+    goal: str, template: SteeringConfig, model_id: str | None = None
+) -> SteeringConfig:
+    """The config a server should steer ``goal`` with: certified layers and band, else the template.
+
+    The layers, reference strength and strength band come from the goal's
+    certification record, so what is served is what the gate passed. A goal whose
+    band was never swept is held at its certified strength (``min == max``); a goal
+    with no certification at all keeps the template's layers and band and is
+    already reported uncertified by :func:`extract_steering_vectors`. The record
+    names the model it was measured on; serving another model gets the same
+    numbers and a warning, because the alternative -- the template's layers --
+    was measured on nothing at all.
+    """
+    certification = certification_for(goal)
+    if certification is None or certification.layers is None:
+        return replace(template)
+    if model_id is not None and certification.model is not None and model_id != certification.model:
+        logger.warning(
+            "Goal %r: layers %s and strength band were certified on %s, not %s; "
+            "serving them unverified",
+            goal,
+            certification.layers,
+            certification.model,
+            model_id,
+        )
+    strength = (
+        certification.strength if certification.strength is not None else template.base_strength
+    )
+    low, high = certification.strength_band or (strength, strength)
+    return replace(
+        template,
+        steering_layers=list(certification.layers),
+        readout_layer=certification.readout_layer,
+        base_strength=strength,
+        min_strength=low,
+        max_strength=high,
+    )
+
+
+def calibration_texts(
+    model: nn.Module,
+    tokenizer,
+    goal: str,
+    num_prompts: int = 24,
+    new_tokens: int = 32,
+    chat_kwargs: dict | None = None,
+    load_dataset: Callable[..., Iterable[dict]] | None = None,
+) -> list[str]:
+    """Texts that sample the *served* regime for ``goal``: its own prompts, answered.
+
+    The resting distribution the homeostat is calibrated against must be the one it
+    will read at inference. General prose without the chat template is not: #4
+    measured chat-formatted answers sitting about two sigma above it along the
+    truthful direction, which pinned the loop at the floor of its band. So the
+    calibration corpus is the goal's contrastive prompts, wrapped in the chat
+    template when the tokenizer has one, each followed by the model's own greedy
+    continuation. Prompts are spread over the certified set so no tier dominates.
+    """
+    pair_set, _, _ = _load_pairs(goal, None, None, load_dataset)
+    prompts = [pair.prompt for pair in pair_set.pairs]
+    stride = max(1, len(prompts) // num_prompts)
+    chosen = prompts[::stride][:num_prompts]
+    template = getattr(tokenizer, "chat_template", None)
+    texts = []
+    for prompt in chosen:
+        if template:
+            text = tokenizer.apply_chat_template(
+                [{"role": "user", "content": prompt}],
+                tokenize=False,
+                add_generation_prompt=True,
+                **(chat_kwargs or {}),
+            )
+        else:
+            text = prompt
+        if new_tokens > 0 and hasattr(model, "generate"):
+            inputs = tokenizer(text, return_tensors="pt").to(next(model.parameters()).device)
+            with torch.no_grad():
+                generated = model.generate(  # pyright: ignore[reportCallIssue] # HF stubs
+                    **inputs, max_new_tokens=new_tokens, do_sample=False
+                )
+            text = tokenizer.decode(generated[0], skip_special_tokens=False)
+        texts.append(text)
+    return texts

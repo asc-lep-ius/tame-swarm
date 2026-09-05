@@ -169,7 +169,7 @@ def create_steering_trace_plot(
 
     strength_history = steering_trace["strength_history"]
     alignment_history = steering_trace.get("alignment_history", [])
-    target_alignment = steering_trace.get("target_alignment", 0.7)
+    target_alignment = steering_trace.get("target_alignment")
 
     # Downsample for performance
     max_points = 100 if simplified else 500
@@ -211,8 +211,8 @@ def create_steering_trace_plot(
             secondary_y=True,
         )
 
-        # Target alignment line - skip during simplified mode
-        if not simplified:
+        # Setpoint line - skip during simplified mode or when the loop has none
+        if not simplified and target_alignment is not None:
             fig.add_hline(
                 y=target_alignment,
                 line_dash="dash",
@@ -307,7 +307,9 @@ def get_homeostasis_status() -> str:
                 "**Homeostasis Status**",
                 f"- Base Strength: {config['base_strength']}",
                 f"- Adaptive: {config['adaptive']}",
-                f"- Target Alignment: {config['target_alignment']}",
+                f"- Setpoint: {config.get('setpoint', config.get('target_alignment'))}",
+                f"- Layers: {config.get('steering_layers')} "
+                f"(readout {config.get('readout_layer')})",
             ]
 
             if stats:
@@ -346,7 +348,7 @@ def stream_chat(
             "return_stats": show_stats,
         }
 
-        if steering_strength >= 0:
+        if steering_strength > 0:
             payload["steering_strength"] = steering_strength
 
         # Use streaming endpoint with much longer timeout (10 minutes)
@@ -511,12 +513,17 @@ def create_ui():
                     preset_extended = gr.Button("Extended (2048)", size="sm")
                     preset_max = gr.Button("Max (4096)", size="sm")
 
+                # The served reference strength and band come from the goal's
+                # certification (2-6 for truthful); 0 leaves the served configuration.
+                # The slider deliberately reaches past the band: a per-request
+                # override is an experiment knob, and /generate holds it for one
+                # request only, unlike /steering/update which refuses it.
                 steering_strength = gr.Slider(
-                    minimum=-0.1,
-                    maximum=1.5,
-                    value=-0.1,
-                    step=0.1,
-                    label="Steering Strength (-0.1 = adaptive)",
+                    minimum=0.0,
+                    maximum=8.0,
+                    value=0.0,
+                    step=0.25,
+                    label="Steering Strength (0 = served configuration)",
                 )
 
                 show_stats = gr.Checkbox(value=True, label="Show MoB Stats")

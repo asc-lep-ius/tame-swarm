@@ -236,7 +236,8 @@ Profiles are defined in [`config.py`](config.py). Change `ACTIVE_MODEL` to switc
 
 | Profile | `hidden_dim` | `intermediate_dim` | MoB Layers | Adapter Rank | ~VRAM (inference) | Notes |
 |---------|-------------|--------------------:|:----------:|:------------:|:-----------------:|-------|
-| `gemma-2-2b` | 2304 | 9216 | 5–18 (13 layers) | 32 | ~8 GB | Fastest; no approval needed |
+| `qwen3-1.7b` (active) | 2048 | 6144 | 6–22 (16 layers) | 32 | ~7 GB | Ungated; every README measurement is on it |
+| `gemma-2-2b` | 2304 | 9216 | 5–18 (13 layers) | 32 | ~8 GB | Fast; requires accepting a licence |
 | `llama-3.2-3b` | 3072 | 8192 | 6–20 (14 layers) | 32 | ~10 GB | Requires Meta access |
 | `mistral-7b` | 4096 | 14336 | 8–24 (16 layers) | 32 | ~16 GB | Best quality; most VRAM |
 

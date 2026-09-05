@@ -210,3 +210,48 @@ def test_pipeline_rejects_max_pairs_zero():
             source="builtin",
             max_pairs=0,
         )
+
+
+def test_pipeline_extracts_the_readout_layer_alongside_the_actuators():
+    model = MonotonicModel(vocab_size=64, hidden_dim=8, num_layers=6)
+    extraction = extract_steering_vectors(
+        model,
+        SimpleCharTokenizer(64),
+        goal="safe",
+        config=SteeringConfig(steering_layers=[1, 2], readout_layer=3),
+        source="builtin",
+    )
+    assert sorted(extraction.vectors) == [1, 2, 3]
+    assert extraction.layers == [1, 2, 3]
+
+
+def test_serving_config_takes_layers_and_band_from_the_certification():
+    from steering_pipeline import serving_config
+
+    template = SteeringConfig(steering_layers=[6, 7], base_strength=0.3, max_strength=1.5)
+
+    truthful = serving_config("truthful", template)
+    assert truthful.steering_layers == [13, 16, 17, 18, 19, 20, 21]
+    assert truthful.readout_layer == 22
+    assert (truthful.base_strength, truthful.min_strength, truthful.max_strength) == (4.0, 2.0, 6.0)
+
+    # Certified at one strength with no swept band: served constant at that strength.
+    reasoning = serving_config("reasoning", template)
+    assert reasoning.steering_layers == [14, 18, 22]
+    assert reasoning.min_strength == reasoning.max_strength == 4.0
+
+    # No certification at all: the template stands, and extraction reports it uncertified.
+    assert serving_config("deliberation", template).steering_layers == [6, 7]
+    assert template.steering_layers == [6, 7]
+
+
+def test_calibration_texts_sample_the_goal_prompts_in_the_served_format():
+    from steering_pipeline import calibration_texts
+
+    model = MonotonicModel(vocab_size=64, hidden_dim=8, num_layers=6)
+    texts = calibration_texts(model, SimpleCharTokenizer(64), goal="safe", num_prompts=6)
+
+    assert len(texts) == 6
+    assert len(set(texts)) == 6
+    # No chat template and no generate on the fake: the prompts themselves, unchanged.
+    assert all("Human:" in text or "Q:" in text for text in texts)
