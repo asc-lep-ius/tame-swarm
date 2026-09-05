@@ -95,8 +95,12 @@ def test_goal_similarity_matrix_is_symmetric_with_unit_diagonal():
     model = MonotonicModel(vocab_size=64, hidden_dim=8, num_layers=6)
     tokenizer = SimpleCharTokenizer(64)
     config = SteeringConfig(steering_layers=[2])
+    # Explicit built-in source: the certified truthful source is a HF dataset, and a
+    # unit test must not reach for the network or the cache.
     vectors_by_goal = {
-        goal: extract_steering_vectors(model, tokenizer, goal=goal, config=config).vectors
+        goal: extract_steering_vectors(
+            model, tokenizer, goal=goal, config=config, source="builtin"
+        ).vectors
         for goal in ("truthful", "reasoning", "safe")
     }
     goals, matrix = goal_similarity_matrix(vectors_by_goal, layer=2)
@@ -115,3 +119,94 @@ def test_steering_vector_keeps_a_zero_diff_inert_instead_of_nan():
     sv = SteeringVector("degenerate", torch.zeros(8), layer=0)
     assert torch.all(sv.vector == 0)
     assert torch.isfinite(sv.vector).all()
+
+
+def _tqa_rows(count):
+    return [
+        {
+            "question": f"Q{i}?",
+            "mc1_targets": {"choices": [f"right{i}", f"wrong{i}"], "labels": [1, 0]},
+        }
+        for i in range(count)
+    ]
+
+
+def test_pipeline_default_source_is_the_certified_one():
+    model = MonotonicModel(vocab_size=64, hidden_dim=8, num_layers=6)
+    extraction = extract_steering_vectors(
+        model,
+        SimpleCharTokenizer(64),
+        goal="truthful",
+        config=SteeringConfig(steering_layers=[2]),
+        load_dataset=lambda *a, **k: _tqa_rows(12),
+    )
+    assert extraction.source == "truthful_qa"
+    assert extraction.pair_format == "multiple_choice"
+    assert extraction.certified and extraction.fallback_reason is None
+    assert "certified" in extraction.vectors[2].description
+
+
+def test_pipeline_falls_back_to_builtin_and_flags_the_vector_uncertified():
+    def offline(*_a, **_k):
+        raise OSError("no cache")
+
+    model = MonotonicModel(vocab_size=64, hidden_dim=8, num_layers=6)
+    extraction = extract_steering_vectors(
+        model,
+        SimpleCharTokenizer(64),
+        goal="truthful",
+        config=SteeringConfig(steering_layers=[2]),
+        load_dataset=offline,
+    )
+    assert extraction.source == "builtin"
+    assert extraction.pair_format == "multiple_choice"
+    assert not extraction.certified
+    assert extraction.fallback_reason and "truthful_qa unavailable" in extraction.fallback_reason
+    assert "UNCERTIFIED" in extraction.vectors[2].description
+
+
+def test_pipeline_explicit_override_is_certified_only_when_it_names_the_certified_pair():
+    model = MonotonicModel(vocab_size=64, hidden_dim=8, num_layers=6)
+    tokenizer = SimpleCharTokenizer(64)
+    config = SteeringConfig(steering_layers=[2])
+    certified = extract_steering_vectors(
+        model, tokenizer, goal="safe", config=config, source="builtin"
+    )
+    assert certified.certified and certified.pair_format == "completion"
+    overridden = extract_steering_vectors(
+        model,
+        tokenizer,
+        goal="safe",
+        config=config,
+        source="builtin",
+        pair_format="multiple_choice",
+    )
+    assert not overridden.certified and overridden.pair_format == "multiple_choice"
+
+
+def test_pipeline_reports_a_goal_outside_certified_as_uncertified():
+    model = MonotonicModel(vocab_size=64, hidden_dim=8, num_layers=6)
+    extraction = extract_steering_vectors(
+        model,
+        SimpleCharTokenizer(64),
+        goal="deliberation",
+        config=SteeringConfig(steering_layers=[2]),
+    )
+    assert not extraction.certified
+    assert extraction.fallback_reason and "no certified" in extraction.fallback_reason
+    assert "UNCERTIFIED" in extraction.vectors[2].description
+
+
+def test_pipeline_rejects_max_pairs_zero():
+    import pytest
+
+    model = MonotonicModel(vocab_size=64, hidden_dim=8, num_layers=6)
+    with pytest.raises(ValueError, match="no pairs"):
+        extract_steering_vectors(
+            model,
+            SimpleCharTokenizer(64),
+            goal="safe",
+            config=SteeringConfig(steering_layers=[2]),
+            source="builtin",
+            max_pairs=0,
+        )

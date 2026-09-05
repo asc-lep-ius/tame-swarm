@@ -1,7 +1,8 @@
 """Warm the HuggingFace cache with the contrastive A/B datasets.
 
-The `train` Docker target and any run that loads pairs with ``source="truthful_qa"``
-or ``source="Anthropic/hh-rlhf"`` read these from the mounted HF cache volume. This
+The `train` Docker target and any run that loads pairs with ``source="truthful_qa"``,
+``source="geometry_of_truth/<name>"`` or ``source="Anthropic/hh-rlhf"`` read these
+from the mounted HF cache volume. This
 downloads them once so the first run does not block on the network, and so an
 offline run finds them locally. It is deliberately *not* baked into the image: the
 cache is a volume shared across the dev, train and validation containers, which
@@ -11,6 +12,9 @@ Run:  uv run python scripts/warm_hf_datasets.py
 """
 
 import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tame"))
 
 
 def main() -> int:
@@ -23,6 +27,15 @@ def main() -> int:
     print("Warming truthful_qa (multiple_choice, validation) ...")
     truthful = load_dataset("truthful_qa", "multiple_choice", split="validation")
     print(f"  cached {len(truthful)} rows")
+
+    print("Warming Geometry of Truth statement sets (cities, sp_en_trans) ...")
+    from contrastive_sources import GEOMETRY_OF_TRUTH_URL  # noqa: PLC0415
+
+    for name in ("cities", "sp_en_trans"):
+        statements = load_dataset(
+            "csv", data_files=GEOMETRY_OF_TRUTH_URL.format(name=name), split="train"
+        )
+        print(f"  cached {name}: {len(statements)} rows")
 
     print("Warming Anthropic/hh-rlhf (harmless-base, train) ...")
     # Stream and touch a bounded prefix: the converter streams too, so the files
