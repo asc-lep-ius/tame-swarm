@@ -1,9 +1,12 @@
-"""The goal loop: calibrated setpoint, one strength per goal, local fallback after damage.
+"""The goal tissue: coupled per-layer cells, a shared pattern, one rule with no fallback.
 
-Where a property can be stated against the measured plant it is asserted with a
-simulated one; where it concerns the wiring it runs on the identity-layer fakes,
-whose response to an injection is exactly the additive passthrough, so the gain
-the calibration should recover is known in closed form.
+Every steered layer is a cell that senses its own reading and runs its own
+integrator; the integrators are diffusively coupled, so the tissue-level loop is
+the consensus they converge on rather than a privileged sensor. Where a property
+can be stated against the measured plant it is asserted with a simulated tissue;
+where it concerns the wiring it runs on the identity-layer fakes, whose response
+to an injection is exactly the additive passthrough, so every lift the
+calibration should recover is known in closed form.
 """
 
 import pytest
@@ -23,42 +26,68 @@ from steering import SteeringConfig, SteeringVector
 from .steering_fakes import MonotonicModel, SimpleCharTokenizer
 
 HIDDEN = 8
+ACTUATORS = (1, 2)
+READOUT = 3
+# Identity layers with one shared direction: the lift a cell reads per unit of
+# strength is the number of actuators below it.
+LIFTS = {1: 0.0, 2: 1.0, 3: 2.0}
 
 
 def unit(vector: torch.Tensor) -> torch.Tensor:
     return vector / vector.norm()
 
 
-def calibration(
-    gain: float, sigma: float = 1.0, base: float = 2.0, layers=(1, 2)
-) -> AlignmentCalibration:
+def calibration(base: float = 2.0, sigma: float = 1.0) -> AlignmentCalibration:
     return AlignmentCalibration(
         layers={
-            layer: LayerCalibration(resting_mean=0.0, resting_sigma=sigma, token_sigma=sigma)
-            for layer in (*layers, max(layers) + 1)
+            layer: LayerCalibration(
+                resting_mean=0.0, resting_sigma=sigma, token_sigma=sigma, lift=LIFTS[layer]
+            )
+            for layer in (*ACTUATORS, READOUT)
         },
-        readout_layer=max(layers) + 1,
-        gain=gain,
+        actuators=ACTUATORS,
+        sensors=(*ACTUATORS, READOUT),
         reference_strength=base,
         num_passages=4,
     )
 
 
-class Plant:
-    """The measured shape: the readout sees ``resting + content + gain * last strength``."""
+class Tissue:
+    """The measured plant, cell by cell: each reading is content plus the effort below it."""
 
-    def __init__(self, gain: float, direction: torch.Tensor, content: float = 0.0):
-        self.gain, self.direction, self.content = gain, direction, content
-        self.last_strength = 0.0
+    def __init__(self, homeostat: AdaptiveHomeostat, direction: torch.Tensor, content=0.0):
+        self.homeostat, self.direction = homeostat, direction
+        if isinstance(content, dict):
+            self.content = dict(content)
+        else:
+            self.content = dict.fromkeys((*ACTUATORS, READOUT), float(content))
+        self.strengths: dict[int, float] = dict.fromkeys(ACTUATORS, 0.0)
+        self.dead: set[int] = set()
 
-    def hidden(self) -> torch.Tensor:
-        projection = self.content + self.gain * self.last_strength
-        return (projection * self.direction).view(1, 1, -1)
+    def hidden(self, layer: int) -> torch.Tensor:
+        below = sum(self.strengths[lower] for lower in ACTUATORS if lower < layer)
+        return ((self.content[layer] + below) * self.direction).view(1, 1, -1)
+
+    def step(self) -> None:
+        for layer in (*ACTUATORS, READOUT):
+            if layer in self.dead:
+                # A removed hook neither senses nor injects.
+                if layer in ACTUATORS:
+                    self.strengths[layer] = 0.0
+                continue
+            strength = self.homeostat.sense(layer, self.hidden(layer), self.direction)
+            if layer in ACTUATORS:
+                self.strengths[layer] = strength
+
+    def run(self, passes: int) -> None:
+        for _ in range(passes):
+            self.step()
 
 
-def loop_config(**overrides) -> SteeringConfig:
+def tissue_config(**overrides) -> SteeringConfig:
     defaults = dict(
-        steering_layers=[1, 2],
+        steering_layers=list(ACTUATORS),
+        readout_layer=READOUT,
         base_strength=2.0,
         min_strength=0.0,
         max_strength=4.0,
@@ -70,14 +99,18 @@ def loop_config(**overrides) -> SteeringConfig:
     return SteeringConfig(**defaults)
 
 
+def make(content=0.0, **overrides) -> tuple[AdaptiveHomeostat, Tissue]:
+    direction = unit(torch.randn(HIDDEN))
+    homeostat = AdaptiveHomeostat(tissue_config(**overrides), calibration=calibration())
+    return homeostat, Tissue(homeostat, direction, content)
+
+
 def test_uncalibrated_loop_keeps_the_legacy_cosine_contract():
     """Without a calibration the loop regulates cos(h, v) toward target_alignment, as before."""
-    config = SteeringConfig(
-        adaptive=True, target_alignment=0.99, base_strength=0.3, max_strength=5.0
-    )
+    config = SteeringConfig(adaptive=True, target_alignment=0.99, base_strength=0.3, max_strength=5)
     homeostat = AdaptiveHomeostat(config)
     direction = unit(torch.randn(HIDDEN))
-    orthogonal = unit(torch.randn(HIDDEN) - 0 * direction)
+    orthogonal = unit(torch.randn(HIDDEN))
     orthogonal = unit(orthogonal - (orthogonal @ direction) * direction)
 
     strength = homeostat.compute_strength(orthogonal.view(1, 1, -1), direction)
@@ -87,147 +120,138 @@ def test_uncalibrated_loop_keeps_the_legacy_cosine_contract():
     assert not homeostat.calibrated
 
 
-def test_calibrated_loop_settles_at_the_reference_strength_on_resting_content():
-    """The setpoint is the lift the reference strength produces: no deficit, no correction."""
-    config = loop_config()
-    direction = unit(torch.randn(HIDDEN))
-    homeostat = AdaptiveHomeostat(config, calibration=calibration(gain=0.5))
-    plant = Plant(gain=0.5, direction=direction)
-
-    for _ in range(60):
-        plant.last_strength = homeostat.compute_strength(plant.hidden(), direction)
-
-    assert plant.last_strength == pytest.approx(config.base_strength, abs=1e-3)
-    assert abs(homeostat.controller.snapshot(homeostat.goal).error) < 1e-3
+def test_per_cell_setpoints_are_the_lift_each_cell_reads_at_the_reference_strength():
+    homeostat, _ = make()
+    assert homeostat.cell_setpoint(1) == 0.0
+    assert homeostat.cell_setpoint(2) == pytest.approx(2.0)
+    assert homeostat.cell_setpoint(3) == pytest.approx(4.0)
+    # The tissue's gain is the mean cell gain, which is what the shared gains derive from.
+    assert homeostat.calibration is not None
+    assert homeostat.calibration.gain_z == pytest.approx(1.0)
 
 
-def test_calibrated_loop_compensates_a_content_deficit_and_removes_the_error():
-    """A stream below its resting alignment is pushed harder until the lift is restored."""
-    config = loop_config()
-    direction = unit(torch.randn(HIDDEN))
-    homeostat = AdaptiveHomeostat(config, calibration=calibration(gain=0.5))
-    plant = Plant(gain=0.5, direction=direction, content=-0.5)
+def test_tissue_settles_at_the_reference_strength_on_resting_content():
+    homeostat, tissue = make()
+    tissue.run(80)
 
-    for _ in range(80):
-        plant.last_strength = homeostat.compute_strength(plant.hidden(), direction)
-
-    # Restoring a 0.5 deficit through a gain of 0.5 takes one extra unit of strength.
-    assert plant.last_strength == pytest.approx(config.base_strength + 1.0, abs=1e-2)
-    assert abs(homeostat.controller.snapshot(homeostat.goal).error) < 1e-2
+    for layer in ACTUATORS:
+        assert tissue.strengths[layer] == pytest.approx(2.0, abs=1e-2)
+    assert abs(homeostat.status()["error"]) < 1e-2
 
 
-def test_calibrated_loop_saturates_at_the_band_and_reports_it():
-    config = loop_config(max_strength=2.5)
-    direction = unit(torch.randn(HIDDEN))
-    homeostat = AdaptiveHomeostat(config, calibration=calibration(gain=0.5))
-    plant = Plant(gain=0.5, direction=direction, content=-5.0)
+def test_tissue_compensates_a_content_deficit_in_consensus():
+    """Every cell reads the same deficit; the tissue's mean error goes to zero, not each cell's.
 
-    for _ in range(40):
-        plant.last_strength = homeostat.compute_strength(plant.hidden(), direction)
+    The bottom cell can never see its own effect, so its error stays; the cells above
+    it absorb the correction. With a shared integrator both actuators carry the same
+    effort, and ``2a + b = 1.5`` with ``a == b`` puts each half a unit above the reference.
+    """
+    homeostat, tissue = make(content=-0.5)
+    tissue.run(120)
 
-    assert plant.last_strength == pytest.approx(2.5)
+    assert abs(homeostat.status()["error"]) < 2e-2
+    for layer in ACTUATORS:
+        assert tissue.strengths[layer] == pytest.approx(2.5, abs=5e-2)
+
+
+def test_tissue_saturates_at_the_band_and_reports_it():
+    homeostat, tissue = make(content=-5.0, max_strength=2.5)
+    tissue.run(60)
+
+    assert all(tissue.strengths[layer] == pytest.approx(2.5) for layer in ACTUATORS)
     assert homeostat.status()["integral_saturated"] is True
 
 
+def test_integrators_are_shared_across_cells():
+    """The slow state is isopotential: every cell carries the same memory."""
+    homeostat, tissue = make(content={1: -1.0, 2: 0.5, 3: -0.3})
+    tissue.run(30)
+    integrals = [cell["i_term"] for cell in homeostat.status()["cells"]]
+    assert integrals[0] == pytest.approx(integrals[1], abs=1e-9)
+    assert integrals[1] == pytest.approx(integrals[2], abs=1e-9)
+
+
+def test_local_proportional_term_pushes_where_the_deficit_is_without_winding_up():
+    """A blind cell's deficit shows in its own effort through P only; the integral stays shared."""
+    homeostat, tissue = make(content={1: -1.0, 2: 0.0, 3: 0.0}, kp=0.5)
+    tissue.run(120)
+
+    assert tissue.strengths[1] > tissue.strengths[2]
+    assert tissue.strengths[1] < homeostat.config.max_strength
+    cells = homeostat.status()["cells"]
+    assert cells[0]["i_term"] == pytest.approx(cells[1]["i_term"], abs=1e-9)
+    assert abs(homeostat.status()["error"]) < 2e-2
+
+
+def test_a_removed_cell_drops_out_of_the_consensus_and_rejoins():
+    """Undesigned damage: a hook that stops firing must not freeze the tissue on its stale state."""
+    homeostat, tissue = make(content=-0.5, max_strength=8.0)
+    tissue.run(40)
+    steady = dict(tissue.strengths)
+
+    tissue.dead.add(2)
+    tissue.run(3)
+    alive = {cell["layer"]: cell["alive"] for cell in homeostat.status()["cells"]}
+    assert alive == {1: True, 2: False, 3: True}
+    # The survivors keep regulating: the tissue error is computed over live cells only,
+    # the dead cell's stale error no longer enters the consensus, and the remaining
+    # actuator takes up the effort the removed one used to supply.
+    tissue.run(80)
+    assert abs(homeostat.status()["error"]) < 5e-2
+    assert tissue.strengths[1] > steady[1] + 1.0
+
+    tissue.dead.clear()
+    tissue.run(3)
+    assert all(cell["alive"] for cell in homeostat.status()["cells"])
+
+
 def test_gains_are_derived_from_the_calibration_unless_pinned():
-    direction_free = AdaptiveHomeostat(loop_config(), calibration=calibration(gain=0.5))
-    kp, ki = direction_free.gains()
+    derived = AdaptiveHomeostat(tissue_config(), calibration=calibration())
+    kp, ki = derived.gains()
     assert ki > 0
     # A filter with alpha 1 has no time constant, so SIMC prescribes integral-only control.
     assert kp == 0.0
 
-    pinned = AdaptiveHomeostat(loop_config(kp=0.3, ki=0.05), calibration=calibration(gain=0.5))
+    pinned = AdaptiveHomeostat(tissue_config(kp=0.3, ki=0.05), calibration=calibration())
     assert pinned.gains() == (0.3, 0.05)
 
     filtered = AdaptiveHomeostat(
-        loop_config(measurement_filter_alpha=0.1), calibration=calibration(gain=0.5)
+        tissue_config(measurement_filter_alpha=0.1), calibration=calibration()
     )
-    kp_filtered, _ = filtered.gains()
-    assert kp_filtered > 0
+    assert filtered.gains()[0] > 0
 
 
 def test_set_gains_rejects_an_integral_gain_the_plant_cannot_stabilise():
-    homeostat = AdaptiveHomeostat(loop_config(), calibration=calibration(gain=0.5))
+    homeostat = AdaptiveHomeostat(tissue_config(), calibration=calibration())
     limit = homeostat.max_stable_ki()
-    assert limit == pytest.approx(2.0 / 0.5)
+    assert homeostat.calibration is not None
+    assert limit == pytest.approx(2.0 / (homeostat.calibration.gain_z * homeostat.dead_time))
     with pytest.raises(ValueError, match="ki"):
         homeostat.set_gains(ki=limit * 1.01)
     homeostat.set_gains(ki=limit * 0.5, kp=0.1)
     assert homeostat.gains() == (0.1, pytest.approx(limit * 0.5))
 
 
-def test_broadcast_strength_is_shared_and_falls_back_when_the_sensor_is_silent():
-    """Local autonomy: the sensor's strength while it fires, a local rule when it stops."""
-    config = loop_config()
-    direction = unit(torch.randn(HIDDEN))
-    homeostat = AdaptiveHomeostat(config, calibration=calibration(gain=0.5))
-    homeostat.bind_layers([1, 2], {1: direction, 2: direction})
-
-    deficit_hidden = (-3.0 * direction).view(1, 1, -1)
-    # Pass 1: nothing has been measured yet, both actuators inject the base strength.
-    assert homeostat.actuate(1, deficit_hidden, direction) == config.base_strength
-    assert homeostat.actuate(2, deficit_hidden, direction) == config.base_strength
-    homeostat.compute_strength(deficit_hidden, direction)
-    # Pass 2: the sensor's verdict is broadcast to every layer.
-    broadcast = homeostat.actuate(1, deficit_hidden, direction)
-    assert broadcast > config.base_strength
-    assert homeostat.actuate(2, deficit_hidden, direction) == broadcast
-    assert homeostat.sensor_alive
-
-    # The sensor stops firing; by pass 3 the actuators notice and regulate locally.
-    local = homeostat.actuate(1, deficit_hidden, direction)
-    assert not homeostat.sensor_alive
-    assert local > config.base_strength
-    assert local <= config.max_strength
-    resting_hidden = torch.zeros(1, 1, HIDDEN)
-    assert homeostat.actuate(1, resting_hidden, direction) == pytest.approx(config.base_strength)
-
-
-def test_local_rule_discounts_the_passthrough_of_lower_layers():
-    """An upper layer must not read its lower neighbour's injection as a surplus to undo."""
-    config = loop_config()
-    direction = unit(torch.randn(HIDDEN))
-    homeostat = AdaptiveHomeostat(config, calibration=calibration(gain=0.5))
-    homeostat.bind_layers([1, 2], {1: direction, 2: direction})
-    # Two passes without a sensor step: by the third the actuators regulate locally.
-    for _ in range(2):
-        homeostat.actuate(1, torch.zeros(1, 1, HIDDEN), direction)
-
-    lower = homeostat.actuate(1, torch.zeros(1, 1, HIDDEN), direction)
-    # Layer 2 sees exactly what layer 1 injected, and nothing else.
-    upper = homeostat.actuate(2, (lower * direction).view(1, 1, -1), direction)
-    assert upper == pytest.approx(lower)
-
-
-def test_reset_clears_loop_memory_and_histories():
-    config = loop_config()
-    direction = unit(torch.randn(HIDDEN))
-    homeostat = AdaptiveHomeostat(config, calibration=calibration(gain=0.5))
-    for _ in range(3):
-        homeostat.compute_strength((-1.0 * direction).view(1, 1, -1), direction)
+def test_reset_clears_cells_and_histories():
+    homeostat, tissue = make(content=-0.5)
+    tissue.run(3)
     assert len(homeostat.alignment_history) == 3
+    assert len(homeostat.strength_history) == 3
 
     homeostat.reset()
     assert len(homeostat.alignment_history) == 0
-    assert len(homeostat.strength_history) == 0
     assert homeostat.controller.states == {}
-    assert homeostat.current_strength == config.base_strength
+    assert homeostat.current_strength == 2.0
 
 
 def test_snapshot_round_trips_through_a_dict():
-    config = loop_config()
-    direction = unit(torch.randn(HIDDEN))
-    homeostat = AdaptiveHomeostat(config, calibration=calibration(gain=0.5))
-    for _ in range(3):
-        homeostat.compute_strength((-1.0 * direction).view(1, 1, -1), direction)
+    homeostat, tissue = make(content=-0.5)
+    tissue.run(5)
 
-    snapshot = homeostat.snapshot()
-    restored = AdaptiveHomeostat(config, calibration=calibration(gain=0.5))
-    restored.restore(snapshot)
-    assert restored.controller.snapshot(restored.goal) == homeostat.controller.snapshot(
-        homeostat.goal
-    )
-    assert restored.current_strength == homeostat.current_strength
+    restored = AdaptiveHomeostat(tissue_config(), calibration=calibration())
+    restored.restore(homeostat.snapshot())
+    assert restored.controller.states == homeostat.controller.states
+    assert restored.current_strength == pytest.approx(homeostat.current_strength)
 
 
 # --- calibration and wiring on the identity-layer fakes
@@ -237,8 +261,8 @@ def identity_vectors(direction: torch.Tensor, layers) -> dict[int, SteeringVecto
     return {layer: SteeringVector("goal", direction.clone(), layer) for layer in layers}
 
 
-def test_calibration_recovers_the_additive_passthrough_gain():
-    """Identity layers pass an injection straight up, so the gain is the summed cosines."""
+def test_calibration_recovers_the_lift_every_cell_reads():
+    """Identity layers pass an injection straight up: a cell's lift is the actuators below it."""
     model = MonotonicModel(vocab_size=32, hidden_dim=HIDDEN, num_layers=4)
     tokenizer = SimpleCharTokenizer()
     direction = unit(torch.eye(HIDDEN)[1])
@@ -247,52 +271,46 @@ def test_calibration_recovers_the_additive_passthrough_gain():
 
     result = calibrate_alignment(model, tokenizer, vectors, config, texts=["abc", "defg", "hij"])
 
-    assert result.readout_layer == 3
-    assert set(result.layers) == {1, 2, 3}
-    assert result.gain == pytest.approx(2.0, abs=1e-4)
-    assert result.layers[3].resting_mean == pytest.approx(0.0, abs=1e-5)
+    assert result.actuators == (1, 2)
+    assert result.sensors == (1, 2, 3)
+    for layer, lift in LIFTS.items():
+        assert result.layers[layer].lift == pytest.approx(lift, abs=1e-4)
+        assert result.layers[layer].resting_mean == pytest.approx(0.0, abs=1e-5)
     assert result.reference_strength == 2.0
 
 
-def test_cognitive_homeostat_attaches_actuators_and_one_sensor():
+def test_cognitive_homeostat_attaches_a_cell_per_layer_and_one_sensor_only_readout():
     model = MonotonicModel(vocab_size=32, hidden_dim=HIDDEN, num_layers=4)
     tokenizer = SimpleCharTokenizer()
     direction = unit(torch.eye(HIDDEN)[1])
-    config = SteeringConfig(
-        steering_layers=[1, 2],
-        readout_layer=3,
-        base_strength=2.0,
-        adaptive=True,
-        measurement_filter_alpha=1.0,
-        orthogonal_projection=False,
-    )
+    config = tissue_config()
     coordinator = CognitiveHomeostat(config)
     coordinator.add_steering_vectors(identity_vectors(direction, layers=[1, 2, 3]))
     coordinator.calibrate(model, tokenizer, texts=["abc", "defg", "hij"])
     coordinator.attach_to_model(model)
 
     assert {layer for layer, hook in coordinator.hooks.items() if hook.injects} == {1, 2}
-    assert coordinator.hooks[3].measures and not coordinator.hooks[3].injects
+    assert not coordinator.hooks[3].injects
 
     ids = tokenizer("abcd", return_tensors="pt")["input_ids"]
     for _ in range(3):
         model(ids)
     stats = coordinator.get_alignment_stats()
     assert stats["pid"]["step_count"] == 3
-    assert stats["setpoint"] == pytest.approx(coordinator.homeostat.setpoint)
+    assert [cell["layer"] for cell in stats["pid"]["cells"]] == [1, 2, 3]
     assert config.min_strength <= stats["current_strength"] <= config.max_strength
     coordinator.detach_from_model()
 
 
-def test_top_actuator_doubles_as_sensor_when_no_readout_vector_exists():
+def test_top_actuator_is_the_top_cell_when_no_readout_vector_exists():
     config = SteeringConfig(steering_layers=[1, 2], adaptive=True, orthogonal_projection=False)
     coordinator = CognitiveHomeostat(config)
     coordinator.add_steering_vectors(identity_vectors(unit(torch.randn(HIDDEN)), layers=[1, 2]))
     model = MonotonicModel(vocab_size=32, hidden_dim=HIDDEN, num_layers=4)
     coordinator.attach_to_model(model)
 
-    assert coordinator.hooks[2].injects and coordinator.hooks[2].measures
-    assert coordinator.hooks[1].injects and not coordinator.hooks[1].measures
+    assert set(coordinator.hooks) == {1, 2}
+    assert all(hook.injects for hook in coordinator.hooks.values())
     coordinator.detach_from_model()
 
 

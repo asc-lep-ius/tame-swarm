@@ -44,13 +44,30 @@ class HealthResponse(BaseModel):
     steering_active: bool
 
 
+class CellStatus(BaseModel):
+    """One layer's cell: its own reading, setpoint and controller terms."""
+
+    layer: int
+    injects: bool
+    alive: bool
+    setpoint: float
+    process_variable: float
+    error: float
+    p_term: float
+    i_term: float
+    d_term: float
+    output: float
+    saturated: bool
+    step_count: int
+
+
 class PIDStatus(BaseModel):
-    """One goal loop's controller terms, so a reader can tell regulation from a constant."""
+    """One goal's tissue, as the mean over its live cells, plus every cell."""
 
     goal: str
     calibrated: bool
-    sensor_alive: bool
     readout_layer: int | None
+    alive_cells: int
     setpoint: float
     process_variable: float
     error: float
@@ -63,6 +80,7 @@ class PIDStatus(BaseModel):
     kp: float
     ki: float
     kd: float
+    cells: list[CellStatus] = Field(default_factory=list)
 
 
 class GainUpdate(BaseModel):

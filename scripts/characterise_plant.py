@@ -457,7 +457,7 @@ def main() -> None:
     template = SteeringConfig(adaptive=True, orthogonal_projection=False)
     config = serving_config(args.goal, template, model_id=args.model)
     print(
-        f"model={args.model} goal={args.goal} layers={config.steering_layers} "
+        f"model={args.model} goal={args.goal} actuators={config.steering_layers} "
         f"readout={config.readout_layer} strength={config.base_strength} "
         f"band=[{config.min_strength}, {config.max_strength}]"
     )
@@ -474,26 +474,28 @@ def main() -> None:
     kp, ki = loop.gains()
     print("\n== 1. Calibration (goal prompts + greedy answers, unsteered; position 0 excluded)")
     for layer, stats in sorted(calibration.layers.items()):
+        role = "actuator" if layer in calibration.actuators else "readout"
         print(
-            f"  L{layer:2d}: resting {stats.resting_mean:+8.2f}  "
-            f"sigma_tok {stats.token_sigma:6.2f}  sigma_slow {stats.resting_sigma:6.2f}"
+            f"  L{layer:2d} {role:<8}: resting {stats.resting_mean:+8.2f}  "
+            f"sigma_tok {stats.token_sigma:6.2f}  sigma_slow {stats.resting_sigma:6.2f}  "
+            f"lift {stats.lift:+6.2f}/unit = {stats.gain_z:+.3f} sigma/unit  "
+            f"setpoint {calibration.setpoint_z(layer):+.3f} sigma"
         )
     print(
-        f"  readout {calibration.readout_layer}: gain {calibration.gain:+.3f} proj/unit = "
-        f"{calibration.gain_z:+.3f} sigma/unit; setpoint {calibration.setpoint_z:+.3f} sigma at "
-        f"strength {calibration.reference_strength}"
+        f"  tissue gain {calibration.gain_z:+.3f} sigma/unit (mean over cells); "
+        f"tissue setpoint {loop.setpoint:+.3f} sigma at strength {calibration.reference_strength}"
     )
     print(
         f"  filter tau {loop.filter_time_constant:.1f} tok, closed-loop tau "
-        f"{config.closed_loop_tau or max(loop.filter_time_constant, 1.0):.1f} tok -> "
+        f"{loop.closed_loop_tau:.1f} tok, dead time {loop.dead_time:.0f} tok -> "
         f"SIMC kp {kp:.4f}, ki {ki:.4f}; stability bound ki < {loop.max_stable_ki():.4f}"
     )
     report["calibration"] = dict(
         layers={layer: vars(stats) for layer, stats in calibration.layers.items()},
-        readout=calibration.readout_layer,
-        gain=calibration.gain,
+        actuators=calibration.actuators,
+        sensors=calibration.sensors,
         gain_z=calibration.gain_z,
-        setpoint_z=calibration.setpoint_z,
+        setpoint_z=loop.setpoint,
         kp=kp,
         ki=ki,
         max_stable_ki=loop.max_stable_ki(),
