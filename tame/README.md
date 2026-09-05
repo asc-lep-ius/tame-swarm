@@ -21,7 +21,11 @@ This directory contains the full implementation of the TAME multi-scale competen
 | [`mob/wealth.py`](mob/wealth.py) | Wealth update paths (loss, quality, participation) | `update_wealth_from_loss()` |
 | [`mob/utils.py`](mob/utils.py) | Gini coefficient, serialisation helpers | `compute_gini()` |
 | [`mob/mob_config.py`](mob/mob_config.py) | MoBConfig dataclass | `MoBConfig` |
-| [`steering.py`](steering.py) | **Cognitive Homeostasis** — steering vector extraction, P-controller, orthogonal projection | `CognitiveHomeostat`, `SteeringVectorExtractor`, `AdaptiveHomeostat` |
+| [`steering.py`](steering.py) | **Cognitive Homeostasis** — steering vector extraction (prefix + completion-position), P-controller, orthogonal projection | `CognitiveHomeostat`, `SteeringVectorExtractor`, `AdaptiveHomeostat` |
+| [`contrastive_data.py`](contrastive_data.py) | Behavioural pair format, dataset loaders, quality checks | `ContrastivePair`, `ContrastivePairSet`, `HFContrastiveLoader`, `load_contrastive_dataset()` |
+| [`contrastive_templates.py`](contrastive_templates.py) | Built-in behavioural pairs (60/goal, 3 tiers) and the retained instruction-prefix control | `BUILTIN_PAIRS`, `INSTRUCTION_PREFIX_CONTROL` |
+| [`steering_pipeline.py`](steering_pipeline.py) | Load → extract → normalise → goal-similarity report | `extract_steering_vectors()`, `log_goal_similarity()` |
+| [`behavioural_validation.py`](behavioural_validation.py) | Held-out log-odds gate vs. random and instruction-prefix controls | `validate_steering_vector()`, `mean_log_odds()` |
 | [`train.py`](train.py) | Training loop — loss-based wealth updates, confidence calibration, checkpointing | `TAMETrainer`, `TrainingConfig` |
 | [`setup_tame.py`](setup_tame.py) | End-to-end workflow orchestrator (check → train → export) | `run_training()`, `export_for_inference()` |
 | [`chat_ui.py`](chat_ui.py) | Gradio interface with live VCG auction & steering trace visualisation | `create_wealth_distribution_plot()`, `create_steering_trace_plot()` |
@@ -92,13 +96,14 @@ If `orthogonal_projection` is enabled, `v_steer` is first projected to be orthog
 
 **Steering vector extraction:**
 
-Vectors are computed via the Difference-in-Means method:
-1. Run positive prompts (e.g., "Answer accurately and truthfully") through the model
-2. Run negative prompts (e.g., "Make up a plausible-sounding but false answer") through the model
-3. Capture activations at each target layer
-4. $v_{\text{steer}} = \text{mean}(h^+) - \text{mean}(h^-)$
+Vectors are a difference-in-means, but read at the position where the model *exhibits* the behaviour ([#3](../README.md#phase-1--steering-economy-coupling)):
 
-The resulting vector points in the direction of the desired behavioural trait.
+1. Load behavioural pairs for the goal — shared prompts with contrasting A/B **completions** (`contrastive_data.load_contrastive_dataset`)
+2. For each pair, run `prompt + positive` and `prompt + negative`, reading the activation at the recorded completion position (the answer token, default `-1`)
+3. $v_{\text{steer}} = \text{mean}(h^+) - \text{mean}(h^-)$ over pairs, per layer
+4. L2-normalise, so magnitudes are comparable across goals
+
+`steering_pipeline.extract_steering_vectors` is the default the server uses; `SteeringVectorExtractor.extract` (mean-pooled instruction prefixes) is retained for the negative control. The former instruction-prefix templates now live in `contrastive_templates.INSTRUCTION_PREFIX_CONTROL`.
 
 **Available steering goals:**
 
@@ -110,7 +115,7 @@ The resulting vector points in the direction of the desired behavioural trait.
 
 **Current limitations:**
 
-- **Thin contrastive data:** Only 4 prompt pairs per goal in `STEERING_TEMPLATES`. The activation engineering literature recommends 50–200 diverse pairs for robust trait directions. With 4 pairs, the vector may capture prompt-surface features rather than the genuine latent trait. [Phase 1b](../README.md#phase-1--steering-economy-coupling) addresses this.
+- **Goal-dependent vector quality ([#3](../README.md#phase-1--steering-economy-coupling), measured):** the behavioural pipeline is in place (60 pairs/goal, answer-token read, held-out log-odds gate), but the vectors are only as good as the direction is linear. On Qwen3-1.7B `safe` validates robustly, `reasoning` is marginal, and `truthful` fails — a diff-in-means over heterogeneous facts does not yield a transferable truthfulness direction. See [Steering validation](../README.md#steering-validation-3). `truthful` quality is the open item [#4](../README.md#phase-1--steering-economy-coupling) inherits.
 - **P-controller only:** The current controller uses proportional control only. Under stochastic sampling (temperature > 0), this produces oscillation around the target without convergence. [Phase 1c](../README.md#phase-1--steering-economy-coupling) upgrades to full PID with anti-windup.
 - **Decoupled from routing:** Steering corrects the output *after* MoB has already routed. The goal state should shape *which experts activate*, not just correct the result. [Phase 1a](../README.md#phase-1--steering-economy-coupling) couples steering alignment into expert confidence computation.
 
