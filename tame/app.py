@@ -15,8 +15,8 @@ from mob import MixtureOfBidders, MoBConfig, apply_mob_to_model, load_mob_state
 from steering import (
     CognitiveHomeostat,
     SteeringConfig,
-    create_default_steering_vectors,
 )
+from steering_pipeline import extract_steering_vectors
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -169,15 +169,21 @@ class TAMEApplication:
 
         homeostat: CognitiveHomeostat | None = None
         try:
-            steering_vectors = create_default_steering_vectors(
+            extraction = extract_steering_vectors(
                 model,
                 tokenizer,
                 goal="truthful",
-                layers=steering_config.steering_layers,
+                config=steering_config,
+            )
+            logger.info(
+                "[HOMEOSTASIS] Extracted from %d behavioural pairs (%s), tiers %s",
+                extraction.pair_count,
+                extraction.source,
+                extraction.tier_counts,
             )
 
             homeostat = CognitiveHomeostat(steering_config)
-            homeostat.add_steering_vectors(steering_vectors)
+            homeostat.add_steering_vectors(extraction.vectors)
 
             if steering_config.orthogonal_projection:
                 homeostat.estimate_capability_subspaces(model, tokenizer)
@@ -192,7 +198,7 @@ class TAMEApplication:
 
             homeostat.attach_to_model(model)
 
-            logger.info("[HOMEOSTASIS] Steering attached to %d layers", len(steering_vectors))
+            logger.info("[HOMEOSTASIS] Steering attached to %d layers", len(extraction.vectors))
         except Exception as e:
             logger.warning("[HOMEOSTASIS] Steering extraction failed: %s", e)
             logger.warning("[HOMEOSTASIS] Continuing without steering (degraded mode)")

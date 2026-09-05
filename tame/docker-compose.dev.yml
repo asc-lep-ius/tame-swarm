@@ -1,8 +1,11 @@
 services:
   tame:
-    build: 
+    build:
       context: .
       dockerfile: Dockerfile
+      # The API never loads datasets at runtime, so the dev server runs the lean
+      # serve image (no datasets/peft/mlflow). Training uses the default target.
+      target: serve
     volumes:
       # Mount source code for live editing
       - .:/app
