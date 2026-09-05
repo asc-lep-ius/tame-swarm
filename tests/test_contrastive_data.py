@@ -161,6 +161,29 @@ def test_split_shared_prefix_backs_up_to_a_word_boundary():
     assert pos == " Russia." and neg == " Romania."
 
 
+def test_identical_rows_yield_empty_tails_and_are_dropped_by_the_converters():
+    prompt, pos, neg = _split_shared_prefix("same text here", "same text here")
+    assert prompt == "same text here" and pos == "" and neg == ""
+
+    rows = [
+        {
+            "chosen": "\n\nHuman: hi\n\nAssistant: help",
+            "rejected": "\n\nHuman: hi\n\nAssistant: help",
+        }
+    ]
+    loader = HFContrastiveLoader(load_dataset=lambda *a, **k: rows)
+    with pytest.raises(ValueError, match="no pairs"):
+        loader.load("safe", "Anthropic/hh-rlhf")
+
+    statements = [
+        {"statement": "The city of X is in Y.", "label": 1, "city": "X"},
+        {"statement": "The city of X is in Y.", "label": 0, "city": "X"},
+    ]
+    loader = HFContrastiveLoader(load_dataset=lambda *a, **k: statements)
+    with pytest.raises(ValueError, match="no pairs"):
+        loader.load("truthful", "geometry_of_truth/cities")
+
+
 def test_hf_loader_converts_truthful_qa_rows_without_network():
     rows = [
         {
@@ -267,6 +290,18 @@ def test_multiple_choice_letters_are_balanced_within_every_tier():
         counts = letter_counts(pair for pair in mc if pair.tier == tier)
         assert abs(counts["A"] - counts["B"]) <= 1, (tier, counts)
     assert {pair.correct_letter for pair in mc} == {"A", "B"}
+
+
+@pytest.mark.parametrize("per_tier", [15, 5, 7])
+def test_multiple_choice_odd_tiers_do_not_stack_their_spare_letter(per_tier):
+    """Three odd tiers must leave the whole set within one, not three, of balance."""
+    from contrastive_data import letter_imbalance
+
+    pairs = [pair for tier in TIERS for pair in _content_pairs(per_tier, tier)]
+    mc = to_multiple_choice(pairs, seed=1)
+    assert letter_imbalance(mc) <= 1, letter_counts(mc)
+    for tier in TIERS:
+        assert letter_imbalance(pair for pair in mc if pair.tier == tier) <= 1
 
 
 def test_multiple_choice_assignment_is_seeded_and_not_a_fixed_alternation():
@@ -417,6 +452,37 @@ def test_certified_load_does_not_swallow_converter_bugs():
     # which is a data bug and must surface, not degrade to the built-in set.
     with pytest.raises(ValueError):
         load_certified_dataset("truthful", load_dataset=bad_rows)
+
+
+def test_certified_load_of_an_uncertified_goal_is_flagged_not_certified(caplog):
+    """A goal absent from CERTIFIED (the deliberation proxy) must never read as certified."""
+    from contrastive_data import certification_for, load_certified_dataset
+
+    assert certification_for("deliberation") is None
+    with caplog.at_level("WARNING"):
+        loaded = load_certified_dataset("deliberation")
+    assert not loaded.certified
+    assert loaded.fallback_reason and "no certified" in loaded.fallback_reason
+    assert loaded.pair_set.source == "builtin"
+    assert "UNCERTIFIED" in caplog.text
+
+
+def test_certified_load_falls_back_on_a_datasets_build_error():
+    exceptions = pytest.importorskip("datasets.exceptions")
+
+    def failing_build(*_a, **_k):
+        raise exceptions.DatasetGenerationError("parquet conversion failed")
+
+    from contrastive_data import load_certified_dataset
+
+    loaded = load_certified_dataset("truthful", load_dataset=failing_build)
+    assert not loaded.certified and loaded.pair_set.source == "builtin"
+
+
+def test_geometry_of_truth_rejects_a_name_that_is_not_a_plain_file_stem():
+    loader = HFContrastiveLoader(load_dataset=lambda *a, **k: [])
+    with pytest.raises(ValueError, match="must match"):
+        loader.load("truthful", "geometry_of_truth/../secrets")
 
 
 def test_certified_load_of_a_builtin_goal_never_falls_back():

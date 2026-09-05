@@ -44,10 +44,13 @@ from behavioural_validation import ValidationResult, validate_steering_vector  #
 from contrastive_data import (  # noqa: E402
     BUILTIN_SOURCE,
     COMPLETION_FORMAT,
+    MAX_LETTER_IMBALANCE,
     MULTIPLE_CHOICE_FORMAT,
     Certification,
     ContrastivePair,
     certification_for,
+    letter_counts,
+    letter_imbalance,
     load_contrastive_dataset,
     load_instruction_prefix_control,
     to_multiple_choice,
@@ -105,7 +108,18 @@ def load_split(goal, source, args):
 
 
 def in_format(pairs, pair_format, seed):
-    return to_multiple_choice(pairs, seed=seed) if pair_format == MULTIPLE_CHOICE_FORMAT else pairs
+    """Convert one split to ``pair_format`` and refuse a letter set the module would flag.
+
+    The gate must not run on a set whose own quality report calls it unbalanced: a
+    skewed letter assignment leaks the bare A-minus-B direction into the vector
+    and, if the held-out set skews the same way, into the effect as well.
+    """
+    if pair_format != MULTIPLE_CHOICE_FORMAT:
+        return pairs
+    converted = to_multiple_choice(pairs, seed=seed)
+    if letter_imbalance(converted) > MAX_LETTER_IMBALANCE:
+        raise ValueError(f"letter assignment unbalanced: {letter_counts(converted)}")
+    return converted
 
 
 def other_format(pair_format):
@@ -115,7 +129,7 @@ def other_format(pair_format):
 def certification_under_test(goal) -> Certification:
     if goal in CANDIDATE_FORMATS:
         return Certification(BUILTIN_SOURCE, CANDIDATE_FORMATS[goal])
-    return certification_for(goal)
+    return certification_for(goal) or Certification(BUILTIN_SOURCE, COMPLETION_FORMAT)
 
 
 def load_model(model_id: str):

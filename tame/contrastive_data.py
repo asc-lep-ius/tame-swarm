@@ -176,9 +176,9 @@ def _split_role_prompt(prompt: str) -> tuple[str, str]:
     return prompt.rstrip(), ""
 
 
-def _balanced_letters(count: int, rng: random.Random) -> list[str]:
-    """Exactly half A, half B (odd counts spare one A), in a seeded random order."""
-    letters = list(MC_LETTERS) * (count // 2) + list(MC_LETTERS[: count % 2])
+def _balanced_letters(count: int, spare: str, rng: random.Random) -> list[str]:
+    """Half A, half B, an odd count's spare going to ``spare``, in seeded random order."""
+    letters = list(MC_LETTERS) * (count // 2) + ([spare] if count % 2 else [])
     rng.shuffle(letters)
     return letters
 
@@ -210,8 +210,9 @@ def to_multiple_choice(pairs: Iterable[ContrastivePair], seed: int = 0) -> list[
     set cancels the letter-identity component and leaves the choice direction.
 
     Balance is a property of the set being averaged, so convert the extraction set
-    and the held-out set separately rather than converting once and splitting.
-    Pairs already in this format pass through unchanged.
+    and the held-out set separately rather than converting once and splitting, and
+    check :func:`letter_imbalance` on whatever is finally averaged. Pairs already
+    in this format pass through unchanged.
     """
     rng = random.Random(seed)
     materialised = list(pairs)
@@ -220,9 +221,15 @@ def to_multiple_choice(pairs: Iterable[ContrastivePair], seed: int = 0) -> list[
         if pair.pair_format == COMPLETION_FORMAT:
             by_tier.setdefault(pair.tier, []).append(index)
 
+    # Each odd tier leaves one spare letter; alternate which letter takes it across
+    # tiers, in a fixed tier order, so the whole set is also within one of balance
+    # rather than accumulating one spare A per tier.
     converted = list(materialised)
-    for indices in by_tier.values():
-        for index, letter in zip(indices, _balanced_letters(len(indices), rng), strict=True):
+    spares = iter(MC_LETTERS * ((len(by_tier) + 1) // 2 + 1))
+    for tier in sorted(by_tier, key=lambda name: TIERS.index(name) if name in TIERS else 99):
+        indices = by_tier[tier]
+        spare = next(spares) if len(indices) % 2 else MC_LETTERS[0]
+        for index, letter in zip(indices, _balanced_letters(len(indices), spare, rng), strict=True):
             converted[index] = _as_multiple_choice(materialised[index], letter)
     return converted
 
@@ -505,13 +512,14 @@ CERTIFIED: dict[str, Certification] = {
 _UNCERTIFIED = Certification(BUILTIN_SOURCE, COMPLETION_FORMAT)
 
 
-def certification_for(goal: str) -> Certification:
-    return CERTIFIED.get(goal, _UNCERTIFIED)
+def certification_for(goal: str) -> Certification | None:
+    """The certified (source, format) for ``goal``, or ``None`` if the gate never passed it."""
+    return CERTIFIED.get(goal)
 
 
 def resolve_pair_format(goal: str, pair_format: str | None = None) -> str:
     """The explicit format if given, else the goal's certified default."""
-    resolved = pair_format or certification_for(goal).pair_format
+    resolved = pair_format or (certification_for(goal) or _UNCERTIFIED).pair_format
     if resolved not in PAIR_FORMATS:
         raise ValueError(f"pair_format must be one of {sorted(PAIR_FORMATS)}, got {resolved!r}")
     return resolved
@@ -560,11 +568,10 @@ def load_contrastive_dataset(
         return pair_set_in_format(goal, _CUSTOM_PAIRS[goal], "custom", resolved, seed)
 
     # Imported here, not at module level: the sources module depends on this one.
-    from contrastive_sources import HFContrastiveLoader  # noqa: PLC0415
+    from contrastive_sources import HFContrastiveLoader, default_loader  # noqa: PLC0415
 
-    return HFContrastiveLoader(load_dataset=load_dataset).load(
-        goal, source, limit=limit, pair_format=resolved, seed=seed
-    )
+    loader = default_loader() if load_dataset is None else HFContrastiveLoader(load_dataset)
+    return loader.load(goal, source, limit=limit, pair_format=resolved, seed=seed)
 
 
 @dataclass(frozen=True)
@@ -592,6 +599,13 @@ def load_certified_dataset(
     failures fall back -- a converter bug (``ValueError``) still raises.
     """
     certification = certification_for(goal)
+    if certification is None:
+        reason = f"goal {goal!r} has no certified (source, format); using built-in pairs"
+        logger.warning("Goal %r: %s -- the extracted vector is UNCERTIFIED", goal, reason)
+        pair_set = load_contrastive_dataset(
+            goal, source=BUILTIN_SOURCE, pair_format=_UNCERTIFIED.pair_format, seed=seed
+        )
+        return CertifiedLoad(pair_set=pair_set, certified=False, fallback_reason=reason)
     try:
         pair_set = load_contrastive_dataset(
             goal,
@@ -601,7 +615,7 @@ def load_certified_dataset(
             pair_format=certification.pair_format,
             seed=seed,
         )
-    except (RuntimeError, OSError) as exc:
+    except (RuntimeError, OSError, *_dataset_build_errors()) as exc:
         if certification.source == BUILTIN_SOURCE:
             raise
         reason = f"{certification.source} unavailable ({exc}); using built-in pairs"
@@ -611,6 +625,21 @@ def load_certified_dataset(
         )
         return CertifiedLoad(pair_set=fallback, certified=False, fallback_reason=reason)
     return CertifiedLoad(pair_set=pair_set, certified=True)
+
+
+def _dataset_build_errors() -> tuple[type[Exception], ...]:
+    """``datasets``' own error base, if the package is installed.
+
+    ``DatasetNotFoundError`` is an ``OSError``, but a failed build or parquet
+    conversion raises ``DatasetGenerationError``, which is not; both are
+    environmental and both must fall back rather than leave the server unsteered.
+    Resolved lazily so the ``serve`` extra never imports ``datasets``.
+    """
+    try:
+        from datasets.exceptions import DatasetsError  # noqa: PLC0415
+    except ImportError:
+        return ()
+    return (DatasetsError,)
 
 
 def load_instruction_prefix_control(goal: str) -> ContrastivePairSet:

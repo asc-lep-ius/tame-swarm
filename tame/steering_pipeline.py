@@ -23,6 +23,7 @@ from contrastive_data import (
     Certification,
     ContrastivePairSet,
     certification_for,
+    letter_counts,
     letter_imbalance,
     load_certified_dataset,
     load_contrastive_dataset,
@@ -114,12 +115,15 @@ def extract_steering_vectors(
 
     pair_set, certified, fallback_reason = _load_pairs(goal, source, pair_format, load_dataset)
     pairs = pair_set.pairs if max_pairs is None else pair_set.pairs[:max_pairs]
+    if not pairs:
+        raise ValueError(f"goal {goal!r}: no pairs to extract from (max_pairs={max_pairs})")
     if pair_set.is_multiple_choice and letter_imbalance(pairs) > MAX_LETTER_IMBALANCE:
         logger.warning(
-            "Goal %r: truncating to %d pairs unbalanced the correct letters; the vector "
-            "carries some of the bare A-minus-B direction",
+            "Goal %r: correct letters are unbalanced over the %d pairs being averaged "
+            "(%s); the vector carries some of the bare A-minus-B direction",
             goal,
             len(pairs),
+            letter_counts(pairs),
         )
 
     extractor = SteeringVectorExtractor(model, tokenizer, resolved)

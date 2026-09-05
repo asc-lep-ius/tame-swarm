@@ -15,6 +15,7 @@ must not be imported here at module level: this module depends on that one.
 """
 
 import logging
+import re
 from collections.abc import Callable, Iterable
 
 from contrastive_data import (
@@ -48,6 +49,19 @@ GEOMETRY_OF_TRUTH_URL = (
 # true-with-false under this shared prefix, so the diff-in-means is the paper's
 # unpaired mu(true) - mu(false) while the pair still has a non-empty prompt.
 GOT_STATEMENT_PREFIX = "Statement:"
+# The set name is interpolated into a URL path; keep it to the repository's file names.
+_GOT_NAME = re.compile(r"[a-z0-9_]+")
+
+# One loader for the public path, so repeated loads of the same (goal, dataset,
+# limit, format, seed) in a process convert once.
+_DEFAULT_LOADER: "HFContrastiveLoader | None" = None
+
+
+def default_loader() -> "HFContrastiveLoader":
+    global _DEFAULT_LOADER  # noqa: PLW0603
+    if _DEFAULT_LOADER is None:
+        _DEFAULT_LOADER = HFContrastiveLoader()
+    return _DEFAULT_LOADER
 
 
 class HFContrastiveLoader:
@@ -58,8 +72,8 @@ class HFContrastiveLoader:
     ``Anthropic/hh-rlhf`` pairs a shared conversation with a chosen (harmless) and
     a rejected (harmful) continuation. Each converter knows one dataset's schema
     and emits :class:`ContrastivePair` objects with the answer token as the read
-    position. Results are cached in-process so repeated goals in one run pay the
-    conversion once.
+    position. Results are cached per loader; the public load path shares one
+    loader (:func:`default_loader`) so repeated goals in a process convert once.
     """
 
     def __init__(self, load_dataset: Callable[..., Iterable[dict]] | None = None):
@@ -112,6 +126,10 @@ class HFContrastiveLoader:
         converter = self._converters().get(dataset)
         if converter is None and dataset.startswith(GEOMETRY_OF_TRUTH_SOURCE + "/"):
             name = dataset.split("/", 1)[1]
+            if not _GOT_NAME.fullmatch(name):
+                raise ValueError(
+                    f"Geometry-of-Truth set name {name!r} must match {_GOT_NAME.pattern}"
+                )
             return lambda goal, limit: self._from_geometry_of_truth(name, dataset, limit)
         return converter
 
@@ -166,6 +184,8 @@ class HFContrastiveLoader:
             prompt, chosen, rejected = _split_shared_prefix(row["chosen"], row["rejected"])
             if not chosen.strip() or not rejected.strip() or not prompt.strip():
                 continue
+            if chosen.strip() == rejected.strip():
+                continue
             pairs.append(
                 ContrastivePair(
                     prompt=prompt,
@@ -196,6 +216,9 @@ def _split_shared_prefix(chosen: str, rejected: str) -> tuple[str, str, str]:
     split = 0
     while split < limit and chosen[split] == rejected[split]:
         split += 1
+    if chosen == rejected:
+        # No divergence at all: two empty tails, which every converter drops.
+        return chosen, "", ""
     boundary = chosen.rfind(" ", 0, split)
     if boundary > 0:
         split = boundary
@@ -220,6 +243,8 @@ def _matched_statement_pairs(
             continue
         prompt, positive, negative = _split_shared_prefix(statements[1], statements[0])
         if not prompt.strip() or not positive.strip() or not negative.strip():
+            continue
+        if positive.strip() == negative.strip():
             continue
         pairs.append(
             ContrastivePair(

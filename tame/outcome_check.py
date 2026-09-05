@@ -28,7 +28,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 
-from behavioural_validation import _attach
+from behavioural_validation import attach_steering_hooks
 from contrastive_data import ContrastivePair
 from steering import SteeringConfig
 
@@ -74,12 +74,13 @@ def contains_answer(generation: str, answer: str) -> bool:
 
 
 def _eos_ids(tokenizer) -> set[int]:
-    ids = set()
-    for attr in ("eos_token_id", "pad_token_id"):
-        value = getattr(tokenizer, attr, None)
-        if isinstance(value, int):
-            ids.add(value)
-    return ids
+    """End-of-text ids; ``eos_token_id`` may be an int or a list (Llama-3 style)."""
+    value = getattr(tokenizer, "eos_token_id", None)
+    if isinstance(value, int):
+        return {value}
+    if isinstance(value, (list, tuple)):
+        return {int(item) for item in value}
+    return set()
 
 
 def greedy_continue(
@@ -171,7 +172,7 @@ def measure_outcome(
     base_len, base_acc, base_texts = _run(
         model, tokenizer, pairs, device, max_new_tokens, stop_strings
     )
-    handles = _attach(model, directions, config)
+    handles = attach_steering_hooks(model, directions, config)
     try:
         steer_len, steer_acc, steer_texts = _run(
             model, tokenizer, pairs, device, max_new_tokens, stop_strings

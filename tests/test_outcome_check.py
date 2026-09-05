@@ -89,3 +89,17 @@ def test_measure_outcome_reports_length_and_accuracy_deltas():
     assert result.length_delta == -6.0
     assert 0.0 <= result.baseline_accuracy <= 1.0
     assert result.accuracy_delta == result.steered_accuracy - result.baseline_accuracy
+
+
+def test_eos_ids_accepts_int_list_or_nothing():
+    from outcome_check import _eos_ids
+
+    class Tok:
+        eos_token_id = [7, 9]
+        pad_token_id = 0
+
+    assert _eos_ids(Tok()) == {7, 9}
+    Tok.eos_token_id = 3
+    assert _eos_ids(Tok()) == {3}
+    Tok.eos_token_id = None
+    assert _eos_ids(Tok()) == set(), "pad alone is not an end-of-text signal"

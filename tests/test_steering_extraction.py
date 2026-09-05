@@ -182,3 +182,31 @@ def test_pipeline_explicit_override_is_certified_only_when_it_names_the_certifie
         pair_format="multiple_choice",
     )
     assert not overridden.certified and overridden.pair_format == "multiple_choice"
+
+
+def test_pipeline_reports_a_goal_outside_certified_as_uncertified():
+    model = MonotonicModel(vocab_size=64, hidden_dim=8, num_layers=6)
+    extraction = extract_steering_vectors(
+        model,
+        SimpleCharTokenizer(64),
+        goal="deliberation",
+        config=SteeringConfig(steering_layers=[2]),
+    )
+    assert not extraction.certified
+    assert extraction.fallback_reason and "no certified" in extraction.fallback_reason
+    assert "UNCERTIFIED" in extraction.vectors[2].description
+
+
+def test_pipeline_rejects_max_pairs_zero():
+    import pytest
+
+    model = MonotonicModel(vocab_size=64, hidden_dim=8, num_layers=6)
+    with pytest.raises(ValueError, match="no pairs"):
+        extract_steering_vectors(
+            model,
+            SimpleCharTokenizer(64),
+            goal="safe",
+            config=SteeringConfig(steering_layers=[2]),
+            source="builtin",
+            max_pairs=0,
+        )
