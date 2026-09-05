@@ -44,8 +44,9 @@ class SteeringConfig:
     measurement_filter_alpha: float = 0.1
     # Tokens over which the loop corrects a deviation; None = the filter time constant.
     closed_loop_tau: float | None = None
-    # Layer the sensor reads; None = the layer above the top actuator when a vector
-    # exists there, else the top actuator read after its own injection.
+    # The sensor-only cell; None = the layer above the top actuator when a vector
+    # exists there, else the top actuator is the top cell (every cell reads its own
+    # layer before its own injection).
     readout_layer: int | None = None
     max_strength: float = 1.5  # Maximum steering strength
     min_strength: float = 0.0  # Minimum steering strength

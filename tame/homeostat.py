@@ -26,29 +26,47 @@ controller with subordinates:
 
 Gains are derived from the measured tissue gain by SIMC (``pid_controller``)
 unless the config pins them. Without a calibration the loop keeps the legacy
-contract -- one implicit cell regulating cosine toward ``target_alignment`` with a
-proportional gain -- so probes and tests that never calibrate behave as before.
+contract in shape -- one implicit cell regulating cosine toward
+``target_alignment`` with a proportional gain -- reading the last position through
+the same filter as a calibrated cell.
 """
 
 import logging
+import math
 from collections import deque
 from collections.abc import Sequence
-from dataclasses import dataclass, field
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from homeostat_calibration import (
+    AlignmentCalibration,
+    LayerCalibration,
+    calibrate_alignment,
+    resolve_readout_layer,
+    transformer_layers,
+)
 from pid_controller import PIDConfig, PIDController, PIDState, simc_pi_gains
 from steering import (
-    CAPABILITY_CORPUS,
     SteeringConfig,
     SteeringVector,
     estimate_capability_subspace,
     project_steering_direction,
 )
+
+__all__ = [
+    "AdaptiveHomeostat",
+    "AlignmentCalibration",
+    "CognitiveHomeostat",
+    "LayerCalibration",
+    "SteeringHook",
+    "calibrate_alignment",
+    "critical_integral_gain",
+    "resolve_readout_layer",
+]
 
 logger = logging.getLogger(__name__)
 
@@ -66,65 +84,27 @@ MIN_CLOSED_LOOP_TAU = 1.0
 # cell's own reading is one token old, and the mean error every cell integrates is
 # frozen at the start of the pass, so it is a token older still.
 SHARED_DEAD_TIME = 2.0
-# Position 0 carries the attention-sink activation (norm ~17,000 against a median of
-# 60-1,400 on Qwen3-1.7B); it is not a sample of the resting distribution.
-FIRST_CALIBRATION_POSITION = 1
-SIGMA_FLOOR = 1e-6
-
-
-@dataclass(frozen=True)
-class LayerCalibration:
-    """One cell's resting state, and the lift it reads when every actuator injects."""
-
-    resting_mean: float
-    # Standard deviation of per-passage means: the slow variability the filtered
-    # reading actually has, and the unit the setpoint and gains are expressed in.
-    resting_sigma: float
-    token_sigma: float
-    # Projection units per unit of strength this cell reads with every actuator
-    # injecting -- the passthrough from the layers below plus the network's
-    # response, its own injection excluded. Zero for the lowest actuator.
-    lift: float = 0.0
-
-    @property
-    def sigma(self) -> float:
-        return max(self.resting_sigma, SIGMA_FLOOR)
-
-    @property
-    def gain_z(self) -> float:
-        return self.lift / self.sigma
-
-
-@dataclass(frozen=True)
-class AlignmentCalibration:
-    """Per-cell resting states and lifts; the tissue gain the shared gains derive from."""
-
-    layers: dict[int, LayerCalibration]
-    actuators: tuple[int, ...]
-    sensors: tuple[int, ...]
-    reference_strength: float
-    num_passages: int
-
-    def z(self, layer: int, projection: float) -> float:
-        calibration = self.layers[layer]
-        return (projection - calibration.resting_mean) / calibration.sigma
-
-    def setpoint_z(self, layer: int) -> float:
-        return self.layers[layer].gain_z * self.reference_strength
-
-    @property
-    def gain_z(self) -> float:
-        """Tissue gain: mean cell lift per unit of strength, in each cell's own sigma."""
-        return float(np.mean([self.layers[layer].gain_z for layer in self.sensors]))
-
-    @property
-    def readout_layer(self) -> int:
-        return max(self.sensors)
+# Gain margin on the integral gain's stability bound: the API accepts up to half
+# the critical gain of the modelled delay loop.
+INTEGRAL_GAIN_MARGIN = 0.5
 
 
 def _unit(vector: torch.Tensor) -> torch.Tensor:
     norm = vector.norm()
     return vector if norm == 0 else vector / norm
+
+
+def critical_integral_gain(process_gain: float, delay: int) -> float:
+    """Integral gain at which the delay loop ``y_t = K u_(t - delay)`` goes marginal.
+
+    With ``I_t = I_(t-1) + r - K ki I_(t-delay)`` the characteristic polynomial is
+    ``z^(delay-1) (z - 1) + K ki``, whose critical loop gain is
+    ``2 sin(pi / (2 (2 delay - 1)))``: 2 for a one-step delay, 1 for two, 0.618 for
+    three. Above it the error oscillates without decaying.
+    """
+    if process_gain <= 0 or delay < 1:
+        raise ValueError("process_gain must be positive and delay at least one step")
+    return 2.0 * math.sin(math.pi / (2.0 * (2.0 * delay - 1.0))) / process_gain
 
 
 def _last_position(hidden_states: torch.Tensor) -> torch.Tensor:
@@ -214,14 +194,16 @@ class AdaptiveHomeostat:
         return (derived_kp if kp is None else kp), (derived_ki if ki is None else ki)
 
     def max_stable_ki(self) -> float | None:
-        """Stability bound for the integral gain on the measured plant.
+        """Largest integral gain the API accepts: half the critical gain for this plant.
 
-        With a static gain ``K`` and a dead time of two tokens the integral-only loop
-        is stable iff ``K ki < 1``; conservative once the filter adds its own pole.
+        The shared integrator sees the consensus error with a delay of
+        :attr:`dead_time` tokens; :func:`critical_integral_gain` gives the gain at
+        which that loop stops decaying, and the bound keeps a factor of two below it.
         """
         if self.calibration is None:
             return None
-        return 2.0 / (self.calibration.gain_z * self.dead_time)
+        critical = critical_integral_gain(self.calibration.gain_z, int(round(self.dead_time)))
+        return INTEGRAL_GAIN_MARGIN * critical
 
     def max_kd(self) -> float:
         """A one-sigma-per-token swing of the reading may not move the output past the band."""
@@ -237,6 +219,8 @@ class AdaptiveHomeostat:
         if ki is not None and ki_limit is not None and ki > ki_limit:
             raise ValueError(f"ki {ki} exceeds the stability bound {ki_limit:.4g} for this plant")
         if kd is not None and kd > self.max_kd():
+            if self.max_kd() == 0:
+                raise ValueError("this goal is served at a constant strength; kd cannot act")
             raise ValueError(f"kd {kd} exceeds the noise bound {self.max_kd():.4g}")
         if kp is not None:
             self.config.kp = kp
@@ -307,7 +291,9 @@ class AdaptiveHomeostat:
         low, high = self.config.min_strength, self.config.max_strength
         strength = min(high, max(low, tissue_strength + local))
         self._strength[layer] = strength
-        self._saturated[layer] = state.saturated or strength <= low or strength >= high
+        self._saturated[layer] = high > low and (
+            state.saturated or strength <= low or strength >= high
+        )
         self._record()
         return strength
 
@@ -330,7 +316,7 @@ class AdaptiveHomeostat:
 
     def live_cells(self) -> list[int]:
         """Cells that fired in this pass or the previous one."""
-        return sorted(cell for cell, seen in self._seen.items() if seen >= self._pass - 1)
+        return sorted(cell for cell, seen in list(self._seen.items()) if seen >= self._pass - 1)
 
     def _live_actuators(self) -> list[int]:
         return [cell for cell in self.live_cells() if self._injects(cell)]
@@ -530,148 +516,6 @@ class SteeringHook:
         return steer_vec
 
 
-# --- calibration ---------------------------------------------------------------------
-
-
-def _transformer_layers(model: nn.Module) -> nn.ModuleList:
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        return cast(nn.ModuleList, getattr(model.model, "layers"))  # noqa: B009
-    if hasattr(model, "layers"):
-        return cast(nn.ModuleList, getattr(model, "layers"))  # noqa: B009
-    raise ValueError("Cannot find transformer layers")
-
-
-def _input_device(model: nn.Module) -> torch.device:
-    inner = getattr(model, "model", model)
-    embed = getattr(inner, "embed_tokens", None)
-    if embed is not None:
-        return embed.weight.device
-    return next(model.parameters()).device
-
-
-@dataclass
-class _ProjectionRecorder:
-    """Per-position projections onto each layer's direction, read before any injection there."""
-
-    directions: dict[int, torch.Tensor]
-    inject: dict[int, float] = field(default_factory=dict)
-    records: dict[int, list[torch.Tensor]] = field(default_factory=dict)
-
-    def hook(self, layer: int):
-        def _hook(module, inputs, output):
-            hidden = output[0] if isinstance(output, tuple) else output
-            direction = self.directions[layer].to(hidden.device, hidden.dtype)
-            start = FIRST_CALIBRATION_POSITION if hidden.shape[1] > 1 else 0
-            projection = (hidden[0, start:].float() @ direction.float()).detach().cpu()
-            self.records.setdefault(layer, []).append(projection)
-            if layer not in self.inject:
-                return output
-            hidden = hidden + self.inject[layer] * direction
-            return (hidden,) + tuple(output[1:]) if isinstance(output, tuple) else hidden
-
-        return _hook
-
-    def run(self, model: nn.Module, tokenizer, texts: Sequence[str], max_length: int) -> None:
-        layers = _transformer_layers(model)
-        handles = [
-            layers[layer].register_forward_hook(self.hook(layer)) for layer in self.directions
-        ]
-        device = _input_device(model)
-        try:
-            for text in texts:
-                inputs = tokenizer(
-                    text, return_tensors="pt", max_length=max_length, truncation=True
-                ).to(device)
-                with torch.no_grad():
-                    model(**inputs)
-        finally:
-            for handle in handles:
-                handle.remove()
-
-
-def _layer_statistics(records: list[torch.Tensor], lift: float) -> LayerCalibration:
-    tokens = torch.cat(records)
-    passage_means = torch.stack([record.mean() for record in records])
-    return LayerCalibration(
-        resting_mean=float(tokens.mean().item()),
-        resting_sigma=float(passage_means.std().item()) if len(records) > 1 else 0.0,
-        token_sigma=float(tokens.std().item()) if tokens.numel() > 1 else 0.0,
-        lift=lift,
-    )
-
-
-def resolve_readout_layer(config: SteeringConfig, vector_layers: Sequence[int]) -> int:
-    """The sensor-only cell: configured, else the layer above the top actuator, else the top."""
-    actuators = [layer for layer in vector_layers if layer in config.steering_layers]
-    if not actuators:
-        raise ValueError(
-            f"no steering vector at any configured steering layer {config.steering_layers}"
-        )
-    top = max(actuators)
-    if config.readout_layer is not None:
-        if config.readout_layer not in vector_layers:
-            raise ValueError(f"no steering vector at readout layer {config.readout_layer}")
-        return config.readout_layer
-    return top + 1 if top + 1 in vector_layers else top
-
-
-def calibrate_alignment(
-    model: nn.Module,
-    tokenizer,
-    vectors: dict[int, SteeringVector],
-    config: SteeringConfig,
-    texts: Sequence[str] | None = None,
-    max_length: int = 128,
-) -> AlignmentCalibration:
-    """Measure every cell's resting state and the lift it reads at the reference strength.
-
-    Two passes over the corpus: unsteered, recording every cell, then steered at
-    ``config.base_strength`` on every actuator, recording every cell again before
-    its own injection. Each cell's lift is its mean rise per unit of strength.
-    Position 0 is excluded from both; see :data:`FIRST_CALIBRATION_POSITION`.
-    """
-    if config.base_strength <= 0:
-        raise ValueError("calibration needs a positive base_strength to measure the lift against")
-    corpus = list(texts) if texts is not None else list(CAPABILITY_CORPUS)
-    if not corpus:
-        raise ValueError("calibration corpus is empty")
-
-    readout = resolve_readout_layer(config, list(vectors))
-    actuators = tuple(sorted(layer for layer in vectors if layer in config.steering_layers))
-    sensors = tuple(sorted({*actuators, readout}))
-    directions = {layer: _unit(vectors[layer].vector.float()) for layer in sensors}
-
-    resting = _ProjectionRecorder(directions)
-    resting.run(model, tokenizer, corpus, max_length)
-    steered = _ProjectionRecorder(directions, inject=dict.fromkeys(actuators, config.base_strength))
-    steered.run(model, tokenizer, corpus, max_length)
-
-    layers = {}
-    for layer in sensors:
-        rest_mean = float(torch.cat(resting.records[layer]).mean().item())
-        steered_mean = float(torch.cat(steered.records[layer]).mean().item())
-        lift = (steered_mean - rest_mean) / config.base_strength
-        layers[layer] = _layer_statistics(resting.records[layer], lift)
-
-    calibration = AlignmentCalibration(
-        layers=layers,
-        actuators=actuators,
-        sensors=sensors,
-        reference_strength=config.base_strength,
-        num_passages=len(corpus),
-    )
-    logger.info(
-        "Alignment calibration over %d passages: cells %s, tissue gain %.4f sigma/unit, "
-        "cell setpoints %s at strength %.2f",
-        len(corpus),
-        sensors,
-        calibration.gain_z,
-        {layer: round(calibration.setpoint_z(layer), 3) for layer in sensors},
-        config.base_strength,
-    )
-    return calibration
-
-
 # --- coordinator -----------------------------------------------------------------------
 
 
@@ -747,20 +591,29 @@ class CognitiveHomeostat(nn.Module):
         self.set_capability_subspaces(subspaces)
         return subspaces
 
-    def calibrate(
-        self, model: nn.Module, tokenizer, texts: Sequence[str] | None = None
-    ) -> AlignmentCalibration:
-        """Measure the cells' resting states and lifts, and rebuild the tissue around them."""
+    def calibrate(self, model: nn.Module, tokenizer, texts: Sequence[str]) -> AlignmentCalibration:
+        """Measure the cells' resting states and lifts, and rebuild the tissue around them.
+
+        Measured along the directions the hooks will inject -- the projected ones
+        when the capability projection is on -- and only while detached, since a
+        stream the live hooks are steering is not a resting one.
+        """
+        if self._registered_hooks:
+            raise RuntimeError("detach the homeostat before calibrating it")
+        directions = {layer: self.projected_direction(layer)[0] for layer in self.steering_vectors}
         self.calibration = calibrate_alignment(
-            model, tokenizer, self.steering_vectors, self.config, texts=texts
+            model,
+            tokenizer,
+            self.steering_vectors,
+            self.config,
+            texts=texts,
+            directions=directions,
         )
         self.homeostat = AdaptiveHomeostat(self.config, self.calibration, goal=self.goal)
-        for hook in self.hooks.values():
-            hook.homeostat = self.homeostat
         return self.calibration
 
     def attach_to_model(self, model: nn.Module):
-        layers = _transformer_layers(model)
+        layers = transformer_layers(model)
         readout = self.readout_layer
         cells = {layer: True for layer in self.actuator_layers}
         cells.setdefault(readout, False)

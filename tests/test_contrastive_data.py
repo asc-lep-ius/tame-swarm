@@ -556,3 +556,15 @@ def test_geometry_of_truth_respects_limit_and_can_be_lettered():
     assert len(loader.load("truthful", "geometry_of_truth/cities", limit=4)) == 4
     mc = loader.load("truthful", "geometry_of_truth/cities", pair_format=MULTIPLE_CHOICE_FORMAT)
     assert mc.is_multiple_choice and mc.quality_report().letters_balanced
+
+
+def test_interleaved_split_is_the_gate_split_and_disjoint():
+    from contrastive_data import certified_source, interleaved_split
+
+    pairs = list(load_contrastive_dataset("safe", source="builtin"))
+    extract, held = interleaved_split(pairs, 15)
+    assert len(held) == 15
+    assert len(extract) + len(held) == len(pairs)
+    assert not {id(p) for p in extract} & {id(p) for p in held}
+    assert certified_source("truthful") == "truthful_qa"
+    assert certified_source("deliberation") == "builtin"

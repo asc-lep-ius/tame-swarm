@@ -9,7 +9,11 @@ class GenerateRequest(BaseModel):
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     steering_strength: float | None = Field(
         default=None,
-        description="Override steering strength (0.0-1.5). None = adaptive.",
+        gt=0.0,
+        description=(
+            "Hold the injection at this strength for the request. None = the served "
+            "configuration (constant certified strength, or the loop when adaptive)."
+        ),
     )
     goal: str | None = Field(
         default="truthful",
@@ -24,7 +28,8 @@ class GenerateRequest(BaseModel):
 class GenerateResponse(BaseModel):
     response: str
     usage: dict[str, int]
-    homeostasis: dict[str, float] | None = None
+    # The loop's stats: scalars plus histories and the per-cell PID status.
+    homeostasis: dict[str, Any] | None = None
     mob_stats: dict[str, Any] | None = None
 
 

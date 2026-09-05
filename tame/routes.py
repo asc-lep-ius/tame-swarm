@@ -4,7 +4,7 @@ import logging
 from threading import Thread
 
 import torch
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from transformers import TextIteratorStreamer
 
@@ -412,24 +412,29 @@ async def generate_stream(req: GenerateRequest, tame: TAMEApplication = Depends(
 
 
 @router.post("/steering/update")
-async def update_steering(
+def update_steering(
     tame: TAMEApplication = Depends(get_tame_app),
     goal: str = "truthful",
-    strength: float | None = None,
-    kp: float | None = None,
-    ki: float | None = None,
-    kd: float | None = None,
+    strength: float | None = Query(default=None, gt=0.0),
+    kp: float | None = Query(default=None, ge=0.0),
+    ki: float | None = Query(default=None, ge=0.0),
+    kd: float | None = Query(default=None, ge=0.0),
 ):
     """Swap the served goal (re-extract, re-calibrate, re-attach) and optionally set gains.
 
-    ``strength`` defaults to the goal's certified reference strength. Gains are
-    applied after the calibration so their bounds are checked against the plant.
+    ``strength`` defaults to the goal's certified reference strength and must lie
+    inside its certified band. Gains are applied after the calibration so their
+    bounds are checked against the plant. Synchronous on purpose: the swap runs
+    minutes of forward passes, and a sync endpoint runs in the threadpool rather
+    than stalling the event loop and every other request with it.
     """
     if tame.homeostat is None:
         raise HTTPException(status_code=400, detail="Steering not initialized")
 
     try:
         extraction = tame.install_goal(goal, strength=strength)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except Exception as e:
         logger.error("Steering update error: %s", e)
         raise HTTPException(status_code=500, detail="Steering update failed") from e

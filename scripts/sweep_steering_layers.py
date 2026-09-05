@@ -44,6 +44,8 @@ from behavioural_validation import held_out_accuracy, validate_steering_vector  
 from contrastive_data import (  # noqa: E402
     COMPLETION_FORMAT,
     certification_for,
+    certified_source,
+    interleaved_split,
     load_contrastive_dataset,
     load_instruction_prefix_control,
     to_multiple_choice,
@@ -100,13 +102,11 @@ def candidate_sets(
 
 
 def split_pairs(goal: str, held_out: int):
-    """The certified source split as ``validate_steering`` splits it, both in letter format."""
-    certification = certification_for(goal)
-    source = certification.source if certification else "builtin"
-    content = list(load_contrastive_dataset(goal, source=source, pair_format=COMPLETION_FORMAT))
-    k = max(2, len(content) // 200)
-    held_content = [pair for index, pair in enumerate(content) if index % k == 0][:200]
-    extract_content = [pair for index, pair in enumerate(content) if index % k != 0]
+    """The certified source split as the gate splits it, both sides in letter format."""
+    content = list(
+        load_contrastive_dataset(goal, source=certified_source(goal), pair_format=COMPLETION_FORMAT)
+    )
+    extract_content, held_content = interleaved_split(content, 200)
     extract = to_multiple_choice(extract_content, seed=SEED_EXTRACT)
     held = to_multiple_choice(held_content, seed=SEED_HELD_OUT)[:held_out]
     return extract, held, held_content

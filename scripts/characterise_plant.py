@@ -39,7 +39,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tame"))
 
 from contrastive_data import (  # noqa: E402
     COMPLETION_FORMAT,
-    certification_for,
+    certified_source,
+    interleaved_split,
     load_contrastive_dataset,
     to_multiple_choice,
 )
@@ -74,12 +75,12 @@ def load_model(model_id: str):
 
 
 def held_out_pairs(goal: str, count: int):
-    """The certified held-out split, content format, interleaved as validate_steering does."""
-    certification = certification_for(goal)
-    source = certification.source if certification else "builtin"
-    pairs = list(load_contrastive_dataset(goal, source=source, pair_format=COMPLETION_FORMAT))
-    k = max(2, len(pairs) // 200)
-    return [pair for index, pair in enumerate(pairs) if index % k == 0][:count]
+    """The certified held-out split, content format, as the gate takes it."""
+    pairs = list(
+        load_contrastive_dataset(goal, source=certified_source(goal), pair_format=COMPLETION_FORMAT)
+    )
+    _, held = interleaved_split(pairs, 200)
+    return held[:count]
 
 
 def first_index(mask: torch.Tensor, default: int) -> int:
@@ -257,7 +258,7 @@ def cross_goal(model, tokenizer, device, config, forced, goals, strength):
     readouts = {}
     extractor = SteeringVectorExtractor(model, tokenizer, [readout])
     for goal in goals:
-        pairs = list(load_contrastive_dataset(goal, source=serving_source(goal)))
+        pairs = list(load_contrastive_dataset(goal, source=certified_source(goal)))
         readouts[goal] = extractor.extract_from_pairs(pairs[:200])[readout].vector
     # resting sigma of each goal at the readout (slow), unsteered
     sigma, resting = {}, {}
@@ -298,11 +299,6 @@ def cross_goal(model, tokenizer, device, config, forced, goals, strength):
     return matrix
 
 
-def serving_source(goal: str) -> str:
-    certification = certification_for(goal)
-    return certification.source if certification else "builtin"
-
-
 def letter_log_odds(model, tokenizer, device, homeostat, pair, rationale_tokens):
     """Generate a rationale with the loop running, then read the letter choice."""
     prompt = pair.prompt.rsplit("Answer:", 1)[0] + RATIONALE_CUE
@@ -339,6 +335,7 @@ def value_test(model, tokenizer, device, homeostat, config, pairs, rationale_tok
     low = resting_t <= resting_t.median()
 
     results = {}
+    entering_adaptive = config.adaptive
     for mode in ("constant", "adaptive"):
         config.adaptive = mode == "adaptive"
         odds, strengths = [], []
@@ -349,7 +346,7 @@ def value_test(model, tokenizer, device, homeostat, config, pairs, rationale_tok
             odds.append(value)
             strengths.append(loop.current_strength)
         results[mode] = dict(odds=torch.tensor(odds), strength=torch.tensor(strengths))
-    config.adaptive = True
+    config.adaptive = entering_adaptive
 
     delta = results["adaptive"]["odds"] - results["constant"]["odds"]
     summary = {}

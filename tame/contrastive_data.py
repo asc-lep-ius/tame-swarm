@@ -697,6 +697,27 @@ def load_instruction_prefix_control(goal: str) -> ContrastivePairSet:
     )
 
 
+def certified_source(goal: str) -> str:
+    """The source a goal is certified on, or the built-in templates."""
+    certification = certification_for(goal)
+    return certification.source if certification else BUILTIN_SOURCE
+
+
+def interleaved_split(
+    pairs: Sequence[ContrastivePair], held_out: int
+) -> tuple[list[ContrastivePair], list[ContrastivePair]]:
+    """Every k-th pair held out so topics interleave; the rest extract.
+
+    The split the gate certifies on. Every script that measures against the
+    certified held-out set takes it from here, so a change to the split cannot
+    silently desynchronise a measurement from the certification.
+    """
+    k = max(2, len(pairs) // max(1, held_out))
+    kept = [pair for index, pair in enumerate(pairs) if index % k == 0][:held_out]
+    rest = [pair for index, pair in enumerate(pairs) if index % k != 0]
+    return rest, kept
+
+
 def replace_read_position(pair: ContrastivePair, read_position: int) -> ContrastivePair:
     """A copy of ``pair`` reading at a different completion position."""
     return replace(pair, read_position=read_position)

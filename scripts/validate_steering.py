@@ -49,6 +49,7 @@ from contrastive_data import (  # noqa: E402
     Certification,
     ContrastivePair,
     certification_for,
+    interleaved_split,
     letter_counts,
     letter_imbalance,
     load_contrastive_dataset,
@@ -91,20 +92,12 @@ def split_by_tier(pairs, held_out_per_tier):
     return list(reversed(extract)), list(reversed(held_out))
 
 
-def split_interleaved(pairs, held_out_n):
-    """Every k-th pair held out so topics interleave; the rest extract."""
-    k = max(2, len(pairs) // max(1, held_out_n))
-    held_out = [pair for index, pair in enumerate(pairs) if index % k == 0][:held_out_n]
-    extract = [pair for index, pair in enumerate(pairs) if index % k != 0]
-    return extract, held_out
-
-
 def load_split(goal, source, args):
     """Content-format extraction and held-out sets for ``goal`` from ``source``."""
     pairs = list(load_contrastive_dataset(goal, source=source, pair_format=COMPLETION_FORMAT))
     if source == BUILTIN_SOURCE:
         return split_by_tier(pairs, args.held_out_per_tier)
-    return split_interleaved(pairs, args.held_out)
+    return interleaved_split(pairs, args.held_out)
 
 
 def in_format(pairs, pair_format, seed):

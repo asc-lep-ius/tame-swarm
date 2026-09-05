@@ -140,3 +140,73 @@ def test_steering_update_installs_the_goal_and_reports_the_band(
     assert body["layers"] == [1, 2]
     assert body["strength_band"] == [0.0, 4.0]
     assert body["pid"]["kp"] == 0.2
+
+
+def test_generate_response_carries_the_loop_history_and_pid_status(loaded_homeostat):
+    """The stats the homeostat returns must fit the response model, or /generate 500s."""
+    import torch
+
+    from models import GenerateResponse
+
+    homeostat, _ = loaded_homeostat
+    direction = homeostat.steering_vectors[1].vector
+    for _ in range(3):
+        homeostat.homeostat.compute_strength(direction.view(1, 1, -1), direction)
+    stats = homeostat.get_alignment_stats()
+    assert stats["alignment_history"] and isinstance(stats["pid"], dict)
+
+    response = GenerateResponse(response="x", usage={"input_tokens": 1}, homeostasis=stats)
+    assert response.homeostasis is not None
+    assert len(response.homeostasis["strength_history"]) == 3
+    assert torch.is_tensor(direction)
+
+
+def test_steering_update_rejects_bad_strengths(client, mock_tame_app, loaded_homeostat):
+    from unittest.mock import MagicMock
+
+    homeostat, _ = loaded_homeostat
+    mock_tame_app.homeostat = homeostat
+    assert client.post("/steering/update", params={"strength": -5}).status_code == 422
+    assert client.post("/steering/update", params={"strength": 0}).status_code == 422
+
+    mock_tame_app.install_goal = MagicMock(side_effect=ValueError("outside the certified band"))
+    resp = client.post("/steering/update", params={"goal": "truthful", "strength": 40})
+    assert resp.status_code == 422
+    assert "band" in resp.json()["detail"]
+
+
+def test_install_goal_reattaches_the_old_loop_when_the_new_one_fails(monkeypatch):
+    import torch
+
+    import app as app_module
+    from homeostat import CognitiveHomeostat
+    from steering import SteeringVector
+
+    from .steering_fakes import MonotonicModel, SimpleCharTokenizer
+
+    model = MonotonicModel(vocab_size=32, hidden_dim=8, num_layers=4)
+    config = SteeringConfig(steering_layers=[1, 2], orthogonal_projection=False)
+    homeostat = CognitiveHomeostat(config)
+    for layer in (1, 2):
+        homeostat.add_steering_vector(layer, SteeringVector("truthful", torch.randn(8), layer))
+    homeostat.attach_to_model(model)
+    tame = app_module.TAMEApplication(
+        model=model,  # pyright: ignore[reportArgumentType]
+        tokenizer=SimpleCharTokenizer(),  # pyright: ignore[reportArgumentType]
+        homeostat=homeostat,
+        mob_config=MoBConfig(num_experts=2, top_k=1, hidden_dim=8, intermediate_dim=16),
+        steering_config=config,
+        model_id="fake",
+        steering_template=config,
+    )
+
+    def explode(*_args, **_kwargs):
+        raise RuntimeError("no such goal")
+
+    monkeypatch.setattr(app_module, "build_homeostat", explode)
+    with pytest.raises(RuntimeError):
+        tame.install_goal("safe")
+
+    assert tame.homeostat is homeostat
+    assert len(homeostat._registered_hooks) == 2
+    homeostat.detach_from_model()

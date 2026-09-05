@@ -51,15 +51,23 @@ def build_homeostat(
     """Extract, calibrate and attach the loop for ``goal``; startup and the API share this path.
 
     The config is derived from the goal's certification (layers, reference
-    strength, band); ``strength`` overrides the reference strength, and so the
-    setpoint the calibration measures. Calibration failures degrade to the legacy
-    cosine loop with a warning rather than leaving the server unsteered.
+    strength, band); ``strength`` overrides the reference strength -- and so the
+    setpoint the calibration measures -- but only inside the certified band.
+    ``template`` must be the pristine template, never a previously served config:
+    gains pinned through the API and a certified goal's layers would otherwise
+    leak into the next goal. Calibration failures degrade to the legacy cosine
+    loop with a warning rather than leaving the server unsteered.
     """
     config = serving_config(goal, template, model_id=model_id)
     if strength is not None:
+        if strength <= 0:
+            raise ValueError(f"strength must be positive, got {strength}")
+        if not config.min_strength <= strength <= config.max_strength:
+            raise ValueError(
+                f"strength {strength} is outside the certified band "
+                f"[{config.min_strength}, {config.max_strength}] for goal {goal!r}"
+            )
         config.base_strength = strength
-        config.min_strength = min(config.min_strength, strength)
-        config.max_strength = max(config.max_strength, strength)
 
     extraction = extract_steering_vectors(model, tokenizer, goal=goal, config=config)
     logger.info(
@@ -126,6 +134,9 @@ class TAMEApplication:
     mob_config: MoBConfig
     steering_config: SteeringConfig
     model_id: str
+    # The pristine loop settings every goal install starts from; ``steering_config``
+    # is the config of the goal currently served, and carries its pinned gains.
+    steering_template: SteeringConfig | None = None
 
     @classmethod
     def from_profile(cls) -> TAMEApplication:
@@ -158,10 +169,11 @@ class TAMEApplication:
         # A template: the served goal's layers, reference strength and band come
         # from its certification record (see build_homeostat). The MoB layer range
         # here is only what an uncertified goal falls back to.
-        steering_config = SteeringConfig(
+        steering_template = SteeringConfig(
             steering_layers=list(range(profile["mob_layers_start"], profile["mob_layers_end"])),
             adaptive=ADAPTIVE_STEERING,
         )
+        steering_config = steering_template
 
         logger.info("=" * 60)
         logger.info("TAME SWARM: Initializing Agential Architecture")
@@ -264,7 +276,7 @@ class TAMEApplication:
         homeostat: CognitiveHomeostat | None = None
         try:
             homeostat, _, steering_config = build_homeostat(
-                model, tokenizer, steering_config, DEFAULT_GOAL, model_id=model_id
+                model, tokenizer, steering_template, DEFAULT_GOAL, model_id=model_id
             )
         except Exception as e:
             logger.warning("[HOMEOSTASIS] Steering extraction failed: %s", e)
@@ -282,20 +294,34 @@ class TAMEApplication:
             mob_config=mob_config,
             steering_config=steering_config,
             model_id=model_id,
+            steering_template=steering_template,
         )
 
     def install_goal(self, goal: str, strength: float | None = None) -> SteeringExtraction:
-        """Swap the served goal at runtime: detach, re-extract, re-calibrate, re-attach."""
-        if self.homeostat is not None:
-            self.homeostat.detach_from_model()
-        self.homeostat, extraction, self.steering_config = build_homeostat(
-            self.model,  # pyright: ignore[reportArgumentType] # AutoModelForCausalLM is an nn.Module at runtime
-            self.tokenizer,
-            self.steering_config,
-            goal,
-            model_id=self.model_id,
-            strength=strength,
-        )
+        """Swap the served goal at runtime: detach, re-extract, re-calibrate, re-attach.
+
+        The old hooks come off first because a calibration measured under them
+        would not be a resting stream; if the new goal cannot be built they go
+        straight back, so the server never silently serves an unsteered model.
+        """
+        template = self.steering_template or self.steering_config
+        previous = self.homeostat
+        if previous is not None:
+            previous.detach_from_model()
+        try:
+            homeostat, extraction, config = build_homeostat(
+                self.model,  # pyright: ignore[reportArgumentType] # AutoModelForCausalLM is an nn.Module at runtime
+                self.tokenizer,
+                template,
+                goal,
+                model_id=self.model_id,
+                strength=strength,
+            )
+        except Exception:
+            if previous is not None:
+                previous.attach_to_model(self.model)  # pyright: ignore[reportArgumentType] # as above
+            raise
+        self.homeostat, self.steering_config = homeostat, config
         return extraction
 
     def start_mob_tracking(self) -> None:

@@ -20,6 +20,7 @@ from homeostat import (
     LayerCalibration,
     SteeringHook,
     calibrate_alignment,
+    critical_integral_gain,
 )
 from steering import SteeringConfig, SteeringVector
 
@@ -27,6 +28,7 @@ from .steering_fakes import MonotonicModel, SimpleCharTokenizer
 
 HIDDEN = 8
 ACTUATORS = (1, 2)
+CALIBRATION_TEXTS = ["abc", "defg", "hij", "klmn"]
 READOUT = 3
 # Identity layers with one shared direction: the lift a cell reads per unit of
 # strength is the number of actuators below it.
@@ -199,6 +201,7 @@ def test_a_removed_cell_drops_out_of_the_consensus_and_rejoins():
     tissue.run(80)
     assert abs(homeostat.status()["error"]) < 5e-2
     assert tissue.strengths[1] > steady[1] + 1.0
+    assert homeostat.current_strength == pytest.approx(tissue.strengths[1])
 
     tissue.dead.clear()
     tissue.run(3)
@@ -221,15 +224,77 @@ def test_gains_are_derived_from_the_calibration_unless_pinned():
     assert filtered.gains()[0] > 0
 
 
+def simulate_integral_loop(gain: float, ki: float, delay: int, steps: int = 600) -> float:
+    """Integral-only control of ``y_t = gain * u_(t - delay)``; the final |error|."""
+    outputs = [0.0] * delay
+    integral, error = 0.0, 1.0
+    for _ in range(steps):
+        reading = gain * outputs[-delay]
+        error = 1.0 - reading
+        integral += error
+        outputs.append(ki * integral)
+    return abs(error)
+
+
+def test_critical_integral_gain_separates_decay_from_oscillation():
+    critical = critical_integral_gain(1.0, delay=2)
+    assert critical == pytest.approx(1.0)
+    assert critical_integral_gain(1.0, delay=3) == pytest.approx(0.618, abs=1e-3)
+    assert simulate_integral_loop(1.0, 0.9 * critical, delay=2) < 1e-3
+    assert simulate_integral_loop(1.0, 1.1 * critical, delay=2) > 0.1
+
+
 def test_set_gains_rejects_an_integral_gain_the_plant_cannot_stabilise():
     homeostat = AdaptiveHomeostat(tissue_config(), calibration=calibration())
     limit = homeostat.max_stable_ki()
     assert homeostat.calibration is not None
-    assert limit == pytest.approx(2.0 / (homeostat.calibration.gain_z * homeostat.dead_time))
+    critical = critical_integral_gain(homeostat.calibration.gain_z, 2)
+    assert limit is not None and limit < critical
+    # The accepted bound still converges on the modelled delay loop.
+    assert simulate_integral_loop(homeostat.calibration.gain_z, limit, delay=2) < 1e-3
     with pytest.raises(ValueError, match="ki"):
         homeostat.set_gains(ki=limit * 1.01)
     homeostat.set_gains(ki=limit * 0.5, kp=0.1)
     assert homeostat.gains() == (0.1, pytest.approx(limit * 0.5))
+
+
+def test_gain_derivation_reads_the_closed_loop_and_filter_time_constants():
+    slow = AdaptiveHomeostat(tissue_config(closed_loop_tau=20.0), calibration=calibration())
+    fast = AdaptiveHomeostat(tissue_config(closed_loop_tau=5.0), calibration=calibration())
+    assert slow.gains()[1] < fast.gains()[1]
+    filtered = AdaptiveHomeostat(
+        tissue_config(measurement_filter_alpha=0.2), calibration=calibration()
+    )
+    assert filtered.filter_time_constant == pytest.approx(4.0)
+    assert filtered.gains()[0] > 0
+
+
+def test_reading_filters_over_passes_and_takes_the_last_position():
+    homeostat, _ = make(measurement_filter_alpha=0.5)
+    direction = unit(torch.randn(HIDDEN))
+    hidden = torch.stack([torch.zeros(HIDDEN), torch.zeros(HIDDEN), 5.0 * direction]).view(1, 3, -1)
+    assert homeostat.reading(hidden, direction) == pytest.approx(5.0)
+
+    homeostat.sense(3, (2.0 * direction).view(1, 1, -1), direction)
+    homeostat.sense(3, torch.zeros(1, 1, HIDDEN), direction)
+    # Second reading is 0 but the filtered process variable is halfway back to 2.
+    assert homeostat.status()["cells"][2]["process_variable"] == pytest.approx(1.0)
+
+
+def test_local_push_past_the_band_is_reported_as_saturation():
+    homeostat, tissue = make(content={1: -10.0, 2: 0.0, 3: 0.0}, kp=0.5)
+    tissue.run(20)
+    cells = homeostat.status()["cells"]
+    assert cells[0]["saturated"] is True
+    assert cells[0]["i_term"] == pytest.approx(cells[1]["i_term"], abs=1e-9)
+
+
+def test_band_less_goal_is_never_reported_saturated():
+    homeostat, tissue = make(content=-5.0, min_strength=2.0, max_strength=2.0)
+    tissue.run(10)
+    assert homeostat.status()["integral_saturated"] is False
+    with pytest.raises(ValueError, match="constant strength"):
+        homeostat.set_gains(kd=0.1)
 
 
 def test_reset_clears_cells_and_histories():
@@ -252,6 +317,15 @@ def test_snapshot_round_trips_through_a_dict():
     restored.restore(homeostat.snapshot())
     assert restored.controller.states == homeostat.controller.states
     assert restored.current_strength == pytest.approx(homeostat.current_strength)
+    assert restored.status()["process_variable"] == pytest.approx(
+        homeostat.status()["process_variable"]
+    )
+    # The filter state came across too: one more identical pass agrees exactly.
+    twin = Tissue(restored, tissue.direction, -0.5)
+    twin.strengths = dict(tissue.strengths)
+    tissue.step()
+    twin.step()
+    assert twin.strengths == pytest.approx(tissue.strengths)
 
 
 # --- calibration and wiring on the identity-layer fakes
@@ -269,7 +343,7 @@ def test_calibration_recovers_the_lift_every_cell_reads():
     vectors = identity_vectors(direction, layers=[1, 2, 3])
     config = SteeringConfig(steering_layers=[1, 2], base_strength=2.0, readout_layer=3)
 
-    result = calibrate_alignment(model, tokenizer, vectors, config, texts=["abc", "defg", "hij"])
+    result = calibrate_alignment(model, tokenizer, vectors, config, texts=CALIBRATION_TEXTS)
 
     assert result.actuators == (1, 2)
     assert result.sensors == (1, 2, 3)
@@ -277,6 +351,32 @@ def test_calibration_recovers_the_lift_every_cell_reads():
         assert result.layers[layer].lift == pytest.approx(lift, abs=1e-4)
         assert result.layers[layer].resting_mean == pytest.approx(0.0, abs=1e-5)
     assert result.reference_strength == 2.0
+    assert set(result.directions) == {1, 2, 3}
+    with pytest.raises(ValueError, match="passages"):
+        calibrate_alignment(model, tokenizer, vectors, config, texts=["abc", "de"])
+
+
+def test_calibration_is_measured_along_the_direction_the_hooks_inject():
+    """With the capability projection on, the hook injects the projected direction; so must
+    the calibration read it, or the resting state is measured on a different variable."""
+    model = MonotonicModel(vocab_size=32, hidden_dim=HIDDEN, num_layers=4)
+    tokenizer = SimpleCharTokenizer()
+    raw = unit(torch.eye(HIDDEN)[1] + 0.5 * torch.eye(HIDDEN)[0])
+    config = tissue_config(orthogonal_projection=True)
+    coordinator = CognitiveHomeostat(config)
+    coordinator.add_steering_vectors(identity_vectors(raw, layers=[1, 2, 3]))
+    coordinator.set_capability_subspaces({layer: torch.eye(HIDDEN)[:1] for layer in (1, 2, 3)})
+    coordinator.calibrate(model, tokenizer, texts=CALIBRATION_TEXTS)
+    coordinator.attach_to_model(model)
+
+    assert coordinator.calibration is not None
+    for layer, hook in coordinator.hooks.items():
+        injected = hook._direction(torch.device("cpu"), torch.float32)
+        assert torch.allclose(coordinator.calibration.directions[layer], injected, atol=1e-6)
+        assert not torch.allclose(injected, raw, atol=1e-3)
+    with pytest.raises(RuntimeError, match="detach"):
+        coordinator.calibrate(model, tokenizer, texts=CALIBRATION_TEXTS)
+    coordinator.detach_from_model()
 
 
 def test_cognitive_homeostat_attaches_a_cell_per_layer_and_one_sensor_only_readout():
@@ -286,7 +386,7 @@ def test_cognitive_homeostat_attaches_a_cell_per_layer_and_one_sensor_only_reado
     config = tissue_config()
     coordinator = CognitiveHomeostat(config)
     coordinator.add_steering_vectors(identity_vectors(direction, layers=[1, 2, 3]))
-    coordinator.calibrate(model, tokenizer, texts=["abc", "defg", "hij"])
+    coordinator.calibrate(model, tokenizer, texts=CALIBRATION_TEXTS)
     coordinator.attach_to_model(model)
 
     assert {layer for layer, hook in coordinator.hooks.items() if hook.injects} == {1, 2}
