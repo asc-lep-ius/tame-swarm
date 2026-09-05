@@ -332,6 +332,8 @@ def main() -> None:
 
     print_summary(gate_rows)
 
+    if len(vectors_by_goal) < 2:
+        return
     mid_layer = layers[len(layers) // 2]
     print(f"\nGoal cosine similarity at layer {mid_layer} (for the #4 orthogonalisation decision):")
     pairwise = log_goal_similarity(vectors_by_goal, mid_layer)
