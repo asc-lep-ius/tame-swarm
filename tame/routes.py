@@ -408,6 +408,9 @@ async def update_steering(
             "goal": goal,
             "strength": strength,
             "layers": tame.steering_config.steering_layers,
+            "source": extraction.source,
+            "pair_format": extraction.pair_format,
+            "certified": extraction.certified,
         }
 
     except Exception as e:

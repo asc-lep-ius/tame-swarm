@@ -176,11 +176,19 @@ class TAMEApplication:
                 config=steering_config,
             )
             logger.info(
-                "[HOMEOSTASIS] Extracted from %d behavioural pairs (%s), tiers %s",
+                "[HOMEOSTASIS] Extracted from %d %s pairs (%s, %s), tiers %s",
                 extraction.pair_count,
+                extraction.pair_format,
                 extraction.source,
+                "certified" if extraction.certified else "UNCERTIFIED",
                 extraction.tier_counts,
             )
+            if not extraction.certified:
+                logger.warning(
+                    "[HOMEOSTASIS] Steering on an uncertified '%s' vector: %s",
+                    extraction.goal,
+                    extraction.fallback_reason or "source/format is not the certified pair",
+                )
 
             homeostat = CognitiveHomeostat(steering_config)
             homeostat.add_steering_vectors(extraction.vectors)

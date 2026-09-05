@@ -11,19 +11,29 @@ behaviour: A/B completions of a shared prompt, read at the answer token.
 
 A :class:`ContrastivePair` is therefore a *shared prompt* plus two contrasting
 **completions**, with a recorded read position -- the token whose activation the
-extractor reads. The instruction-prefix templates are retained (see
+extractor reads. It comes in two formats (#17). In the *completion* format the
+arms are the answers themselves, read at the answer token; that read also carries
+what the answer is *about*, which over heterogeneous facts swamps the behaviour
+and is why the #3 ``truthful`` vector steered toward falsehood. In the
+*multiple-choice* format -- CAA's actual one -- both answers sit in the prompt as
+``(A)``/``(B)`` options, each arm is a single letter, and the read is at the
+letter: the moment of commitment, identical content, only the choice differs.
+Each goal has a certified (source, format) in :data:`CERTIFIED`; the gate in
+``scripts/validate_steering.py`` is what puts an entry there.
+
+The instruction-prefix templates are retained (see
 :data:`INSTRUCTION_PREFIX_CONTROL`) not because they are useful for steering but
 because they are the artefact this design is trying to avoid extracting, which
 makes them the negative control the behavioural validation measures against.
 
-This module is the data and validation half; the extraction that reads these
-pairs at their recorded positions lives in ``steering.py``, and the pipeline that
-ties loading, extraction and normalisation together lives in
-``steering_pipeline.py``. Loading published A/B datasets from HuggingFace is
-optional and imports ``datasets`` lazily, so the ``serve`` extra never needs it.
+This module is the data and validation half; the converters for published
+datasets live in ``contrastive_sources.py``, the extraction that reads these
+pairs at their recorded positions in ``steering.py``, and the pipeline that ties
+loading, extraction and normalisation together in ``steering_pipeline.py``.
 """
 
 import logging
+import random
 import re
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field, replace
@@ -51,11 +61,26 @@ MIN_PAIRS_PER_TIER = 15
 # so their difference is noise added to the mean. A quality warning, not a
 # rejection: the caller decides whether a near-duplicate pair earns its place.
 MAX_COMPLETION_SIMILARITY = 0.95
-# Default cap on pairs drawn from a *streaming* HF source (hh-rlhf is ~42k rows),
-# so a bare `load_contrastive_dataset(..., source="Anthropic/hh-rlhf")` yields an
-# extraction-sized set rather than materialising the whole split. Pass an explicit
-# `limit` to override. truthful_qa is small enough (817 rows) to leave uncapped.
-DEFAULT_HF_STREAM_LIMIT = 500
+# How a pair presents its contrast to the model. ``completion`` is the #3 shape:
+# the two arms are the answers themselves, read at the answer token. That reads
+# *what the answer is about* along with whether it is right, and for
+# heterogeneous facts the content dominates the diff-in-means -- the failure #17
+# diagnosed. ``multiple_choice`` is CAA's actual format (Rimsky et al., 2024):
+# both answers sit in the shared prompt as ``(A)``/``(B)`` options, each arm is a
+# single letter, and the read is at the letter -- the moment of commitment, where
+# the content is identical between arms and only the choice differs.
+COMPLETION_FORMAT = "completion"
+MULTIPLE_CHOICE_FORMAT = "multiple_choice"
+PAIR_FORMATS = frozenset({COMPLETION_FORMAT, MULTIPLE_CHOICE_FORMAT})
+MC_LETTERS: tuple[str, str] = ("A", "B")
+# The role markers the built-in templates and HF converters end a prompt with;
+# multiple-choice conversion splits the question from the answer stem here.
+_ROLE_MARKERS = ("A:", "Assistant:")
+MC_ANSWER_CUE = "Answer:"
+# A letter assignment further from balance than this many pairs leaks the bare
+# "A minus B" token direction into the diff-in-means. Conversion balances exactly;
+# the tolerance exists for sets truncated after conversion.
+MAX_LETTER_IMBALANCE = 1
 
 VALID_TIERS = frozenset(TIERS)
 
@@ -77,6 +102,11 @@ class ContrastivePair:
     read_position: int = -1
     tier: str = "medium"
     source: str = "builtin"
+    pair_format: str = COMPLETION_FORMAT
+    # Multiple-choice only: the letter the *positive* option was placed under. It
+    # is what makes the randomisation auditable -- a set's letter counts must be
+    # balanced, or the diff-in-means carries the bare "A minus B" token direction.
+    correct_letter: str | None = None
 
     def __post_init__(self) -> None:
         if not self.prompt.strip():
@@ -85,6 +115,21 @@ class ContrastivePair:
             raise ValueError("both completions must be non-empty")
         if self.tier not in VALID_TIERS:
             raise ValueError(f"tier must be one of {sorted(VALID_TIERS)}, got {self.tier!r}")
+        if self.pair_format not in PAIR_FORMATS:
+            raise ValueError(f"pair_format must be one of {sorted(PAIR_FORMATS)}")
+        if self.pair_format == MULTIPLE_CHOICE_FORMAT:
+            self._check_multiple_choice()
+        elif self.correct_letter is not None:
+            raise ValueError("correct_letter is only meaningful for multiple_choice pairs")
+
+    def _check_multiple_choice(self) -> None:
+        if self.correct_letter not in MC_LETTERS:
+            raise ValueError(f"multiple_choice pair needs correct_letter in {MC_LETTERS}")
+        expected_wrong = _other_letter(self.correct_letter)
+        if self.positive_completion.strip() != self.correct_letter:
+            raise ValueError("multiple_choice positive completion must be the correct letter")
+        if self.negative_completion.strip() != expected_wrong:
+            raise ValueError("multiple_choice negative completion must be the other letter")
 
     @property
     def positive_text(self) -> str:
@@ -111,6 +156,91 @@ def _jaccard(left: str, right: str) -> float:
     return len(a & b) / len(a | b)
 
 
+def _other_letter(letter: str) -> str:
+    return MC_LETTERS[1] if letter == MC_LETTERS[0] else MC_LETTERS[0]
+
+
+def _split_role_prompt(prompt: str) -> tuple[str, str]:
+    """(question block, answer stem) of a completion-format prompt.
+
+    The templates and QA converters end every prompt with a role line -- ``A:`` or
+    ``Assistant:`` -- optionally followed by the start of the answer ("A: It is
+    located in"). The stem belongs to the option text, not the question, so each
+    multiple-choice option reads as a complete answer. A prompt with no role line
+    (a declarative statement prefix) is all question and has no stem.
+    """
+    question, _, last_line = prompt.rstrip().rpartition("\n")
+    for marker in _ROLE_MARKERS:
+        if last_line.startswith(marker):
+            return question, last_line[len(marker) :].strip()
+    return prompt.rstrip(), ""
+
+
+def _balanced_letters(count: int, rng: random.Random) -> list[str]:
+    """Exactly half A, half B (odd counts spare one A), in a seeded random order."""
+    letters = list(MC_LETTERS) * (count // 2) + list(MC_LETTERS[: count % 2])
+    rng.shuffle(letters)
+    return letters
+
+
+def _as_multiple_choice(pair: ContrastivePair, correct_letter: str) -> ContrastivePair:
+    question, stem = _split_role_prompt(pair.prompt)
+    positive = f"{stem} {pair.positive_completion.strip()}".strip()
+    negative = f"{stem} {pair.negative_completion.strip()}".strip()
+    option_a, option_b = (positive, negative) if correct_letter == "A" else (negative, positive)
+    prompt = f"{question}\n(A) {option_a}\n(B) {option_b}\n{MC_ANSWER_CUE}"
+    return replace(
+        pair,
+        prompt=prompt,
+        positive_completion=f" {correct_letter}",
+        negative_completion=f" {_other_letter(correct_letter)}",
+        read_position=-1,
+        pair_format=MULTIPLE_CHOICE_FORMAT,
+        correct_letter=correct_letter,
+    )
+
+
+def to_multiple_choice(pairs: Iterable[ContrastivePair], seed: int = 0) -> list[ContrastivePair]:
+    """Re-express completion pairs in CAA's ``(A)``/``(B)`` letter format.
+
+    The two answers move into the shared prompt as options and each arm becomes a
+    single letter, read at that letter (``read_position=-1``). Which letter carries
+    the correct option is assigned by a seeded shuffle that is *exactly balanced
+    within each tier*, so averaging ``h(correct letter) - h(wrong letter)`` over the
+    set cancels the letter-identity component and leaves the choice direction.
+
+    Balance is a property of the set being averaged, so convert the extraction set
+    and the held-out set separately rather than converting once and splitting.
+    Pairs already in this format pass through unchanged.
+    """
+    rng = random.Random(seed)
+    materialised = list(pairs)
+    by_tier: dict[str, list[int]] = {}
+    for index, pair in enumerate(materialised):
+        if pair.pair_format == COMPLETION_FORMAT:
+            by_tier.setdefault(pair.tier, []).append(index)
+
+    converted = list(materialised)
+    for indices in by_tier.values():
+        for index, letter in zip(indices, _balanced_letters(len(indices), rng), strict=True):
+            converted[index] = _as_multiple_choice(materialised[index], letter)
+    return converted
+
+
+def letter_counts(pairs: Iterable[ContrastivePair]) -> dict[str, int]:
+    """How many multiple-choice pairs place the correct option under each letter."""
+    counts = dict.fromkeys(MC_LETTERS, 0)
+    for pair in pairs:
+        if pair.correct_letter is not None:
+            counts[pair.correct_letter] += 1
+    return counts
+
+
+def letter_imbalance(pairs: Iterable[ContrastivePair]) -> int:
+    counts = letter_counts(pairs)
+    return abs(counts["A"] - counts["B"])
+
+
 @dataclass(frozen=True)
 class QualityReport:
     """What a set's pairs look like, and every way they fall short.
@@ -126,6 +256,7 @@ class QualityReport:
     duplicate_pairs: list[int]
     lexical_near_duplicates: list[tuple[int, int]]
     high_similarity_pairs: list[tuple[int, float]]
+    letter_counts: dict[str, int] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
     @property
@@ -133,12 +264,24 @@ class QualityReport:
         return self.pair_count >= MIN_PAIRS_PER_GOAL
 
     @property
+    def letters_balanced(self) -> bool:
+        """Vacuously true for completion-format sets, which have no letters."""
+        if not self.letter_counts:
+            return True
+        return abs(self.letter_counts["A"] - self.letter_counts["B"]) <= MAX_LETTER_IMBALANCE
+
+    @property
     def meets_tier_coverage(self) -> bool:
         return all(self.tier_counts.get(tier, 0) >= MIN_PAIRS_PER_TIER for tier in VALID_TIERS)
 
     @property
     def ok(self) -> bool:
-        return self.meets_count and self.meets_tier_coverage and not self.duplicate_pairs
+        return (
+            self.meets_count
+            and self.meets_tier_coverage
+            and not self.duplicate_pairs
+            and self.letters_balanced
+        )
 
 
 @dataclass(frozen=True)
@@ -181,6 +324,10 @@ class ContrastivePairSet:
         for pair in self.pairs:
             counts[pair.tier] += 1
         return counts
+
+    @property
+    def is_multiple_choice(self) -> bool:
+        return any(pair.pair_format == MULTIPLE_CHOICE_FORMAT for pair in self.pairs)
 
     def quality_report(
         self, embedder: Callable[[Sequence[str]], torch.Tensor] | None = None
@@ -229,6 +376,13 @@ class ContrastivePairSet:
             if counts.get(tier, 0) < MIN_PAIRS_PER_TIER:
                 warnings.append(f"tier {tier!r} has {counts.get(tier, 0)} < {MIN_PAIRS_PER_TIER}")
 
+        letters = letter_counts(self.pairs) if self.is_multiple_choice else {}
+        if letters and abs(letters["A"] - letters["B"]) > MAX_LETTER_IMBALANCE:
+            warnings.append(
+                f"correct-letter counts {letters} are unbalanced: the diff-in-means would "
+                "carry the bare A-minus-B token direction"
+            )
+
         return QualityReport(
             goal=self.goal,
             pair_count=len(self.pairs),
@@ -236,6 +390,7 @@ class ContrastivePairSet:
             duplicate_pairs=duplicate_pairs,
             lexical_near_duplicates=lexical_near_duplicates,
             high_similarity_pairs=high_similarity_pairs,
+            letter_counts=letters,
             warnings=warnings,
         )
 
@@ -324,33 +479,138 @@ def available_goals(source: str = "builtin") -> list[str]:
     return sorted(BUILTIN_PAIRS)
 
 
+@dataclass(frozen=True)
+class Certification:
+    """The (source, format) pair the behavioural gate certified for a goal."""
+
+    source: str
+    pair_format: str
+
+
+# What each goal is extracted from by default: the (source, format) the gate in
+# ``scripts/validate_steering.py`` certified on the reference model, with the
+# measurements in the README "Steering validation" section. ``safe`` keeps the
+# completion format because that is its certified shape; moving a passing goal to
+# a new format would spend the control the other goals are measured against.
+# ``truthful`` is certified on TruthfulQA, not the built-in facts: the built-in
+# held-out is saturated (the model prefers the true option by ~6 nats already), so
+# no direction can be told from noise there, while TruthfulQA's misconceptions are
+# adversarial by construction and 817 rows deep.
+BUILTIN_SOURCE = "builtin"
+CERTIFIED: dict[str, Certification] = {
+    "truthful": Certification("truthful_qa", MULTIPLE_CHOICE_FORMAT),
+    "reasoning": Certification(BUILTIN_SOURCE, MULTIPLE_CHOICE_FORMAT),
+    "safe": Certification(BUILTIN_SOURCE, COMPLETION_FORMAT),
+}
+_UNCERTIFIED = Certification(BUILTIN_SOURCE, COMPLETION_FORMAT)
+
+
+def certification_for(goal: str) -> Certification:
+    return CERTIFIED.get(goal, _UNCERTIFIED)
+
+
+def resolve_pair_format(goal: str, pair_format: str | None = None) -> str:
+    """The explicit format if given, else the goal's certified default."""
+    resolved = pair_format or certification_for(goal).pair_format
+    if resolved not in PAIR_FORMATS:
+        raise ValueError(f"pair_format must be one of {sorted(PAIR_FORMATS)}, got {resolved!r}")
+    return resolved
+
+
+def pair_set_in_format(
+    goal: str, pairs: Iterable[ContrastivePair], source: str, pair_format: str, seed: int
+) -> ContrastivePairSet:
+    materialised = list(pairs)
+    if pair_format == MULTIPLE_CHOICE_FORMAT:
+        materialised = to_multiple_choice(materialised, seed=seed)
+    return ContrastivePairSet.from_pairs(goal, materialised, source=source)
+
+
 def load_contrastive_dataset(
     goal: str,
     source: str = "builtin",
     load_dataset: Callable[..., Iterable[dict]] | None = None,
     limit: int | None = None,
+    pair_format: str | None = None,
+    seed: int = 0,
 ) -> ContrastivePairSet:
     """Load one goal's pairs from the built-in templates, custom registrations, or HF.
 
     ``source`` is ``"builtin"`` (the hand-authored templates), ``"custom"`` (pairs
     registered via :func:`register_contrastive_pairs`), or a HuggingFace dataset
-    name understood by :class:`HFContrastiveLoader`. The HF path imports
+    name understood by :class:`contrastive_sources.HFContrastiveLoader`. The HF path imports
     ``datasets`` lazily and accepts an injected ``load_dataset`` so it is testable
     without the network. ``limit`` caps how many pairs an HF source yields; it is
     ignored for the built-in and custom sources, which are already bounded.
+
+    ``pair_format`` selects the shape the pairs are presented in (see
+    :data:`PAIR_FORMATS`); ``None`` takes the goal's certified default. Every
+    source is authored in the completion format and converted on load, so one
+    content table serves both formats. ``seed`` fixes the letter randomisation.
     """
+    resolved = resolve_pair_format(goal, pair_format)
     if source == "builtin":
         if goal not in BUILTIN_PAIRS:
             raise ValueError(f"unknown goal {goal!r}; built-in goals: {available_goals()}")
-        return ContrastivePairSet.from_pairs(
-            goal, _pairs_from_records(BUILTIN_PAIRS[goal], "builtin"), source="builtin"
-        )
+        pairs = _pairs_from_records(BUILTIN_PAIRS[goal], "builtin")
+        return pair_set_in_format(goal, pairs, "builtin", resolved, seed)
     if source == "custom":
         if goal not in _CUSTOM_PAIRS:
             raise ValueError(f"no custom pairs registered for goal {goal!r}")
-        return ContrastivePairSet.from_pairs(goal, _CUSTOM_PAIRS[goal], source="custom")
+        return pair_set_in_format(goal, _CUSTOM_PAIRS[goal], "custom", resolved, seed)
 
-    return HFContrastiveLoader(load_dataset=load_dataset).load(goal, source, limit=limit)
+    # Imported here, not at module level: the sources module depends on this one.
+    from contrastive_sources import HFContrastiveLoader  # noqa: PLC0415
+
+    return HFContrastiveLoader(load_dataset=load_dataset).load(
+        goal, source, limit=limit, pair_format=resolved, seed=seed
+    )
+
+
+@dataclass(frozen=True)
+class CertifiedLoad:
+    """A goal's pairs from its certified source, or the fallback with the reason."""
+
+    pair_set: ContrastivePairSet
+    certified: bool
+    fallback_reason: str | None = None
+
+
+def load_certified_dataset(
+    goal: str,
+    load_dataset: Callable[..., Iterable[dict]] | None = None,
+    limit: int | None = None,
+    seed: int = 0,
+) -> CertifiedLoad:
+    """The goal's certified (source, format), falling back to the built-in set.
+
+    The certified source may need the ``train`` extra (``datasets``) and a warm HF
+    cache; the ``serve`` image has neither. Rather than fail to start, the loader
+    drops to the built-in templates in the certified *format* and says so: the
+    vector the server then steers on is uncertified, and the caller is expected to
+    log that rather than present it as the measured one. Only the environmental
+    failures fall back -- a converter bug (``ValueError``) still raises.
+    """
+    certification = certification_for(goal)
+    try:
+        pair_set = load_contrastive_dataset(
+            goal,
+            source=certification.source,
+            load_dataset=load_dataset,
+            limit=limit,
+            pair_format=certification.pair_format,
+            seed=seed,
+        )
+    except (RuntimeError, OSError) as exc:
+        if certification.source == BUILTIN_SOURCE:
+            raise
+        reason = f"{certification.source} unavailable ({exc}); using built-in pairs"
+        logger.warning("Goal %r: %s -- the extracted vector is UNCERTIFIED", goal, reason)
+        fallback = load_contrastive_dataset(
+            goal, source=BUILTIN_SOURCE, pair_format=certification.pair_format, seed=seed
+        )
+        return CertifiedLoad(pair_set=fallback, certified=False, fallback_reason=reason)
+    return CertifiedLoad(pair_set=pair_set, certified=True)
 
 
 def load_instruction_prefix_control(goal: str) -> ContrastivePairSet:
@@ -368,123 +628,6 @@ def load_instruction_prefix_control(goal: str) -> ContrastivePairSet:
         _pairs_from_records(INSTRUCTION_PREFIX_CONTROL[goal], "instruction-prefix"),
         source="instruction-prefix-control",
     )
-
-
-class HFContrastiveLoader:
-    """Convert published A/B datasets from HuggingFace into the standard format.
-
-    The datasets worth pulling are worth pulling *because* they are already A/B:
-    ``truthful_qa`` pairs a question with a correct answer and distractors;
-    ``Anthropic/hh-rlhf`` pairs a shared conversation with a chosen (harmless) and
-    a rejected (harmful) continuation. Each converter knows one dataset's schema
-    and emits :class:`ContrastivePair` objects with the answer token as the read
-    position. Results are cached in-process so repeated goals in one run pay the
-    conversion once.
-    """
-
-    def __init__(self, load_dataset: Callable[..., Iterable[dict]] | None = None):
-        self._load_dataset = load_dataset
-        self._cache: dict[tuple[str, str], ContrastivePairSet] = {}
-
-    def load(self, goal: str, dataset: str, limit: int | None = None) -> ContrastivePairSet:
-        key = (goal, dataset)
-        if key in self._cache:
-            return self._cache[key]
-
-        converter = self._converters().get(dataset)
-        if converter is None:
-            raise ValueError(
-                f"no HuggingFace converter for dataset {dataset!r}; "
-                f"known: {sorted(self._converters())}"
-            )
-        pairs = converter(goal, limit)
-        pair_set = ContrastivePairSet.from_pairs(goal, pairs, source=dataset)
-        self._cache[key] = pair_set
-        return pair_set
-
-    def _resolve_loader(self) -> Callable[..., Iterable[dict]]:
-        if self._load_dataset is not None:
-            return self._load_dataset
-        try:
-            from datasets import load_dataset  # noqa: PLC0415
-        except ImportError as exc:  # pragma: no cover - exercised only without the train extra
-            raise RuntimeError(
-                "loading contrastive pairs from HuggingFace needs the 'train' extra "
-                "(datasets); install it or pass source='builtin'"
-            ) from exc
-        return load_dataset
-
-    def _converters(self) -> dict[str, Callable[[str, int | None], list[ContrastivePair]]]:
-        return {
-            "truthful_qa": self._from_truthful_qa,
-            "Anthropic/hh-rlhf": self._from_hh_rlhf,
-        }
-
-    def _from_truthful_qa(self, goal: str, limit: int | None) -> list[ContrastivePair]:
-        rows = self._resolve_loader()("truthful_qa", "multiple_choice", split="validation")
-        pairs: list[ContrastivePair] = []
-        for row in rows:
-            targets = row["mc1_targets"]
-            choices, labels = targets["choices"], targets["labels"]
-            correct = [choice for choice, label in zip(choices, labels, strict=False) if label == 1]
-            wrong = [choice for choice, label in zip(choices, labels, strict=False) if label == 0]
-            if not correct or not wrong:
-                continue
-            pairs.append(
-                ContrastivePair(
-                    prompt=f"Q: {row['question']}\nA:",
-                    positive_completion=" " + correct[0].strip(),
-                    negative_completion=" " + wrong[0].strip(),
-                    read_position=-1,
-                    tier="hard",  # adversarial by construction: plausible falsehoods
-                    source="truthful_qa",
-                )
-            )
-            if limit is not None and len(pairs) >= limit:
-                break
-        return pairs
-
-    def _from_hh_rlhf(self, goal: str, limit: int | None) -> list[ContrastivePair]:
-        # harmless-base streams ~42k rows; without a cap this materialises the whole
-        # split into ContrastivePair objects. Default to a sane extraction-sized cap
-        # so an unbounded call from the public loader is not a foot-gun.
-        limit = DEFAULT_HF_STREAM_LIMIT if limit is None else limit
-        rows = self._resolve_loader()(
-            "Anthropic/hh-rlhf", data_dir="harmless-base", split="train", streaming=True
-        )
-        pairs: list[ContrastivePair] = []
-        for row in rows:
-            prompt, chosen, rejected = _split_shared_prefix(row["chosen"], row["rejected"])
-            if not chosen.strip() or not rejected.strip() or not prompt.strip():
-                continue
-            pairs.append(
-                ContrastivePair(
-                    prompt=prompt,
-                    positive_completion=chosen,
-                    negative_completion=rejected,
-                    read_position=-1,
-                    tier="medium",
-                    source="Anthropic/hh-rlhf",
-                )
-            )
-            if limit is not None and len(pairs) >= limit:
-                break
-        return pairs
-
-
-def _split_shared_prefix(chosen: str, rejected: str) -> tuple[str, str, str]:
-    """Shared prompt and the two divergent tails of a preference pair.
-
-    hh-rlhf stores a whole conversation twice, identical up to the final assistant
-    turn. The shared prefix is the prompt; the tails are the contrasting
-    completions the behaviour is read from. Split at the last common character so
-    both tails begin at the same point in the same turn.
-    """
-    limit = min(len(chosen), len(rejected))
-    split = 0
-    while split < limit and chosen[split] == rejected[split]:
-        split += 1
-    return chosen[:split], chosen[split:], rejected[split:]
 
 
 def replace_read_position(pair: ContrastivePair, read_position: int) -> ContrastivePair:
