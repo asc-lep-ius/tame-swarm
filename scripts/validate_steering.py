@@ -139,7 +139,7 @@ def load_model(model_id: str):
     model = AutoModelForCausalLM.from_pretrained(model_id, dtype=torch.float32)
     model.eval()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
+    model.to(device)  # pyright: ignore[reportArgumentType] # HF stubs
     return model, tokenizer, device
 
 
