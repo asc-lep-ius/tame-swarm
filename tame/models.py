@@ -42,3 +42,36 @@ class HealthResponse(BaseModel):
     architecture: str
     mob_active: bool
     steering_active: bool
+
+
+class PIDStatus(BaseModel):
+    """One goal loop's controller terms, so a reader can tell regulation from a constant."""
+
+    goal: str
+    calibrated: bool
+    sensor_alive: bool
+    readout_layer: int | None
+    setpoint: float
+    process_variable: float
+    error: float
+    p_term: float
+    i_term: float
+    d_term: float
+    output: float
+    integral_saturated: bool
+    step_count: int
+    kp: float
+    ki: float
+    kd: float
+
+
+class GainUpdate(BaseModel):
+    """Runtime gain change; upper bounds are checked against the calibrated plant."""
+
+    goal: str | None = Field(default=None, description="Goal loop to tune; default: the loaded one")
+    kp: float | None = Field(default=None, ge=0.0)
+    ki: float | None = Field(default=None, ge=0.0)
+    kd: float | None = Field(default=None, ge=0.0)
+    adaptive: bool | None = Field(
+        default=None, description="Turn the loop on or off without re-extracting"
+    )

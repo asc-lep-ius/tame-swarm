@@ -2,11 +2,9 @@ import pytest
 import torch
 import torch.nn as nn
 
+from homeostat import AdaptiveHomeostat, CognitiveHomeostat, SteeringHook
 from steering import (
-    AdaptiveHomeostat,
-    CognitiveHomeostat,
     SteeringConfig,
-    SteeringHook,
     SteeringVector,
     SteeringVectorExtractor,
     estimate_capability_subspace,
@@ -19,7 +17,9 @@ def test_steering_config_defaults():
     assert cfg.base_strength == 0.3
     assert cfg.adaptive is True
     assert cfg.target_alignment == 0.7
-    assert cfg.kp == 0.5
+    assert cfg.kp is None
+    assert cfg.ki is None
+    assert cfg.kd == 0.0
     assert cfg.max_strength == 1.5
     assert cfg.min_strength == 0.0
     assert cfg.orthogonal_projection is True

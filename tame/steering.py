@@ -1,20 +1,15 @@
 import logging
-from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, cast
 
-import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 if TYPE_CHECKING:
     from contrastive_data import ContrastivePair
 
 logger = logging.getLogger(__name__)
-
-MAX_HISTORY_LENGTH = 10_000
 
 DEFAULT_CAPABILITY_SUBSPACE_RANK = 8
 # Token activations are pooled per layer before the SVD; this bounds the pool so a
@@ -28,11 +23,30 @@ MIN_RETAINED_NORM_FRACTION = 0.05
 
 @dataclass
 class SteeringConfig:
+    """Where to inject, how hard, and how the loop that sets the strength is tuned.
+
+    The loop's gains, setpoint and units come from a calibration measured against
+    the loaded model (``homeostat.calibrate_alignment``); the fields here either
+    pin a value or leave it ``None`` to be derived. ``target_alignment`` is the
+    legacy cosine setpoint and is only read while no calibration exists.
+    """
+
     steering_layers: list[int] = field(default_factory=lambda: list(range(10, 20)))
-    base_strength: float = 0.3  # Base steering coefficient (alpha)
-    adaptive: bool = True  # Whether to use adaptive control
-    target_alignment: float = 0.7  # Target cosine similarity
-    kp: float = 0.5  # Proportional controller gain
+    base_strength: float = 0.3  # Reference injection strength; the loop's bias term
+    adaptive: bool = True  # Whether the loop sets the strength, or base_strength is constant
+    target_alignment: float = 0.7  # Legacy cosine setpoint, used only when uncalibrated
+    kp: float | None = None  # Proportional gain; None = derived (LEGACY_KP when uncalibrated)
+    ki: float | None = None  # Integral gain; None = derived from the calibration
+    kd: float = 0.0  # Derivative gain; ships disabled (noise-sensitive on a per-token reading)
+    derivative_filter_alpha: float = 0.1  # EMA weight on the derivative term
+    # EMA weight on the sensor reading; its time constant (1 - alpha) / alpha tokens is
+    # the plant's only dynamics, and what the gain derivation is computed against.
+    measurement_filter_alpha: float = 0.1
+    # Tokens over which the loop corrects a deviation; None = the filter time constant.
+    closed_loop_tau: float | None = None
+    # Layer the sensor reads; None = the layer above the top actuator when a vector
+    # exists there, else the top actuator read after its own injection.
+    readout_layer: int | None = None
     max_strength: float = 1.5  # Maximum steering strength
     min_strength: float = 0.0  # Minimum steering strength
     orthogonal_projection: bool = True  # Project out general capability space
@@ -40,6 +54,20 @@ class SteeringConfig:
     # capability subspace. Higher ranks protect more of the model's behaviour and
     # leave less of the steering vector standing; see MIN_RETAINED_NORM_FRACTION.
     capability_subspace_rank: int = DEFAULT_CAPABILITY_SUBSPACE_RANK
+
+    def __post_init__(self) -> None:
+        for name in ("kp", "ki", "kd"):
+            value = getattr(self, name)
+            if value is not None and value < 0:
+                raise ValueError(f"{name} must be non-negative, got {value}")
+        for name in ("derivative_filter_alpha", "measurement_filter_alpha"):
+            value = getattr(self, name)
+            if not 0 < value <= 1:
+                raise ValueError(f"{name} must be in (0, 1], got {value}")
+        if self.closed_loop_tau is not None and self.closed_loop_tau <= 0:
+            raise ValueError(f"closed_loop_tau must be positive, got {self.closed_loop_tau}")
+        if self.min_strength > self.max_strength:
+            raise ValueError("min_strength must not exceed max_strength")
 
 
 def project_out_subspace(vector: torch.Tensor, subspace: torch.Tensor) -> torch.Tensor:
@@ -388,260 +416,6 @@ class SteeringVectorExtractor:
             hidden = self.activations[layer_idx].float().cpu()
             result[layer_idx] = hidden[0, position]
         return result
-
-
-class AdaptiveHomeostat:
-    def __init__(self, config: SteeringConfig):
-        self.config = config
-        self.alignment_history: deque[float] = deque(maxlen=MAX_HISTORY_LENGTH)
-        self.strength_history: deque[float] = deque(maxlen=MAX_HISTORY_LENGTH)
-
-    def compute_strength(self, hidden_states: torch.Tensor, steering_vector: torch.Tensor) -> float:
-        if not self.config.adaptive:
-            return self.config.base_strength
-
-        # Compute cosine similarity (alignment)
-        # Use mean across batch and sequence
-        state_mean = hidden_states.mean(dim=(0, 1))
-        alignment = F.cosine_similarity(
-            state_mean.unsqueeze(0), steering_vector.unsqueeze(0), dim=-1
-        ).item()
-
-        self.alignment_history.append(alignment)
-
-        error = self.config.target_alignment - alignment
-        strength = self.config.base_strength + self.config.kp * error
-
-        # Clamp to valid range
-        strength = max(self.config.min_strength, min(self.config.max_strength, strength))
-
-        self.strength_history.append(strength)
-
-        return strength
-
-    def reset(self):
-        self.alignment_history = deque(maxlen=MAX_HISTORY_LENGTH)
-        self.strength_history = deque(maxlen=MAX_HISTORY_LENGTH)
-
-
-class SteeringHook:
-    def __init__(
-        self,
-        steering_vector: SteeringVector,
-        config: SteeringConfig,
-        homeostat: AdaptiveHomeostat | None = None,
-        capability_subspace: torch.Tensor | None = None,
-    ):
-        self.steering_vector = steering_vector
-        self.config = config
-        self.homeostat = homeostat or AdaptiveHomeostat(config)
-        self.capability_subspace = capability_subspace
-        self._last_strength = config.base_strength
-        self._direction_cache: torch.Tensor | None = None
-        self._direction_key: tuple[torch.device, torch.dtype] | None = None
-
-    def __call__(
-        self, module: nn.Module, input: tuple[torch.Tensor, ...], output: tuple[torch.Tensor, ...]
-    ) -> tuple[torch.Tensor, ...] | torch.Tensor:
-        if isinstance(output, tuple):
-            hidden_states = output[0]
-            rest = output[1:]
-        else:
-            hidden_states = output
-            rest = ()
-
-        steer_vec = self._direction(hidden_states.device, hidden_states.dtype)
-
-        strength = self.homeostat.compute_strength(hidden_states, steer_vec)
-        self._last_strength = strength
-
-        modified = hidden_states + strength * steer_vec.unsqueeze(0).unsqueeze(0)
-
-        if rest:
-            return (modified,) + rest
-        return modified
-
-    def _direction(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-        """The steering direction this hook injects, projected and cached.
-
-        The projection depends only on the vector and the subspace, so recomputing
-        it per forward pass would repeat a Gram-Schmidt sweep on every token.
-        """
-        key = (device, dtype)
-        if self._direction_key == key and self._direction_cache is not None:
-            return self._direction_cache
-
-        steer_vec = self.steering_vector.vector.to(device=device, dtype=dtype)
-        if self.config.orthogonal_projection and self.capability_subspace is not None:
-            steer_vec = self._project_out_capabilities(steer_vec, device, dtype)
-
-        self._direction_cache = steer_vec
-        self._direction_key = key
-        return steer_vec
-
-    def _project_out_capabilities(
-        self, steer_vec: torch.Tensor, device: torch.device, dtype: torch.dtype
-    ) -> torch.Tensor:
-        assert self.capability_subspace is not None
-        direction, _ = project_steering_direction(
-            steer_vec,
-            self.capability_subspace.to(device=device, dtype=dtype),
-            layer=self.steering_vector.layer,
-            rank=self.config.capability_subspace_rank,
-        )
-        return direction
-
-
-class CognitiveHomeostat(nn.Module):
-    def __init__(self, config: SteeringConfig):
-        super().__init__()
-        self.config = config
-        self.steering_vectors: dict[int, SteeringVector] = {}
-        self.capability_subspaces: dict[int, torch.Tensor] = {}
-        self.hooks: dict[int, SteeringHook] = {}
-        self._registered_hooks: list = []
-        self.homeostat = AdaptiveHomeostat(config)
-
-    def add_steering_vector(self, layer: int, vector: SteeringVector):
-        self.steering_vectors[layer] = vector
-        logger.info(f"Added steering vector '{vector.name}' to layer {layer}")
-
-    def add_steering_vectors(self, vectors: dict[int, SteeringVector]):
-        for layer, vector in vectors.items():
-            self.add_steering_vector(layer, vector)
-
-    def set_capability_subspaces(self, subspaces: dict[int, torch.Tensor]) -> None:
-        """Install per-layer capability bases; hooks pick them up on the next attach."""
-        for layer, subspace in subspaces.items():
-            if subspace.ndim != 2:
-                raise ValueError(
-                    f"Layer {layer}: capability subspace must be (rank, hidden_dim), "
-                    f"got shape {tuple(subspace.shape)}"
-                )
-            steering_vector = self.steering_vectors.get(layer)
-            if steering_vector is not None and subspace.shape[-1] != steering_vector.vector.numel():
-                raise ValueError(
-                    f"Layer {layer}: capability subspace has hidden_dim "
-                    f"{subspace.shape[-1]}, steering vector has "
-                    f"{steering_vector.vector.numel()}"
-                )
-
-        self.capability_subspaces = dict(subspaces)
-        logger.info(f"Installed capability subspaces for layers {sorted(subspaces)}")
-
-    def estimate_capability_subspaces(
-        self,
-        model: nn.Module,
-        tokenizer,
-        texts: list[str] | None = None,
-    ) -> dict[int, torch.Tensor]:
-        """Estimate and install the capability subspace for every steered layer."""
-        subspaces = estimate_capability_subspace(
-            model,
-            tokenizer,
-            layers=sorted(self.steering_vectors) or list(self.config.steering_layers),
-            texts=texts,
-            rank=self.config.capability_subspace_rank,
-        )
-        self.set_capability_subspaces(subspaces)
-        return subspaces
-
-    def attach_to_model(self, model: nn.Module):
-        if hasattr(model, "model") and hasattr(model.model, "layers"):
-            layers = cast(nn.ModuleList, getattr(model.model, "layers"))  # noqa: B009
-        elif hasattr(model, "layers"):
-            layers = cast(nn.ModuleList, getattr(model, "layers"))  # noqa: B009
-        else:
-            raise ValueError("Cannot find transformer layers")
-
-        # Register hooks for layers with steering vectors
-        for layer_idx, steering_vector in self.steering_vectors.items():
-            if layer_idx >= len(layers):
-                logger.warning(f"Layer {layer_idx} out of range, skipping")
-                continue
-
-            hook_obj = SteeringHook(
-                steering_vector=steering_vector,
-                config=self.config,
-                homeostat=self.homeostat,
-                capability_subspace=self.capability_subspaces.get(layer_idx),
-            )
-            self.hooks[layer_idx] = hook_obj
-
-            handle = layers[layer_idx].register_forward_hook(hook_obj)
-            self._registered_hooks.append(handle)
-
-        logger.info(f"Attached {len(self._registered_hooks)} steering hooks to model")
-
-    def detach_from_model(self):
-        for handle in self._registered_hooks:
-            handle.remove()
-        self._registered_hooks = []
-        self.hooks = {}
-        logger.info("Detached all steering hooks")
-
-    def projected_direction(self, layer: int) -> tuple[torch.Tensor, float]:
-        """The direction actually injected at ``layer``, and its retained norm share.
-
-        Anything else that consumes the goal direction must read it from here rather
-        than from the raw steering vector. ``SteeringCoupling`` in particular keeps
-        its own copy in a buffer, so seeding it from the unprojected vector would
-        leave the routing coupling steering toward a direction the residual-stream
-        injection has already decided not to use.
-        """
-        vector = self.steering_vectors[layer].vector
-        subspace = self.capability_subspaces.get(layer)
-        if subspace is None or not self.config.orthogonal_projection:
-            return vector, 1.0
-
-        return project_steering_direction(
-            vector,
-            subspace.to(device=vector.device, dtype=vector.dtype),
-            layer=layer,
-            rank=self.config.capability_subspace_rank,
-        )
-
-    def get_capability_retention(self) -> dict[int, float]:
-        """Share of each steering vector's norm surviving its capability projection.
-
-        A diagnostic, not a guarantee: it reports how much of the goal direction was
-        orthogonal to general-task variation, not whether capability was preserved.
-        Measuring that needs a held-out benchmark.
-        """
-        return {
-            layer: self.projected_direction(layer)[1]
-            for layer in self.steering_vectors
-            if layer in self.capability_subspaces
-        }
-
-    def get_alignment_stats(self) -> dict[str, Any]:
-        if not self.homeostat.alignment_history:
-            return {}
-
-        history = self.homeostat.alignment_history
-        strength_history = self.homeostat.strength_history
-
-        stats = {
-            "current_alignment": history[-1] if history else 0.0,
-            "mean_alignment": np.mean(list(history)),
-            "min_alignment": min(history),
-            "max_alignment": max(history),
-            "current_strength": list(self.hooks.values())[0]._last_strength
-            if self.hooks
-            else self.config.base_strength,
-            "alignment_history": list(history),
-            "strength_history": list(strength_history),
-        }
-
-        if strength_history:
-            stats["mean_strength"] = np.mean(list(strength_history))
-            stats["max_strength"] = max(strength_history)
-            stats["min_strength"] = min(strength_history)
-
-        return stats
-
-    def reset(self):
-        self.homeostat.reset()
 
 
 # A deliberately broad slice of ordinary model work: exposition, narrative,

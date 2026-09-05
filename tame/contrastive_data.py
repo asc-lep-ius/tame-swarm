@@ -488,10 +488,22 @@ def available_goals(source: str = "builtin") -> list[str]:
 
 @dataclass(frozen=True)
 class Certification:
-    """The (source, format) pair the behavioural gate certified for a goal."""
+    """What the behavioural gate certified for a goal: the pairs, and where they act.
+
+    ``layers`` and ``strength`` are the injection the gate was measured at;
+    ``strength_band`` is the range of strengths that still pass it, when that was
+    swept (#4), and ``readout_layer`` is where the homeostat's sensor reads. A goal
+    without a measured band is served at its certified strength, held constant:
+    the loop may only move within a band the gate has actually passed.
+    """
 
     source: str
     pair_format: str
+    layers: tuple[int, ...] | None = None
+    strength: float | None = None
+    strength_band: tuple[float, float] | None = None
+    readout_layer: int | None = None
+    model: str | None = None
 
 
 # What each goal is extracted from by default: the (source, format) the gate in
@@ -504,10 +516,35 @@ class Certification:
 # no direction can be told from noise there, while TruthfulQA's misconceptions are
 # adversarial by construction and 817 rows deep.
 BUILTIN_SOURCE = "builtin"
+# #17 measured every goal at layers 14/18/22, strength 4.0. #4 swept ``truthful``
+# layer by layer on Qwen3-1.7B: the direction steers the *wrong* way below layer 13,
+# reads prompt wording at 12 (the prefix control outscores it), passes alone at 13
+# and 16-21, and is null from 22 up. As a set, 13 + 16-21 passes the gate at every
+# strength from 2 to 8 with the prefix control below zero; the band stops at 6
+# because the log-probability drift on natural continuations doubles again at 8.
+# Dropping 13 halves the effect; adding 24 changes nothing.
+TRUTHFUL_LAYERS = (13, 16, 17, 18, 19, 20, 21)
+CERTIFIED_MODEL = "Qwen/Qwen3-1.7B"
 CERTIFIED: dict[str, Certification] = {
-    "truthful": Certification("truthful_qa", MULTIPLE_CHOICE_FORMAT),
-    "reasoning": Certification(BUILTIN_SOURCE, MULTIPLE_CHOICE_FORMAT),
-    "safe": Certification(BUILTIN_SOURCE, COMPLETION_FORMAT),
+    "truthful": Certification(
+        "truthful_qa",
+        MULTIPLE_CHOICE_FORMAT,
+        layers=TRUTHFUL_LAYERS,
+        strength=4.0,
+        strength_band=(2.0, 6.0),
+        readout_layer=22,
+        model=CERTIFIED_MODEL,
+    ),
+    "reasoning": Certification(
+        BUILTIN_SOURCE,
+        MULTIPLE_CHOICE_FORMAT,
+        layers=(14, 18, 22),
+        strength=4.0,
+        model=CERTIFIED_MODEL,
+    ),
+    "safe": Certification(
+        BUILTIN_SOURCE, COMPLETION_FORMAT, layers=(14, 18, 22), strength=4.0, model=CERTIFIED_MODEL
+    ),
 }
 _UNCERTIFIED = Certification(BUILTIN_SOURCE, COMPLETION_FORMAT)
 

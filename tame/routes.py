@@ -2,18 +2,22 @@ import asyncio
 import json
 import logging
 from threading import Thread
-from typing import cast
 
 import torch
-import torch.nn as nn
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
 from transformers import TextIteratorStreamer
 
 from app import TAMEApplication
 from dependencies import get_tame_app
-from models import GenerateRequest, GenerateResponse, HealthResponse, SwarmStatus
-from steering_pipeline import extract_steering_vectors
+from models import (
+    GainUpdate,
+    GenerateRequest,
+    GenerateResponse,
+    HealthResponse,
+    PIDStatus,
+    SwarmStatus,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,15 +77,43 @@ def get_homeostasis_status(tame: TAMEApplication = Depends(get_tame_app)):
         return {"status": "disabled", "message": "Steering not active"}
 
     stats = tame.homeostat.get_alignment_stats()
+    config = tame.steering_config
     return {
         "status": "active",
         "config": {
-            "base_strength": tame.steering_config.base_strength,
-            "adaptive": tame.steering_config.adaptive,
-            "target_alignment": tame.steering_config.target_alignment,
+            "goal": tame.homeostat.goal,
+            "base_strength": config.base_strength,
+            "min_strength": config.min_strength,
+            "max_strength": config.max_strength,
+            "adaptive": config.adaptive,
+            "steering_layers": list(config.steering_layers),
+            "readout_layer": tame.homeostat.readout_layer,
+            "setpoint": tame.homeostat.homeostat.setpoint,
+            "target_alignment": config.target_alignment,
         },
+        "pid": PIDStatus(**tame.homeostat.pid_status()).model_dump(),
         "current_stats": stats,
     }
+
+
+@router.put("/steering/gains", response_model=PIDStatus)
+def update_gains(update: GainUpdate, tame: TAMEApplication = Depends(get_tame_app)):
+    """Change the loop's gains in place; bounds come from the calibrated plant."""
+    if tame.homeostat is None:
+        raise HTTPException(status_code=400, detail="Steering not initialized")
+    if update.goal is not None and update.goal != tame.homeostat.goal:
+        raise HTTPException(
+            status_code=404,
+            detail=f"goal {update.goal!r} is not loaded ({tame.homeostat.goal!r} is)",
+        )
+    try:
+        status = tame.homeostat.set_gains(kp=update.kp, ki=update.ki, kd=update.kd)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if update.adaptive is not None:
+        tame.homeostat.config.adaptive = update.adaptive
+        tame.homeostat.reset()
+    return PIDStatus(**status)
 
 
 @router.get("/traces/wealth")
@@ -99,7 +131,7 @@ def get_steering_traces(tame: TAMEApplication = Depends(get_tame_app)):
         "status": "active",
         "alignment_history": stats.get("alignment_history", []),
         "strength_history": stats.get("strength_history", []),
-        "target_alignment": tame.steering_config.target_alignment,
+        "target_alignment": stats.get("setpoint", tame.homeostat.homeostat.setpoint),
         "base_strength": tame.steering_config.base_strength,
         "mean_alignment": stats.get("mean_alignment"),
         "mean_strength": stats.get("mean_strength"),
@@ -303,7 +335,7 @@ async def generate_stream(req: GenerateRequest, tame: TAMEApplication = Depends(
                                 trace_update["steering_trace"] = {
                                     "strength_history": strength_history,
                                     "alignment_history": alignment_history,
-                                    "target_alignment": tame.steering_config.target_alignment,
+                                    "target_alignment": homeo_stats.get("setpoint"),
                                 }
 
                         yield f"data: {json.dumps(trace_update)}\n\n"
@@ -338,7 +370,7 @@ async def generate_stream(req: GenerateRequest, tame: TAMEApplication = Depends(
                 final_stats["steering_trace"] = {
                     "alignment_history": homeo_stats.get("alignment_history", []),
                     "strength_history": homeo_stats.get("strength_history", []),
-                    "target_alignment": tame.steering_config.target_alignment,
+                    "target_alignment": homeo_stats.get("setpoint"),
                 }
 
             if req.return_stats:
@@ -383,36 +415,41 @@ async def generate_stream(req: GenerateRequest, tame: TAMEApplication = Depends(
 async def update_steering(
     tame: TAMEApplication = Depends(get_tame_app),
     goal: str = "truthful",
-    strength: float = 0.3,
+    strength: float | None = None,
+    kp: float | None = None,
+    ki: float | None = None,
+    kd: float | None = None,
 ):
+    """Swap the served goal (re-extract, re-calibrate, re-attach) and optionally set gains.
+
+    ``strength`` defaults to the goal's certified reference strength. Gains are
+    applied after the calibration so their bounds are checked against the plant.
+    """
     if tame.homeostat is None:
         raise HTTPException(status_code=400, detail="Steering not initialized")
 
     try:
-        tame.homeostat.detach_from_model()
-
-        extraction = extract_steering_vectors(
-            cast(nn.Module, tame.model),
-            tame.tokenizer,
-            goal=goal,
-            config=tame.steering_config,
-        )
-
-        tame.homeostat.config.base_strength = strength
-
-        tame.homeostat.add_steering_vectors(extraction.vectors)
-        tame.homeostat.attach_to_model(cast(nn.Module, tame.model))
-
-        return {
-            "status": "updated",
-            "goal": goal,
-            "strength": strength,
-            "layers": tame.steering_config.steering_layers,
-            "source": extraction.source,
-            "pair_format": extraction.pair_format,
-            "certified": extraction.certified,
-        }
-
+        extraction = tame.install_goal(goal, strength=strength)
     except Exception as e:
         logger.error("Steering update error: %s", e)
         raise HTTPException(status_code=500, detail="Steering update failed") from e
+
+    if any(value is not None for value in (kp, ki, kd)):
+        try:
+            tame.homeostat.set_gains(kp=kp, ki=ki, kd=kd)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    config = tame.steering_config
+    return {
+        "status": "updated",
+        "goal": goal,
+        "strength": config.base_strength,
+        "strength_band": [config.min_strength, config.max_strength],
+        "layers": list(config.steering_layers),
+        "readout_layer": tame.homeostat.readout_layer,
+        "source": extraction.source,
+        "pair_format": extraction.pair_format,
+        "certified": extraction.certified,
+        "pid": PIDStatus(**tame.homeostat.pid_status()).model_dump(),
+    }

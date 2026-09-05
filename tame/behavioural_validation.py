@@ -41,7 +41,8 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 from contrastive_data import ContrastivePair
-from steering import SteeringConfig, SteeringHook, SteeringVector
+from homeostat import SteeringHook
+from steering import SteeringConfig, SteeringVector
 
 logger = logging.getLogger(__name__)
 
