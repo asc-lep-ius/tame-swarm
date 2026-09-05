@@ -174,3 +174,37 @@ def test_hf_loader_rejects_unknown_dataset():
     loader = HFContrastiveLoader(load_dataset=lambda *a, **k: [])
     with pytest.raises(ValueError, match="no HuggingFace converter"):
         loader.load("truthful", "some_unknown_dataset")
+
+
+def test_register_rejects_records_missing_required_keys():
+    with pytest.raises(ValueError, match="missing keys"):
+        register_contrastive_pairs("probe", [{"prompt": "p", "positive": " a"}])
+
+
+def test_hf_loader_respects_limit():
+    rows = [
+        {
+            "question": f"Q{i}?",
+            "mc1_targets": {"choices": [f"right{i}", f"wrong{i}"], "labels": [1, 0]},
+        }
+        for i in range(10)
+    ]
+    loader = HFContrastiveLoader(load_dataset=lambda *a, **k: rows)
+    assert len(loader.load("truthful", "truthful_qa", limit=3)) == 3
+
+
+def test_hh_rlhf_caps_the_streaming_split_by_default():
+    from contrastive_data import DEFAULT_HF_STREAM_LIMIT
+
+    def endless_loader(*_a, **_k):
+        i = 0
+        while True:
+            yield {
+                "chosen": f"\n\nHuman: hi\n\nAssistant: safe {i}",
+                "rejected": f"\n\nHuman: hi\n\nAssistant: harm {i}",
+            }
+            i += 1
+
+    loader = HFContrastiveLoader(load_dataset=endless_loader)
+    pair_set = loader.load("safe", "Anthropic/hh-rlhf")
+    assert len(pair_set) == DEFAULT_HF_STREAM_LIMIT

@@ -51,6 +51,11 @@ MIN_PAIRS_PER_TIER = 15
 # so their difference is noise added to the mean. A quality warning, not a
 # rejection: the caller decides whether a near-duplicate pair earns its place.
 MAX_COMPLETION_SIMILARITY = 0.95
+# Default cap on pairs drawn from a *streaming* HF source (hh-rlhf is ~42k rows),
+# so a bare `load_contrastive_dataset(..., source="Anthropic/hh-rlhf")` yields an
+# extraction-sized set rather than materialising the whole split. Pass an explicit
+# `limit` to override. truthful_qa is small enough (817 rows) to leave uncapped.
+DEFAULT_HF_STREAM_LIMIT = 500
 
 VALID_TIERS = frozenset(TIERS)
 
@@ -249,18 +254,26 @@ class ContrastivePairSet:
         ]
 
 
+_REQUIRED_RECORD_KEYS = ("prompt", "positive", "negative")
+
+
 def _pairs_from_records(records: Iterable[dict], source: str) -> list[ContrastivePair]:
-    return [
-        ContrastivePair(
-            prompt=record["prompt"],
-            positive_completion=record["positive"],
-            negative_completion=record["negative"],
-            read_position=record.get("read_position", -1),
-            tier=record.get("tier", "medium"),
-            source=source,
+    pairs = []
+    for record in records:
+        missing = [key for key in _REQUIRED_RECORD_KEYS if key not in record]
+        if missing:
+            raise ValueError(f"contrastive pair record is missing keys {missing}: {record!r}")
+        pairs.append(
+            ContrastivePair(
+                prompt=record["prompt"],
+                positive_completion=record["positive"],
+                negative_completion=record["negative"],
+                read_position=record.get("read_position", -1),
+                tier=record.get("tier", "medium"),
+                source=source,
+            )
         )
-        for record in records
-    ]
+    return pairs
 
 
 # Custom pairs registered at runtime, keyed by goal. Kept separate from the
@@ -315,6 +328,7 @@ def load_contrastive_dataset(
     goal: str,
     source: str = "builtin",
     load_dataset: Callable[..., Iterable[dict]] | None = None,
+    limit: int | None = None,
 ) -> ContrastivePairSet:
     """Load one goal's pairs from the built-in templates, custom registrations, or HF.
 
@@ -322,7 +336,8 @@ def load_contrastive_dataset(
     registered via :func:`register_contrastive_pairs`), or a HuggingFace dataset
     name understood by :class:`HFContrastiveLoader`. The HF path imports
     ``datasets`` lazily and accepts an injected ``load_dataset`` so it is testable
-    without the network.
+    without the network. ``limit`` caps how many pairs an HF source yields; it is
+    ignored for the built-in and custom sources, which are already bounded.
     """
     if source == "builtin":
         if goal not in BUILTIN_PAIRS:
@@ -335,7 +350,7 @@ def load_contrastive_dataset(
             raise ValueError(f"no custom pairs registered for goal {goal!r}")
         return ContrastivePairSet.from_pairs(goal, _CUSTOM_PAIRS[goal], source="custom")
 
-    return HFContrastiveLoader(load_dataset=load_dataset).load(goal, source)
+    return HFContrastiveLoader(load_dataset=load_dataset).load(goal, source, limit=limit)
 
 
 def load_instruction_prefix_control(goal: str) -> ContrastivePairSet:
@@ -430,6 +445,10 @@ class HFContrastiveLoader:
         return pairs
 
     def _from_hh_rlhf(self, goal: str, limit: int | None) -> list[ContrastivePair]:
+        # harmless-base streams ~42k rows; without a cap this materialises the whole
+        # split into ContrastivePair objects. Default to a sane extraction-sized cap
+        # so an unbounded call from the public loader is not a foot-gun.
+        limit = DEFAULT_HF_STREAM_LIMIT if limit is None else limit
         rows = self._resolve_loader()(
             "Anthropic/hh-rlhf", data_dir="harmless-base", split="train", streaming=True
         )

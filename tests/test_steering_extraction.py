@@ -106,3 +106,12 @@ def test_goal_similarity_matrix_is_symmetric_with_unit_diagonal():
 
     pairwise = log_goal_similarity(vectors_by_goal, layer=2)
     assert set(pairwise) == {("reasoning", "safe"), ("reasoning", "truthful"), ("safe", "truthful")}
+
+
+def test_steering_vector_keeps_a_zero_diff_inert_instead_of_nan():
+    """Identical completions give a zero diff-in-means; normalising it must not NaN."""
+    from steering import SteeringVector
+
+    sv = SteeringVector("degenerate", torch.zeros(8), layer=0)
+    assert torch.all(sv.vector == 0)
+    assert torch.isfinite(sv.vector).all()

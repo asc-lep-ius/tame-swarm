@@ -108,7 +108,16 @@ def project_steering_direction(
 class SteeringVector:
     def __init__(self, name: str, vector: torch.Tensor, layer: int, description: str = ""):
         self.name = name
-        self.vector = vector / vector.norm()  # Normalize
+        norm = vector.norm()
+        if norm <= 0 or not torch.isfinite(norm):
+            # A degenerate diff-in-means (e.g. identical positive/negative
+            # completions) would divide to NaN and steer with full confidence in a
+            # meaningless direction. Keep the zero vector: a zero direction is an
+            # honest no-op that the hook and the coupling both treat as inert.
+            logger.warning("Steering vector '%s' has zero/non-finite norm; kept inert", name)
+            self.vector = torch.zeros_like(vector)
+        else:
+            self.vector = vector / norm
         self.layer = layer
         self.description = description
 
@@ -326,11 +335,9 @@ class SteeringVectorExtractor:
                     description=f"Behavioural diff-in-means from {used} completion pairs",
                 )
 
+            total = len(pairs) if hasattr(pairs, "__len__") else used
             logger.info(
-                "Behavioural extraction: %d/%d pairs used, layers %s",
-                used,
-                len(list(pairs)) if hasattr(pairs, "__len__") else used,
-                self.layers,
+                "Behavioural extraction: %d/%d pairs used, layers %s", used, total, self.layers
             )
             return steering_vectors
         finally:
