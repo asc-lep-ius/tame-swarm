@@ -13,7 +13,7 @@ from transformers import TextIteratorStreamer
 from app import TAMEApplication
 from dependencies import get_tame_app
 from models import GenerateRequest, GenerateResponse, HealthResponse, SwarmStatus
-from steering import create_default_steering_vectors
+from steering_pipeline import extract_steering_vectors
 
 logger = logging.getLogger(__name__)
 
@@ -391,16 +391,16 @@ async def update_steering(
     try:
         tame.homeostat.detach_from_model()
 
-        steering_vectors = create_default_steering_vectors(
+        extraction = extract_steering_vectors(
             cast(nn.Module, tame.model),
             tame.tokenizer,
             goal=goal,
-            layers=tame.steering_config.steering_layers,
+            config=tame.steering_config,
         )
 
         tame.homeostat.config.base_strength = strength
 
-        tame.homeostat.add_steering_vectors(steering_vectors)
+        tame.homeostat.add_steering_vectors(extraction.vectors)
         tame.homeostat.attach_to_model(cast(nn.Module, tame.model))
 
         return {
