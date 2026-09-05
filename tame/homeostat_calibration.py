@@ -94,7 +94,7 @@ class AlignmentCalibration:
         return max(self.sensors)
 
 
-def _unit(vector: torch.Tensor) -> torch.Tensor:
+def unit_vector(vector: torch.Tensor) -> torch.Tensor:
     norm = vector.norm()
     return vector if norm == 0 else vector / norm
 
@@ -214,7 +214,7 @@ def calibrate_alignment(
     actuators = tuple(sorted(layer for layer in vectors if layer in config.steering_layers))
     sensors = tuple(sorted({*actuators, readout}))
     measured = {
-        layer: _unit((directions or {}).get(layer, vectors[layer].vector).float().cpu())
+        layer: unit_vector((directions or {}).get(layer, vectors[layer].vector).float().cpu())
         for layer in sensors
     }
 

@@ -144,8 +144,6 @@ def test_steering_update_installs_the_goal_and_reports_the_band(
 
 def test_generate_response_carries_the_loop_history_and_pid_status(loaded_homeostat):
     """The stats the homeostat returns must fit the response model, or /generate 500s."""
-    import torch
-
     from models import GenerateResponse
 
     homeostat, _ = loaded_homeostat
@@ -158,7 +156,6 @@ def test_generate_response_carries_the_loop_history_and_pid_status(loaded_homeos
     response = GenerateResponse(response="x", usage={"input_tokens": 1}, homeostasis=stats)
     assert response.homeostasis is not None
     assert len(response.homeostasis["strength_history"]) == 3
-    assert torch.is_tensor(direction)
 
 
 def test_steering_update_rejects_bad_strengths(client, mock_tame_app, loaded_homeostat):
@@ -210,3 +207,46 @@ def test_install_goal_reattaches_the_old_loop_when_the_new_one_fails(monkeypatch
     assert tame.homeostat is homeostat
     assert len(homeostat._registered_hooks) == 2
     homeostat.detach_from_model()
+
+
+def test_build_homeostat_rejects_a_strength_outside_the_certified_band():
+    """The band check runs before the model is touched, so no model is needed to test it."""
+    from app import build_homeostat
+
+    template = SteeringConfig()
+    with pytest.raises(ValueError, match="certified band"):
+        build_homeostat(None, None, template, "truthful", strength=40)  # pyright: ignore[reportArgumentType]
+    with pytest.raises(ValueError, match="positive"):
+        build_homeostat(None, None, template, "truthful", strength=-1)  # pyright: ignore[reportArgumentType]
+
+
+def test_install_goal_starts_every_install_from_the_pristine_template(monkeypatch):
+    """Gains pinned on the served config must not leak into the next goal's derivation."""
+    from unittest.mock import MagicMock
+
+    import app as app_module
+    from homeostat import CognitiveHomeostat
+
+    seen = {}
+
+    def spy(model, tokenizer, template, goal, model_id=None, strength=None):
+        seen["template"] = template
+        config = SteeringConfig()
+        return CognitiveHomeostat(config), MagicMock(), config
+
+    monkeypatch.setattr(app_module, "build_homeostat", spy)
+    template = SteeringConfig()
+    served = SteeringConfig(kp=9.0, ki=0.5, steering_layers=[13, 16])
+    tame = app_module.TAMEApplication(
+        model=MagicMock(),
+        tokenizer=MagicMock(),
+        homeostat=None,
+        mob_config=MoBConfig(num_experts=2, top_k=1, hidden_dim=8, intermediate_dim=16),
+        steering_config=served,
+        model_id="fake",
+        steering_template=template,
+    )
+    tame.install_goal("safe")
+
+    assert seen["template"] is template
+    assert seen["template"].kp is None

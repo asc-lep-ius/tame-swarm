@@ -48,6 +48,7 @@ from homeostat_calibration import (
     calibrate_alignment,
     resolve_readout_layer,
     transformer_layers,
+    unit_vector,
 )
 from pid_controller import PIDConfig, PIDController, PIDState, simc_pi_gains
 from steering import (
@@ -87,11 +88,6 @@ SHARED_DEAD_TIME = 2.0
 # Gain margin on the integral gain's stability bound: the API accepts up to half
 # the critical gain of the modelled delay loop.
 INTEGRAL_GAIN_MARGIN = 0.5
-
-
-def _unit(vector: torch.Tensor) -> torch.Tensor:
-    norm = vector.norm()
-    return vector if norm == 0 else vector / norm
 
 
 def critical_integral_gain(process_gain: float, delay: int) -> float:
@@ -254,7 +250,7 @@ class AdaptiveHomeostat:
     def reading(self, hidden_states: torch.Tensor, steering_vector: torch.Tensor) -> float:
         """Projection of the last position onto the goal direction (cosine when uncalibrated)."""
         state = _last_position(hidden_states)
-        direction = _unit(steering_vector.float().to(state.device))
+        direction = unit_vector(steering_vector.float().to(state.device))
         if self.calibration is None:
             return float(F.cosine_similarity(state, direction, dim=0).item())
         return float((state @ direction).item())
@@ -412,7 +408,7 @@ class AdaptiveHomeostat:
                     "saturated": self._saturated.get(layer, False),
                     "seen": seen,
                 }
-                for layer, seen in self._seen.items()
+                for layer, seen in list(self._seen.items())
             },
         }
 

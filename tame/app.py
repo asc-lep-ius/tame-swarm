@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -173,7 +173,7 @@ class TAMEApplication:
             steering_layers=list(range(profile["mob_layers_start"], profile["mob_layers_end"])),
             adaptive=ADAPTIVE_STEERING,
         )
-        steering_config = steering_template
+        steering_config = replace(steering_template)
 
         logger.info("=" * 60)
         logger.info("TAME SWARM: Initializing Agential Architecture")

@@ -310,10 +310,13 @@ def test_reset_clears_cells_and_histories():
 
 
 def test_snapshot_round_trips_through_a_dict():
-    homeostat, tissue = make(content=-0.5)
+    # A real filter, so the round trip has filter state to lose.
+    homeostat, tissue = make(content=-0.5, measurement_filter_alpha=0.5)
     tissue.run(5)
 
-    restored = AdaptiveHomeostat(tissue_config(), calibration=calibration())
+    restored = AdaptiveHomeostat(
+        tissue_config(measurement_filter_alpha=0.5), calibration=calibration()
+    )
     restored.restore(homeostat.snapshot())
     assert restored.controller.states == homeostat.controller.states
     assert restored.current_strength == pytest.approx(homeostat.current_strength)

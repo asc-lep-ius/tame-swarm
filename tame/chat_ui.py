@@ -515,6 +515,9 @@ def create_ui():
 
                 # The served reference strength and band come from the goal's
                 # certification (2-6 for truthful); 0 leaves the served configuration.
+                # The slider deliberately reaches past the band: a per-request
+                # override is an experiment knob, and /generate holds it for one
+                # request only, unlike /steering/update which refuses it.
                 steering_strength = gr.Slider(
                     minimum=0.0,
                     maximum=8.0,
