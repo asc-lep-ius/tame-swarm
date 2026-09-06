@@ -371,7 +371,7 @@ def test_the_market_re_forms_after_routing_was_forced_onto_the_least_competent(s
         "the market does not re-form: at the 150-step horizon this test asserts, routing no "
         "longer tracks competence (r -0.31 to -0.03 on the three seeds, 0.81-0.82 before), "
         "the best expert holds 9-11% of its steady share and the loss is 2.6-3.7x steady; "
-        "at 300 steps r -0.35 to +0.16, 0.2-1.4% and 1.9-4.3x. Two candidate causes: the "
+        "at 300 steps r -0.35 to +0.16, 0.5-0.7% and 1.9-4.4x. Two candidate causes: the "
         "ceiling, and the starved experts' heads receiving no realised-value signal during "
         "the episode; the ceiling measurement supports the first, nothing here excludes the "
         "second. The band is #16's."

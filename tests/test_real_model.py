@@ -28,7 +28,10 @@ and every regime replays it token by token through the cache, as the plant probe
 stable, one flipped token rewrites the tail, and the inference economy drifts
 between generations, so a measurement on freshly generated text compares
 regimes on different content; a replay compares them on the same. The economy
-is frozen for every replay for the same reason.
+is frozen for every replay for the same reason. The pairing is also what makes
+the removal test's 40-token windows enough: the content variation that sets the
+0.4 sigma standard error above is shared between the regimes and cancels in
+their difference, so the naive figure overstates the noise on the comparison.
 
 ``gpu``-marked. Loads the model from the local HuggingFace cache once per module
 and never downloads. Without the cache it skips on a developer's machine and
@@ -94,6 +97,9 @@ CONTENT_PUSH = -1.2
 # the inert loop +1.10 sigma over the tail, the live loop +0.15 at a strength
 # raised by 0.56; the same tokens unpushed read -0.01 inert and -0.15 live.
 RECOVERY_SIGMA = 0.6
+# The push must bite for the recovery to mean anything; measured 1.10 against this
+# floor (the unseeded fixture read 1.44 on other tokens), so a failure here says the
+# push weakened on this substrate, not that the loop improved.
 INERT_ERROR_SIGMA = 0.8
 STRENGTH_RISE = 0.3
 # After the top actuator is removed the survivors' strength must rise; by how much
