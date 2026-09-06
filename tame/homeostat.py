@@ -131,7 +131,9 @@ class AdaptiveHomeostat:
         self._pass = 0
         self._recorded_pass = 0
         self._last_layer: int | None = None
-        self._consensus: float | None = None
+        # The tissue's frozen consensus for the pass: ``(mean error, mean setpoint,
+        # mean reading)`` over the live cells, or None before the first pass.
+        self._consensus: tuple[float, float, float] | None = None
 
     # --- configuration -----------------------------------------------------------
 
@@ -279,9 +281,18 @@ class AdaptiveHomeostat:
 
         # The controller integrates the tissue's mean error (frozen for this pass);
         # the cell's own deviation from it enters through the proportional term only.
-        shared = 0.0 if self._consensus is None else self._consensus
+        # The consensus is handed over as the tissue's mean reading against the
+        # tissue's mean setpoint, not as a single error: the error, and with it the
+        # integral and proportional terms, is the same either way, but the
+        # derivative acts on the process variable precisely so that a setpoint
+        # change cannot kick it, and a setpoint folded into the process variable
+        # would kick it on every re-install of the goal (found by #6's integration test).
+        if self._consensus is None:
+            shared, shared_setpoint, shared_pv = 0.0, setpoint, setpoint
+        else:
+            shared, shared_setpoint, shared_pv = self._consensus
         tissue_strength, state = self.controller.step(
-            self._key(layer), setpoint, setpoint - shared, bias=self.config.base_strength
+            self._key(layer), shared_setpoint, shared_pv, bias=self.config.base_strength
         )
         local = self.gains()[0] * (error - shared)
         low, high = self.config.min_strength, self.config.max_strength
@@ -305,7 +316,12 @@ class AdaptiveHomeostat:
         """
         if self._last_layer is None or layer <= self._last_layer:
             live = [cell for cell in self.live_cells() if cell in self._error]
-            self._consensus = float(np.mean([self._error[cell] for cell in live])) if live else None
+            if live:
+                mean_pv = float(np.mean([self._pv[cell] for cell in live]))
+                mean_setpoint = float(np.mean([self.cell_setpoint(cell) for cell in live]))
+                self._consensus = (mean_setpoint - mean_pv, mean_setpoint, mean_pv)
+            else:
+                self._consensus = None
             self._pass += 1
         self._last_layer = layer
         self._seen[layer] = self._pass
