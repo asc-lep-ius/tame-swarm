@@ -121,7 +121,10 @@ test-gpu:
   extends: .python-job
   script:
     - nvidia-smi
-    - uv run pytest tests/ -x --tb=short -m gpu
+    # #6 budgets the GPU job at 120 seconds (measured 96 on the RTX 5070 Ti with
+    # Qwen3-1.7B loaded from the runner's HF cache); the durations make a
+    # regression against that budget visible in the job log.
+    - uv run pytest tests/ -x --tb=short -m gpu --durations=10
 
 # --- Build stage ---
 docker-build:
