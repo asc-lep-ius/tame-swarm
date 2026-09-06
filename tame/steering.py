@@ -321,12 +321,37 @@ class SteeringVectorExtractor:
         A pair whose completion is entirely truncated away is skipped with a
         warning rather than read at a prompt token.
         """
+        positives, negatives = self.read_pairs(pairs, max_length)
+        used = int(next(iter(positives.values())).shape[0])
+
+        steering_vectors = {}
+        for layer_idx in self.layers:
+            steering_vectors[layer_idx] = SteeringVector(
+                name="extracted",
+                vector=positives[layer_idx].mean(dim=0) - negatives[layer_idx].mean(dim=0),
+                layer=layer_idx,
+                description=f"Behavioural diff-in-means from {used} completion pairs",
+            )
+
+        total = len(pairs) if hasattr(pairs, "__len__") else used
+        logger.info("Behavioural extraction: %d/%d pairs used, layers %s", used, total, self.layers)
+        return steering_vectors
+
+    def read_pairs(
+        self, pairs: "Sequence[ContrastivePair]", max_length: int = 128
+    ) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
+        """Per-layer ``(pairs, hidden)`` reads at each pair's completion position, both arms.
+
+        The reads :meth:`extract_from_pairs` averages, before the averaging -- what
+        a diagnostic over the activation geometry (``behavioural_validation.
+        pca_separability``) needs. Pairs whose completion is truncated away are
+        skipped, so both stacks have the same rows in the same order.
+        """
         self._register_hooks()
         try:
             input_device = self._input_device()
             positives: dict[int, list[torch.Tensor]] = {layer: [] for layer in self.layers}
             negatives: dict[int, list[torch.Tensor]] = {layer: [] for layer in self.layers}
-            used = 0
 
             for pair in pairs:
                 pos = self._read_completion_activations(
@@ -348,27 +373,13 @@ class SteeringVectorExtractor:
                 for layer_idx in self.layers:
                     positives[layer_idx].append(pos[layer_idx])
                     negatives[layer_idx].append(neg[layer_idx])
-                used += 1
 
-            if used == 0:
+            if not next(iter(positives.values()), []):
                 raise ValueError("no usable pairs: every completion was empty or truncated away")
-
-            steering_vectors = {}
-            for layer_idx in self.layers:
-                pos_mean = torch.stack(positives[layer_idx]).mean(dim=0)
-                neg_mean = torch.stack(negatives[layer_idx]).mean(dim=0)
-                steering_vectors[layer_idx] = SteeringVector(
-                    name="extracted",
-                    vector=pos_mean - neg_mean,
-                    layer=layer_idx,
-                    description=f"Behavioural diff-in-means from {used} completion pairs",
-                )
-
-            total = len(pairs) if hasattr(pairs, "__len__") else used
-            logger.info(
-                "Behavioural extraction: %d/%d pairs used, layers %s", used, total, self.layers
+            return (
+                {layer: torch.stack(reads) for layer, reads in positives.items()},
+                {layer: torch.stack(reads) for layer, reads in negatives.items()},
             )
-            return steering_vectors
         finally:
             self._remove_hooks()
 

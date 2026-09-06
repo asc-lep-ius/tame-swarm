@@ -101,6 +101,34 @@ class ValidationResult:
         return self.beats_random and self.beats_control
 
 
+def pca_separability(positives: torch.Tensor, negatives: torch.Tensor) -> float:
+    """Separation of the two arms' reads along their leading principal axis, in within-arm sigmas.
+
+    The diagnostic #3 demoted from gate to report. It is the class separation a
+    linear probe would see, and it is *not* evidence that a direction steers:
+    prompt-surface features separate especially cleanly, so the instruction-prefix
+    control tends to score higher here than the behavioural pairs do. Reported
+    beside the gate so a reader can see the two disagree; never read by
+    :func:`validate_steering_vector`. Zero when the two arms read identically, and
+    NaN when there is no variance to measure against.
+    """
+    pooled = torch.cat([positives, negatives]).float()
+    centred = pooled - pooled.mean(dim=0, keepdim=True)
+    if centred.shape[0] < 2 or not bool((centred.abs() > 0).any()):
+        return 0.0
+    axis = torch.linalg.svd(centred, full_matrices=False).Vh[0]
+    pos_projection = positives.float() @ axis
+    neg_projection = negatives.float() @ axis
+    within = torch.cat(
+        [pos_projection - pos_projection.mean(), neg_projection - neg_projection.mean()]
+    )
+    spread = float(within.std()) if within.numel() > 1 else 0.0
+    separation = float((pos_projection.mean() - neg_projection.mean()).abs())
+    if spread == 0.0:
+        return float("inf") if separation > 0.0 else 0.0
+    return separation / spread
+
+
 def _completion_log_prob(
     model: nn.Module, tokenizer, prompt: str, completion: str, device: torch.device, max_length: int
 ) -> float:
