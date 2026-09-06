@@ -281,6 +281,13 @@ def test_training_forward_requires_the_step_to_have_been_set():
     coupling(hidden)
 
 
+@pytest.mark.parametrize("direction", [torch.zeros(HIDDEN), torch.full((HIDDEN,), float("nan"))])
+def test_a_degenerate_direction_is_refused(direction):
+    """A coupling that could never act must not be attachable in silence."""
+    with pytest.raises(ValueError, match="could never act"):
+        SteeringCoupling(SteeringCouplingConfig(hidden_dim=HIDDEN), direction)
+
+
 def test_a_training_mob_refuses_to_forward_a_coupling_nobody_stepped(training_mob_layer):
     training_mob_layer.attach_coupling(_unit(2))
 

@@ -222,7 +222,10 @@ class SteeringCoupling(nn.Module):
 
         norm = float(direction.norm().item())
         if not math.isfinite(norm) or norm <= config.eps:
-            return torch.zeros_like(direction)
+            raise ValueError(
+                "steering direction has zero or non-finite norm; a coupling seeded from it "
+                "could never act"
+            )
         return direction / norm
 
 

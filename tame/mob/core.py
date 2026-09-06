@@ -240,7 +240,7 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         # private value objective backpropagates into the backbone that every other
         # expert reads -- a shared auxiliary loss, which is the central planner the
         # auction exists to replace. Detaching the input rather than the coupling
-        # output keeps SteeringCoupling.projection trainable.
+        # output keeps SteeringCoupling.detector trainable.
         routing_hidden_states = hidden_states.detach()
 
         # The auxiliary objectives -- each head's value objective and the router

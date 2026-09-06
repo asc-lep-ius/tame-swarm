@@ -373,6 +373,46 @@ def test_coupling_goal_seeds_the_certified_mob_layers_and_trains_the_receptor(
     assert measurements["coupling/detector_norm_mean"] == 0.0, "nothing has stepped yet"
 
 
+def test_setup_checks_that_the_seeded_state_survived_the_device_move(
+    smoke_fixture, tmp_path, monkeypatch
+):
+    """A coupling that lost its direction on the device move would log as seeded and add nothing.
+
+    ``to_empty`` on the re-dispatch fallback reallocates every buffer without
+    copying it; the guard runs after every device move and compares each coupling
+    with the snapshot seeding took.
+    """
+    import train as train_module
+
+    model_id, _ = smoke_fixture
+    _certify_smoke_goal(monkeypatch, model_id, layers=(2,))
+    calls: list[int] = []
+    guard = train_module.TAMETrainer._assert_seeded_couplings_intact
+    monkeypatch.setattr(
+        train_module.TAMETrainer,
+        "_assert_seeded_couplings_intact",
+        lambda self: (calls.append(1), guard(self)),
+    )
+    trainer = TAMETrainer(_config(smoke_fixture, tmp_path / "guard", coupling_goal="smoke"))
+    trainer.setup()
+    assert calls == [1], "setup must run the guard once, after the device move"
+
+    coupling = get_mob_layers(trainer.model)[1].coupling
+    kept = coupling.steering_direction.clone()
+    with torch.no_grad():
+        coupling.steering_direction.zero_()
+    with pytest.raises(RuntimeError, match="layer 2 did not survive"):
+        guard(trainer)
+
+    with torch.no_grad():
+        coupling.steering_direction.copy_(kept)
+    guard(trainer)
+    with torch.no_grad():
+        coupling.detector.uniform_(-0.01, 0.01)
+    with pytest.raises(RuntimeError, match="layer 2 did not survive"):
+        guard(trainer)
+
+
 def test_without_a_coupling_goal_routing_stays_uncoupled(smoke_fixture, tmp_path):
     trainer = TAMETrainer(_config(smoke_fixture, tmp_path / "plain"))
     trainer.setup()
@@ -412,6 +452,7 @@ def test_setup_refuses_a_goal_whose_certified_layers_carry_no_mob_layer(
         ({"coupling_goal": "deliberation"}, "no certified layers"),
         ({"coupling_goal": "truthful", "model_id": "google/gemma-2-2b-it"}, "certified on"),
         ({"coupling_goal": "truthful", "router": "dense"}, "dense arm"),
+        ({"coupling_goal": "truthful", "coupling_beta": 0.0}, "inert"),
         ({"coupling_beta": -0.1}, "coupling_beta"),
     ],
 )

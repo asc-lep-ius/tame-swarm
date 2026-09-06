@@ -85,7 +85,12 @@ except ImportError:
     logger.warning("'accelerate' library not installed. Model re-dispatch disabled.")
 
 from config import get_active_profile
-from coupling import DEFAULT_COUPLING_BETA, DEFAULT_WARMUP_STEPS, SteeringCouplingConfig
+from coupling import (
+    DEFAULT_COUPLING_BETA,
+    DEFAULT_WARMUP_STEPS,
+    SteeringCoupling,
+    SteeringCouplingConfig,
+)
 from determinism import configure_determinism, seed_worker
 from evaluation import (
     DEFAULT_HELD_OUT_SEQUENCES,
@@ -310,6 +315,11 @@ class TrainingConfig:
                 raise ValueError(
                     "coupling_goal needs a MoB layer to couple; the dense arm has none"
                 )
+            if self.coupling_beta <= 0:
+                raise ValueError(
+                    "coupling_beta must be positive when coupling_goal is set: a coupling "
+                    "seeded at beta 0 is attached and inert"
+                )
             # Raises UncertifiedDirectionError here, at construction, rather than
             # after the model has loaded: the goal must be certified, at named
             # layers, on this model.
@@ -357,6 +367,9 @@ class TAMETrainer:
         self.scheduler = None
         self.train_dataloader = None
         self.mob_config: MoBConfig | None = None
+        # What seeding left in each coupled layer, checked again after the device
+        # move: see _assert_seeded_couplings_intact.
+        self._seeded_couplings: dict[int, tuple[SteeringCoupling, torch.Tensor, torch.Tensor]] = {}
 
         # Training state
         self.global_step = 0
@@ -448,6 +461,8 @@ class TAMETrainer:
         elif self.device.type != "cuda":
             # Move to device if not using CUDA
             self.model = self.model.to(self.device)  # pyright: ignore[reportArgumentType] # .to() overload expects Device, not torch.device
+
+        self._assert_seeded_couplings_intact()
 
         # Setup optimizer
         self._setup_optimizer()
@@ -565,6 +580,14 @@ class TAMETrainer:
                 f"coupling_goal={extraction.goal!r} seeded nothing: none of its certified "
                 f"layers {layers} is a MoB layer ({requested.start}-{requested.stop - 1})"
             )
+        self._seeded_couplings = {
+            layer: (
+                coupling,
+                coupling.steering_direction.detach().float().cpu().clone(),
+                coupling.detector.detach().float().cpu().clone(),
+            )
+            for layer, coupling in seeded.items()
+        }
         logger.info(
             "Coupling: %r seeded at MoB layers %s (beta %.3f, warmup %d steps); "
             "MoB layers %s stay uncoupled, their direction is uncertified",
@@ -574,6 +597,27 @@ class TAMETrainer:
             self.config.coupling_warmup_steps,
             [layer for layer in requested if layer not in seeded],
         )
+
+    def _assert_seeded_couplings_intact(self) -> None:
+        """The device move must leave every seeded coupling exactly as seeding left it.
+
+        ``_redispatch_model``'s meta-materialisation path calls ``to_empty``, which
+        reallocates every parameter and buffer without copying, and the pretrained
+        reload restores only keys the checkpoint has -- so a coupling could come out
+        of it with a zero direction and a randomly re-initialised receptor, log as
+        seeded, and add nothing forever. That is the silent no-op this flag exists to
+        remove, so the state is compared against the snapshot taken at seeding.
+        """
+        for layer, (coupling, direction, detector) in self._seeded_couplings.items():
+            live_direction = coupling.steering_direction.detach().float().cpu()
+            live_detector = coupling.detector.detach().float().cpu()
+            if not torch.allclose(live_direction, direction, atol=1e-3) or not torch.allclose(
+                live_detector, detector, atol=1e-3
+            ):
+                raise RuntimeError(
+                    f"the coupling seeded at layer {layer} did not survive the device move: "
+                    "its direction or receptor no longer matches what seeding left"
+                )
 
     def _redispatch_model(self):
         """

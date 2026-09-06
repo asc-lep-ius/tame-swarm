@@ -347,13 +347,14 @@ def seed_coupling(
         )
     blocks = transformer_layers(model)
     seeded: dict[int, SteeringCoupling] = {}
+    retained: dict[int, float] = {}
     skipped: list[int] = []
     for layer_idx in layers:
         mob = _mob_at(blocks[layer_idx]) if layer_idx < len(blocks) else None
         if mob is None or layer_idx not in homeostat.steering_vectors:
             skipped.append(layer_idx)
             continue
-        direction, _ = homeostat.projected_direction(layer_idx)
+        direction, retained[layer_idx] = homeostat.projected_direction(layer_idx)
         seeded[layer_idx] = mob.attach_coupling(direction, config)
     if skipped:
         logger.info(
@@ -361,5 +362,11 @@ def seed_coupling(
             extraction.goal,
             skipped,
         )
-    logger.info("Coupling for %r seeded at MoB layers %s", extraction.goal, sorted(seeded))
+    logger.info(
+        "Coupling for %r seeded at MoB layers %s; the capability projection retained %s of "
+        "the direction",
+        extraction.goal,
+        sorted(seeded),
+        {layer: round(share, 3) for layer, share in sorted(retained.items())},
+    )
     return seeded
