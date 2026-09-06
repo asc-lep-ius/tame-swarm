@@ -96,6 +96,20 @@ LEDGER_BUFFERS = (
 )
 
 
+def ledger_initial_values(config: MoBConfig) -> dict[str, float]:
+    """What every ledger holds before the first settlement: the economy at rest.
+
+    The one source for both the constructor and the trainer's post-condition that
+    a freshly converted layer starts here (#19).
+    """
+    return {
+        "expert_wealth": config.initial_wealth,
+        "expert_usage_count": 0.0,
+        "expert_baseline_loss": 1.0,
+        "expert_performance_ema": 0.0,
+    }
+
+
 class MixtureOfBidders(WealthUpdateMixin, nn.Module):
     def _apply(self, fn, recurse=True):  # type: ignore[override]
         """Move the layer as usual, then put the ledgers back in float32.
@@ -160,25 +174,8 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
             else SoftmaxRouter(config.num_experts, config.top_k)
         )
 
-        self.register_buffer(
-            "expert_wealth",
-            torch.full((config.num_experts,), config.initial_wealth),
-        )
-
-        self.register_buffer(
-            "expert_usage_count",
-            torch.zeros(config.num_experts),
-        )
-
-        self.register_buffer(
-            "expert_baseline_loss",
-            torch.ones(config.num_experts),
-        )
-
-        self.register_buffer(
-            "expert_performance_ema",
-            torch.zeros(config.num_experts),
-        )
+        for ledger, value in ledger_initial_values(config).items():
+            self.register_buffer(ledger, torch.full((config.num_experts,), float(value)))
 
         self.last_stats: MoBStats | None = None
 

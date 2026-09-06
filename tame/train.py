@@ -21,6 +21,7 @@ import logging
 import math
 import os
 import shutil
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -101,20 +102,24 @@ from evaluation import (
     is_held_out_position,
 )
 from homeostat import CognitiveHomeostat
+from homeostat_calibration import transformer_layers
 from metrics import MetricSink
 from mob import (
     ROUTER_AUCTION,
     ROUTER_SOFTMAX,
     ROUTING_SATURATION_THRESHOLD,
+    MixtureOfBidders,
     MoBConfig,
     apply_mob_to_model,
     get_mob_layers,
     get_mob_statistics,
     get_total_calibration_loss,
     get_total_router_z_loss,
+    ledger_initial_values,
     save_mob_state,
     update_all_mob_from_loss,
 )
+from mob.experts import CONFIDENCE_INITIAL_LOGIT, ConfidenceHead
 from parity import ArmFingerprint, data_order_fingerprint, fingerprint_arm
 from specialisation import SpecialisationReport, probe_specialisation
 from steering import SteeringConfig
@@ -150,6 +155,55 @@ METRICS_FILENAME = "metrics.jsonl"
 # Only meaningful for top_k > 1: at top_k == 1 the effective count is 1.0 and the
 # saturated fraction 1.0 by construction, and neither is a fault.
 MIN_HEALTHY_EFFECTIVE_EXPERTS = 1.5
+
+
+# Elements sampled from a weight to fingerprint it: enough that a re-initialised
+# or garbage tensor cannot match by chance, small enough to keep one per layer.
+FINGERPRINT_SAMPLES = 4096
+# The FFN projections an upcycled MoB copies into its shared base.
+SHARED_BASE_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
+
+
+def _weight_fingerprint(weight: torch.Tensor) -> torch.Tensor:
+    flat = weight.detach().flatten()
+    stride = max(1, flat.numel() // FINGERPRINT_SAMPLES)
+    return flat[::stride].float().cpu().clone()
+
+
+def _ffn_of(block: nn.Module) -> nn.Module | None:
+    for attribute in ("mlp", "feed_forward"):
+        candidate = getattr(block, attribute, None)
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _ffn_fingerprints(
+    model: nn.Module, layer_indices: Sequence[int]
+) -> dict[int, dict[str, torch.Tensor]]:
+    """Fingerprint the FFN weights about to become each MoB layer's shared base.
+
+    Taken before conversion so setup can assert afterwards that the converted
+    model still carries the weights it was loaded with (#19).
+    """
+    blocks = transformer_layers(model)
+    fingerprints: dict[int, dict[str, torch.Tensor]] = {}
+    for layer_idx in layer_indices:
+        ffn = _ffn_of(blocks[layer_idx]) if layer_idx < len(blocks) else None
+        if ffn is None or not all(hasattr(ffn, name) for name in SHARED_BASE_PROJECTIONS):
+            continue
+        fingerprints[layer_idx] = {
+            name: _weight_fingerprint(getattr(ffn, name).weight) for name in SHARED_BASE_PROJECTIONS
+        }
+    return fingerprints
+
+
+def _mob_layer_index(module_name: str) -> int | None:
+    """The transformer layer a MoB module sits in, read off its qualified name."""
+    marker = ".layers."
+    if marker not in module_name:
+        return None
+    return int(module_name.split(marker, 1)[1].split(".", 1)[0])
 
 
 def _scalar(value: object) -> float:
@@ -367,6 +421,9 @@ class TAMETrainer:
         self.scheduler = None
         self.train_dataloader = None
         self.mob_config: MoBConfig | None = None
+        # The FFN weights each converted layer was upcycled from, checked again after
+        # the device move: see _assert_setup_invariants.
+        self._ffn_fingerprints: dict[int, dict[str, torch.Tensor]] = {}
         # What seeding left in each coupled layer, checked again after the device
         # move: see _assert_seeded_couplings_intact.
         self._seeded_couplings: dict[int, tuple[SteeringCoupling, torch.Tensor, torch.Tensor]] = {}
@@ -430,6 +487,11 @@ class TAMETrainer:
             trust_remote_code=True,
         )
 
+        # A tensor still on the meta device means accelerate offloaded part of the
+        # model to CPU or disk because it did not fit GPU memory. Refused here,
+        # before conversion would crash on a meta FFN with a copy error.
+        self._refuse_meta_tensors()
+
         # Apply gradient checkpointing
         if self.config.gradient_checkpointing:
             self.model.gradient_checkpointing_enable()
@@ -452,17 +514,19 @@ class TAMETrainer:
         if self.config.use_lora:
             self._apply_lora()
 
-        # Re-dispatch model after MoB + LoRA transformations to ensure
-        # consistent device placement. Fixes meta device gradient error
-        # when using device_map="auto". Must happen AFTER all model
-        # modifications (MoB and LoRA) are complete.
+        # Nothing built since the load may sit on meta either; the device move
+        # below cannot copy such a tensor, and nothing may "materialise" it.
+        self._refuse_meta_tensors()
+
+        # Re-dispatch after MoB + LoRA so every new module has a device. Must
+        # happen AFTER all model modifications are complete.
         if self.device.type == "cuda" and HAS_ACCELERATE:
             self._redispatch_model()
         elif self.device.type != "cuda":
             # Move to device if not using CUDA
             self.model = self.model.to(self.device)  # pyright: ignore[reportArgumentType] # .to() overload expects Device, not torch.device
 
-        self._assert_seeded_couplings_intact()
+        self._assert_setup_invariants()
 
         # Setup optimizer
         self._setup_optimizer()
@@ -528,6 +592,7 @@ class TAMETrainer:
         # Determine which layers to modify
         layers_to_modify = list(range(self.config.mob_layers_start, self.config.mob_layers_end))
 
+        self._ffn_fingerprints = _ffn_fingerprints(self.model, layers_to_modify)
         self.model = apply_mob_to_model(self.model, mob_config, layers_to_modify=layers_to_modify)
         self.mob_config = mob_config
 
@@ -598,15 +663,92 @@ class TAMETrainer:
             [layer for layer in requested if layer not in seeded],
         )
 
+    def _named_tensors(self) -> list[tuple[str, torch.Tensor]]:
+        assert self.model is not None
+        return list(self.model.named_parameters()) + list(self.model.named_buffers())
+
+    def _refuse_meta_tensors(self) -> None:
+        """Refuse a model that accelerate left partly on the meta device.
+
+        A tensor still on ``meta`` means accelerate offloaded part of the model --
+        to CPU RAM or to disk -- because it did not fit GPU memory. The path that
+        used to "materialise" it -- ``to_empty``, a re-init heuristic, a partial
+        pretrained reload -- returned garbage where the offloaded weights were and
+        random weights in every converted FFN, and trained it (#19). This trainer
+        cannot train an offloaded model, so it says so instead.
+        """
+        offending = [name for name, tensor in self._named_tensors() if tensor.device.type == "meta"]
+        if offending:
+            raise RuntimeError(
+                f"{len(offending)} tensors are on the meta device (first: {offending[:5]}): "
+                "accelerate offloaded part of the model to CPU or disk because it did not fit "
+                "GPU memory, and this trainer cannot train an offloaded model. Use a smaller "
+                "profile (config.ACTIVE_MODEL), convert fewer layers (--mob_layers_start/"
+                "--mob_layers_end), or a GPU with more memory."
+            )
+
+    def _assert_setup_invariants(self) -> None:
+        """What setup hands to training is the model the config names -- checked, not assumed.
+
+        Runs on every setup. Any device path that corrupts state -- the meta
+        materialisation this replaced (#19), or one not written yet -- fails here
+        with the tensor named, rather than training a model nobody loaded.
+        """
+        assert self.model is not None
+        self._refuse_meta_tensors()
+        for name, tensor in self._named_tensors():
+            if tensor.is_floating_point() and not torch.isfinite(tensor).all():
+                raise RuntimeError(f"{name} holds NaN or inf after setup")
+        for name, module in self.model.named_modules():
+            if isinstance(module, MixtureOfBidders):
+                self._assert_mob_pristine(_mob_layer_index(name), module)
+        self._assert_seeded_couplings_intact()
+
+    def _assert_mob_pristine(self, layer_idx: int | None, mob: MixtureOfBidders) -> None:
+        """A freshly converted layer reproduces its FFN and starts its economy at rest."""
+        if mob.config.use_shared_base:
+            expected_base = {} if layer_idx is None else self._ffn_fingerprints.get(layer_idx, {})
+            if not expected_base:
+                # A shared base nobody fingerprinted is a shared base nobody can
+                # vouch for: the FFN had no gate/up/down to copy, or the layer sits
+                # somewhere ``transformer_layers`` does not look.
+                raise RuntimeError(f"no FFN fingerprint recorded for layer {layer_idx}")
+            for name, expected in expected_base.items():
+                live = _weight_fingerprint(getattr(mob, f"base_{name}").weight)
+                if not torch.equal(live, expected):
+                    raise RuntimeError(
+                        f"layer {layer_idx}: shared base {name} no longer equals the FFN it "
+                        "was upcycled from"
+                    )
+        for ledger, value in ledger_initial_values(mob.config).items():
+            if not bool((getattr(mob, ledger) == value).all()):
+                raise RuntimeError(
+                    f"layer {layer_idx}: ledger {ledger} is not at its initial value {value}"
+                )
+        for name, param in mob.experts.named_parameters():
+            if name.endswith("_B.weight") and bool((param != 0).any()):
+                raise RuntimeError(
+                    f"layer {layer_idx}: adapter {name} is not zero, so the converted layer "
+                    "would not reproduce its FFN"
+                )
+        for expert, head in enumerate(mob.confidence_heads):
+            bias = cast(nn.Linear, cast(ConfidenceHead, head).proj).bias
+            if bias is not None and not bool((bias == CONFIDENCE_INITIAL_LOGIT).all()):
+                raise RuntimeError(
+                    f"layer {layer_idx}: confidence head {expert} bias is not at its initial "
+                    f"logit {CONFIDENCE_INITIAL_LOGIT}"
+                )
+
     def _assert_seeded_couplings_intact(self) -> None:
         """The device move must leave every seeded coupling exactly as seeding left it.
 
-        ``_redispatch_model``'s meta-materialisation path calls ``to_empty``, which
-        reallocates every parameter and buffer without copying, and the pretrained
-        reload restores only keys the checkpoint has -- so a coupling could come out
-        of it with a zero direction and a randomly re-initialised receptor, log as
-        seeded, and add nothing forever. That is the silent no-op this flag exists to
-        remove, so the state is compared against the snapshot taken at seeding.
+        ``_redispatch_model`` used to materialise meta tensors with ``to_empty``,
+        which reallocates every parameter and buffer without copying, and a
+        pretrained reload that restored only keys the checkpoint had -- so a coupling
+        could come out of it with a zero direction and a randomly re-initialised
+        receptor, log as seeded, and add nothing forever. #19 removed that path; the
+        check stays, because the silent no-op it catches is the one this flag exists
+        to remove, whatever device path runs.
         """
         for layer, (coupling, direction, detector) in self._seeded_couplings.items():
             live_direction = coupling.steering_direction.detach().float().cpu()
@@ -620,55 +762,17 @@ class TAMETrainer:
                 )
 
     def _redispatch_model(self):
-        """
-        Re-dispatch model after MoB/LoRA transformations using Accelerate.
+        """Re-dispatch after MoB and LoRA so every new module has a device.
 
-        This ensures all newly created modules (MoB, LoRA adapters) are properly placed
-        on devices after modifying the model architecture. Without this, modules created
-        during transformations may remain on 'meta' device causing gradient errors like:
-        "RuntimeError: expected device meta but got cuda:0"
+        ``dispatch_model`` moves materialised tensors; it does not create any. A
+        model with a tensor still on ``meta`` never reaches here (see
+        ``_refuse_meta_tensors``), and the path that used to materialise one --
+        ``to_empty``, a re-init heuristic, a partial pretrained reload -- is gone
+        with #19: it returned garbage where the offloaded weights were and random
+        weights in every converted FFN, and trained it.
         """
         assert self.model is not None
         logger.info("Re-dispatching model after transformations...")
-
-        # First, check for any parameters still on 'meta' device
-        # This can happen with device_map="auto" lazy loading
-        meta_params = []
-        for name, param in self.model.named_parameters():
-            if param.device.type == "meta":
-                meta_params.append(name)
-
-        if meta_params:
-            logger.info(f"Found {len(meta_params)} parameters on meta device, materializing...")
-            # Meta tensors require special handling - can't use .to() directly
-            # Use to_empty() to allocate memory, then initialize weights
-            self.model = self.model.to_empty(device=self.device)
-
-            # Re-initialize any parameters that were on meta device
-            # For most cases these are MoB adapter weights which should start near-zero anyway
-            with torch.no_grad():
-                for name, param in self.model.named_parameters():
-                    if param.isnan().any() or param.isinf().any() or (param == 0).all():
-                        # Parameter needs initialization
-                        if "weight" in name:
-                            if param.dim() >= 2:
-                                # Use kaiming for weight matrices
-                                nn.init.kaiming_uniform_(param, a=math.sqrt(5))
-                            else:
-                                # Small init for 1D weights
-                                nn.init.uniform_(param, -0.01, 0.01)
-                        elif "bias" in name:
-                            nn.init.zeros_(param)
-                        else:
-                            # Default small random init
-                            nn.init.uniform_(param, -0.01, 0.01)
-
-            logger.info("Model materialized and re-initialized on device")
-
-            # Now reload pretrained weights for the base model components
-            # This preserves the original model weights while keeping new MoB/LoRA init
-            self._reload_pretrained_weights()
-            return
 
         try:
             # For PEFT models, we need to work with the underlying model
@@ -708,157 +812,10 @@ class TAMETrainer:
             logger.warning(
                 f"Re-dispatch failed ({type(e).__name__}: {e}), falling back to simple device move"
             )
-            # Fallback: check if we have meta tensors before calling .to()
-            has_meta = any(p.device.type == "meta" for p in self.model.parameters())
-            if has_meta:
-                self.model = self.model.to_empty(device=self.device)
-                self._reload_pretrained_weights()
-            else:
-                self.model = self.model.to(self.device)  # pyright: ignore[reportArgumentType] # .to() overload expects Device, not torch.device
-
-    def _reload_pretrained_weights(self):
-        """
-        Reload pretrained weights after materializing from meta device.
-
-        Uses memory-efficient streaming from safetensors files (<500MB RAM)
-        instead of loading the full model (~14GB RAM).
-        """
-        assert self.model is not None
-        logger.info("Reloading pretrained weights (streaming from safetensors)...")
-
-        try:
-            from huggingface_hub import hf_hub_download, list_repo_files
-            from safetensors import safe_open
-
-            # Get list of safetensor files in the model repo
-            repo_files = list_repo_files(self.config.model_id)
-            safetensor_files = [f for f in repo_files if f.endswith(".safetensors")]
-
-            if not safetensor_files:
-                logger.warning("No safetensors files found, falling back to bin files")
-                self._reload_pretrained_weights_legacy()
-                return
-
-            # Build mapping of current model keys (handling PEFT prefix)
-            current_state_dict = self.model.state_dict()
-
-            # PEFT wraps keys with "base_model.model." prefix
-            # Build reverse mapping: original_key -> peft_key
-            key_mapping = {}
-            for peft_key in current_state_dict:
-                # Strip PEFT prefixes to get original key
-                original_key = peft_key
-                for prefix in ["base_model.model.", "base_model."]:
-                    if original_key.startswith(prefix):
-                        original_key = original_key[len(prefix) :]
-                        break
-                key_mapping[original_key] = peft_key
-
-            copied = 0
-            skipped = 0
-
-            # Stream each safetensor file and copy matching weights
-            for sf_file in safetensor_files:
-                try:
-                    # Download file (uses cache if already downloaded)
-                    local_path = hf_hub_download(
-                        repo_id=self.config.model_id,
-                        filename=sf_file,
-                    )
-
-                    # Open safetensors file for memory-mapped reading
-                    with safe_open(local_path, framework="pt", device="cpu") as f:
-                        for tensor_name in f.keys():  # noqa: SIM118
-                            # Find matching key in current model
-                            peft_key = key_mapping.get(tensor_name)
-
-                            if peft_key and peft_key in current_state_dict:
-                                src_tensor = f.get_tensor(tensor_name)
-                                dst_tensor = current_state_dict[peft_key]
-
-                                if src_tensor.shape == dst_tensor.shape:
-                                    # Copy directly to device
-                                    with torch.no_grad():
-                                        dst_tensor.copy_(src_tensor.to(self.device))
-                                    copied += 1
-                                else:
-                                    skipped += 1
-                            else:
-                                skipped += 1
-
-                except Exception as e:
-                    logger.warning(f"Error loading {sf_file}: {e}")
-                    continue
-
-            logger.info(
-                f"Reloaded {copied} pretrained weight tensors (skipped {skipped} non-matching)"
-            )
-
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-        except ImportError as e:
-            logger.warning(f"Missing dependency for streaming: {e}")
-            logger.warning("Install with: pip install safetensors huggingface_hub")
-            self._reload_pretrained_weights_legacy()
-        except Exception as e:
-            logger.warning(f"Streaming reload failed: {e}")
-            self._reload_pretrained_weights_legacy()
-
-    def _reload_pretrained_weights_legacy(self):
-        """
-        Legacy fallback: reload weights by loading full model.
-        Warning: Uses ~14GB RAM for 7B models.
-        """
-        assert self.model is not None
-        logger.warning("Using legacy weight reload (high RAM usage)")
-
-        try:
-            from transformers import AutoModelForCausalLM
-
-            # Load a fresh copy of weights (on CPU)
-            fresh_model = AutoModelForCausalLM.from_pretrained(
-                self.config.model_id,
-                torch_dtype=self.dtype,
-                device_map="cpu",
-                trust_remote_code=True,
-                low_cpu_mem_usage=True,  # At least try to reduce peak
-            )
-            fresh_state_dict = fresh_model.state_dict()
-            current_state_dict = self.model.state_dict()
-
-            # Build key mapping for PEFT
-            key_mapping = {}
-            for peft_key in current_state_dict:
-                original_key = peft_key
-                for prefix in ["base_model.model.", "base_model."]:
-                    if original_key.startswith(prefix):
-                        original_key = original_key[len(prefix) :]
-                        break
-                key_mapping[original_key] = peft_key
-
-            copied = 0
-            for original_key, param in fresh_state_dict.items():
-                peft_key = key_mapping.get(original_key)
-                if (
-                    peft_key
-                    and peft_key in current_state_dict
-                    and current_state_dict[peft_key].shape == param.shape
-                ):
-                    with torch.no_grad():
-                        current_state_dict[peft_key].copy_(param.to(self.device))
-                    copied += 1
-
-            logger.info(f"Reloaded {copied} pretrained weight tensors")
-
-            del fresh_model
-            del fresh_state_dict
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-
-        except Exception as e:
-            logger.warning(f"Could not reload pretrained weights: {e}")
-            logger.warning("Model will use randomly initialized weights for some components")
+            # dispatch_model may have set tensors to meta before it failed; .to()
+            # would then raise a copy error rather than the refusal.
+            self._refuse_meta_tensors()
+            self.model = self.model.to(self.device)  # pyright: ignore[reportArgumentType] # .to() overload expects Device, not torch.device
 
     def _apply_lora(self):
         """Apply LoRA adapters for memory-efficient training."""
