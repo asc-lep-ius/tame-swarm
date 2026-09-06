@@ -18,9 +18,17 @@ Resolution is the plant's, not the fixture's. #4 measured per-token content
 moving the reading by about a sigma, and the reading carries a 9-token filter, so
 the mean over a 60-token tail has roughly seven independent samples and a
 standard error near 0.4 sigma. Recovery on the real model is therefore stated
-against the inert loop on the same prompt -- the live loop halves the error and
+against the inert loop on the same tokens -- the live loop halves the error and
 pays for it in strength -- with an absolute band no tighter than the tissue's own
 authority, not the 5% band the wired fixture meets.
+
+The same tokens, literally: the unsteered greedy continuation is generated once
+and every regime replays it token by token through the cache, as the plant probe
+(``steering_probe``) does. Greedy decoding under bf16 kernels is not bitwise
+stable, one flipped token rewrites the tail, and the inference economy drifts
+between generations, so a measurement on freshly generated text compares
+regimes on different content; a replay compares them on the same. The economy
+is frozen for every replay for the same reason.
 
 ``gpu``-marked. Loads the model from the local HuggingFace cache once per module
 and never downloads. Without the cache it skips on a developer's machine and
@@ -49,6 +57,7 @@ from contrastive_data import (
 from contrastive_templates import TIERS
 from homeostat import CognitiveHomeostat
 from mob import MoBConfig, SteeringCouplingConfig, apply_mob_to_model
+from mob.utils import frozen_economy
 from steering import SteeringConfig, SteeringVectorExtractor
 from steering_pipeline import (
     calibration_texts,
@@ -77,12 +86,15 @@ TAIL_TOKENS = 60
 # as a seventh of this at the readout (measured: 0.15 sigma), below the prompt's
 # own content deficit.
 CONTENT_PUSH = -1.2
-# Measured on this session's calibration: inert +1.53 sigma over the tail, live
-# +0.54 at a strength raised by 0.92; the same prompt unpushed reads +0.56 inert
-# and -0.17 live.
+# Measured on the replay (bitwise stable across repeats on the RTX 5070 Ti): the
+# inert loop +1.44 sigma over the tail, the live loop +0.38 at a strength raised
+# by 0.55; the same tokens unpushed read +0.31 inert and -0.39 live.
 RECOVERY_SIGMA = 0.6
 INERT_ERROR_SIGMA = 0.8
 STRENGTH_RISE = 0.3
+# After the top actuator is removed the survivors' strength must rise; by how much
+# is the tissue's call (measured +0.39), so only the direction is asserted.
+SURVIVOR_STRENGTH_RISE = 0.1
 SAFE_LAYERS = [14, 18, 22]
 SAFE_STRENGTH = 4.0
 HELD_OUT_PER_TIER = 5
@@ -96,17 +108,22 @@ class ServedSystem:
     config: SteeringConfig
     device: torch.device
     derived_gains: tuple[float, float]
+    # The unsteered greedy continuation of PROMPT, prompt included, and where it ends.
+    tokens: torch.Tensor
+    prompt_length: int
 
-    def generate(self, prompt: str, new_tokens: int) -> str:
-        text = self.tokenizer.apply_chat_template(  # type: ignore[attr-defined]
-            [{"role": "user", "content": prompt}], tokenize=False, add_generation_prompt=True
-        )
-        inputs = self.tokenizer(text, return_tensors="pt").to(self.device)  # type: ignore[operator]
+    def replay(self) -> None:
+        """Teacher-force the fixed continuation through the cache, one token per pass."""
         with torch.no_grad():
-            out = self.model.generate(  # type: ignore[operator]
-                **inputs, max_new_tokens=new_tokens, do_sample=False, min_new_tokens=new_tokens
-            )
-        return self.tokenizer.decode(out[0, inputs["input_ids"].shape[1] :])  # type: ignore[attr-defined]
+            out = self.model(input_ids=self.tokens[:, : self.prompt_length], use_cache=True)
+            cache = out.past_key_values
+            for position in range(self.prompt_length, self.tokens.shape[1]):
+                out = self.model(
+                    input_ids=self.tokens[:, position : position + 1],
+                    past_key_values=cache,
+                    use_cache=True,
+                )
+                cache = out.past_key_values
 
     @property
     def tissue(self):
@@ -191,7 +208,29 @@ def build_served() -> ServedSystem:
             coupling.detector.copy_(coupling.steering_direction)
         coupling.set_coupling_step(coupling.config.warmup_steps)
 
-    return ServedSystem(model, tokenizer, homeostat, config, device, homeostat.homeostat.gains())
+    text = tokenizer.apply_chat_template(
+        [{"role": "user", "content": PROMPT}], tokenize=False, add_generation_prompt=True
+    )
+    inputs = tokenizer(text, return_tensors="pt").to(device)
+    with torch.no_grad(), frozen_economy(model):
+        tokens = model.generate(
+            **inputs,
+            max_new_tokens=GENERATED_TOKENS,
+            min_new_tokens=GENERATED_TOKENS,
+            do_sample=False,
+        )
+    prompt_length = int(inputs["input_ids"].shape[1])
+
+    return ServedSystem(
+        model,
+        tokenizer,
+        homeostat,
+        config,
+        device,
+        homeostat.homeostat.gains(),
+        tokens,
+        prompt_length,
+    )
 
 
 @pytest.fixture(scope="module")
@@ -209,7 +248,8 @@ def attached(system: ServedSystem, inert: bool = False) -> Iterator[None]:
     system.tissue.set_gains(kp=kp, ki=ki)
     system.homeostat.attach_to_model(system.model)
     try:
-        yield
+        with frozen_economy(system.model):
+            yield
     finally:
         system.homeostat.detach_from_model()
         system.tissue.set_gains(kp=system.derived_gains[0], ki=system.derived_gains[1])
@@ -257,17 +297,17 @@ def test_the_served_tissue_is_the_measured_one(served: ServedSystem):
 def inert_under_push(served: ServedSystem) -> tuple[float, float]:
     """The constant-strength loop's tail error and strength under the push: the reference."""
     with attached(served, inert=True), content_push(served, CONTENT_PUSH):
-        served.generate(PROMPT, GENERATED_TOKENS)
+        served.replay()
         return served.tail_error(), served.tail_strength()
 
 
 def test_the_live_tissue_recovers_from_content_pushed_against_the_direction(
     served: ServedSystem, inert_under_push: tuple[float, float]
 ):
-    """Designed perturbation on the real plant, against the inert loop on the same prompt."""
+    """Designed perturbation on the real plant, against the inert loop on the same tokens."""
     inert_error, inert_strength = inert_under_push
     with attached(served), content_push(served, CONTENT_PUSH):
-        served.generate(PROMPT, GENERATED_TOKENS)
+        served.replay()
         live_error = served.tail_error()
         live_strength = served.tail_strength()
 
@@ -283,26 +323,26 @@ def test_the_tissue_carries_on_after_its_top_actuator_is_removed_mid_generation(
     """Undesigned perturbation on the real plant: the top cell stops firing under load.
 
     The removed cell leaves the consensus after one pass, and with it its own
-    reading -- on this prompt about -4 sigma -- so the tissue mean the survivors
+    reading -- on these tokens about -3 sigma -- so the tissue mean the survivors
     regulate is a different number from before, and rises mechanically. What the
     damaged tissue must still do is act on it: the survivors raise their strength,
     and six cells live still hold the error below what the intact constant-strength
-    loop leaves (measured: +0.99 sigma at strength 5.34, against +1.53 inert).
+    loop leaves (measured: +0.86 sigma at strength 4.94, against +1.44 inert and
+    +0.38 at 4.55 with every cell live).
     """
     inert_error, _ = inert_under_push
     top = max(served.homeostat.actuator_layers)
     with attached(served), content_push(served, CONTENT_PUSH):
-        served.generate(PROMPT, GENERATED_TOKENS)
+        served.replay()
         before_strength = served.tail_strength()
-        cells = sorted(served.homeostat.hooks)
-        served.homeostat._registered_hooks[cells.index(top)].remove()
-        served.generate(PROMPT, GENERATED_TOKENS)
+        served.homeostat._registered_hooks[list(served.homeostat.hooks).index(top)].remove()
+        served.replay()
         alive = {cell["layer"]: cell["alive"] for cell in served.tissue.status()["cells"]}
         after_error = served.tail_error()
         after_strength = served.tail_strength()
 
     assert alive[top] is False and all(alive[layer] for layer in alive if layer != top)
-    assert after_strength > before_strength + STRENGTH_RISE
+    assert after_strength > before_strength + SURVIVOR_STRENGTH_RISE
     assert abs(after_error) < abs(inert_error), (after_error, inert_error)
 
 
