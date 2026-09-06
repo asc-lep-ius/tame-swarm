@@ -3,10 +3,18 @@ from pathlib import Path
 
 import pytest
 import torch
+from hypothesis import settings
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "tame"))
 
 from mob import MixtureOfBidders, MoBConfig
+
+# Property-based tests build a MoB layer and run torch per example, which is far
+# slower than hypothesis's default 200 ms deadline expects and varies with the
+# machine, so the deadline is off and the example count is what bounds runtime.
+# ``print_blob`` makes a CI failure reproducible locally with ``@reproduce_failure``.
+settings.register_profile("tame", deadline=None, max_examples=40, print_blob=True)
+settings.load_profile("tame")
 
 TINY_VOCAB_SIZE = 64
 TINY_HIDDEN_DIM = 32
