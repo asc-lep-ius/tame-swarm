@@ -37,7 +37,7 @@ advisory, and a skipped real-model suite is a green job that ran nothing.
 """
 
 import os
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import cast
@@ -80,20 +80,25 @@ CALIBRATION_TOKENS = 16
 PROMPT = "Explain, in a few sentences, why the sky is blue and what colour it turns at sunset."
 GENERATED_TOKENS = 120
 TAIL_TOKENS = 60
+# The actuator is removed halfway through the replay; the two halves are compared
+# on their last tokens, after each has had time to settle.
+DAMAGE_AT = GENERATED_TOKENS // 2
+DAMAGED_TAIL = 40
 # A push against the direction, applied at every actuator's block the way the
 # injection itself is, so each cell reads the pushes below it; -1.2 units against
 # a reference of 4 is inside the band's authority. A push at one block alone reads
 # as a seventh of this at the readout (measured: 0.15 sigma), below the prompt's
 # own content deficit.
 CONTENT_PUSH = -1.2
-# Measured on the replay (bitwise stable across repeats on the RTX 5070 Ti): the
-# inert loop +1.44 sigma over the tail, the live loop +0.38 at a strength raised
-# by 0.55; the same tokens unpushed read +0.31 inert and -0.39 live.
+# Measured on the seeded replay (identical across processes on the RTX 5070 Ti):
+# the inert loop +1.10 sigma over the tail, the live loop +0.15 at a strength
+# raised by 0.56; the same tokens unpushed read -0.01 inert and -0.15 live.
 RECOVERY_SIGMA = 0.6
 INERT_ERROR_SIGMA = 0.8
 STRENGTH_RISE = 0.3
 # After the top actuator is removed the survivors' strength must rise; by how much
-# is the tissue's call (measured +0.39), so only the direction is asserted.
+# is the tissue's call (measured +1.11, from 3.94 to 5.05, holding the error at
+# 0.51 sigma), so only the direction is asserted.
 SURVIVOR_STRENGTH_RISE = 0.1
 SAFE_LAYERS = [14, 18, 22]
 SAFE_STRENGTH = 4.0
@@ -112,8 +117,14 @@ class ServedSystem:
     tokens: torch.Tensor
     prompt_length: int
 
-    def replay(self) -> None:
-        """Teacher-force the fixed continuation through the cache, one token per pass."""
+    def replay(
+        self, damage_at: int | None = None, damage: Callable[[], None] | None = None
+    ) -> None:
+        """Teacher-force the fixed continuation through the cache, one token per pass.
+
+        ``damage`` runs once, after the pass at position ``damage_at``, so a cell can
+        be removed while the tissue is carrying a load.
+        """
         with torch.no_grad():
             out = self.model(input_ids=self.tokens[:, : self.prompt_length], use_cache=True)
             cache = out.past_key_values
@@ -124,6 +135,8 @@ class ServedSystem:
                     use_cache=True,
                 )
                 cache = out.past_key_values
+                if damage is not None and position == damage_at:
+                    damage()
 
     @property
     def tissue(self):
@@ -160,7 +173,15 @@ def _load_model():
 
 
 def build_served() -> ServedSystem:
-    """The served system as ``app.build_homeostat`` builds it, plus the seeded coupling."""
+    """The served system as ``app.build_homeostat`` builds it, plus the seeded coupling.
+
+    Seeded: the MoB conversion jitters the adapters and initialises the heads at
+    random, and an unseeded fixture generates a different continuation in every
+    process, so its numbers would move between runs even though each run's regimes
+    compare like with like.
+    """
+    torch.manual_seed(0)
+    torch.cuda.manual_seed_all(0)
     model, tokenizer = _load_model()
     device = torch.device("cuda")
     model.to(device)  # pyright: ignore[reportArgumentType] # HF stubs
@@ -317,32 +338,36 @@ def test_the_live_tissue_recovers_from_content_pushed_against_the_direction(
     assert live_strength > inert_strength + STRENGTH_RISE
 
 
-def test_the_tissue_carries_on_after_its_top_actuator_is_removed_mid_generation(
+def test_the_tissue_carries_on_after_its_top_actuator_is_removed_mid_replay(
     served: ServedSystem, inert_under_push: tuple[float, float]
 ):
     """Undesigned perturbation on the real plant: the top cell stops firing under load.
 
-    The removed cell leaves the consensus after one pass, and with it its own
-    reading -- on these tokens about -3 sigma -- so the tissue mean the survivors
-    regulate is a different number from before, and rises mechanically. What the
-    damaged tissue must still do is act on it: the survivors raise their strength,
-    and six cells live still hold the error below what the intact constant-strength
-    loop leaves (measured: +0.86 sigma at strength 4.94, against +1.44 inert and
-    +0.38 at 4.55 with every cell live).
+    Halfway through the replay the top actuator's hook is removed. The cell leaves
+    the consensus after one pass, and with it its own reading -- on these tokens
+    about -3 sigma -- so the tissue mean the survivors regulate is a different
+    number from before, and rises mechanically. What the damaged tissue must still
+    do is act on it: the survivors raise their strength over the second half, and
+    six cells live still hold the error below what the intact constant-strength
+    loop leaves (measured: +0.57 sigma at 3.94 before the removal, +0.51 at 5.05
+    after it, against +1.10 inert).
     """
     inert_error, _ = inert_under_push
     top = max(served.homeostat.actuator_layers)
-    with attached(served), content_push(served, CONTENT_PUSH):
-        served.replay()
-        before_strength = served.tail_strength()
+    before: dict[str, float] = {}
+
+    def remove_top_actuator() -> None:
+        before["strength"] = served.tail_strength(DAMAGED_TAIL)
         served.homeostat._registered_hooks[list(served.homeostat.hooks).index(top)].remove()
-        served.replay()
+
+    with attached(served), content_push(served, CONTENT_PUSH):
+        served.replay(damage_at=served.prompt_length + DAMAGE_AT, damage=remove_top_actuator)
         alive = {cell["layer"]: cell["alive"] for cell in served.tissue.status()["cells"]}
-        after_error = served.tail_error()
-        after_strength = served.tail_strength()
+        after_error = served.tail_error(DAMAGED_TAIL)
+        after_strength = served.tail_strength(DAMAGED_TAIL)
 
     assert alive[top] is False and all(alive[layer] for layer in alive if layer != top)
-    assert after_strength > before_strength + SURVIVOR_STRENGTH_RISE
+    assert after_strength > before["strength"] + SURVIVOR_STRENGTH_RISE
     assert abs(after_error) < abs(inert_error), (after_error, inert_error)
 
 
