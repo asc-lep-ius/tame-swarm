@@ -524,6 +524,19 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
     def _get_coupling(self) -> SteeringCoupling | None:
         return cast(SteeringCoupling | None, getattr(self, "coupling", None))
 
+    def routing_parameters(self) -> list[nn.Parameter]:
+        """Parameters trained by nothing but the value objective, at the heads' rate.
+
+        The confidence heads, and the coupling's receptor when one is attached: it
+        shifts what the heads see, is zero-initialised like them, and at the
+        backbone's learning rate would never leave its initialisation either.
+        """
+        parameters = list(self.confidence_heads.parameters())
+        coupling = self._get_coupling()
+        if coupling is not None:
+            parameters.extend(coupling.parameters())
+        return parameters
+
     def _compute_router_z_loss(self, confidence_logits: torch.Tensor) -> torch.Tensor:
         log_z = torch.logsumexp(confidence_logits.float(), dim=-1)
         return log_z.square().mean() * self.config.confidence_z_loss_weight

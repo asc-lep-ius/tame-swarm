@@ -796,13 +796,13 @@ def test_detached_routing_path_still_trains_the_coupling():
 
     mob = _build_training_mob()
     mob.attach_coupling(torch.randn(32), SteeringCouplingConfig(hidden_dim=32))
-    torch.nn.init.normal_(mob.coupling.projection.weight, std=0.05)
+    torch.nn.init.normal_(mob.coupling.detector, std=0.05)
     mob.set_coupling_step(10)
 
     _settle(mob, torch.randn(1, 8, 32))
     mob.get_confidence_calibration_loss().backward()
 
-    grad = mob.coupling.projection.weight.grad
+    grad = mob.coupling.detector.grad
     assert grad is not None and grad.abs().sum().item() > 0.0
 
 
