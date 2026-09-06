@@ -473,7 +473,7 @@ of one config) needs them writing into one store: either set
 | Training (full) | ~24–32 GB | Gradients + optimizer states |
 | Training (LoRA) | ~16–20 GB | Only adapter gradients |
 
-A model that does not fit GPU plus CPU memory is refused at startup rather than trained partly offloaded ([#19](#phase-05--mechanism-correction)): the trainer names the tensors accelerate left on the meta device and the ways out.
+A model that does not fit GPU memory is refused at startup rather than trained partly offloaded to CPU or disk ([#19](#phase-05--mechanism-correction)): the trainer names the tensors accelerate left on the meta device and the ways out — a smaller profile, fewer converted layers, or a larger GPU.
 
 ---
 

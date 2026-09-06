@@ -23,7 +23,7 @@ from .auction import (
     VCGAuctioneer,
     routing_diagnostics,
 )
-from .core import MixtureOfBidders, MoBStats, apply_mob_to_model
+from .core import MixtureOfBidders, MoBStats, apply_mob_to_model, ledger_initial_values
 from .experts import ConfidenceHead, Expert, LightweightExpert
 from .mob_config import MoBConfig
 from .softmax_router import (
@@ -64,6 +64,7 @@ __all__ = [
     "MoBStats",
     "MixtureOfBidders",
     "apply_mob_to_model",
+    "ledger_initial_values",
     "get_mob_layers",
     "frozen_economy",
     "update_all_mob_from_loss",

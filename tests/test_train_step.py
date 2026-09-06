@@ -378,9 +378,9 @@ def test_setup_checks_that_the_seeded_state_survived_the_device_move(
 ):
     """A coupling that lost its direction on the device move would log as seeded and add nothing.
 
-    ``to_empty`` on the re-dispatch fallback reallocates every buffer without
-    copying it; the guard runs after every device move and compares each coupling
-    with the snapshot seeding took.
+    The re-dispatch fallback used to reallocate every buffer with ``to_empty`` (#19
+    removed it); the guard runs after every device move regardless and compares
+    each coupling with the snapshot seeding took.
     """
     import train as train_module
 
@@ -487,7 +487,34 @@ def test_setup_refuses_a_model_left_on_the_meta_device(smoke_fixture, tmp_path, 
         trainer.setup()
 
     assert "lm_head.weight" in str(refusal.value)
-    assert "offloaded to disk" in str(refusal.value)
+    assert "offloaded part of the model" in str(refusal.value)
+
+
+def test_a_model_loaded_with_an_offloaded_ffn_is_refused_before_conversion(
+    smoke_fixture, tmp_path, monkeypatch
+):
+    """The load-time refusal fires before conversion would fail copying a meta FFN.
+
+    Without it the user would see ``Cannot copy out of meta tensor`` from inside
+    ``from_pretrained_ffn`` instead of the refusal and its ways out.
+    """
+    import train as train_module
+
+    load = train_module.AutoModelForCausalLM.from_pretrained
+
+    def load_then_offload(*args, **kwargs):
+        model = load(*args, **kwargs)
+        model.model.layers[1].mlp.gate_proj.to_empty(device="meta")
+        return model
+
+    monkeypatch.setattr(train_module.AutoModelForCausalLM, "from_pretrained", load_then_offload)
+    trainer = TAMETrainer(_config(smoke_fixture, tmp_path / "meta_ffn"))
+
+    with pytest.raises(RuntimeError) as refusal:
+        trainer.setup()
+
+    assert "layers.1.mlp.gate_proj.weight" in str(refusal.value)
+    assert "offloaded part of the model" in str(refusal.value)
 
 
 def _first_adapter_b(mob):
@@ -518,6 +545,17 @@ def test_setup_post_conditions_fail_when_the_converted_model_is_perturbed(
         perturb(get_mob_layers(trainer.model)[1])
 
     with pytest.raises(RuntimeError, match=expected):
+        trainer._assert_setup_invariants()
+
+
+def test_a_converted_layer_nobody_fingerprinted_is_not_trusted(smoke_fixture, tmp_path):
+    """A shared base with no fingerprint is one nobody can vouch for: fail, do not skip."""
+    trainer = TAMETrainer(_config(smoke_fixture, tmp_path / "unfingerprinted"))
+    trainer.setup()
+
+    trainer._ffn_fingerprints.pop(1)
+
+    with pytest.raises(RuntimeError, match="no FFN fingerprint recorded for layer 1"):
         trainer._assert_setup_invariants()
 
 

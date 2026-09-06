@@ -115,6 +115,7 @@ from mob import (
     get_mob_statistics,
     get_total_calibration_loss,
     get_total_router_z_loss,
+    ledger_initial_values,
     save_mob_state,
     update_all_mob_from_loss,
 )
@@ -591,8 +592,7 @@ class TAMETrainer:
         # Determine which layers to modify
         layers_to_modify = list(range(self.config.mob_layers_start, self.config.mob_layers_end))
 
-        if mob_config.use_shared_base:
-            self._ffn_fingerprints = _ffn_fingerprints(self.model, layers_to_modify)
+        self._ffn_fingerprints = _ffn_fingerprints(self.model, layers_to_modify)
         self.model = apply_mob_to_model(self.model, mob_config, layers_to_modify=layers_to_modify)
         self.mob_config = mob_config
 
@@ -670,20 +670,21 @@ class TAMETrainer:
     def _refuse_meta_tensors(self) -> None:
         """Refuse a model that accelerate left partly on the meta device.
 
-        A tensor still on ``meta`` after loading means the model did not fit GPU
-        plus CPU memory and part of it was offloaded to disk. The path that used to
-        "materialise" it -- ``to_empty``, a re-init heuristic, a partial pretrained
-        reload -- returned garbage where the offloaded weights were and random
-        weights in every converted FFN, and trained it (#19). This trainer cannot
-        train an offloaded model, so it says so instead.
+        A tensor still on ``meta`` means accelerate offloaded part of the model --
+        to CPU RAM or to disk -- because it did not fit GPU memory. The path that
+        used to "materialise" it -- ``to_empty``, a re-init heuristic, a partial
+        pretrained reload -- returned garbage where the offloaded weights were and
+        random weights in every converted FFN, and trained it (#19). This trainer
+        cannot train an offloaded model, so it says so instead.
         """
         offending = [name for name, tensor in self._named_tensors() if tensor.device.type == "meta"]
         if offending:
             raise RuntimeError(
                 f"{len(offending)} tensors are on the meta device (first: {offending[:5]}): "
-                "the model did not fit GPU + CPU memory and part of it was offloaded to "
-                "disk, which this trainer cannot train. Use a smaller profile, --use_lora, "
-                "a shorter --max_seq_length, or a machine with more memory."
+                "accelerate offloaded part of the model to CPU or disk because it did not fit "
+                "GPU memory, and this trainer cannot train an offloaded model. Use a smaller "
+                "profile (config.ACTIVE_MODEL), convert fewer layers (--mob_layers_start/"
+                "--mob_layers_end), or a GPU with more memory."
             )
 
     def _assert_setup_invariants(self) -> None:
@@ -705,21 +706,21 @@ class TAMETrainer:
 
     def _assert_mob_pristine(self, layer_idx: int | None, mob: MixtureOfBidders) -> None:
         """A freshly converted layer reproduces its FFN and starts its economy at rest."""
-        expected_base = {} if layer_idx is None else self._ffn_fingerprints.get(layer_idx, {})
-        for name, expected in expected_base.items():
-            live = _weight_fingerprint(getattr(mob, f"base_{name}").weight)
-            if not torch.equal(live, expected):
-                raise RuntimeError(
-                    f"layer {layer_idx}: shared base {name} no longer equals the FFN it was "
-                    "upcycled from"
-                )
-        initial_ledgers = {
-            "expert_wealth": mob.config.initial_wealth,
-            "expert_usage_count": 0.0,
-            "expert_baseline_loss": 1.0,
-            "expert_performance_ema": 0.0,
-        }
-        for ledger, value in initial_ledgers.items():
+        if mob.config.use_shared_base:
+            expected_base = {} if layer_idx is None else self._ffn_fingerprints.get(layer_idx, {})
+            if not expected_base:
+                # A shared base nobody fingerprinted is a shared base nobody can
+                # vouch for: the FFN had no gate/up/down to copy, or the layer sits
+                # somewhere ``transformer_layers`` does not look.
+                raise RuntimeError(f"no FFN fingerprint recorded for layer {layer_idx}")
+            for name, expected in expected_base.items():
+                live = _weight_fingerprint(getattr(mob, f"base_{name}").weight)
+                if not torch.equal(live, expected):
+                    raise RuntimeError(
+                        f"layer {layer_idx}: shared base {name} no longer equals the FFN it "
+                        "was upcycled from"
+                    )
+        for ledger, value in ledger_initial_values(mob.config).items():
             if not bool((getattr(mob, ledger) == value).all()):
                 raise RuntimeError(
                     f"layer {layer_idx}: ledger {ledger} is not at its initial value {value}"
@@ -741,12 +742,13 @@ class TAMETrainer:
     def _assert_seeded_couplings_intact(self) -> None:
         """The device move must leave every seeded coupling exactly as seeding left it.
 
-        ``_redispatch_model``'s meta-materialisation path calls ``to_empty``, which
-        reallocates every parameter and buffer without copying, and the pretrained
-        reload restores only keys the checkpoint has -- so a coupling could come out
-        of it with a zero direction and a randomly re-initialised receptor, log as
-        seeded, and add nothing forever. That is the silent no-op this flag exists to
-        remove, so the state is compared against the snapshot taken at seeding.
+        ``_redispatch_model`` used to materialise meta tensors with ``to_empty``,
+        which reallocates every parameter and buffer without copying, and a
+        pretrained reload that restored only keys the checkpoint had -- so a coupling
+        could come out of it with a zero direction and a randomly re-initialised
+        receptor, log as seeded, and add nothing forever. #19 removed that path; the
+        check stays, because the silent no-op it catches is the one this flag exists
+        to remove, whatever device path runs.
         """
         for layer, (coupling, direction, detector) in self._seeded_couplings.items():
             live_direction = coupling.steering_direction.detach().float().cpu()
@@ -810,6 +812,9 @@ class TAMETrainer:
             logger.warning(
                 f"Re-dispatch failed ({type(e).__name__}: {e}), falling back to simple device move"
             )
+            # dispatch_model may have set tensors to meta before it failed; .to()
+            # would then raise a copy error rather than the refusal.
+            self._refuse_meta_tensors()
             self.model = self.model.to(self.device)  # pyright: ignore[reportArgumentType] # .to() overload expects Device, not torch.device
 
     def _apply_lora(self):
