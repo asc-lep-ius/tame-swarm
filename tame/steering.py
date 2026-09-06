@@ -160,13 +160,47 @@ class SteeringVector:
         )
 
 
+def pca_separability(positives: torch.Tensor, negatives: torch.Tensor) -> float:
+    """Separation of the two arms' reads along their leading principal axis, in within-arm sigmas.
+
+    The diagnostic #3 demoted from gate to report. It is the class separation a
+    linear probe would see, and it is *not* evidence that a direction steers:
+    prompt-surface features separate especially cleanly, so the instruction-prefix
+    control tends to score higher here than the behavioural pairs do. Every
+    behavioural extraction reports it per layer (``SteeringExtraction.separability``)
+    so a reader can see the two disagree; nothing that decides reads it. Zero when
+    the two arms read identically, bounded only by float rounding when each arm
+    reads as a single point.
+    """
+    pooled = torch.cat([positives, negatives]).float()
+    centred = pooled - pooled.mean(dim=0, keepdim=True)
+    if centred.shape[0] < 2 or not bool((centred.abs() > 0).any()):
+        return 0.0
+    axis = torch.linalg.svd(centred, full_matrices=False).Vh[0]
+    pos_projection = positives.float() @ axis
+    neg_projection = negatives.float() @ axis
+    within = torch.cat(
+        [pos_projection - pos_projection.mean(), neg_projection - neg_projection.mean()]
+    )
+    spread = float(within.std()) if within.numel() > 1 else 0.0
+    separation = float((pos_projection.mean() - neg_projection.mean()).abs())
+    if spread == 0.0:
+        return float("inf") if separation > 0.0 else 0.0
+    return separation / spread
+
+
 class SteeringVectorExtractor:
     def __init__(self, model: nn.Module, tokenizer, layers: list[int]):
+        if not layers:
+            raise ValueError("an extractor needs at least one layer to read")
         self.model = model
         self.tokenizer = tokenizer
         self.layers = layers
         self.activations = {}
         self._hooks = []
+        # Per-layer PCA separability of the last behavioural extraction: a
+        # diagnostic the pipeline carries beside the vectors, never a gate.
+        self.last_separability: dict[int, float] = {}
 
     def _get_activation_hook(self, layer_idx: int) -> Callable:
         def hook(module, input, output):
@@ -322,7 +356,7 @@ class SteeringVectorExtractor:
         warning rather than read at a prompt token.
         """
         positives, negatives = self.read_pairs(pairs, max_length)
-        used = int(next(iter(positives.values())).shape[0])
+        used = int(positives[self.layers[0]].shape[0])
 
         steering_vectors = {}
         for layer_idx in self.layers:
@@ -332,9 +366,17 @@ class SteeringVectorExtractor:
                 layer=layer_idx,
                 description=f"Behavioural diff-in-means from {used} completion pairs",
             )
+        self.last_separability = {
+            layer_idx: pca_separability(positives[layer_idx], negatives[layer_idx])
+            for layer_idx in self.layers
+        }
 
         total = len(pairs) if hasattr(pairs, "__len__") else used
         logger.info("Behavioural extraction: %d/%d pairs used, layers %s", used, total, self.layers)
+        logger.info(
+            "PCA separability per layer (a diagnostic, not the gate): %s",
+            {layer: round(value, 3) for layer, value in self.last_separability.items()},
+        )
         return steering_vectors
 
     def read_pairs(
@@ -343,9 +385,9 @@ class SteeringVectorExtractor:
         """Per-layer ``(pairs, hidden)`` reads at each pair's completion position, both arms.
 
         The reads :meth:`extract_from_pairs` averages, before the averaging -- what
-        a diagnostic over the activation geometry (``behavioural_validation.
-        pca_separability``) needs. Pairs whose completion is truncated away are
-        skipped, so both stacks have the same rows in the same order.
+        a diagnostic over the activation geometry (:func:`pca_separability`) needs.
+        Pairs whose completion is truncated away are skipped, so both stacks have
+        the same rows in the same order.
         """
         self._register_hooks()
         try:
@@ -374,7 +416,7 @@ class SteeringVectorExtractor:
                     positives[layer_idx].append(pos[layer_idx])
                     negatives[layer_idx].append(neg[layer_idx])
 
-            if not next(iter(positives.values()), []):
+            if not positives[self.layers[0]]:
                 raise ValueError("no usable pairs: every completion was empty or truncated away")
             return (
                 {layer: torch.stack(reads) for layer, reads in positives.items()},

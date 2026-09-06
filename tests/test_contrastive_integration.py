@@ -21,16 +21,18 @@ the vector is the direction that separates two prompts, which does not beat a
 random one.
 """
 
+import inspect
 import logging
 import math
 import random
+from dataclasses import fields
 from typing import cast
 
 import pytest
 import torch
 import torch.nn as nn
 
-from behavioural_validation import pca_separability, validate_steering_vector
+from behavioural_validation import ValidationResult, validate_steering_vector
 from contrastive_data import (
     COMPLETION_FORMAT,
     ContrastivePair,
@@ -39,7 +41,7 @@ from contrastive_data import (
     register_contrastive_pairs,
 )
 from contrastive_templates import TIERS
-from steering import SteeringConfig, SteeringVectorExtractor
+from steering import SteeringConfig, SteeringVectorExtractor, pca_separability
 from steering_pipeline import extract_steering_vectors
 
 from .steering_fakes import ScriptedModel, SimpleCharTokenizer
@@ -142,6 +144,7 @@ def test_the_extracted_vector_is_the_known_direction_at_unit_norm(pipeline):
     vector = extraction.vectors[LAYER].vector
     assert torch.allclose(vector.norm(), torch.tensor(1.0), atol=1e-5)
     assert torch.allclose(vector, expected / expected.norm(), atol=1e-5)
+    assert extraction.separability[LAYER] > 1e3, "the pipeline reports the diagnostic"
 
 
 def test_reading_the_prompt_instead_of_the_completion_fails_the_gate(pipeline, monkeypatch):
@@ -166,8 +169,7 @@ def test_pca_separability_is_reported_and_is_not_the_gate(pipeline):
     On this fake the behavioural pairs read as two points, so their separability
     is bounded only by float rounding, and the prefix control as one point, zero.
     The numbers are reported so a reader can compare them with the gate's verdicts;
-    the gate's own result carries no such field and does not change if the
-    diagnostic does.
+    the gate's result carries no such field and the gate's code never reads it.
     """
     model, tokenizer, _, _ = pipeline
     extractor = SteeringVectorExtractor(model, tokenizer, [LAYER])
@@ -182,7 +184,8 @@ def test_pca_separability_is_reported_and_is_not_the_gate(pipeline):
 
     assert behavioural > 1e3
     assert control == 0.0
-    assert not hasattr(validate_steering_vector, "separability")
+    assert "separability" not in {spec.name for spec in fields(ValidationResult)}
+    assert "separability" not in inspect.getsource(validate_steering_vector)
 
 
 def test_pca_separability_on_noisy_arms_is_a_finite_ratio():
