@@ -38,8 +38,14 @@ logger = logging.getLogger(__name__)
 # check costs one pass over batches the arm is about to train on anyway.
 DATA_ORDER_PROBE_BATCHES = 8
 
-# The one field an arm is allowed to differ on -- it is the variable under test.
-VARYING_FIELDS = frozenset({"router"})
+# The fields an arm is allowed to differ on -- the variables under test. ``router``
+# is #12's gate comparison; ``coupling_goal`` is #6's coupling ablation, a coupled
+# and an uncoupled auction arm at parity in everything else. The coupling's own
+# parameters (``coupling_beta``, ``coupling_warmup_steps``) are deliberately not
+# here: an uncoupled arm carries them inert, as the softmax arm carries the
+# auction-only fields, and two coupled arms that differ on them are a tuning
+# comparison rather than the ablation.
+VARYING_FIELDS = frozenset({"router", "coupling_goal"})
 
 # Reported for context, not asserted: see the module docstring on ``dense``.
 REPORTED_FIELDS = frozenset({"converted_layers"})
@@ -78,6 +84,11 @@ NOT_A_CONFOUND = {
     # would be redundant with that hash, not a stronger guarantee than it.
     "shuffle_buffer_size": "subsumed by data_order, which hashes the actual token stream",
 }
+
+
+def arm_label(router: str, coupling_goal: str | None = None) -> str:
+    """What an arm is called in tables and summaries: the gate, plus any goal it is coupled to."""
+    return router if coupling_goal is None else f"{router}+{coupling_goal}"
 
 
 class ParityError(AssertionError):
@@ -142,6 +153,10 @@ class ArmFingerprint:
     eval_split: str
     data_order: str
     converted_layers: int
+
+    @property
+    def arm(self) -> str:
+        return arm_label(self.router, self.coupling_goal)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -214,7 +229,7 @@ def fingerprint_arm(
 
 
 def assert_parity(arms: Sequence[ArmFingerprint]) -> None:
-    """Refuse a comparison whose arms differ on anything but the router.
+    """Refuse a comparison whose arms differ on anything but the variables under test.
 
     Raises with the full disagreement rather than the first one found: an arm that
     differs in one field usually differs in three, and reporting them one run at a
@@ -223,9 +238,9 @@ def assert_parity(arms: Sequence[ArmFingerprint]) -> None:
     if len(arms) < 2:
         return
 
-    routers = [arm.router for arm in arms]
-    if len(set(routers)) != len(routers):
-        raise ParityError(f"Arms must have distinct routers, got {routers}")
+    labels = [arm.arm for arm in arms]
+    if len(set(labels)) != len(labels):
+        raise ParityError(f"Arms must be distinct in router or coupling goal, got {labels}")
 
     reference = arms[0]
     disagreements: list[str] = []
@@ -237,7 +252,7 @@ def assert_parity(arms: Sequence[ArmFingerprint]) -> None:
             actual = getattr(arm, field.name)
             if actual != expected:
                 disagreements.append(
-                    f"  {field.name}: {reference.router}={expected!r} vs {arm.router}={actual!r}"
+                    f"  {field.name}: {reference.arm}={expected!r} vs {arm.arm}={actual!r}"
                 )
 
     if disagreements:
@@ -247,7 +262,7 @@ def assert_parity(arms: Sequence[ArmFingerprint]) -> None:
         )
 
     logger.info(
-        f"Parity holds across {len(arms)} arms ({', '.join(routers)}): "
+        f"Parity holds across {len(arms)} arms ({', '.join(labels)}): "
         f"seed={reference.seed}, steps={reference.max_steps}, "
         f"layers={len(reference.requested_layers)}, rank={reference.adapter_rank}, "
         f"eval split={reference.eval_split}, data order={reference.data_order}"

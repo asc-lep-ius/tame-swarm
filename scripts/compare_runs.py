@@ -19,6 +19,12 @@ needs no tracking backend to be installed or configured, and it is the same
 log-of-record principle ``metrics.jsonl`` already follows (see ``metrics.py``) --
 the number has value, MLflow is one of several places it is filed.
 
+When both summaries carry the arm fingerprints ``run_seeds.py`` records, the
+comparison first asserts parity between each seed's pair of arms -- the two groups
+may differ in the router or the coupling goal and in nothing else -- and refuses
+to print a delta whose arms disagree on anything more. A summary written before
+fingerprints were recorded is compared unchecked, and says so.
+
     uv run python scripts/compare_runs.py \\
         --group_a runs/mob --group_b runs/softmax
 """
@@ -27,8 +33,13 @@ import argparse
 import json
 import logging
 import math
+import sys
 from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tame"))
+
+from parity import ArmFingerprint, assert_parity  # noqa: E402
 
 logger = logging.getLogger("compare_runs")
 
@@ -41,6 +52,25 @@ def load_group(path: Path) -> dict[str, Any]:
             "directory produced by scripts/run_seeds.py"
         )
     return json.loads(summary_path.read_text())
+
+
+def assert_groups_at_parity(group_a: dict[str, Any], group_b: dict[str, Any]) -> bool:
+    """Parity between the two groups' seed-matched arms; False when a group has no fingerprints.
+
+    Seeds present in only one group are not compared -- a seed-mismatched pair is
+    a different comparison, not a confound.
+    """
+    prints_a = group_a.get("fingerprints") or {}
+    prints_b = group_b.get("fingerprints") or {}
+    if not prints_a or not prints_b:
+        logger.warning(
+            "one of the groups carries no arm fingerprints (recorded by run_seeds.py since "
+            "#6); parity between the arms is not asserted for this comparison"
+        )
+        return False
+    for seed in sorted(set(prints_a) & set(prints_b), key=str):
+        assert_parity([ArmFingerprint(**prints_a[seed]), ArmFingerprint(**prints_b[seed])])
+    return True
 
 
 def _values(group: dict[str, Any], metric: str) -> list[float]:
@@ -115,16 +145,17 @@ def main() -> None:
     parser.add_argument("--group_a", type=str, required=True)
     parser.add_argument("--group_b", type=str, required=True)
     parser.add_argument(
-        "--label_a", type=str, default=None, help="Default: group_a's router, from its summary"
+        "--label_a", type=str, default=None, help="Default: group_a's arm, from its summary"
     )
-    parser.add_argument("--label_b", type=str, default=None, help="Default: group_b's router")
+    parser.add_argument("--label_b", type=str, default=None, help="Default: group_b's arm")
     args = parser.parse_args()
 
     group_a = load_group(Path(args.group_a))
     group_b = load_group(Path(args.group_b))
-    label_a = args.label_a or str(group_a.get("router", "A"))
-    label_b = args.label_b or str(group_b.get("router", "B"))
+    label_a = args.label_a or str(group_a.get("arm") or group_a.get("router", "A"))
+    label_b = args.label_b or str(group_b.get("arm") or group_b.get("router", "B"))
 
+    checked = assert_groups_at_parity(group_a, group_b)
     comparison = compare(group_a, group_b)
     if not comparison:
         raise SystemExit(
@@ -138,6 +169,11 @@ def main() -> None:
         "\ndelta/std is the delta in units of the pooled replicate spread -- "
         "well under 1 means the effect is not distinguishable from re-running "
         "the same configuration."
+    )
+    print(
+        "parity between the arms: asserted per seed"
+        if checked
+        else "parity between the arms: NOT asserted (no fingerprints in a summary)"
     )
 
 

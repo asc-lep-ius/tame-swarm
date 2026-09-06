@@ -104,8 +104,8 @@ def test_dense_arm_may_convert_nothing():
         ("data_order", "different"),
         ("learning_rate", 3e-5),
         ("batch_size", 4),
-        ("coupling_goal", "truthful"),
         ("coupling_warmup_steps", 50),
+        ("coupling_beta", 0.5),
     ],
 )
 def test_any_other_difference_is_a_confound(field, value):
@@ -128,10 +128,33 @@ def test_all_disagreements_are_reported_at_once():
     assert "max_steps" in message
 
 
-def test_duplicate_routers_are_rejected():
-    """Two arms with the same gate are not a comparison, whatever else matches."""
-    with pytest.raises(ParityError, match="distinct routers"):
+def test_duplicate_arms_are_rejected():
+    """Two arms with the same gate and the same coupling are not a comparison."""
+    with pytest.raises(ParityError, match="distinct"):
         assert_parity([BASE, BASE])
+    with pytest.raises(ParityError, match="distinct"):
+        coupled = replace(BASE, coupling_goal="truthful")
+        assert_parity([coupled, coupled])
+
+
+def test_a_coupled_and_an_uncoupled_auction_arm_are_at_parity():
+    """#6's ablation: the coupling goal is the variable under test and nothing else may move."""
+    coupled = replace(BASE, coupling_goal="truthful")
+
+    assert_parity([BASE, coupled])
+    assert coupled.arm == "mob+truthful"
+    assert BASE.arm == "mob"
+
+
+def test_the_couplings_own_parameters_are_confounds_between_coupled_arms():
+    """Two coupled arms that differ in beta are a tuning comparison, not the ablation."""
+    arms = [
+        replace(BASE, coupling_goal="truthful"),
+        replace(BASE, coupling_goal="safe", coupling_beta=0.5),
+    ]
+
+    with pytest.raises(ParityError, match="coupling_beta"):
+        assert_parity(arms)
 
 
 def test_a_single_arm_is_vacuously_at_parity():

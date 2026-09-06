@@ -4,10 +4,14 @@
     softmax  the same confidence heads, softmaxed, with the economy switched off
     dense    the original FFN, no routing -- the capability-preservation floor
 
-The arms differ in the gate and in nothing else, and that is asserted rather than
-asserted-in-prose: each arm produces a fingerprint covering seed, data order,
-converted layer range, adapter rank, step budget and held-out split, and the
-comparison refuses to print if any two disagree.
+With ``--coupling_goal`` a fourth arm joins them: the auction with the routing
+coupling seeded from that goal's certified direction (#14), #6's ablation arm,
+labelled ``mob+<goal>``.
+
+The arms differ in the gate, or in the coupling, and in nothing else, and that is
+asserted rather than asserted-in-prose: each arm produces a fingerprint covering
+seed, data order, converted layer range, adapter rank, step budget and held-out
+split, and the comparison refuses to print if any two disagree.
 
 By default this runs a **smoke** comparison on a randomly initialised ~45k
 parameter Llama over a synthetic corpus, both built locally so the run needs no
@@ -42,19 +46,29 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from smoke_fixture import build_smoke_fixture  # noqa: E402
 
-from parity import assert_parity  # noqa: E402
-from train import ARMS, TAMETrainer, TrainingConfig  # noqa: E402
+from parity import arm_label, assert_parity  # noqa: E402
+from train import ARM_MOB, ARMS, TAMETrainer, TrainingConfig  # noqa: E402
 
 logger = logging.getLogger("compare_routers")
 
 
-def run_arm(arm: str, config: TrainingConfig) -> dict[str, object]:
+def run_arm(
+    router: str, config: TrainingConfig, coupling_goal: str | None = None
+) -> dict[str, object]:
     """Train one arm to completion and return its fingerprint and final metrics."""
+    arm = arm_label(router, coupling_goal)
     logger.info("=" * 80)
     logger.info(f"Arm: {arm}")
     logger.info("=" * 80)
 
-    trainer = TAMETrainer(replace(config, router=arm, output_dir=f"{config.output_dir}/{arm}"))
+    trainer = TAMETrainer(
+        replace(
+            config,
+            router=router,
+            coupling_goal=coupling_goal,
+            output_dir=f"{config.output_dir}/{arm}",
+        )
+    )
     trainer.setup()
     trainer.train()
 
@@ -91,13 +105,13 @@ def format_table(results: list[dict[str, object]]) -> str:
         ("routing_JS", "spec/routing_js_from_corpus"),
         ("report_dec", "spec/report_decisiveness"),
     ]
-    header = f"{'arm':<9}" + "".join(f"{title:>13}" for title, _ in columns)
+    header = f"{'arm':<14}" + "".join(f"{title:>13}" for title, _ in columns)
     lines = [header, "-" * len(header)]
 
     for result in results:
         metrics = result["metrics"]
         assert isinstance(metrics, dict)
-        row = f"{result['arm']:<9}"
+        row = f"{result['arm']:<14}"
         for _title, key in columns:
             value = metrics.get(key)
             row += f"{value:>13.5f}" if isinstance(value, float) else f"{'-':>13}"
@@ -128,6 +142,15 @@ def main() -> None:
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument(
         "--layers", type=str, default="1:3", help="MoB layer range as start:end (exclusive)"
+    )
+    parser.add_argument(
+        "--coupling_goal",
+        type=str,
+        default=None,
+        help=(
+            "Also run the auction with the routing coupling seeded from this goal's "
+            "certified direction, as a fourth arm (default: the three #12 arms only)"
+        ),
     )
     args = parser.parse_args()
 
@@ -180,7 +203,10 @@ def main() -> None:
     # store, keyed off the workspace all three arms already write under.
     os.environ.setdefault("MLFLOW_TRACKING_URI", f"file:{workspace / 'mlruns'}")
 
-    results = [run_arm(arm, config) for arm in ARMS]
+    arms: list[tuple[str, str | None]] = [(router, None) for router in ARMS]
+    if args.coupling_goal:
+        arms.append((ARM_MOB, args.coupling_goal))
+    results = [run_arm(router, config, coupling_goal) for router, coupling_goal in arms]
     assert_parity([result["fingerprint"] for result in results])  # pyright: ignore[reportArgumentType]
 
     print("\n" + format_table(results))

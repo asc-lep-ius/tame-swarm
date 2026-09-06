@@ -11,9 +11,15 @@ import math
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
-from compare_runs import compare  # noqa: E402
+from compare_runs import assert_groups_at_parity, compare  # noqa: E402
+
+from parity import ParityError  # noqa: E402
+
+from .test_parity import BASE  # noqa: E402
 
 
 def _group(router: str, values: dict[str, list[float]]) -> dict:
@@ -79,3 +85,41 @@ def test_a_metric_with_only_one_seed_in_either_group_is_omitted():
     result = compare(group_a, group_b)
 
     assert "eval/loss" not in result
+
+
+def _with_fingerprints(group: dict, **changes) -> dict:
+    from dataclasses import replace
+
+    prints = {
+        seed: replace(BASE, seed=int(seed), **changes).as_dict() for seed in group["per_seed"]
+    }
+    return {**group, "fingerprints": prints}
+
+
+def test_groups_that_differ_only_in_the_coupling_goal_are_at_parity():
+    """#6's ablation: the coupled and uncoupled auction arms, seed by seed."""
+    group_a = _with_fingerprints(_group("mob", {"eval/loss": [2.79, 2.80, 2.79]}))
+    group_b = _with_fingerprints(
+        _group("mob", {"eval/loss": [2.78, 2.79, 2.79]}), coupling_goal="truthful"
+    )
+
+    assert assert_groups_at_parity(group_a, group_b) is True
+
+
+def test_groups_that_differ_in_a_confound_are_refused():
+    group_a = _with_fingerprints(_group("mob", {"eval/loss": [2.79, 2.80]}))
+    group_b = _with_fingerprints(
+        _group("mob", {"eval/loss": [2.78, 2.79]}), coupling_goal="truthful", adapter_rank=8
+    )
+
+    with pytest.raises(ParityError, match="adapter_rank"):
+        assert_groups_at_parity(group_a, group_b)
+
+
+def test_a_summary_without_fingerprints_is_compared_unchecked(caplog):
+    group = _group("mob", {"eval/loss": [2.79, 2.80]})
+
+    with caplog.at_level("WARNING", logger="compare_runs"):
+        assert assert_groups_at_parity(group, _with_fingerprints(group)) is False
+
+    assert any("no arm fingerprints" in record.message for record in caplog.records)
