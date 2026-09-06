@@ -143,9 +143,10 @@ def log_provenance(mob_config: Any | None = None, fingerprint: Any | None = None
     does. Logged once, from ``TAMETrainer.setup()`` after the MoB config and
     arm fingerprint both exist.
 
-    ``SteeringConfig`` params are not logged here: ``TAMETrainer`` does not
-    build one -- coupling is attached at runtime by nothing yet (#14) -- so
-    there is nothing to log, not an omission.
+    ``SteeringConfig`` params are not logged here: ``TAMETrainer`` builds one
+    only to seed the routing coupling (#14), and everything that seeding depends
+    on -- the goal, beta and warmup -- is a ``TrainingConfig`` field, logged with
+    the rest of them when the run opens.
     """
     if not _ensure_started_for_provenance():
         return

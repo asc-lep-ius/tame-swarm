@@ -28,6 +28,10 @@ from contrastive_data import (
     load_contrastive_dataset,
     resolve_pair_format,
 )
+from coupling import SteeringCoupling, SteeringCouplingConfig
+from homeostat import CognitiveHomeostat
+from homeostat_calibration import transformer_layers
+from mob import MixtureOfBidders
 from steering import SteeringConfig, SteeringVector, SteeringVectorExtractor
 
 logger = logging.getLogger(__name__)
@@ -277,3 +281,92 @@ def calibration_texts(
             text = tokenizer.decode(generated[0], skip_special_tokens=False)
         texts.append(text)
     return texts
+
+
+class UncertifiedDirectionError(ValueError):
+    """A routing coupling would be seeded from a direction the behavioural gate never passed."""
+
+
+def certified_coupling_layers(goal: str, model_id: str | None = None) -> tuple[int, ...]:
+    """The layers at which ``goal``'s direction may seed a routing coupling.
+
+    #4's layer sweep is why this is a gate and not a default: the ``truthful``
+    direction steers *toward* falsehood below layer 13 and reads prompt wording at
+    12, so "the goal direction at layer L" is only the goal direction where the
+    gate passed it. A layer the certification does not name gets no coupling. An
+    uncoupled layer perceives the unshifted stream, which is honest; a layer
+    coupled to a direction that steers the wrong way is not. The record names the
+    model it was measured on, and unlike the hooks -- which serve another model
+    with a warning because their alternative was measured on nothing -- the
+    coupling refuses, because its alternative is to stay off.
+    """
+    certification = certification_for(goal)
+    if certification is None or not certification.layers:
+        raise UncertifiedDirectionError(
+            f"goal {goal!r} has no certified layers; a routing coupling may only be seeded "
+            "where the behavioural gate passed the direction"
+        )
+    if model_id is not None and certification.model is not None and model_id != certification.model:
+        raise UncertifiedDirectionError(
+            f"goal {goal!r} is certified on {certification.model}, not {model_id}; "
+            "the layers a direction acts at do not transfer between models"
+        )
+    return certification.layers
+
+
+def _mob_at(block: nn.Module) -> MixtureOfBidders | None:
+    for attribute in ("mlp", "feed_forward"):
+        candidate = getattr(block, attribute, None)
+        if isinstance(candidate, MixtureOfBidders):
+            return candidate
+    return None
+
+
+def seed_coupling(
+    model: nn.Module,
+    homeostat: CognitiveHomeostat,
+    extraction: SteeringExtraction,
+    layers: Sequence[int],
+    config: SteeringCouplingConfig,
+) -> dict[int, SteeringCoupling]:
+    """Attach a coupling at every MoB layer in ``layers``, seeded with the injected direction.
+
+    ``layers`` is what :func:`certified_coupling_layers` returned, and the
+    extraction must be the certified one: that is checked again here so a caller
+    cannot seed from a fallback vector by passing the right layer numbers. The
+    direction is read from ``homeostat.projected_direction`` -- what the hooks
+    inject after the capability projection -- never from the raw steering vector.
+    A certified layer that carries no MoB layer is skipped and reported; the
+    readout above the top actuator is the usual case.
+    """
+    if not extraction.certified:
+        raise UncertifiedDirectionError(
+            f"goal {extraction.goal!r}: the extracted vector is uncertified "
+            f"({extraction.fallback_reason or 'source/format is not the certified pair'}); "
+            "refusing to seed a routing coupling from it"
+        )
+    blocks = transformer_layers(model)
+    seeded: dict[int, SteeringCoupling] = {}
+    retained: dict[int, float] = {}
+    skipped: list[int] = []
+    for layer_idx in layers:
+        mob = _mob_at(blocks[layer_idx]) if layer_idx < len(blocks) else None
+        if mob is None or layer_idx not in homeostat.steering_vectors:
+            skipped.append(layer_idx)
+            continue
+        direction, retained[layer_idx] = homeostat.projected_direction(layer_idx)
+        seeded[layer_idx] = mob.attach_coupling(direction, config)
+    if skipped:
+        logger.info(
+            "Coupling for %r: certified layers %s carry no MoB layer or no vector; not seeded",
+            extraction.goal,
+            skipped,
+        )
+    logger.info(
+        "Coupling for %r seeded at MoB layers %s; the capability projection retained %s of "
+        "the direction",
+        extraction.goal,
+        sorted(seeded),
+        {layer: round(share, 3) for layer, share in sorted(retained.items())},
+    )
+    return seeded
