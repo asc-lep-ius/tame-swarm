@@ -41,6 +41,9 @@ BASE = ArmFingerprint(
     exploration_rate=0.02,
     confidence_head_learning_rate=5e-3,
     wealth_update_frequency=1,
+    coupling_goal=None,
+    coupling_beta=0.1,
+    coupling_warmup_steps=100,
     gradient_checkpointing=True,
     device="cpu",
     probe_tokens=4096,
@@ -101,6 +104,8 @@ def test_dense_arm_may_convert_nothing():
         ("data_order", "different"),
         ("learning_rate", 3e-5),
         ("batch_size", 4),
+        ("coupling_goal", "truthful"),
+        ("coupling_warmup_steps", 50),
     ],
 )
 def test_any_other_difference_is_a_confound(field, value):
@@ -166,6 +171,8 @@ def test_fingerprint_arm_reads_the_training_config():
         exploration_rate=0.07,
         confidence_head_learning_rate=0.011,
         wealth_update_frequency=19,
+        coupling_beta=0.31,
+        coupling_warmup_steps=37,
         gradient_checkpointing=False,
         device="cpu",
         probe_tokens=8192,
@@ -204,6 +211,9 @@ def test_fingerprint_arm_reads_the_training_config():
     assert arm.exploration_rate == 0.07
     assert arm.confidence_head_learning_rate == 0.011
     assert arm.wealth_update_frequency == 19
+    assert arm.coupling_goal is None
+    assert arm.coupling_beta == 0.31
+    assert arm.coupling_warmup_steps == 37
     assert arm.gradient_checkpointing is False
     assert arm.device == "cpu"
     assert arm.probe_tokens == 8192

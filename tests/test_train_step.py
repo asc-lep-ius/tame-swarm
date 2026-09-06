@@ -267,3 +267,155 @@ def test_realised_values_do_not_depend_on_the_accumulation_setting(smoke_fixture
         assert one is not None and four is not None
         assert (one != 0).any(), "fixture experts must contribute, or the check is vacuous"
         assert torch.allclose(one, four, atol=1e-6)
+
+
+# --- Coupling activation (#14) ---------------------------------------------
+
+
+def _certify_smoke_goal(monkeypatch, model_id: str, layers: tuple[int, ...], certified=True):
+    """Certify a goal for the smoke model and fake its extraction: no network, no HF cache.
+
+    The subspace estimation and the seeding run for real; only the contrastive
+    pairs -- which would pull TruthfulQA -- are replaced.
+    """
+    from smoke_fixture import SMOKE_HIDDEN_DIM
+
+    import train as train_module
+    from contrastive_data import CERTIFIED, MULTIPLE_CHOICE_FORMAT, Certification
+    from steering import SteeringVector
+    from steering_pipeline import SteeringExtraction
+
+    monkeypatch.setitem(
+        CERTIFIED,
+        "smoke",
+        Certification(
+            "truthful_qa", MULTIPLE_CHOICE_FORMAT, layers=layers, strength=1.0, model=model_id
+        ),
+    )
+
+    def fake_extract(model, tokenizer, goal, config):
+        requested = list(config.steering_layers)
+        generator = torch.Generator().manual_seed(1)
+        vectors = {
+            layer: SteeringVector(goal, torch.randn(SMOKE_HIDDEN_DIM, generator=generator), layer)
+            for layer in requested
+        }
+        return SteeringExtraction(
+            goal=goal,
+            vectors=vectors,
+            pair_count=4,
+            source="truthful_qa" if certified else "builtin",
+            layers=requested,
+            tier_counts={},
+            pair_format=MULTIPLE_CHOICE_FORMAT,
+            certified=certified,
+            fallback_reason=None if certified else "truthful_qa needs the train extra",
+        )
+
+    monkeypatch.setattr(train_module, "extract_steering_vectors", fake_extract)
+
+
+def test_coupling_goal_seeds_the_certified_mob_layers_and_trains_the_receptor(
+    smoke_fixture, tmp_path, monkeypatch
+):
+    """The flag couples the intersection of the certified layers and the MoB range, and it learns.
+
+    MoB at layers 1-2, certification at 2-3: only layer 2 is coupled. The receptor
+    sits in the heads' optimizer group, the training step advances the warmup, and
+    one optimizer step moves the receptor off zero through the real path.
+    """
+    model_id, _ = smoke_fixture
+    _certify_smoke_goal(monkeypatch, model_id, layers=(2, 3))
+    config = _config(
+        smoke_fixture,
+        tmp_path / "coupled",
+        coupling_goal="smoke",
+        coupling_beta=0.3,
+        coupling_warmup_steps=2,
+    )
+    trainer = TAMETrainer(config)
+    trainer.setup()
+
+    by_layer = dict(zip([1, 2], get_mob_layers(trainer.model), strict=True))
+    assert not hasattr(by_layer[1], "coupling"), "layer 1 is uncertified and must stay uncoupled"
+    coupling = by_layer[2].coupling
+    assert coupling.config.coupling_beta == 0.3
+    assert coupling.config.warmup_steps == 2
+
+    # The scheduler has already rewritten every group's live ``lr``, so the head
+    # group is found by a head, not by its rate.
+    a_head = by_layer[2].confidence_heads[0].proj.weight
+    groups_with = lambda param: [  # noqa: E731
+        index
+        for index, group in enumerate(trainer.optimizer.param_groups)
+        if any(candidate is param for candidate in group["params"])
+    ]
+    assert groups_with(coupling.detector) == groups_with(a_head)
+    assert trainer.optimizer.param_groups[groups_with(a_head)[0]]["weight_decay"] == 0.0
+
+    batch = next(iter(trainer.train_dataloader))
+    trainer.global_step = 0
+    trainer.train_step(batch)
+    assert int(coupling._coupling_step.item()) == 0
+    assert coupling.detector.grad is not None
+    assert float(coupling.detector.grad.abs().sum()) == 0.0, "no field yet at step 0: beta is 0"
+    for step in (1, 2):
+        trainer.global_step = step
+        trainer.train_step(batch)
+        assert int(coupling._coupling_step.item()) == step
+
+    metrics = by_layer[2].last_stats.coupling_metrics
+    assert metrics is not None
+    assert float(metrics.beta_effective.item()) == pytest.approx(0.3)
+    assert float(coupling.detector.grad.abs().sum()) > 0.0, "the value objective must reach it"
+    measurements = trainer._coupling_measurements()
+    assert measurements["coupling/beta_effective"] == pytest.approx(0.3)
+    assert measurements["coupling/detector_norm_mean"] == 0.0, "nothing has stepped yet"
+
+
+def test_without_a_coupling_goal_routing_stays_uncoupled(smoke_fixture, tmp_path):
+    trainer = TAMETrainer(_config(smoke_fixture, tmp_path / "plain"))
+    trainer.setup()
+    trainer.global_step = 0
+    trainer.train_step(next(iter(trainer.train_dataloader)))
+
+    assert not any(hasattr(mob, "coupling") for mob in get_mob_layers(trainer.model))
+    assert trainer._coupling_measurements() == {}
+
+
+def test_setup_refuses_to_seed_from_a_fallback_vector(smoke_fixture, tmp_path, monkeypatch):
+    from steering_pipeline import UncertifiedDirectionError
+
+    model_id, _ = smoke_fixture
+    _certify_smoke_goal(monkeypatch, model_id, layers=(2,), certified=False)
+    trainer = TAMETrainer(_config(smoke_fixture, tmp_path / "fallback", coupling_goal="smoke"))
+
+    with pytest.raises(UncertifiedDirectionError, match="uncertified"):
+        trainer.setup()
+
+
+def test_setup_refuses_a_goal_whose_certified_layers_carry_no_mob_layer(
+    smoke_fixture, tmp_path, monkeypatch
+):
+    """Seeding nothing under a coupling flag would be the silent no-op #14 exists to remove."""
+    model_id, _ = smoke_fixture
+    _certify_smoke_goal(monkeypatch, model_id, layers=(3,))
+    trainer = TAMETrainer(_config(smoke_fixture, tmp_path / "nomob", coupling_goal="smoke"))
+
+    with pytest.raises(RuntimeError, match="seeded nothing"):
+        trainer.setup()
+
+
+@pytest.mark.parametrize(
+    ("overrides", "match"),
+    [
+        ({"coupling_goal": "deliberation"}, "no certified layers"),
+        ({"coupling_goal": "truthful", "model_id": "google/gemma-2-2b-it"}, "certified on"),
+        ({"coupling_goal": "truthful", "router": "dense"}, "dense arm"),
+        ({"coupling_beta": -0.1}, "coupling_beta"),
+    ],
+)
+def test_an_uncertified_coupling_is_refused_at_construction(overrides, match):
+    """The boundary, not minutes into a run with the model loaded."""
+    with pytest.raises(ValueError, match=match):
+        TrainingConfig(**overrides)

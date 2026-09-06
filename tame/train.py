@@ -85,6 +85,7 @@ except ImportError:
     logger.warning("'accelerate' library not installed. Model re-dispatch disabled.")
 
 from config import get_active_profile
+from coupling import DEFAULT_COUPLING_BETA, DEFAULT_WARMUP_STEPS, SteeringCouplingConfig
 from determinism import configure_determinism, seed_worker
 from evaluation import (
     DEFAULT_HELD_OUT_SEQUENCES,
@@ -94,6 +95,7 @@ from evaluation import (
     evaluate,
     is_held_out_position,
 )
+from homeostat import CognitiveHomeostat
 from metrics import MetricSink
 from mob import (
     ROUTER_AUCTION,
@@ -110,6 +112,14 @@ from mob import (
 )
 from parity import ArmFingerprint, data_order_fingerprint, fingerprint_arm
 from specialisation import SpecialisationReport, probe_specialisation
+from steering import SteeringConfig
+from steering_pipeline import (
+    SteeringExtraction,
+    certified_coupling_layers,
+    extract_steering_vectors,
+    seed_coupling,
+    serving_config,
+)
 from tracking import end_tracking, init_tracking, log_checkpoint, log_provenance
 
 _profile = get_active_profile()
@@ -199,6 +209,16 @@ class TrainingConfig:
     wealth_update_frequency: int = 1  # How often to update wealth (every N steps)
     log_frequency: int = 10  # How often to log comprehensive training statistics (every N steps)
 
+    # Steering-economy coupling (#14). ``coupling_goal`` names the goal whose
+    # certified direction seeds a routing coupling at every MoB layer the
+    # certification names (``steering_pipeline.certified_coupling_layers``) and at
+    # no other; None leaves routing uncoupled, which is the default until #6's
+    # ablation has measured the effect -- the same policy as the homeostat's loop.
+    # The warmup is in training steps, the unit of ``max_steps``.
+    coupling_goal: str | None = None
+    coupling_beta: float = DEFAULT_COUPLING_BETA
+    coupling_warmup_steps: int = DEFAULT_WARMUP_STEPS
+
     # LoRA (optional)
     use_lora: bool = False
     lora_rank: int = 16
@@ -276,11 +296,24 @@ class TrainingConfig:
             "probe_tokens",
             "held_out_sequences",
             "wealth_update_frequency",
+            "coupling_warmup_steps",
         )
         for name in positive_fields:
             value = getattr(self, name)
             if value < 1:
                 raise ValueError(f"{name} must be >= 1, got {value}")
+
+        if self.coupling_beta < 0:
+            raise ValueError(f"coupling_beta must be >= 0, got {self.coupling_beta}")
+        if self.coupling_goal is not None:
+            if self.router == ARM_DENSE:
+                raise ValueError(
+                    "coupling_goal needs a MoB layer to couple; the dense arm has none"
+                )
+            # Raises UncertifiedDirectionError here, at construction, rather than
+            # after the model has loaded: the goal must be certified, at named
+            # layers, on this model.
+            certified_coupling_layers(self.coupling_goal, self.model_id)
 
         if self.checkpoint_keep_last < 0:
             raise ValueError(f"checkpoint_keep_last must be >= 0, got {self.checkpoint_keep_last}")
@@ -392,7 +425,13 @@ class TAMETrainer:
         # unrouted floor, so "convert nothing" is the arm rather than a degenerate
         # configuration of one.
         if self.config.router != ARM_DENSE:
+            # The goal direction is read off the pristine model, before any FFN is
+            # replaced: that is the regime the certification was measured in, and
+            # an upcycled MoB reproduces it at initialisation anyway.
+            seed = self._extract_coupling_direction() if self.config.coupling_goal else None
             self._apply_mob()
+            if seed is not None:
+                self._seed_coupling(*seed)
         else:
             logger.info("Dense arm: leaving the original FFN in place, no MoB layers")
 
@@ -476,6 +515,65 @@ class TAMETrainer:
 
         self.model = apply_mob_to_model(self.model, mob_config, layers_to_modify=layers_to_modify)
         self.mob_config = mob_config
+
+    def _extract_coupling_direction(
+        self,
+    ) -> tuple[CognitiveHomeostat, SteeringExtraction, tuple[int, ...]]:
+        """The certified goal direction at every layer it is certified at, as the hooks inject it.
+
+        The layers, and the capability projection, come from the same path the
+        server steers with (``serving_config``, ``CognitiveHomeostat``), so what the
+        routing perceives is the direction the residual stream would be pushed
+        along -- not the raw vector, which reads several sigma apart from it.
+        """
+        assert self.model is not None
+        goal = self.config.coupling_goal
+        assert goal is not None
+        layers = certified_coupling_layers(goal, self.config.model_id)
+        template = SteeringConfig(
+            steering_layers=list(range(self.config.mob_layers_start, self.config.mob_layers_end)),
+            adaptive=False,
+        )
+        steering_config = serving_config(goal, template, model_id=self.config.model_id)
+        extraction = extract_steering_vectors(
+            self.model, self.tokenizer, goal=goal, config=steering_config
+        )
+        homeostat = CognitiveHomeostat(steering_config)
+        homeostat.add_steering_vectors(extraction.vectors)
+        if steering_config.orthogonal_projection:
+            homeostat.estimate_capability_subspaces(self.model, self.tokenizer)
+        return homeostat, extraction, layers
+
+    def _seed_coupling(
+        self,
+        homeostat: CognitiveHomeostat,
+        extraction: SteeringExtraction,
+        layers: tuple[int, ...],
+    ) -> None:
+        """Attach the coupling where the direction is certified; refuse to seed nothing."""
+        assert self.model is not None
+        assert self.mob_config is not None
+        coupling_config = SteeringCouplingConfig(
+            hidden_dim=self.mob_config.hidden_dim,
+            coupling_beta=self.config.coupling_beta,
+            warmup_steps=self.config.coupling_warmup_steps,
+        )
+        seeded = seed_coupling(self.model, homeostat, extraction, layers, coupling_config)
+        requested = range(self.config.mob_layers_start, self.config.mob_layers_end)
+        if not seeded:
+            raise RuntimeError(
+                f"coupling_goal={extraction.goal!r} seeded nothing: none of its certified "
+                f"layers {layers} is a MoB layer ({requested.start}-{requested.stop - 1})"
+            )
+        logger.info(
+            "Coupling: %r seeded at MoB layers %s (beta %.3f, warmup %d steps); "
+            "MoB layers %s stay uncoupled, their direction is uncertified",
+            extraction.goal,
+            sorted(seeded),
+            self.config.coupling_beta,
+            self.config.coupling_warmup_steps,
+            [layer for layer in requested if layer not in seeded],
+        )
 
     def _redispatch_model(self):
         """
@@ -759,13 +857,12 @@ class TAMETrainer:
         decay_params = []
         no_decay_params = []
 
-        # The heads are trained by nothing but their own value objective, at their
-        # own rate. The scheduler scales every group by the same factor, so the
-        # heads warm up and decay with the backbone; only the base rate differs.
+        # The heads -- and the coupling's receptor, when one is attached -- are
+        # trained by nothing but their own value objective, at their own rate. The
+        # scheduler scales every group by the same factor, so they warm up and
+        # decay with the backbone; only the base rate differs.
         head_params = [
-            param
-            for mob in get_mob_layers(self.model)
-            for param in mob.confidence_heads.parameters()
+            param for mob in get_mob_layers(self.model) for param in mob.routing_parameters()
         ]
         head_ids = {id(param) for param in head_params}
 
@@ -1373,6 +1470,7 @@ class TAMETrainer:
                 measurements["auction/mean_realised_value"] = _scalar(stats["mean_realised_value"])
                 measurements["auction/mean_report"] = _scalar(stats["mean_report"])
                 measurements["auction/mean_win_surplus"] = _scalar(stats["mean_win_surplus"])
+            measurements.update(self._coupling_measurements())
 
             # Format performance EMA with sign
             perf_sign = "+" if perf_ema >= 0 else ""
@@ -1436,6 +1534,35 @@ class TAMETrainer:
             )
 
         self.metrics.log(step, measurements)
+
+    def _coupling_measurements(self) -> dict[str, float]:
+        """Whether the coupling is doing anything, on the curve rather than in a field.
+
+        Absent when no layer is coupled. ``detector_norm`` is the number that tells
+        a coupling that has learned something from one that is attached and inert;
+        ``beta_effective`` shows the warmup actually advancing.
+        """
+        assert self.model is not None
+        metrics = [
+            mob.last_stats.coupling_metrics
+            for mob in get_mob_layers(self.model)
+            if mob.last_stats is not None and mob.last_stats.coupling_metrics is not None
+        ]
+        if not metrics:
+            return {}
+
+        def mean_of(name: str) -> float:
+            return float(torch.stack([getattr(m, name).float() for m in metrics]).mean().item())
+
+        return {
+            "coupling/beta_effective": mean_of("beta_effective"),
+            "coupling/delta_fraction_mean": mean_of("delta_norm_fraction_mean"),
+            "coupling/delta_fraction_max": max(
+                float(m.delta_norm_fraction_max.item()) for m in metrics
+            ),
+            "coupling/alignment_mean": mean_of("steering_alignment_mean"),
+            "coupling/detector_norm_mean": mean_of("detector_norm"),
+        }
 
     def _check_disk_budget(self) -> None:
         """Refuse to start a checkpoint write the disk cannot afford (#13).
@@ -1688,6 +1815,24 @@ def main():
         help="Refuse to write a checkpoint below this much free disk on output_dir",
     )
 
+    # Steering-economy coupling (#14)
+    parser.add_argument(
+        "--coupling_goal",
+        type=str,
+        default=None,
+        help=(
+            "Seed a routing coupling from this goal's certified direction, at its "
+            "certified layers only (default: routing stays uncoupled)"
+        ),
+    )
+    parser.add_argument("--coupling_beta", type=float, default=DEFAULT_COUPLING_BETA)
+    parser.add_argument(
+        "--coupling_warmup_steps",
+        type=int,
+        default=DEFAULT_WARMUP_STEPS,
+        help="Training steps over which the coupling ramps to coupling_beta",
+    )
+
     # Hardware
     parser.add_argument(
         "--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"]
@@ -1724,6 +1869,9 @@ def main():
         shuffle_buffer_size=args.shuffle_buffer_size,
         checkpoint_keep_last=args.checkpoint_keep_last,
         checkpoint_min_free_gb=args.checkpoint_min_free_gb,
+        coupling_goal=args.coupling_goal,
+        coupling_beta=args.coupling_beta,
+        coupling_warmup_steps=args.coupling_warmup_steps,
     )
 
     # Create trainer and run
