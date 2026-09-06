@@ -1,3 +1,31 @@
+"""The steering-economy coupling: the goal direction offered to routing as a perceived feature.
+
+#2's design is perception modulation. The field does not bias bids after the fact;
+it shifts what every confidence head *sees* before it reports, so a head that
+finds the goal direction valuable bids higher on its own and the auction runs
+unchanged. Per token,
+
+    perceived = h + beta_effective * (u . h) * d
+
+where ``d`` is the goal direction the residual-stream hooks inject at this layer
+and ``u`` is the *receptor*: the one learned vector that says which local feature
+of the stream this layer reads as "the field is here". #14 replaced #2's
+``hidden_dim x hidden_dim`` projection with ``u`` because the projection only ever
+entered the forward through its product with ``d`` -- the signal was
+``h . (W^T d)`` -- and every gradient from the zero initialisation lay in
+``span(d) (x) R^n``. The two are the same function class; this one names the
+object being learned and costs a dot product per token instead of a matmul.
+
+The delta is capped at ``max_coupling_fraction`` of the hidden norm per token, and
+ramps in over ``warmup_steps`` so the coupling arrives in the routing dynamics as a
+gradient rather than a step. It is zero-initialised: at day zero the perceived
+stream is the stream, exactly as upcycling preserves the FFN. That makes an inert
+coupling indistinguishable from a fresh one, which is why the receptor's norm and
+``beta_effective`` are both reported, a training-mode forward refuses to run until
+the step has been set, and the tests assert the mechanism where it is non-trivial.
+"""
+
+import logging
 import math
 from dataclasses import dataclass
 from typing import cast
@@ -6,8 +34,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+logger = logging.getLogger(__name__)
+
 DEFAULT_COUPLING_BETA = 0.1
-DEFAULT_WARMUP_STEPS = 1
+# #2's specification. The ramp is what keeps the coupling from arriving in the
+# routing dynamics as a step change; the value of 1 that shipped had removed it.
+DEFAULT_WARMUP_STEPS = 100
+# Below this many steps the ramp has too few distinct levels to be one: the
+# economy settles once per step, so a warmup of a handful of steps is a step
+# change with extra bookkeeping. Warned about, not rejected -- a fixture that wants
+# the coupling at full strength at once says so on purpose.
+MIN_WARMUP_STEPS_FOR_RAMP = 10
 DEFAULT_MAX_COUPLING_FRACTION = 0.1
 DEFAULT_EPS = 1e-8
 SUPPORTED_COUPLING_MODES = frozenset({"perception"})
@@ -36,6 +73,14 @@ class SteeringCouplingConfig:
             raise ValueError(f"Unsupported coupling mode '{self.mode}'. Supported modes: {modes}")
         if self.eps <= 0.0:
             raise ValueError("eps must be positive")
+        if self.warmup_steps < MIN_WARMUP_STEPS_FOR_RAMP:
+            logger.warning(
+                "warmup_steps=%d is below %d: beta_effective reaches coupling_beta within "
+                "%d steps, so the coupling arrives as a step change rather than a ramp",
+                self.warmup_steps,
+                MIN_WARMUP_STEPS_FOR_RAMP,
+                self.warmup_steps,
+            )
 
 
 @dataclass(frozen=True)
@@ -45,14 +90,16 @@ class CouplingMetrics:
     delta_norm_fraction_mean: torch.Tensor
     delta_norm_fraction_max: torch.Tensor
     steering_alignment_mean: torch.Tensor
+    # The receptor's norm: the one number that separates a coupling that has
+    # learned something from one that is attached and inert.
+    detector_norm: torch.Tensor
 
 
 class SteeringCoupling(nn.Module):
     def __init__(self, config: SteeringCouplingConfig, steering_direction: torch.Tensor):
         super().__init__()
         self.config = config
-        self.projection = nn.Linear(config.hidden_dim, config.hidden_dim, bias=False)
-        nn.init.zeros_(self.projection.weight)
+        self.detector = nn.Parameter(torch.zeros(config.hidden_dim))
 
         self.steering_direction: torch.Tensor
         self.register_buffer(
@@ -67,6 +114,10 @@ class SteeringCoupling(nn.Module):
             torch.tensor(0, dtype=torch.long),
             persistent=True,
         )
+        # Whether anything has ever set the step. A coupling whose counter never
+        # advances is a no-op that looks attached, so a training forward refuses
+        # to run in that state rather than route uncoupled under a coupled name.
+        self._step_was_set = False
 
         self.last_metrics: CouplingMetrics | None = None
 
@@ -74,6 +125,11 @@ class SteeringCoupling(nn.Module):
         if hidden_states.shape[-1] != self.config.hidden_dim:
             raise ValueError(
                 f"Expected hidden size {self.config.hidden_dim}, got {hidden_states.shape[-1]}"
+            )
+        if self.training and not self._step_was_set:
+            raise RuntimeError(
+                "SteeringCoupling forwarded in training mode before set_coupling_step was "
+                "called: the warmup would never advance and the coupling would stay inert"
             )
 
         beta_effective = self._effective_beta(hidden_states)
@@ -83,8 +139,7 @@ class SteeringCoupling(nn.Module):
         )
         direction_view = direction.view(*([1] * (hidden_states.ndim - 1)), -1)
 
-        projected = self.projection(hidden_states)
-        steering_signal = (projected * direction_view).sum(dim=-1, keepdim=True)
+        steering_signal = (hidden_states @ self.detector.to(hidden_states.dtype)).unsqueeze(-1)
         raw_delta = beta_effective * steering_signal * direction_view
         delta = self._cap_delta(raw_delta, hidden_states)
 
@@ -95,11 +150,9 @@ class SteeringCoupling(nn.Module):
         if step < 0:
             raise ValueError("coupling step must be non-negative")
         self._coupling_step.fill_(step)
+        self._step_was_set = True
         self.last_metrics = None
         return self
-
-    def set_step(self, step: int) -> "SteeringCoupling":
-        return self.set_coupling_step(step)
 
     def _effective_beta(self, hidden_states: torch.Tensor) -> torch.Tensor:
         step = self._coupling_step.to(device=hidden_states.device, dtype=hidden_states.dtype)
@@ -144,6 +197,7 @@ class SteeringCoupling(nn.Module):
                 dim=-1,
                 eps=self.config.eps,
             )
+            detector_norm = self.detector.detach().float().norm()
 
         return CouplingMetrics(
             active=(beta_effective.detach() > 0.0),
@@ -151,6 +205,7 @@ class SteeringCoupling(nn.Module):
             delta_norm_fraction_mean=delta_fraction.mean().detach(),
             delta_norm_fraction_max=delta_fraction.max().detach(),
             steering_alignment_mean=alignment.mean().detach(),
+            detector_norm=detector_norm,
         )
 
     @staticmethod
@@ -167,7 +222,10 @@ class SteeringCoupling(nn.Module):
 
         norm = float(direction.norm().item())
         if not math.isfinite(norm) or norm <= config.eps:
-            return torch.zeros_like(direction)
+            raise ValueError(
+                "steering direction has zero or non-finite norm; a coupling seeded from it "
+                "could never act"
+            )
         return direction / norm
 
 

@@ -133,6 +133,9 @@ class ArmFingerprint:
     exploration_rate: float
     confidence_head_learning_rate: float
     wealth_update_frequency: int
+    coupling_goal: str | None
+    coupling_beta: float
+    coupling_warmup_steps: int
     gradient_checkpointing: bool
     device: str
     probe_tokens: int
@@ -198,6 +201,9 @@ def fingerprint_arm(
         exploration_rate=config.exploration_rate,
         confidence_head_learning_rate=config.confidence_head_learning_rate,
         wealth_update_frequency=config.wealth_update_frequency,
+        coupling_goal=config.coupling_goal,
+        coupling_beta=config.coupling_beta,
+        coupling_warmup_steps=config.coupling_warmup_steps,
         gradient_checkpointing=config.gradient_checkpointing,
         device=config.device,
         probe_tokens=config.probe_tokens,
