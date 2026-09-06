@@ -319,7 +319,10 @@ def _kick_at_setpoint_step(derivative_on_pv: bool) -> tuple[float, float]:
     reference, reference_tissue = make(kd=1.0)
     reference_tissue.run(100)
     reference_tissue.set_content(-QWEN_TISSUE_GAIN)
-    reading_response = max(reference_tissue.max_d_term() for _ in reference_tissue.run(10))
+    reading_response = 0.0
+    for _ in range(10):
+        reference_tissue.step()
+        reading_response = max(reading_response, reference_tissue.max_d_term())
     return setpoint_kick, reading_response
 
 
@@ -334,6 +337,21 @@ def test_the_derivative_on_the_error_kicks_at_a_setpoint_step():
     setpoint_kick, reading_response = _kick_at_setpoint_step(derivative_on_pv=False)
 
     assert setpoint_kick > 3 * reading_response, (setpoint_kick, reading_response)
+
+
+def test_every_cell_carries_the_same_controller_state_from_the_first_pass():
+    """The first pass is seeded with the tissue setpoint, so the switch to the consensus is no step.
+
+    Seeded with its own setpoint, each cell would remember a different process
+    variable and read the shared one on pass two as a jump -- measured at 0.17 of
+    d_term at ``kd = 1``, four times the setpoint kick the tissue was fixed for.
+    """
+    homeostat, tissue = make(kd=1.0)
+    tissue.run(2)
+
+    states = {homeostat.controller.snapshot(homeostat._key(layer)) for layer in QWEN_CELLS}
+    assert len(states) == 1, "one shared memory, every cell"
+    assert tissue.max_d_term() < 1e-9
 
 
 # --- Multi-goal independence, on the wired system --------------------------------------

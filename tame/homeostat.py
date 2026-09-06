@@ -287,8 +287,12 @@ class AdaptiveHomeostat:
         # derivative acts on the process variable precisely so that a setpoint
         # change cannot kick it, and a setpoint folded into the process variable
         # would kick it on every re-install of the goal (found by #6's integration test).
+        # Before the first consensus exists every cell is seeded with the *tissue*
+        # setpoint, not its own: the derivative remembers the last process variable,
+        # and a cell seeded with its own setpoint would read the switch to the shared
+        # one on the next pass as a jump.
         if self._consensus is None:
-            shared, shared_setpoint, shared_pv = 0.0, setpoint, setpoint
+            shared, shared_setpoint, shared_pv = 0.0, self.setpoint, self.setpoint
         else:
             shared, shared_setpoint, shared_pv = self._consensus
         tissue_strength, state = self.controller.step(
