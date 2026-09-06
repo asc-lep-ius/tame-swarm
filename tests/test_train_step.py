@@ -460,3 +460,74 @@ def test_an_uncertified_coupling_is_refused_at_construction(overrides, match):
     """The boundary, not minutes into a run with the model loaded."""
     with pytest.raises(ValueError, match=match):
         TrainingConfig(**overrides)
+
+
+# --- The model that trains is the model that was loaded (#19) ---------------
+
+
+def test_setup_refuses_a_model_left_on_the_meta_device(smoke_fixture, tmp_path, monkeypatch):
+    """A tensor on meta means accelerate offloaded it; refuse, never 'materialise'.
+
+    The path this replaced reallocated every tensor with ``to_empty``, re-initialised
+    what happened to read as zero, reloaded the checkpoint keys it could match --
+    none of MoB's -- and trained the result.
+    """
+    import train as train_module
+
+    convert = train_module.TAMETrainer._apply_mob
+
+    def convert_then_offload(self):
+        convert(self)
+        self.model.lm_head.to_empty(device="meta")
+
+    monkeypatch.setattr(train_module.TAMETrainer, "_apply_mob", convert_then_offload)
+    trainer = TAMETrainer(_config(smoke_fixture, tmp_path / "meta"))
+
+    with pytest.raises(RuntimeError) as refusal:
+        trainer.setup()
+
+    assert "lm_head.weight" in str(refusal.value)
+    assert "offloaded to disk" in str(refusal.value)
+
+
+def _first_adapter_b(mob):
+    return next(
+        param for name, param in mob.experts.named_parameters() if name.endswith("_B.weight")
+    )
+
+
+PERTURBATIONS = {
+    "shared base": (lambda mob: mob.base_gate_proj.weight.add_(1.0), "shared base gate_proj"),
+    "ledger": (lambda mob: mob.expert_wealth.fill_(1.0), "ledger expert_wealth"),
+    "adapter": (lambda mob: _first_adapter_b(mob).fill_(0.1), "adapter .* is not zero"),
+    "confidence bias": (lambda mob: mob.confidence_heads[0].proj.bias.zero_(), "confidence head 0"),
+    "nan": (lambda mob: mob.base_up_proj.weight[0, 0].fill_(float("nan")), "NaN or inf"),
+}
+
+
+@pytest.mark.parametrize("what", list(PERTURBATIONS))
+def test_setup_post_conditions_fail_when_the_converted_model_is_perturbed(
+    smoke_fixture, tmp_path, what
+):
+    """Each invariant setup asserts has a state in which it fails, named in the error."""
+    trainer = TAMETrainer(_config(smoke_fixture, tmp_path / what.replace(" ", "_")))
+    trainer.setup()  # the unmodified path passes every post-condition
+    perturb, expected = PERTURBATIONS[what]
+
+    with torch.no_grad():
+        perturb(get_mob_layers(trainer.model)[1])
+
+    with pytest.raises(RuntimeError, match=expected):
+        trainer._assert_setup_invariants()
+
+
+def test_the_shared_base_check_reads_the_layer_it_was_taken_from(smoke_fixture, tmp_path):
+    """Fingerprints are keyed by transformer layer; MoB at layers 1-2 must match 1-2, not 0-1."""
+    trainer = TAMETrainer(_config(smoke_fixture, tmp_path / "keyed"))
+    trainer.setup()
+
+    assert sorted(trainer._ffn_fingerprints) == [1, 2]
+    with torch.no_grad():
+        get_mob_layers(trainer.model)[0].base_down_proj.weight.mul_(2.0)
+    with pytest.raises(RuntimeError, match="layer 1: shared base down_proj"):
+        trainer._assert_setup_invariants()
