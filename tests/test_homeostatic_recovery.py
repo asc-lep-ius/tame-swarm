@@ -307,9 +307,10 @@ class _ForcedSubset(torch.nn.Module):
         return AuctionOutcome(selected, weights, torch.zeros_like(weights), rebates, None)
 
 
-def _force_routing(economy: SyntheticEconomy, subset: list[int], steps: int) -> None:
+def _force_routing(economy: SyntheticEconomy, subset: list[int], steps: int, seed: int) -> None:
+    """Route by fiat for ``steps`` steps; the forcing stream is a replicate of the seed too."""
     gate = economy.mob.gate
-    economy.mob.gate = _ForcedSubset(subset, economy.config.top_k, seed=steps)
+    economy.mob.gate = _ForcedSubset(subset, economy.config.top_k, seed=1000 * steps + seed)
     try:
         _window(economy, steps)
     finally:
@@ -334,7 +335,7 @@ def _release_and_measure(seed: int, episode: int) -> tuple[float, float, float, 
     _window(economy, STEADY_STEPS - WINDOW)
     steady_loss, steady_share = _window(economy, WINDOW)
 
-    _force_routing(economy, least_competent, episode)
+    _force_routing(economy, least_competent, episode, seed)
     _window(economy, RELEASE_HORIZON - WINDOW)
     loss, share = _window(economy, WINDOW)
     return (
@@ -352,8 +353,8 @@ def test_the_market_re_forms_after_routing_was_forced_onto_the_least_competent(s
     Every token goes to the three least competent experts, the loss quadruples, and
     the competent experts hold nothing. Released, the auction routes on the reports
     and wealth the experts still carry: within 150 steps routing tracks competence
-    again (r 0.76-0.77 on the three seeds), the best expert holds its pre-episode
-    share (1.1-1.3x it), and the loss is below its steady value (0.72-0.82x).
+    again (r 0.76-0.78 on the three seeds), the best expert holds its pre-episode
+    share (1.18-1.33x it), and the loss is below its steady value (0.74-0.76x).
     """
     loss_ratio, tracking, regained, steady_share = _release_and_measure(seed, SHORT_FORCED_EPISODE)
 
@@ -366,13 +367,14 @@ def test_the_market_re_forms_after_routing_was_forced_onto_the_least_competent(s
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "A 150-step episode drives the incumbents to 656-731 of the 750 wealth ceiling and "
-        "the market does not re-form: at the 150-step horizon this test asserts, routing "
-        "anti-tracks competence (r -0.20 to -0.33 on the three seeds, 0.77 before), the "
-        "best expert holds 4-11% of its steady share and the loss is 3-4x steady; at 300 "
-        "steps r -0.32 to -0.35 and 1%. Two candidate causes: the ceiling, and the starved "
-        "experts' heads receiving no realised-value signal during the episode; the ceiling "
-        "measurement supports the first, nothing here excludes the second. The band is #16's."
+        "A 150-step episode drives the incumbents to 667-746 of the 750 wealth ceiling and "
+        "the market does not re-form: at the 150-step horizon this test asserts, routing no "
+        "longer tracks competence (r -0.31 to -0.03 on the three seeds, 0.81-0.82 before), "
+        "the best expert holds 9-11% of its steady share and the loss is 2.6-3.7x steady; "
+        "at 300 steps r -0.35 to +0.16, 0.2-1.4% and 1.9-4.3x. Two candidate causes: the "
+        "ceiling, and the starved experts' heads receiving no realised-value signal during "
+        "the episode; the ceiling measurement supports the first, nothing here excludes the "
+        "second. The band is #16's."
     ),
 )
 def test_the_market_re_forms_after_a_long_forced_episode():
