@@ -68,8 +68,28 @@ def assert_groups_at_parity(group_a: dict[str, Any], group_b: dict[str, Any]) ->
             "#6); parity between the arms is not asserted for this comparison"
         )
         return False
-    for seed in sorted(set(prints_a) & set(prints_b), key=str):
-        assert_parity([ArmFingerprint(**prints_a[seed]), ArmFingerprint(**prints_b[seed])])
+    shared_seeds = sorted(set(prints_a) & set(prints_b), key=str)
+    if not shared_seeds:
+        logger.warning(
+            "the groups share no seed (%s vs %s); parity between the arms is not asserted",
+            sorted(prints_a, key=str),
+            sorted(prints_b, key=str),
+        )
+        return False
+    try:
+        pairs = [
+            (ArmFingerprint(**prints_a[seed]), ArmFingerprint(**prints_b[seed]))
+            for seed in shared_seeds
+        ]
+    except TypeError as exc:
+        logger.warning(
+            "a summary's fingerprints do not match this version's schema (%s); parity "
+            "between the arms is not asserted",
+            exc,
+        )
+        return False
+    for arm_a, arm_b in pairs:
+        assert_parity([arm_a, arm_b])
     return True
 
 

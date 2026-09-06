@@ -323,18 +323,21 @@ def _coupled_layer(market: Market, seed: int, live: bool) -> tuple[MixtureOfBidd
     return mob, hidden
 
 
-def _reports_through(market: Market, seed: int, live: bool) -> tuple[Market, VCGAuctioneer]:
+def _reports_through(
+    market: Market, seed: int, live: bool
+) -> tuple[Market, VCGAuctioneer, MixtureOfBidders]:
     mob, hidden = _coupled_layer(market, seed, live)
     mob(hidden, update_wealth=False)
     assert mob.last_stats is not None
     reported = Market(market.top_k, market.wealth, mob.last_stats.confidences.clone())
-    return reported, mob.gate  # type: ignore[return-value]
+    return reported, mob.gate, mob  # type: ignore[return-value]
 
 
 @given(markets(), st.integers(0, 2**16))
 def test_the_properties_hold_on_reports_a_live_coupling_produced(market, seed):
-    coupled, gate = _reports_through(market, seed, live=True)
-    detached, _ = _reports_through(market, seed, live=False)
+    coupled, gate, mob = _reports_through(market, seed, live=True)
+    detached, _, _ = _reports_through(market, seed, live=False)
+    assert hasattr(mob, "coupling") and float(mob.coupling.detector.detach().norm()) > 0.0
     assert not torch.equal(coupled.confidences, detached.confidences), "the coupling must be live"
     assert coupled.confidences.min() > 0.0
 
@@ -343,8 +346,8 @@ def test_the_properties_hold_on_reports_a_live_coupling_produced(market, seed):
 
 @given(markets(), st.integers(0, 2**16))
 def test_the_properties_hold_with_the_coupling_detached(market, seed):
-    detached, gate = _reports_through(market, seed, live=False)
-    assert not hasattr(gate, "coupling")
+    detached, gate, mob = _reports_through(market, seed, live=False)
+    assert not hasattr(mob, "coupling")
 
     check_all(detached, gate)
 

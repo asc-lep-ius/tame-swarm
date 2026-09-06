@@ -46,5 +46,6 @@ def wealth_blind_forward(self, confidences, wealth):
     """Allocate on reports alone, as if every expert were equally rich."""
     _, selected = torch.topk(confidences, self.top_k, dim=-1)
     weights = torch.full_like(confidences[..., : self.top_k], 1.0 / self.top_k)
-    zeros = torch.zeros_like(weights)
-    return AuctionOutcome(selected, weights, zeros, zeros, None)
+    return AuctionOutcome(
+        selected, weights, torch.zeros_like(weights), torch.zeros_like(confidences), None
+    )

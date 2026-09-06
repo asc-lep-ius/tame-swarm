@@ -36,6 +36,7 @@ def test_the_check_can_fail(tmp_path):
         "class Trainer:\n"
         "    def run(self, config):\n"
         "        self.declared_and_never_read = 1\n"
+        "        config.only_written = 2\n"
         "        return config.actually_read\n"
     )
 
@@ -43,6 +44,7 @@ def test_the_check_can_fail(tmp_path):
 
     assert "actually_read" in names
     assert "declared_and_never_read" not in names
+    assert "only_written" not in names, "an assignment is not a read"
     assert "eval_steps" in read_names()
 
 

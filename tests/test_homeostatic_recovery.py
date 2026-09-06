@@ -40,7 +40,7 @@ from synthetic_economy import (  # noqa: E402
 
 from mob.auction import AuctionOutcome  # noqa: E402
 
-from .wired_system import ACTUATORS, BELOW_ACTUATORS, build_wired_system  # noqa: E402
+from .wired_system import ACTUATORS, BELOW_ACTUATORS, READOUT, build_wired_system  # noqa: E402
 
 # --- The steering tissue ---------------------------------------------------------
 
@@ -76,7 +76,7 @@ def test_the_tissue_recovers_from_content_that_drags_the_stream_off_its_setpoint
     it can answer it. The regulated variable is the tissue's mean error over its
     live cells -- what the shared integrator drives -- and it returns to within 5%
     of the tissue setpoint well inside the 200-pass budget (measured: inside the
-    band from pass 33, at 0.1% by pass 50) while the actuators' strength rises to
+    band from pass 23, coupled or not) while the actuators' strength rises to
     carry the deficit. With the coupling live the routing perceives the same
     direction; the tissue's recovery does not depend on it either way.
     """
@@ -125,19 +125,32 @@ def test_a_deficit_below_the_bottom_actuator_is_diluted_over_the_live_cells():
     assert sum(others) / len(others) == pytest.approx(-blind / len(others), rel=0.05)
 
 
+READOUT_DRIFT_FRACTION = 0.02
+
+
+def _readout_error(system) -> tuple[float, float]:
+    cell = next(cell for cell in system.tissue().status()["cells"] if cell["layer"] == READOUT)
+    return cell["error"], cell["setpoint"]
+
+
 def test_the_tissue_recovers_after_an_actuator_is_removed_mid_generation():
     """Undesigned perturbation: a cell stops firing while the tissue is carrying a load.
 
-    The removed cell leaves the consensus after one pass, the surviving actuators
-    take up its share of the effort, and the tissue error -- which spikes to about
-    13% of the setpoint at the removal -- is back inside the 5% band within the
-    budget (measured: by pass 50, at zero by 100).
+    The removed cell leaves the consensus after one pass and the surviving
+    actuators take up its share of the effort. The tissue error is the mean over
+    the cells still live, a quantity the removal itself redefines, so the outcome
+    that counts is measured at the top of the stack: the readout, which acts on
+    nothing and sits downstream of every actuator, ends where it was before the
+    damage (measured: within 0.3% of its setpoint, against the 2% allowed). The
+    tissue mean peaks near 15% of the setpoint at pass 14 and is back inside the
+    5% band by pass 37.
     """
     system = build_wired_system()
     system.run(SETTLE_PASSES)
     system.set_content("truthful", CONTENT_DEFICIT)
     assert _passes_to_recover(system) is not None
     strengths_before = dict(system.tissue()._strength)
+    readout_before, readout_setpoint = _readout_error(system)
     killed = ACTUATORS[2]
 
     system.kill_actuator(killed)
@@ -148,6 +161,8 @@ def test_the_tissue_recovers_after_an_actuator_is_removed_mid_generation():
     assert _passes_to_recover(system) is not None
     survivors = [layer for layer in ACTUATORS if layer != killed]
     assert all(system.tissue()._strength[layer] > strengths_before[layer] for layer in survivors)
+    readout_after, _ = _readout_error(system)
+    assert abs(readout_after - readout_before) <= READOUT_DRIFT_FRACTION * readout_setpoint
 
 
 def test_the_inert_loop_cannot_absorb_a_removed_actuator():
@@ -227,8 +242,10 @@ def test_the_market_re_forms_around_a_senescent_expert(seed):
     and at first wins more than before -- it costs it nothing. Its realised value
     is now zero, its head learns that, its bids fall, and the tokens flow to the
     next-most-competent experts: within 200 steps the loss sits at the floor a
-    collective born without that expert reaches, the dead cell holds under 1% of
-    the slots, and the survivors' routing still tracks their competence.
+    collective born without that expert reaches (measured 0.76-0.96x it on the
+    three seeds -- below it, since the survivors have had 200 more steps than
+    that collective), the dead cell holds under 1% of the slots (0.001-0.006),
+    and the survivors' routing still tracks their competence (r 0.61-0.82).
     """
     competence = shuffled(DEFAULT_COMPETENCE, seed)
     best = int(competence.argmax())
@@ -247,9 +264,9 @@ def test_the_market_re_forms_around_a_senescent_expert(seed):
 def test_frozen_heads_leave_the_senescent_expert_in_the_market():
     """The pairing: without the value objective only its draining wealth removes the dead cell.
 
-    Measured at 200 steps after damage over the three seeds above: loss 1.42-1.68x
-    the floor and a dead share of 0.10-0.18, against 1.06x and under 0.01 with the
-    heads learning.
+    Measured at 200 steps after damage over the three seeds above: loss 1.21-1.51x
+    the born-without floor and a dead share of 0.10-0.18, against 0.76-0.96x and
+    under 0.01 with the heads learning.
     """
     seed = SEEDS[0]
     competence = shuffled(DEFAULT_COMPETENCE, seed)
@@ -269,15 +286,20 @@ def test_frozen_heads_leave_the_senescent_expert_in_the_market():
 class _ForcedSubset(torch.nn.Module):
     """A gate that ignores every report and routes each token to a fixed subset of experts."""
 
-    def __init__(self, subset: list[int], top_k: int):
+    def __init__(self, subset: list[int], top_k: int, seed: int):
         super().__init__()
         self.subset = torch.tensor(subset)
         self.top_k = top_k
+        # Its own stream, so the forcing does not move the economy's draws.
+        self.generator = torch.Generator().manual_seed(seed)
 
     def forward(self, confidences: torch.Tensor, wealth: torch.Tensor) -> AuctionOutcome:
         batch, seq_len, num_experts = confidences.shape
         draws = torch.stack(
-            [torch.randperm(len(self.subset))[: self.top_k] for _ in range(batch * seq_len)]
+            [
+                torch.randperm(len(self.subset), generator=self.generator)[: self.top_k]
+                for _ in range(batch * seq_len)
+            ]
         ).view(batch, seq_len, self.top_k)
         selected = self.subset[draws]
         weights = torch.full_like(confidences[..., : self.top_k], 1.0 / self.top_k)
@@ -287,7 +309,7 @@ class _ForcedSubset(torch.nn.Module):
 
 def _force_routing(economy: SyntheticEconomy, subset: list[int], steps: int) -> None:
     gate = economy.mob.gate
-    economy.mob.gate = _ForcedSubset(subset, economy.config.top_k)
+    economy.mob.gate = _ForcedSubset(subset, economy.config.top_k, seed=steps)
     try:
         _window(economy, steps)
     finally:
@@ -330,8 +352,8 @@ def test_the_market_re_forms_after_routing_was_forced_onto_the_least_competent(s
     Every token goes to the three least competent experts, the loss quadruples, and
     the competent experts hold nothing. Released, the auction routes on the reports
     and wealth the experts still carry: within 150 steps routing tracks competence
-    again, the best expert holds its pre-episode share, and the loss is back at its
-    steady value.
+    again (r 0.76-0.77 on the three seeds), the best expert holds its pre-episode
+    share (1.1-1.3x it), and the loss is below its steady value (0.72-0.82x).
     """
     loss_ratio, tracking, regained, steady_share = _release_and_measure(seed, SHORT_FORCED_EPISODE)
 
@@ -344,10 +366,13 @@ def test_the_market_re_forms_after_routing_was_forced_onto_the_least_competent(s
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "A 150-step episode drives the incumbents to the wealth ceiling (730 of 750) and "
-        "the market does not re-form within 300 steps on any of three seeds: routing "
-        "tracks competence at r = 0.16 against 0.84 before, the best expert's share falls "
-        "to zero. Wealth overturns reports by up to the band's 50x; the band is #16's."
+        "A 150-step episode drives the incumbents to 656-731 of the 750 wealth ceiling and "
+        "the market does not re-form: at the 150-step horizon this test asserts, routing "
+        "anti-tracks competence (r -0.20 to -0.33 on the three seeds, 0.77 before), the "
+        "best expert holds 4-11% of its steady share and the loss is 3-4x steady; at 300 "
+        "steps r -0.32 to -0.35 and 1%. Two candidate causes: the ceiling, and the starved "
+        "experts' heads receiving no realised-value signal during the episode; the ceiling "
+        "measurement supports the first, nothing here excludes the second. The band is #16's."
     ),
 )
 def test_the_market_re_forms_after_a_long_forced_episode():
@@ -394,8 +419,9 @@ def test_the_economy_re_equilibrates_after_an_experts_wealth_is_zeroed(seed):
     reason=(
         "A ruined but competent expert does not come back: at the default exploration rate "
         "it holds about one token in 300, and what it earns there barely outpaces decay at "
-        "the floor -- wealth 25 to 33 credits over 200 steps (24 to 34 with exploration off, "
-        "29 to 79 with decay off), win share 0.002 throughout. Its return waits on #16."
+        "the floor -- 33 credits against a median of 113 after 200 steps, win share 0.002 "
+        "(in a probe on the same fixture: 34 with exploration off, 79 with decay off). Its "
+        "return waits on #16."
     ),
 )
 def test_a_ruined_competent_expert_returns_to_the_market():

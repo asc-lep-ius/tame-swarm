@@ -134,8 +134,9 @@ class WiredSystem:
     def kill_actuator(self, layer: int, goal: str | None = None) -> None:
         """Remove one cell's hook mid-generation: the cell neither senses nor injects."""
         homeostat = self.homeostats[goal or self.goals[0]]
-        cells = sorted(homeostat.hooks)
-        handle = homeostat._registered_hooks[cells.index(layer)]
+        # ``hooks`` and ``_registered_hooks`` are filled in the same loop, in the
+        # same order, so the dict's insertion order is the handle list's order.
+        handle = homeostat._registered_hooks[list(homeostat.hooks).index(layer)]
         handle.remove()
 
     def step(self) -> None:

@@ -22,8 +22,10 @@ against the inert loop on the same prompt -- the live loop halves the error and
 pays for it in strength -- with an absolute band no tighter than the tissue's own
 authority, not the 5% band the wired fixture meets.
 
-``gpu``-marked. Loads the model from the local HuggingFace cache once per session
-and skips, loudly, when it is not there; never downloads.
+``gpu``-marked. Loads the model from the local HuggingFace cache once per module
+and never downloads. Without the cache it skips on a developer's machine and
+**fails** under CI: #13's rule is that the job validating the science may not be
+advisory, and a skipped real-model suite is a green job that ran nothing.
 """
 
 import os
@@ -129,7 +131,14 @@ def _load_model():
             MODEL_ID, local_files_only=True, dtype=torch.bfloat16
         )
     except OSError as exc:  # pragma: no cover - depends on the runner's cache
-        pytest.skip(f"{MODEL_ID} is not in the local HuggingFace cache: {exc}")
+        message = f"{MODEL_ID} is not in the local HuggingFace cache: {exc}"
+        if os.environ.get("CI"):
+            pytest.fail(
+                message + " -- the GPU runner must mount the workstation's cache into the "
+                "job (docker volume ~/.cache/huggingface:/root/.cache/huggingface:ro) so the "
+                "real-model tests run rather than skip"
+            )
+        pytest.skip(message)
     return model, tokenizer
 
 

@@ -14,7 +14,15 @@ LoRA branch would look dead. Only reads through a config object count --
 ``config.<field>``, ``<anything>.config.<field>`` or one of the other holder
 names below -- and deliberately *not* ``args.<field>``: parsing a CLI flag into a
 namespace is not the same as the configuration steering anything, and counting it
-would let a flag that goes nowhere satisfy the check.
+would let a flag that goes nowhere satisfy the check. Only *loads* count: a field
+that is assigned and never read is exactly the defect.
+
+The match is by attribute name across the whole package, not per config class, so
+a name two configs share (``hidden_dim``; ``kp``, ``ki``, ``kd`` and
+``derivative_filter_alpha`` between ``SteeringConfig`` and ``PIDConfig``) is
+satisfied by a read of either. Resolving the holder's class statically would need
+type inference the check does not have; the collision is named here so nobody
+mistakes the per-class parametrisation for a per-class guarantee.
 """
 
 import ast
@@ -34,7 +42,7 @@ def attribute_reads(tree: ast.AST) -> set[str]:
     """Attribute names read off anything that plausibly holds a config."""
     names: set[str] = set()
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Attribute):
+        if not isinstance(node, ast.Attribute) or not isinstance(node.ctx, ast.Load):
             continue
 
         base = node.value

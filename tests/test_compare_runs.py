@@ -9,6 +9,7 @@ depend on anything slower than this.
 
 import math
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -19,7 +20,7 @@ from compare_runs import assert_groups_at_parity, compare  # noqa: E402
 
 from parity import ParityError  # noqa: E402
 
-from .test_parity import BASE  # noqa: E402
+from .arm_fingerprints import BASE  # noqa: E402
 
 
 def _group(router: str, values: dict[str, list[float]]) -> dict:
@@ -88,8 +89,6 @@ def test_a_metric_with_only_one_seed_in_either_group_is_omitted():
 
 
 def _with_fingerprints(group: dict, **changes) -> dict:
-    from dataclasses import replace
-
     prints = {
         seed: replace(BASE, seed=int(seed), **changes).as_dict() for seed in group["per_seed"]
     }
@@ -114,6 +113,19 @@ def test_groups_that_differ_in_a_confound_are_refused():
 
     with pytest.raises(ParityError, match="adapter_rank"):
         assert_groups_at_parity(group_a, group_b)
+
+
+def test_groups_that_share_no_seed_are_compared_unchecked(caplog):
+    group_a = _with_fingerprints(_group("mob", {"eval/loss": [2.79, 2.80]}))
+    group_b = _with_fingerprints(_group("mob", {"eval/loss": [2.78, 2.79]}))
+    group_b["fingerprints"] = {
+        seed + 10: prints for seed, prints in group_b["fingerprints"].items()
+    }
+
+    with caplog.at_level("WARNING", logger="compare_runs"):
+        assert assert_groups_at_parity(group_a, group_b) is False
+
+    assert any("share no seed" in record.message for record in caplog.records)
 
 
 def test_a_summary_without_fingerprints_is_compared_unchecked(caplog):
