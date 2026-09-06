@@ -488,8 +488,8 @@ class TAMETrainer:
         )
 
         # A tensor still on the meta device means accelerate offloaded part of the
-        # model to disk because it did not fit. Refused here, before conversion
-        # would crash on a meta FFN with a message about copying tensors.
+        # model to CPU or disk because it did not fit GPU memory. Refused here,
+        # before conversion would crash on a meta FFN with a copy error.
         self._refuse_meta_tensors()
 
         # Apply gradient checkpointing

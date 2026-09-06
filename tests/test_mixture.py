@@ -550,3 +550,15 @@ def test_the_ledgers_stay_float32_under_a_half_precision_model():
     assert mob.expert_wealth.dtype == torch.float32
     moved = (mob.expert_wealth - 83.5).abs()
     assert (moved > 0).any() and (moved < 0.1).all(), moved
+
+
+def test_every_ledger_is_registered_from_the_same_list_that_keeps_it_float32():
+    """One list keeps the ledgers float32 through ``.to(dtype)``; the other registers them.
+
+    A ledger added to one list and not the other would be registered and then
+    silently demoted to bf16 -- the defect the ``LEDGER_BUFFERS`` comment records
+    as measured -- or kept float32 and never created.
+    """
+    from mob.core import LEDGER_BUFFERS, ledger_initial_values
+
+    assert set(LEDGER_BUFFERS) == set(ledger_initial_values(MoBConfig()))
