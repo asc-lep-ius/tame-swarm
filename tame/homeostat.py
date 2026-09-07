@@ -181,7 +181,8 @@ class AdaptiveHomeostat:
         lift is exactly zero -- so it senses, records and reports but does not move
         the integrator; the cells above it are no longer pushed past their own
         setpoints to zero a mean that includes an error nobody can correct. A cell
-        outside the calibration votes as one, as it did before.
+        outside the calibration votes as one, as it did before -- unreachable in the
+        served flow, which adds every vector, calibrates and only then attaches.
         """
         if self.calibration is None or layer not in self.calibration.layers:
             return 1.0
@@ -382,7 +383,11 @@ class AdaptiveHomeostat:
 
     @property
     def error(self) -> float:
-        """The consensus error over the live cells: what the shared integrator drives to zero."""
+        """The consensus error over the live cells: what the shared integrator drives to zero.
+
+        Zero while no live cell can be moved, as well as at setpoint; ``alive_cells``
+        and :attr:`sensed_error` in :meth:`status` tell the two apart.
+        """
         live = [cell for cell in self.live_cells() if cell in self._error]
         consensus = self._consensus_of(live, self._error.__getitem__)
         return 0.0 if consensus is None else consensus
@@ -394,7 +399,11 @@ class AdaptiveHomeostat:
         return float(np.mean([self._error[cell] for cell in live])) if live else 0.0
 
     def _record(self) -> None:
-        """One history entry per pass, updated as the pass's cells fire."""
+        """One history entry per pass, updated as the pass's cells fire.
+
+        The entry is the consensus reading; while no live cell can be moved it falls
+        back to the plain mean, so a history spanning such a stretch mixes the two.
+        """
         live = [cell for cell in self.live_cells() if cell in self._pv]
         consensus = self._consensus_of(live, self._pv.__getitem__)
         alignment = (

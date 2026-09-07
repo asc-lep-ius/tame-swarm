@@ -109,6 +109,8 @@ def _uniform_consensus(system) -> None:
     tissue = system.tissue()
     assert tissue.calibration is not None
     tissue.calibration = replace(tissue.calibration, weighting="uniform")
+    # The gains derive from the calibration's gain, so the controller is rebuilt the
+    # way set_gains rebuilds it; the plain mean's gains are the ones #4 recorded.
     tissue.controller.config = tissue._pid_config()
 
 
@@ -125,7 +127,10 @@ def test_content_below_the_bottom_actuator_leaves_the_regulable_cells_at_their_o
     its error stands (+167 sigma, a quarter of the tissue setpoint) and is reported,
     while the shared integrator regulates the cells that can be moved: each of the
     four settles within 5% of its *own* setpoint (measured: +2.7%, 0.0%, -0.5%,
-    -0.6%), not only the tissue mean. The test below is the pairing this replaced.
+    -0.6%), not only the tissue mean. The consensus itself is barely disturbed by
+    construction -- the blind cell no longer votes, so it is in band from the first
+    pass -- and the per-cell assertion is the property. The test below is the
+    pairing this replaced.
     """
     system = build_wired_system()
     system.run(SETTLE_PASSES)

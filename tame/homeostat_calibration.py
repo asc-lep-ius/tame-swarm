@@ -113,7 +113,8 @@ class AlignmentCalibration:
         the process gain the shared gains derive from. Under ``gain`` the integrator's
         fixed point, ``sum(g_i e_i) = 0``, is the common strength that minimises the
         sum of squared cell errors: one shared actuator setting, least-squares best
-        for the cells it can move.
+        for the cells it can move -- given every gain non-negative, as every measured
+        calibration's is; a negative lift is excluded on :meth:`weight`'s own argument.
         """
         weights = [self.weight(layer) for layer in self.sensors]
         gains = [self.layers[layer].gain_z for layer in self.sensors]

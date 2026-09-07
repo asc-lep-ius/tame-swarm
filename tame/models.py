@@ -80,6 +80,10 @@ class PIDStatus(BaseModel):
     plain mean error over the same cells, which still counts a cell nothing can
     correct; ``setpoint`` is the nominal one over every calibrated cell, which
     differs from the live consensus setpoint only while a controllable cell is dead.
+    ``error`` is also zero while no live cell can be moved -- ``alive_cells`` and
+    ``sensed_error`` tell that from a tissue at setpoint -- and ``p_term``,
+    ``i_term`` and ``d_term`` are plain means over the live cells, so ``p_term``
+    tracks ``kp * sensed_error`` rather than ``kp * error``.
     """
 
     goal: str
