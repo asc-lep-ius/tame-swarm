@@ -38,9 +38,16 @@ from synthetic_economy import (  # noqa: E402
     shuffled,
 )
 
+from homeostat_calibration import ConsensusWeighting  # noqa: E402
 from mob.auction import AuctionOutcome  # noqa: E402
 
-from .wired_system import ACTUATORS, BELOW_ACTUATORS, READOUT, build_wired_system  # noqa: E402
+from .wired_system import (  # noqa: E402
+    ACTUATORS,
+    BELOW_ACTUATORS,
+    READOUT,
+    WiredSystem,
+    build_wired_system,
+)
 
 # --- The steering tissue ---------------------------------------------------------
 
@@ -104,11 +111,11 @@ def test_the_inert_loop_leaves_the_deficit_in_place():
     assert system.strength() == pytest.approx(system.tissue().config.base_strength)
 
 
-def _uniform_consensus(system) -> None:
-    """The rule before #21: every live cell votes as one, the blind cell included."""
+def _consensus_weighting(system, weighting: ConsensusWeighting) -> None:
+    """Re-weight the consensus: ``uniform`` is the rule before #21, ``calibrated`` before #22."""
     tissue = system.tissue()
     assert tissue.calibration is not None
-    tissue.calibration = replace(tissue.calibration, weighting="uniform")
+    tissue.calibration = replace(tissue.calibration, weighting=weighting)
     # The gains derive from the calibration's gain, so the controller is rebuilt the
     # way set_gains rebuilds it; the plain mean's gains are the ones #4 recorded.
     tissue.controller.config = tissue._pid_config()
@@ -155,7 +162,7 @@ def test_the_uniform_consensus_dilutes_the_blind_deficit_over_the_live_cells():
     cell is at its own setpoint (measured: -12.4%, -6.9%, -5.7%, -5.1%).
     """
     system = build_wired_system()
-    _uniform_consensus(system)
+    _consensus_weighting(system, "uniform")
     system.run(SETTLE_PASSES)
     system.set_content("truthful", DEAD_CELL_DEFICIT, layer=BELOW_ACTUATORS)
 
@@ -216,6 +223,102 @@ def test_the_inert_loop_cannot_absorb_a_removed_actuator():
     system.kill_actuator(ACTUATORS[2])
     assert _passes_to_recover(system) is None
     assert abs(system.error()) > error_before
+
+
+SURVIVORS_OF_THE_BOTTOM = (*ACTUATORS[2:], READOUT)
+
+
+def _remove_bottom_actuator(
+    weighting: ConsensusWeighting = "gain",
+) -> tuple[WiredSystem, int | None, dict[int, float], dict[int, dict]]:
+    """Settle under load, then remove the bottom actuator.
+
+    The system, the pass at which its consensus was back in band (or None), the
+    actuators' strengths before the damage, and the per-cell status after it.
+    """
+    system = build_wired_system()
+    _consensus_weighting(system, weighting)
+    system.run(SETTLE_PASSES)
+    system.set_content("truthful", CONTENT_DEFICIT)
+    assert _passes_to_recover(system) is not None
+    strengths_before = dict(system.tissue()._strength)
+    system.kill_actuator(ACTUATORS[0])
+    recovered_at = _passes_to_recover(system)
+    cells = {cell["layer"]: cell for cell in system.tissue().status()["cells"]}
+    return system, recovered_at, strengths_before, cells
+
+
+def _survivors_consensus(cells: dict[int, dict]) -> tuple[float, float]:
+    """The cells above the new bottom cell: their gain-weighted mean error and squared-error sum."""
+    survivors = [cells[layer] for layer in SURVIVORS_OF_THE_BOTTOM]
+    weights = sum(cell["weight"] for cell in survivors)
+    weighted = sum(cell["weight"] * cell["error"] for cell in survivors) / weights
+    return weighted, sum(cell["error"] ** 2 for cell in survivors)
+
+
+def test_removing_the_bottom_actuator_blinds_the_cell_above_it_and_the_survivors_hold_consensus():
+    """Undesigned damage that moves the bottom of the tissue (#22).
+
+    With actuator 1 gone nothing live injects below cell 2: it reads content alone,
+    its error is its whole setpoint plus the deficit (+615 sigma, reported), and no
+    action can change it. Its weight follows the live tissue below it, zero, so the
+    shared integrator regulates the three cells it can still move: their
+    gain-weighted consensus is back inside the 5% band at pass 24 and ends at 0.01%
+    of the setpoint, every surviving actuator raises its strength, and the tissue
+    setpoint is theirs (688 sigma against the calibrated 641, with ``error`` still
+    ``setpoint - process_variable``). The survivors do not each return to their
+    own setpoints (measured +19.8%, -2.7%, -9.6%): the removal changed every
+    survivor's real gain, unevenly, so one common strength can no longer reach all
+    three, and what remains is the least-squares residual of the damaged plant.
+    The pairing below shows the part of that residual the rule removes.
+    """
+    system, recovered_at, strengths_before, cells = _remove_bottom_actuator()
+    tissue = system.tissue()
+    new_bottom = cells[ACTUATORS[1]]
+
+    assert cells[ACTUATORS[0]]["alive"] is False
+    assert new_bottom["alive"] and new_bottom["weight"] == 0.0
+    assert new_bottom["error"] > new_bottom["setpoint"], "its whole setpoint plus the deficit"
+    assert recovered_at is not None and recovered_at <= RECOVERY_PASSES, recovered_at
+    weighted, _ = _survivors_consensus(cells)
+    assert abs(weighted) <= RECOVERY_FRACTION * tissue.setpoint
+    assert all(tissue._strength[layer] > strengths_before[layer] for layer in ACTUATORS[1:])
+
+    status = tissue.status()
+    survivors = [cells[layer] for layer in SURVIVORS_OF_THE_BOTTOM]
+    survivors_setpoint = sum(c["weight"] * c["setpoint"] for c in survivors) / sum(
+        c["weight"] for c in survivors
+    )
+    assert status["setpoint"] == pytest.approx(survivors_setpoint)
+    assert status["setpoint"] != pytest.approx(tissue.nominal_setpoint)
+    assert status["setpoint"] - status["process_variable"] == pytest.approx(status["error"])
+
+
+def test_the_calibrated_weighting_dilutes_the_new_bottom_cells_error_over_the_survivors():
+    """The pairing: cell 2 keeps its calibrated weight and votes on an error nobody can fix.
+
+    The shared integrator zeroes a consensus that includes it, so the survivors'
+    own consensus is pushed past setpoint by 2's weighted error over their weights
+    -- 19% of the tissue setpoint, the #21 dilution reappearing one cell up -- and
+    the tissue reports itself in band (from pass 39, against 24 under the live
+    rule) while the cells it can move are not. Their squared-error sum is 3.4x the
+    live rule's: the fixed point is the least-squares common strength for a set
+    that includes a cell with no gain at all.
+    """
+    _, live_recovered_at, _, live_cells = _remove_bottom_actuator("gain")
+    system, recovered_at, _, cells = _remove_bottom_actuator("calibrated")
+    new_bottom = cells[ACTUATORS[1]]
+    survivor_weights = sum(cells[layer]["weight"] for layer in SURVIVORS_OF_THE_BOTTOM)
+
+    assert new_bottom["weight"] > 0.0
+    assert recovered_at is not None
+    weighted, squared = _survivors_consensus(cells)
+    dilution = -new_bottom["weight"] * new_bottom["error"] / survivor_weights
+    assert weighted == pytest.approx(dilution, rel=0.02)
+    assert abs(weighted) > RECOVERY_FRACTION * system.setpoint()
+    _, live_squared = _survivors_consensus(live_cells)
+    assert squared > 2 * live_squared, (squared, live_squared)
+    assert live_recovered_at is not None and live_recovered_at < recovered_at
 
 
 # --- The expert economy ----------------------------------------------------------

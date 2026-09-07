@@ -26,8 +26,11 @@ controller with subordinates:
   fighting -- the bottom cell included, whose push is the earliest answer to a
   deficit that on a residual stream reaches every cell above it.
 - **Damage.** Liveness is a property of firing, not of wiring: a cell that misses
-  a pass drops out of the consensus and rejoins when it fires again. There is no
-  fallback path, because the local rule *is* the rule.
+  a pass drops out of the consensus and rejoins when it fires again. Controllability
+  is a property of the live tissue below a cell, not of the tissue that was
+  calibrated: a cell whose last live actuator below it dies is the new bottom
+  cell, and it weighs nothing until one returns (#22). There is no fallback path,
+  because the local rule *is* the rule.
 
 Gains are derived from the measured tissue gain by SIMC (``pid_controller``)
 unless the config pins them. Without a calibration the loop keeps the legacy
@@ -161,31 +164,53 @@ class AdaptiveHomeostat:
         return self.config.target_alignment
 
     @property
-    def setpoint(self) -> float:
-        """The nominal tissue setpoint, or the legacy cosine target.
+    def nominal_setpoint(self) -> float:
+        """The tissue setpoint with every cell live, or the legacy cosine target.
 
         ``gain_z * reference_strength``: the consensus of the cell setpoints over
-        every calibrated cell, under the same weights as the consensus the
-        integrator regulates. While a controllable cell is dead the integrator's
-        own setpoint is the consensus over the *live* cells, which differs from this
-        nominal one by the dead cell's share (#22).
+        every calibrated cell, under the weights the calibration gives them.
         """
         if self.calibration is None:
             return self.config.target_alignment
         return self.calibration.gain_z * self.calibration.reference_strength
 
+    @property
+    def setpoint(self) -> float:
+        """What the tissue aims at now: the consensus of the cell setpoints over the live cells.
+
+        Taken under the same weights as the consensus the integrator regulates, so
+        :attr:`error` is this less the consensus reading. It is the nominal setpoint
+        whenever every cell is live, and stands in for it before the first pass and
+        while no live cell can be moved; after damage it follows the cells that
+        remain controllable (#22), because the calibrated number describes a tissue
+        that no longer exists and no cell consults it.
+        """
+        consensus = self._consensus_of(self._sensing_cells(), self.cell_setpoint)
+        return self.nominal_setpoint if consensus is None else consensus
+
     def cell_weight(self, layer: int) -> float:
-        """How much of the shared memory this cell writes: its controllability (#21).
+        """How much of the shared memory this cell writes: its controllability (#21, #22).
 
         The bottom actuator reads content no actuator can answer -- its calibrated
         lift is exactly zero -- so it senses, records and reports but does not move
         the integrator; the cells above it are no longer pushed past their own
-        setpoints to zero a mean that includes an error nobody can correct. A cell
-        outside the calibration votes as one, as it did before -- unreachable in the
-        served flow, which adds every vector, calibrates and only then attaches.
+        setpoints to zero a mean that includes an error nobody can correct. That
+        lift was calibrated with every actuator injecting, so it stands only while
+        some actuator below the cell still fires: once the last one dies the cell is
+        the new bottom cell, and it weighs nothing until one returns (#22). Before
+        the tissue has fired at all there is no liveness to consult and the
+        calibrated weight stands. The pairing weightings ignore liveness by
+        definition: ``calibrated`` keeps the gain the calibration measured,
+        ``uniform`` counts every live cell as one. A cell outside the calibration
+        votes as one, as it did before -- unreachable in the served flow, which adds
+        every vector, calibrates and only then attaches.
         """
         if self.calibration is None or layer not in self.calibration.layers:
             return 1.0
+        fired = bool(self._seen)
+        blind = fired and not any(actuator < layer for actuator in self._live_actuators())
+        if blind and self.calibration.weighting == "gain":
+            return 0.0
         return self.calibration.weight(layer)
 
     def _consensus_of(self, cells: Sequence[int], value: Callable[[int], float]) -> float | None:
@@ -322,12 +347,14 @@ class AdaptiveHomeostat:
         # derivative acts on the process variable precisely so that a setpoint
         # change cannot kick it, and a setpoint folded into the process variable
         # would kick it on every re-install of the goal (found by #6's integration test).
-        # Before the first consensus exists every cell is seeded with the *tissue*
-        # setpoint, not its own: the derivative remembers the last process variable,
-        # and a cell seeded with its own setpoint would read the switch to the shared
-        # one on the next pass as a jump.
+        # Before the first consensus exists every cell is seeded with the *nominal*
+        # setpoint, not its own and not the live one, which mid-pass is a consensus
+        # over the cells that have fired so far: the derivative remembers the last
+        # process variable, and a cell seeded with any other setpoint would read the
+        # switch to the shared one on the next pass as a jump.
         if self._consensus is None:
-            shared, shared_setpoint, shared_pv = 0.0, self.setpoint, self.setpoint
+            seed = self.nominal_setpoint
+            shared, shared_setpoint, shared_pv = 0.0, seed, seed
         else:
             shared, shared_setpoint, shared_pv = self._consensus
         tissue_strength, state = self.controller.step(
@@ -356,7 +383,7 @@ class AdaptiveHomeostat:
         is nothing the integrator can act on and the memory holds.
         """
         if self._last_layer is None or layer <= self._last_layer:
-            live = [cell for cell in self.live_cells() if cell in self._error]
+            live = self._sensing_cells()
             mean_pv = self._consensus_of(live, self._pv.__getitem__)
             mean_setpoint = self._consensus_of(live, self.cell_setpoint)
             if mean_pv is not None and mean_setpoint is not None:
@@ -374,6 +401,10 @@ class AdaptiveHomeostat:
     def _live_actuators(self) -> list[int]:
         return [cell for cell in self.live_cells() if self._injects(cell)]
 
+    def _sensing_cells(self) -> list[int]:
+        """The live cells that have read: the ones a consensus is taken over."""
+        return [cell for cell in self.live_cells() if cell in self._error]
+
     @property
     def current_strength(self) -> float:
         actuators = [cell for cell in self._live_actuators() if cell in self._strength]
@@ -388,14 +419,13 @@ class AdaptiveHomeostat:
         Zero while no live cell can be moved, as well as at setpoint; ``alive_cells``
         and :attr:`sensed_error` in :meth:`status` tell the two apart.
         """
-        live = [cell for cell in self.live_cells() if cell in self._error]
-        consensus = self._consensus_of(live, self._error.__getitem__)
+        consensus = self._consensus_of(self._sensing_cells(), self._error.__getitem__)
         return 0.0 if consensus is None else consensus
 
     @property
     def sensed_error(self) -> float:
         """The plain mean error over the live cells, controllable or not: what the tissue reads."""
-        live = [cell for cell in self.live_cells() if cell in self._error]
+        live = self._sensing_cells()
         return float(np.mean([self._error[cell] for cell in live])) if live else 0.0
 
     def _record(self) -> None:
