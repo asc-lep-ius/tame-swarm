@@ -37,9 +37,12 @@ MIN_CALIBRATION_PASSAGES = 4
 # How a cell's reading enters the tissue consensus (#21). ``gain``: by its calibrated
 # gain per unit of strength, so a cell the tissue's effort cannot move -- the bottom
 # actuator, whose lift is exactly zero -- senses and reports but does not write to
-# the shared memory. ``uniform``: every live cell equally, controllable or not, the
-# rule before #21, kept so the dilution it causes can be reproduced as a pairing.
-ConsensusWeighting = Literal["gain", "uniform"]
+# the shared memory; at runtime the tissue also zeroes it once nothing live injects
+# below the cell (#22). ``calibrated``: the same gain whatever still fires below,
+# the rule between #21 and #22. ``uniform``: every live cell equally, controllable
+# or not, the rule before #21. The last two are kept so the dilution each causes
+# can be reproduced as a pairing.
+ConsensusWeighting = Literal["gain", "calibrated", "uniform"]
 
 
 @dataclass(frozen=True)

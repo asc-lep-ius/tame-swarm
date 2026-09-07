@@ -125,6 +125,13 @@ class MeasuredTissue:
     the mean strength of the actuators below the cell, which is that calibration's
     plant. Readings are in sigma directly (resting mean 0, sigma 1), the injection
     is the passthrough #4 found it to be, and the token noise is optional.
+
+    A removed actuator (``dead``) neither senses nor injects, and the cells above
+    read the mean strength of the actuators below them that are still live, their
+    lift per unit of it unchanged: the static-gain idealisation the loop's fixed
+    gains already make (the real plant's survivors lose some gain with every
+    actuator below them, which the wired fixture carries). A cell with no live
+    actuator below it reads content alone.
     """
 
     def __init__(self, homeostat: AdaptiveHomeostat, content: float = 0.0):
@@ -132,18 +139,27 @@ class MeasuredTissue:
         self.content: dict[int, float] = dict.fromkeys(QWEN_CELLS, content)
         self.strengths: dict[int, float] = dict.fromkeys(QWEN_ACTUATORS, 0.0)
         self.noise: torch.Generator | None = None
+        self.dead: set[int] = set()
 
     def set_content(self, content: float) -> None:
         self.content = dict.fromkeys(self.content, content)
 
     def reading(self, layer: int) -> float:
-        below = [self.strengths[actuator] for actuator in QWEN_ACTUATORS if actuator < layer]
+        below = [
+            self.strengths[actuator]
+            for actuator in QWEN_ACTUATORS
+            if actuator < layer and actuator not in self.dead
+        ]
         lift = QWEN_CELL_LIFTS[layer] * (sum(below) / len(below) if below else 0.0)
         noise = float(torch.randn(1, generator=self.noise)) if self.noise is not None else 0.0
         return self.content[layer] + lift + noise
 
     def step(self) -> float:
         for layer in QWEN_CELLS:
+            if layer in self.dead:
+                if layer in QWEN_ACTUATORS:
+                    self.strengths[layer] = 0.0
+                continue
             hidden = (self.reading(layer) * DIRECTION).view(1, 1, -1)
             strength = self.homeostat.sense(layer, hidden, DIRECTION)
             if layer in QWEN_ACTUATORS:
@@ -412,13 +428,15 @@ def _blind_deficit(weighting: ConsensusWeighting) -> tuple[AdaptiveHomeostat, di
     return homeostat, {cell["layer"]: cell for cell in homeostat.status()["cells"]}
 
 
-def _blind_push_bound(layer: int, kp: float, blind_error: float) -> float:
+def _blind_push_bound(
+    layer: int, kp: float, blind_error: float, dead: tuple[int, ...] = ()
+) -> float:
     """What the blind cell's own proportional push can move ``layer`` by.
 
     The push, ``kp`` times the blind error, is one actuator's; ``layer`` reads the
-    mean strength of the actuators below it through its own lift.
+    mean strength of the live actuators below it through its own lift.
     """
-    below = [actuator for actuator in QWEN_ACTUATORS if actuator < layer]
+    below = [actuator for actuator in QWEN_ACTUATORS if actuator < layer and actuator not in dead]
     return QWEN_CELL_LIFTS[layer] * kp * blind_error / len(below)
 
 
@@ -466,6 +484,87 @@ def test_the_uniform_consensus_dilutes_the_blind_deficit_over_the_survivors():
     mean_survivor_error = sum(c["error"] for c in survivors) / len(survivors)
     assert mean_survivor_error == pytest.approx(-blind["error"] / len(survivors), rel=0.02)
     assert all(cell["error"] < 0 for cell in survivors)
+
+
+# --- The new bottom cell: blind at runtime, and out of the shared memory (#22) ---------
+
+
+def _bottom_actuator_removed(
+    weighting: ConsensusWeighting,
+) -> tuple[AdaptiveHomeostat, dict[int, dict]]:
+    """Cell 13 stops firing on resting content, settled; the tissue and its status by layer."""
+    homeostat = AdaptiveHomeostat(qwen_config(), qwen_calibration(weighting=weighting))
+    tissue = MeasuredTissue(homeostat)
+    tissue.run(100)
+    tissue.dead.add(QWEN_ACTUATORS[0])
+    tissue.run(300)
+    return homeostat, {cell["layer"]: cell for cell in homeostat.status()["cells"]}
+
+
+def _survivors_consensus(cells: dict[int, dict], layers: tuple[int, ...]) -> float:
+    """The gain-weighted mean error over ``layers``: what their shared integrator settles."""
+    survivors = [cells[layer] for layer in layers]
+    weights = sum(cell["weight"] for cell in survivors)
+    return sum(cell["weight"] * cell["error"] for cell in survivors) / weights
+
+
+def test_removing_the_bottom_actuator_blinds_the_cell_above_it_and_the_survivors_hold_setpoint():
+    """Cell 13 stops firing; cell 16, whose whole lift it supplied, is the new bottom cell.
+
+    No content deficit is needed: with nothing live injecting below it, 16 reads
+    its resting state against a setpoint of 0.88 sigma, an error no action can
+    change. Its weight follows the live tissue below it, zero, so it is reported
+    and not regulated, and the consensus over the six survivors settles at zero --
+    with the tissue setpoint now theirs, 2.09 sigma against the calibrated 2.01,
+    and ``error`` still ``setpoint - process_variable``. What remains is 16's own
+    proportional push, 1.4 units on an error it can never relieve, which cell 17
+    now reads alone (-0.48 sigma) and the cells above read diluted over the live
+    actuators below them, each inside the bound that push implies.
+    """
+    homeostat, cells = _bottom_actuator_removed("gain")
+    kp = homeostat.gains()[0]
+    removed, new_bottom = cells[QWEN_ACTUATORS[0]], cells[QWEN_ACTUATORS[1]]
+    survivors = QWEN_CELLS[2:]
+
+    assert removed["alive"] is False
+    assert new_bottom["alive"] and new_bottom["weight"] == 0.0
+    assert new_bottom["error"] == pytest.approx(new_bottom["setpoint"], abs=1e-3)
+    assert abs(homeostat.error) < 1e-3
+    assert homeostat.sensed_error > 0.0
+    assert abs(_survivors_consensus(cells, survivors)) < 1e-3
+    for layer in survivors:
+        bound = _blind_push_bound(layer, kp, new_bottom["error"], dead=(QWEN_ACTUATORS[0],))
+        assert abs(cells[layer]["error"]) < bound, cells[layer]
+    assert new_bottom["output"] > cells[QWEN_ACTUATORS[2]]["output"] + 1.0
+
+    status = homeostat.status()
+    survivor_gains = [QWEN_CELL_LIFTS[layer] for layer in survivors]
+    survivors_setpoint = sum(g * g for g in survivor_gains) / sum(survivor_gains)
+    assert status["setpoint"] == pytest.approx(survivors_setpoint * QWEN_REFERENCE_STRENGTH)
+    assert status["setpoint"] > homeostat.nominal_setpoint
+    assert status["setpoint"] - status["process_variable"] == pytest.approx(status["error"])
+
+
+def test_the_calibrated_weighting_dilutes_the_new_bottom_cells_error_over_the_survivors():
+    """The pairing: cell 16 keeps its calibrated 0.22 and votes on an error nobody can fix.
+
+    The consensus is zeroed by pushing the six survivors' own consensus past
+    setpoint by 16's weighted error over their weights, ``0.22 x 0.88 / 3.10 =
+    0.06`` sigma: the #21 dilution reappearing one cell up, smaller here than the
+    spread 16's push causes, and systematic where that is not. The tissue setpoint
+    stays the calibrated one, so the status reads in band while the cells it can
+    move are not.
+    """
+    homeostat, cells = _bottom_actuator_removed("calibrated")
+    new_bottom = cells[QWEN_ACTUATORS[1]]
+    survivors = QWEN_CELLS[2:]
+    survivor_weights = sum(cells[layer]["weight"] for layer in survivors)
+
+    assert new_bottom["weight"] == pytest.approx(QWEN_CELL_LIFTS[QWEN_ACTUATORS[1]])
+    assert abs(homeostat.error) < 1e-3
+    dilution = -new_bottom["weight"] * new_bottom["error"] / survivor_weights
+    assert _survivors_consensus(cells, survivors) == pytest.approx(dilution, rel=0.02)
+    assert homeostat.setpoint == pytest.approx(homeostat.nominal_setpoint)
 
 
 # --- Multi-goal independence, on the wired system --------------------------------------

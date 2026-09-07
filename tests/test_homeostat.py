@@ -251,6 +251,89 @@ def test_a_removed_cell_drops_out_of_the_consensus_and_rejoins():
     assert all(cell["alive"] for cell in homeostat.status()["cells"])
 
 
+def test_the_cell_above_a_removed_bottom_actuator_goes_blind_and_stops_voting():
+    """Undesigned damage that moves the bottom of the tissue (#22).
+
+    Cell 2's lift came entirely from actuator 1, so once 1 stops firing nothing
+    live injects below 2: it reads content alone, its error is its whole setpoint
+    plus the deficit, and no action can change it. Its weight follows the live
+    tissue below it, zero, so the consensus is cell 3 alone, the tissue setpoint
+    is cell 3's, and the one actuator left carries 3 to it. Paired with the
+    calibrated weighting, which keeps 2's gain of one: the integrator zeroes
+    ``1 * 2.5 + 2 * e_3``, pushing cell 3 past its setpoint by 1.25 -- the blind
+    error times its weight over the survivor's. When actuator 1 fires again cell 2
+    is controllable again and weighs what it was calibrated to.
+    """
+    homeostat, tissue = make(content=-0.5, max_strength=8.0)
+    tissue.run(40)
+    nominal = homeostat.setpoint
+
+    tissue.dead.add(1)
+    tissue.run(120)
+    status = homeostat.status()
+    cells = {cell["layer"]: cell for cell in status["cells"]}
+
+    assert cells[1]["alive"] is False
+    assert cells[2]["alive"] and cells[2]["weight"] == 0.0
+    assert cells[2]["error"] == pytest.approx(homeostat.cell_setpoint(2) + 0.5)
+    assert cells[3]["weight"] == 2.0
+    assert abs(cells[3]["error"]) < 5e-2
+    assert status["setpoint"] == pytest.approx(homeostat.cell_setpoint(3))
+    assert status["setpoint"] - status["process_variable"] == pytest.approx(status["error"])
+    assert homeostat.nominal_setpoint == pytest.approx(nominal)
+
+    static = AdaptiveHomeostat(
+        tissue_config(max_strength=8.0),
+        calibration=replace(calibration(), weighting="calibrated"),
+    )
+    twin = Tissue(static, tissue.direction, -0.5)
+    twin.run(40)
+    twin.dead.add(1)
+    twin.run(120)
+    twin_cells = {cell["layer"]: cell for cell in static.status()["cells"]}
+    assert twin_cells[2]["weight"] == 1.0
+    assert twin_cells[3]["error"] == pytest.approx(-1.25, abs=5e-2)
+    assert abs(static.error) < 5e-2
+
+    tissue.dead.clear()
+    tissue.run(3)
+    assert homeostat.cell_weight(2) == 1.0
+    assert homeostat.setpoint == pytest.approx(nominal)
+
+
+def test_a_tissue_with_no_live_actuator_holds_its_memory_and_reports_what_it_still_senses():
+    """Every actuator dead (#22): nothing weighs, the integrator holds, the readout still reports.
+
+    With both actuators gone the readout is the only live cell and nothing live
+    injects below it, so no live cell can be moved: the consensus error is zero by
+    its own rule, ``sensed_error`` carries the readout's deficit, the tissue
+    setpoint is the readout's own -- what the cell that still senses remembers,
+    not the calibration's number -- and the shared memory holds where it was
+    until an actuator returns.
+    """
+    homeostat, tissue = make(content=-0.5, max_strength=8.0)
+    tissue.run(40)
+
+    tissue.dead.update(ACTUATORS)
+    tissue.run(5)
+    memory = homeostat.status()["i_term"]
+    tissue.run(40)
+    status = homeostat.status()
+
+    assert status["alive_cells"] == 1
+    assert status["error"] == 0.0
+    assert status["sensed_error"] == pytest.approx(homeostat.cell_setpoint(READOUT) + 0.5)
+    assert status["setpoint"] == pytest.approx(homeostat.cell_setpoint(READOUT))
+    assert status["setpoint"] != pytest.approx(homeostat.nominal_setpoint)
+    assert status["setpoint"] - status["process_variable"] == pytest.approx(status["sensed_error"])
+    assert status["i_term"] == pytest.approx(memory)
+
+    tissue.dead.clear()
+    tissue.run(3)
+    assert homeostat.status()["alive_cells"] == 3
+    assert homeostat.setpoint == pytest.approx(homeostat.nominal_setpoint)
+
+
 def test_gains_are_derived_from_the_calibration_unless_pinned():
     derived = AdaptiveHomeostat(tissue_config(), calibration=calibration())
     kp, ki = derived.gains()
