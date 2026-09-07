@@ -157,7 +157,8 @@ class MeasuredTissue:
     def step(self) -> float:
         for layer in QWEN_CELLS:
             if layer in self.dead:
-                self.strengths[layer] = 0.0
+                if layer in QWEN_ACTUATORS:
+                    self.strengths[layer] = 0.0
                 continue
             hidden = (self.reading(layer) * DIRECTION).view(1, 1, -1)
             strength = self.homeostat.sense(layer, hidden, DIRECTION)

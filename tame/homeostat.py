@@ -207,17 +207,20 @@ class AdaptiveHomeostat:
         some actuator below the cell still fires: once the last one dies the cell is
         the new bottom cell, and it weighs nothing until one returns (#22). Before
         the tissue has fired at all there is no liveness to consult and the
-        calibrated weight stands. The pairing weightings ignore liveness by
-        definition: ``calibrated`` keeps the gain the calibration measured,
-        ``uniform`` counts every live cell as one. A cell outside the calibration
-        votes as one, as it did before -- unreachable in the served flow, which adds
-        every vector, calibrates and only then attaches.
+        calibrated weight stands. The gate has no hysteresis: an actuator that fires
+        intermittently flips the cell above it between its calibrated weight and
+        zero, and the tissue setpoint with it -- served hooks fire every pass. Nor
+        does it change the served tissue, because the lowest sensor there is the
+        bottom actuator itself, whose calibrated lift is exactly zero. The pairing
+        weightings ignore liveness by definition: ``calibrated`` keeps the gain the
+        calibration measured, ``uniform`` counts every live cell as one. A cell
+        outside the calibration votes as one, as it did before -- unreachable in the
+        served flow, which adds every vector, calibrates and only then attaches.
         """
         if self.calibration is None or layer not in self.calibration.layers:
             return 1.0
-        fired = bool(self._seen)
-        blind = fired and not any(actuator < layer for actuator in self._live_actuators())
-        if blind and self.calibration.weighting == "gain":
+        gated = self.calibration.weighting == "gain" and bool(self._seen)
+        if gated and not any(actuator < layer for actuator in self._live_actuators()):
             return 0.0
         return self.calibration.weight(layer)
 

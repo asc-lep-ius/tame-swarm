@@ -263,13 +263,15 @@ def test_removing_the_bottom_actuator_blinds_the_cell_above_it_and_the_survivors
     its error is its whole setpoint plus the deficit (+615 sigma, reported), and no
     action can change it. Its weight follows the live tissue below it, zero, so the
     shared integrator regulates the three cells it can still move: their
-    gain-weighted consensus is back inside the 5% band at pass 24 and ends at 0.01%
-    of the setpoint, every surviving actuator raises its strength, and the tissue
-    setpoint is theirs (688 sigma against the calibrated 641, with ``error`` still
-    ``setpoint - process_variable``). The survivors do not each return to their
-    own setpoints (measured +19.8%, -2.7%, -9.6%): the removal changed every
-    survivor's real gain, unevenly, so one common strength can no longer reach all
-    three, and what remains is the least-squares residual of the damaged plant.
+    gain-weighted consensus -- which is the tissue error once cell 2 weighs
+    nothing, so the recovery helper asserts it -- is back inside the 5% band at
+    pass 24 and ends at 0.01% of the setpoint, every surviving actuator raises its
+    strength, and the tissue setpoint is theirs (688 sigma against the calibrated
+    641, with ``error`` still ``setpoint - process_variable``). The survivors do
+    not each return to their own setpoints (measured +19.8%, -2.7%, -9.6%): the
+    removal changed every survivor's real gain, unevenly, so one common strength
+    can no longer reach all three, and what remains is the least-squares residual
+    of the damaged plant.
     The pairing below shows the part of that residual the rule removes.
     """
     system, recovered_at, strengths_before, cells = _remove_bottom_actuator()
@@ -280,8 +282,6 @@ def test_removing_the_bottom_actuator_blinds_the_cell_above_it_and_the_survivors
     assert new_bottom["alive"] and new_bottom["weight"] == 0.0
     assert new_bottom["error"] > new_bottom["setpoint"], "its whole setpoint plus the deficit"
     assert recovered_at is not None and recovered_at <= RECOVERY_PASSES, recovered_at
-    weighted, _ = _survivors_consensus(cells)
-    assert abs(weighted) <= RECOVERY_FRACTION * tissue.setpoint
     assert all(tissue._strength[layer] > strengths_before[layer] for layer in ACTUATORS[1:])
 
     status = tissue.status()
