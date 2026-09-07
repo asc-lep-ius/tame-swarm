@@ -306,14 +306,21 @@ def test_the_tissue_unwinds_within_fifty_tokens_of_a_pinning_deficit_lifting():
 
 
 def test_a_free_integrator_winds_up_and_recovers_three_times_slower():
-    """Measured: the accumulator at 95 against 4.3, and back in band at pass 137 against 40."""
+    """Measured: the accumulator at 95 against 4.3, and back in band at pass 137 against 40.
+
+    The free accumulator also passes the limit the conditional one may never
+    exceed -- the whole band over the integral gain, 22 here -- which is the
+    property in the module's own units; the ratios are the size of the pairing.
+    """
     conditional, conditional_tissue = make()
     conditional_integral, conditional_recovered = _pin_then_release(conditional, conditional_tissue)
     homeostat, tissue = make()
     pin_pid_config(homeostat, anti_windup=False, integral_limit=None)
     integral, recovered = _pin_then_release(homeostat, tissue)
 
-    assert conditional_recovered is not None
+    band_limit = conditional.controller.config.integral_limit
+    assert conditional_recovered is not None and band_limit is not None
+    assert integral > band_limit, (integral, band_limit)
     assert integral > 10 * conditional_integral, (integral, conditional_integral)
     assert recovered is None or recovered > 3 * conditional_recovered, (
         recovered,

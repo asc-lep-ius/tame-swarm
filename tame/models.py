@@ -75,9 +75,11 @@ class CellStatus(BaseModel):
 class PIDStatus(BaseModel):
     """One goal's tissue as its consensus over the live cells, plus every cell.
 
-    ``setpoint``, ``process_variable`` and ``error`` are the controllability-weighted
-    means the shared integrator regulates; ``sensed_error`` is the plain mean error
-    over the live cells, which still counts a cell nothing can correct.
+    ``process_variable`` and ``error`` are the controllability-weighted means over
+    the live cells that the shared integrator regulates; ``sensed_error`` is the
+    plain mean error over the same cells, which still counts a cell nothing can
+    correct; ``setpoint`` is the nominal one over every calibrated cell, which
+    differs from the live consensus setpoint only while a controllable cell is dead.
     """
 
     goal: str

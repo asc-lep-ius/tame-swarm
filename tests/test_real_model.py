@@ -105,12 +105,15 @@ DAMAGED_TAIL = 40
 CONTENT_PUSH = -1.2
 # Measured on the seeded replay (identical across processes on the RTX 5070 Ti),
 # as the gain-weighted consensus over the tail: the inert loop +2.16 sigma, the
-# live loop +0.61 at a strength raised by 0.82; the same tokens unpushed read
-# +0.70 inert and +0.22 live. (The plain mean over all eight cells read +1.10 and
-# +0.15, -0.01 and -0.15 before #21: the middle cells' deficit and the top cells'
-# surplus cancelled in it.) The band is the measured live error plus one tail
-# standard error, as it was before.
-RECOVERY_SIGMA = 1.0
+# live loop +0.61 at a strength raised by 0.82, so the live loop removes 72% of
+# the inert error; the same tokens unpushed read +0.70 inert and +0.22 live. (The
+# plain mean over all eight cells read +1.10 and +0.15, -0.01 and -0.15 before
+# #21, an 86% removal: the middle cells' deficit and the top cells' surplus
+# cancelled in it.) The absolute band is a fifth of the tissue setpoint: four
+# times the fixture's 5% band, on a substrate whose tail standard error is
+# already 8% of that setpoint. Measured 0.61 of 5.05 sigma, 12% (the plain mean:
+# 0.15 of 3.88, 4%).
+RECOVERY_FRACTION = 0.2
 # The push must bite for the recovery to mean anything; measured 2.16 against this
 # floor (1.10 as the plain mean), so a failure here says the push weakened on this
 # substrate, not that the loop improved.
@@ -376,7 +379,7 @@ def test_the_live_tissue_recovers_from_content_pushed_against_the_direction(
 
     assert inert_error > INERT_ERROR_SIGMA, "the push must bite for the recovery to mean anything"
     assert abs(live_error) < 0.5 * abs(inert_error), (live_error, inert_error)
-    assert abs(live_error) < RECOVERY_SIGMA, (live_error, inert_error)
+    assert abs(live_error) < RECOVERY_FRACTION * served.tissue.setpoint, (live_error, inert_error)
     assert live_strength > inert_strength + STRENGTH_RISE
     assert blind["weight"] == 0.0 and blind["alive"] and abs(blind["error"]) > 0.0
 

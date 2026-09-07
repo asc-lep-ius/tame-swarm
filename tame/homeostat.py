@@ -162,17 +162,17 @@ class AdaptiveHomeostat:
 
     @property
     def setpoint(self) -> float:
-        """The tissue setpoint: the consensus of the cell setpoints, or the legacy cosine target.
+        """The nominal tissue setpoint, or the legacy cosine target.
 
-        The same weights as the consensus the integrator regulates, so the tissue
-        setpoint is ``gain_z * reference_strength`` exactly as each cell's is.
+        ``gain_z * reference_strength``: the consensus of the cell setpoints over
+        every calibrated cell, under the same weights as the consensus the
+        integrator regulates. While a controllable cell is dead the integrator's
+        own setpoint is the consensus over the *live* cells, which differs from this
+        nominal one by the dead cell's share (#22).
         """
         if self.calibration is None:
             return self.config.target_alignment
-        consensus = self._consensus_of(self.cells, self.cell_setpoint)
-        if consensus is None:
-            return float(np.mean([self.cell_setpoint(layer) for layer in self.cells]))
-        return consensus
+        return self.calibration.gain_z * self.calibration.reference_strength
 
     def cell_weight(self, layer: int) -> float:
         """How much of the shared memory this cell writes: its controllability (#21).

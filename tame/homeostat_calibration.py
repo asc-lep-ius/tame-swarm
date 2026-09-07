@@ -271,11 +271,20 @@ def calibrate_alignment(
         num_passages=len(corpus),
         directions=measured,
     )
+    wrong_way = [layer for layer in sensors if layers[layer].lift < 0]
+    if wrong_way:
+        logger.warning(
+            "Alignment calibration: negative lift at %s -- the tissue's effort moves these "
+            "cells the wrong way; they sense and report but do not enter the consensus",
+            wrong_way,
+        )
     logger.info(
-        "Alignment calibration over %d passages: cells %s, tissue gain %.4f sigma/unit, "
-        "cell setpoints %s at strength %.2f",
+        "Alignment calibration over %d passages: cells %s, gains %s sigma/unit, consensus "
+        "weights %s, tissue gain %.4f sigma/unit, cell setpoints %s at strength %.2f",
         len(corpus),
         sensors,
+        {layer: round(layers[layer].gain_z, 3) for layer in sensors},
+        {layer: round(calibration.weight(layer), 3) for layer in sensors},
         calibration.gain_z,
         {layer: round(calibration.setpoint_z(layer), 3) for layer in sensors},
         config.base_strength,
