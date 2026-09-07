@@ -44,8 +44,8 @@ from .wired_system import ACTUATORS, BELOW_ACTUATORS, READOUT, build_wired_syste
 
 # --- The steering tissue ---------------------------------------------------------
 
-# #6's acceptance criterion: the tissue's mean error within this fraction of the
-# tissue setpoint, within this many forward passes of the disturbance.
+# #6's acceptance criterion: the tissue's consensus error within this fraction of
+# the tissue setpoint, within this many forward passes of the disturbance.
 RECOVERY_FRACTION = 0.05
 RECOVERY_PASSES = 200
 SETTLE_PASSES = 60
@@ -73,12 +73,13 @@ def test_the_tissue_recovers_from_content_that_drags_the_stream_off_its_setpoint
     """Designed perturbation: a persistent deficit above the bottom actuator.
 
     Every cell above the bottom actuator reads the deficit and the actuators above
-    it can answer it. The regulated variable is the tissue's mean error over its
-    live cells -- what the shared integrator drives -- and it returns to within 5%
-    of the tissue setpoint well inside the 200-pass budget (measured: inside the
-    band from pass 23, coupled or not) while the actuators' strength rises to
-    carry the deficit. With the coupling live the routing perceives the same
-    direction; the tissue's recovery does not depend on it either way.
+    it can answer it. The regulated variable is the tissue's consensus error over
+    its live cells, each weighted by its gain -- what the shared integrator drives
+    -- and it returns to within 5% of the tissue setpoint well inside the 200-pass
+    budget (measured: inside the band from pass 22, coupled or not) while the
+    actuators' strength rises to carry the deficit. With the coupling live the
+    routing perceives the same direction; the tissue's recovery does not depend on
+    it either way.
     """
     system = build_wired_system(coupled=coupled)
     system.run(SETTLE_PASSES)
@@ -103,26 +104,66 @@ def test_the_inert_loop_leaves_the_deficit_in_place():
     assert system.strength() == pytest.approx(system.tissue().config.base_strength)
 
 
-def test_a_deficit_below_the_bottom_actuator_is_diluted_over_the_live_cells():
-    """The tissue's answer to a deficit no cell can act on, pinned as a property.
+def _uniform_consensus(system) -> None:
+    """The rule before #21: every live cell votes as one, the blind cell included."""
+    tissue = system.tissue()
+    assert tissue.calibration is not None
+    tissue.calibration = replace(tissue.calibration, weighting="uniform")
+    # The gains derive from the calibration's gain, so the controller is rebuilt the
+    # way set_gains rebuilds it; the plain mean's gains are the ones #4 recorded.
+    tissue.controller.config = tissue._pid_config()
+
+
+def _blind_and_others(system) -> tuple[dict, list[dict]]:
+    cells = system.tissue().status()["cells"]
+    return cells[0], cells[1:]
+
+
+def test_content_below_the_bottom_actuator_leaves_the_regulable_cells_at_their_own_setpoints():
+    """A deficit no cell can act on (#21): the blind cell reports it and nobody pays for it.
 
     Content that enters below every actuator is read by the bottom cell too, and
-    nothing can correct it there. The shared integrator drives the tissue *mean*
-    to zero regardless, so the regulable cells settle past their setpoints by the
-    blind cell's error divided by the number of other live cells. The tissue meets
-    its criterion on the mean; the cost is paid by the cells above, and it shrinks
-    with the cell count -- one seventh on the served eight-cell tissue, one
-    quarter here.
+    nothing can correct it there. Its weight in the consensus is its gain, zero, so
+    its error stands (+167 sigma, a quarter of the tissue setpoint) and is reported,
+    while the shared integrator regulates the cells that can be moved: each of the
+    four settles within 5% of its *own* setpoint (measured: +2.7%, 0.0%, -0.5%,
+    -0.6%), not only the tissue mean. The consensus itself is barely disturbed by
+    construction -- the blind cell no longer votes, so it is in band from the first
+    pass -- and the per-cell assertion is the property. The test below is the
+    pairing this replaced.
     """
     system = build_wired_system()
     system.run(SETTLE_PASSES)
     system.set_content("truthful", DEAD_CELL_DEFICIT, layer=BELOW_ACTUATORS)
 
     assert _passes_to_recover(system) is not None
-    errors = [cell["error"] for cell in system.tissue().status()["cells"]]
-    blind, others = errors[0], errors[1:]
-    assert blind > RECOVERY_FRACTION * system.setpoint(), "the bottom cell stays in deficit"
-    assert sum(others) / len(others) == pytest.approx(-blind / len(others), rel=0.05)
+    blind, others = _blind_and_others(system)
+    assert blind["weight"] == 0.0
+    assert blind["error"] > RECOVERY_FRACTION * system.setpoint(), (
+        "the bottom cell stays in deficit"
+    )
+    assert all(abs(cell["error"]) <= RECOVERY_FRACTION * cell["setpoint"] for cell in others)
+
+
+def test_the_uniform_consensus_dilutes_the_blind_deficit_over_the_live_cells():
+    """The pairing: counted as one live cell of five, the blind error is zeroed by the other four.
+
+    The shared integrator drives the plain mean to zero regardless, so the regulable
+    cells settle past their setpoints by the blind cell's error divided by the
+    number of other live cells -- one quarter here, one seventh on the served
+    eight-cell tissue -- and the tissue meets its criterion on the mean while no
+    cell is at its own setpoint (measured: -12.4%, -6.9%, -5.7%, -5.1%).
+    """
+    system = build_wired_system()
+    _uniform_consensus(system)
+    system.run(SETTLE_PASSES)
+    system.set_content("truthful", DEAD_CELL_DEFICIT, layer=BELOW_ACTUATORS)
+
+    assert _passes_to_recover(system) is not None
+    blind, others = _blind_and_others(system)
+    errors = [cell["error"] for cell in others]
+    assert sum(errors) / len(errors) == pytest.approx(-blind["error"] / len(others), rel=0.05)
+    assert any(abs(cell["error"]) > RECOVERY_FRACTION * cell["setpoint"] for cell in others)
 
 
 READOUT_DRIFT_FRACTION = 0.02
@@ -141,9 +182,9 @@ def test_the_tissue_recovers_after_an_actuator_is_removed_mid_generation():
     the cells still live, a quantity the removal itself redefines, so the outcome
     that counts is measured at the top of the stack: the readout, which acts on
     nothing and sits downstream of every actuator, ends where it was before the
-    damage (measured: within 0.3% of its setpoint, against the 2% allowed). The
-    tissue mean peaks near 15% of the setpoint at pass 14 and is back inside the
-    5% band by pass 37.
+    damage (measured: within 1.4% of its setpoint, against the 2% allowed). The
+    consensus error peaks near 17% of the setpoint at pass 14 and is back inside
+    the 5% band by pass 38.
     """
     system = build_wired_system()
     system.run(SETTLE_PASSES)

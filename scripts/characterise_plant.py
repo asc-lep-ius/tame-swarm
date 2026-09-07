@@ -423,7 +423,7 @@ def main() -> None:
             f"setpoint {calibration.setpoint_z(layer):+.3f} sigma"
         )
     print(
-        f"  tissue gain {calibration.gain_z:+.3f} sigma/unit (mean over cells); "
+        f"  tissue gain {calibration.gain_z:+.3f} sigma/unit (gain-weighted mean over cells); "
         f"tissue setpoint {loop.setpoint:+.3f} sigma at strength {calibration.reference_strength}"
     )
     print(

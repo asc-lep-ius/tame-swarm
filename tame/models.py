@@ -50,11 +50,17 @@ class HealthResponse(BaseModel):
 
 
 class CellStatus(BaseModel):
-    """One layer's cell: its own reading, setpoint and controller terms."""
+    """One layer's cell: its own reading, setpoint and controller terms.
+
+    ``weight`` is the cell's share of the tissue consensus -- its calibrated gain
+    per unit of strength -- so a cell the tissue's effort cannot move reports its
+    reading here with a weight of zero.
+    """
 
     layer: int
     injects: bool
     alive: bool
+    weight: float
     setpoint: float
     process_variable: float
     error: float
@@ -67,7 +73,18 @@ class CellStatus(BaseModel):
 
 
 class PIDStatus(BaseModel):
-    """One goal's tissue, as the mean over its live cells, plus every cell."""
+    """One goal's tissue as its consensus over the live cells, plus every cell.
+
+    ``process_variable`` and ``error`` are the controllability-weighted means over
+    the live cells that the shared integrator regulates; ``sensed_error`` is the
+    plain mean error over the same cells, which still counts a cell nothing can
+    correct; ``setpoint`` is the nominal one over every calibrated cell, which
+    differs from the live consensus setpoint only while a controllable cell is dead.
+    ``error`` is also zero while no live cell can be moved -- ``alive_cells`` and
+    ``sensed_error`` tell that from a tissue at setpoint -- and ``p_term``,
+    ``i_term`` and ``d_term`` are plain means over the live cells, so ``p_term``
+    tracks ``kp * sensed_error`` rather than ``kp * error``.
+    """
 
     goal: str
     calibrated: bool
@@ -76,6 +93,7 @@ class PIDStatus(BaseModel):
     setpoint: float
     process_variable: float
     error: float
+    sensed_error: float
     p_term: float
     i_term: float
     d_term: float
