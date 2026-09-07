@@ -9,20 +9,26 @@ lifts of 0 to 0.58 sigma per unit of strength across 13, 16-21 and the readout
 two-token consensus delay -- so every bound below is the one that measurement
 implies, not one assumed:
 
-- SIMC on that plant gives ``kp = 1.97, ki = 0.22``; the closed-loop time constant
-  is the filter's 9 tokens, so a step settles to 5% in about ``3 x (9 + 2) = 33``
-  tokens, and the recorded settling under the served sampling was 16.
+- The consensus the shared integrator regulates weights each cell by its gain
+  (#21), so the tissue gain is ``sum(g^2) / sum(g) = 0.50`` sigma per unit rather
+  than the plain mean 0.42 that counted the blind cell, and SIMC gives
+  ``kp = 1.63, ki = 0.18`` (1.97 and 0.22 on the plain mean, as #4 recorded); the
+  closed-loop time constant is the filter's 9 tokens, so a step settles to 5% in
+  about ``3 x (9 + 2) = 33`` tokens, and the recorded settling under the served
+  sampling was 16.
 - The P-only loop this replaced sat against a permanent error of 0.69-0.79 with
   the setpoint unreachable; on a reachable deficit P control leaves
-  ``d / (1 + K kp)`` of it, which is 0.27 sigma of 0.5, and PI leaves none.
+  ``d / (1 + K kp)`` of it -- 0.27 sigma of 0.5 whatever the gain, since SIMC fixes
+  ``K kp`` at ``tau / (tau_c + theta)`` -- and PI leaves none.
 
 Each property is paired with the state that breaks it: the integral removed, the
 integral gain four times its derived value (inside the API's stability bound and
 still past the overshoot bound), the accumulator freed from conditional
-integration, the derivative filter removed, and the derivative moved onto the
-error. The setpoint-kick pairing is the one that found a defect: the tissue used
-to hand the controller ``setpoint - consensus`` as its process variable, so a
-setpoint change kicked a derivative that was designed to ignore it.
+integration, the derivative filter removed, the derivative moved onto the error,
+and the blind cell counted as one of eight. The setpoint-kick pairing is the one
+that found a defect: the tissue used to hand the controller ``setpoint -
+consensus`` as its process variable, so a setpoint change kicked a derivative that
+was designed to ignore it.
 """
 
 from dataclasses import replace
@@ -31,7 +37,7 @@ import pytest
 import torch
 
 from homeostat import AdaptiveHomeostat
-from homeostat_calibration import AlignmentCalibration, LayerCalibration
+from homeostat_calibration import AlignmentCalibration, ConsensusWeighting, LayerCalibration
 from steering import SteeringConfig
 
 from .wired_system import build_wired_system
@@ -55,9 +61,15 @@ QWEN_CELLS: tuple[int, ...] = (*QWEN_ACTUATORS, QWEN_READOUT)
 QWEN_REFERENCE_STRENGTH = 4.0
 QWEN_BAND = (2.0, 6.0)
 QWEN_FILTER_ALPHA = 0.1
-QWEN_SIMC_GAINS = (1.97, 0.22)
-# The mean of the cell lifts above; the README rounds it to 0.42.
-QWEN_TISSUE_GAIN = 0.415
+# The consensus gain the shared gains derive from: the gain-weighted mean of the cell
+# lifts above, sum(g^2) / sum(g) (#21), and the SIMC gains it gives.
+QWEN_TISSUE_GAIN = 0.502
+QWEN_SIMC_GAINS = (1.63, 0.18)
+# The plain mean of the lifts, which counts the blind cell's zero: the tissue gain #4
+# recorded (the README rounds it to 0.42) and the gains it derived, reproduced by
+# the uniform consensus as the pairing.
+QWEN_MEAN_LIFT = 0.415
+QWEN_RECORDED_GAINS = (1.97, 0.22)
 FILTER_TOKENS = (1 - QWEN_FILTER_ALPHA) / QWEN_FILTER_ALPHA
 CONSENSUS_DEAD_TIME = 2
 SETTLE_BOUND = int(3 * (FILTER_TOKENS + CONSENSUS_DEAD_TIME))  # 33
@@ -74,7 +86,9 @@ PINNING_DEFICIT = 2.0
 DIRECTION = torch.eye(8)[0]
 
 
-def qwen_calibration(reference_strength: float = QWEN_REFERENCE_STRENGTH) -> AlignmentCalibration:
+def qwen_calibration(
+    reference_strength: float = QWEN_REFERENCE_STRENGTH, weighting: ConsensusWeighting = "gain"
+) -> AlignmentCalibration:
     return AlignmentCalibration(
         layers={
             layer: LayerCalibration(resting_mean=0.0, resting_sigma=1.0, token_sigma=1.0, lift=lift)
@@ -84,6 +98,7 @@ def qwen_calibration(reference_strength: float = QWEN_REFERENCE_STRENGTH) -> Ali
         sensors=(*QWEN_ACTUATORS, QWEN_READOUT),
         reference_strength=reference_strength,
         num_passages=24,
+        weighting=weighting,
     )
 
 
@@ -168,7 +183,8 @@ def pin_pid_config(homeostat: AdaptiveHomeostat, **changes) -> None:
 # --- The gains are the measured plant's -------------------------------------------
 
 
-def test_the_derived_gains_are_the_ones_the_characterisation_recorded():
+def test_the_derived_gains_follow_the_consensus_gain_of_the_recorded_lifts():
+    """The gains derive from the gain the integrator sees; #4's plain mean is the pairing."""
     homeostat, _ = make()
     kp, ki = homeostat.gains()
 
@@ -177,6 +193,11 @@ def test_the_derived_gains_are_the_ones_the_characterisation_recorded():
     assert homeostat.calibration is not None
     assert homeostat.calibration.gain_z == pytest.approx(QWEN_TISSUE_GAIN, abs=0.005)
     assert homeostat.setpoint == pytest.approx(QWEN_TISSUE_GAIN * QWEN_REFERENCE_STRENGTH, abs=0.01)
+
+    recorded = AdaptiveHomeostat(qwen_config(), qwen_calibration(weighting="uniform"))
+    assert recorded.calibration is not None
+    assert recorded.calibration.gain_z == pytest.approx(QWEN_MEAN_LIFT, abs=0.005)
+    assert recorded.gains() == pytest.approx(QWEN_RECORDED_GAINS, rel=0.02)
 
 
 # --- Step response, with the bound the plant justifies -----------------------------
@@ -194,7 +215,7 @@ def _setpoint_step(
 
 
 def test_a_setpoint_step_settles_within_the_plant_bound_without_overshoot():
-    """Three closed-loop time constants plus the delay: 33 tokens (measured: 28), overshoot 0.5%."""
+    """Three closed-loop time constants plus the delay: 33 tokens (measured: 26), overshoot 1.4%."""
     homeostat, tissue = make()
     errors, step = _setpoint_step(homeostat, tissue)
 
@@ -204,18 +225,22 @@ def test_a_setpoint_step_settles_within_the_plant_bound_without_overshoot():
 
 
 def test_the_integral_removed_never_settles_the_step():
-    """P control leaves ``1 / (1 + K kp)`` of the step -- 0.55 on the lumped plant.
+    """P control leaves ``1 / (1 + K kp)`` of the step -- 0.55 on the lumped plant, whatever K.
 
     The tissue's cells have different lifts and its bottom cell none, so the lumped
-    prediction is approximate on it: 0.60 measured for a setpoint step, 0.25 against
-    0.27 for the deficit below. Either way, more than half the step never closes.
+    prediction is approximate on it, and in a known direction: the bottom actuator's
+    setpoint is zero before and after the step, so it pushes nothing extra, and the
+    cell above it, which reads that actuator alone, is left with the whole step.
+    Measured: 0.64 of the step (0.60 under the plain mean, where the blind cell's
+    own zero error masked that lag). Either way, more than half never closes.
     """
     homeostat, tissue = make(ki=0.0)
     errors, step = _setpoint_step(homeostat, tissue)
 
     assert settled_at(errors, BAND_FRACTION * step) is None
     p_only_residual = 1 / (1 + QWEN_TISSUE_GAIN * homeostat.gains()[0])
-    assert errors[-1] / step == pytest.approx(p_only_residual, rel=0.15)
+    assert errors[-1] / step == pytest.approx(p_only_residual, rel=0.2)
+    assert errors[-1] / step > p_only_residual
     assert errors[-1] / step > 0.5
 
 
@@ -238,7 +263,10 @@ def test_pi_removes_the_steady_state_error_the_p_only_loop_leaves():
     The recorded baseline was worse still -- the P loop sat 0.69-0.79 from a
     setpoint it could never reach -- but that number is not a property of the
     controller, it is a property of an unreachable setpoint; the reachable case is
-    the comparison the controller can be held to.
+    the comparison the controller can be held to. On the tissue the P-only residual
+    comes out below the lumped 0.27 (measured 0.24): the bottom cell's deficit is
+    one nothing removes, so it pushes hardest of all, and every cell above reads
+    that push.
     """
     pi, pi_tissue = make(content=-DEFICIT)
     p_only, p_tissue = make(content=-DEFICIT, ki=0.0)
@@ -247,7 +275,8 @@ def test_pi_removes_the_steady_state_error_the_p_only_loop_leaves():
 
     predicted_p_error = DEFICIT / (1 + QWEN_TISSUE_GAIN * p_only.gains()[0])
     assert abs(pi.error) < 0.01
-    assert p_only.error == pytest.approx(predicted_p_error, rel=0.1)
+    assert p_only.error == pytest.approx(predicted_p_error, rel=0.15)
+    assert 0 < p_only.error < predicted_p_error
     assert abs(p_only.error) > 20 * abs(pi.error)
     assert pi.current_strength > p_only.current_strength
 
@@ -268,6 +297,7 @@ def _pin_then_release(
 
 
 def test_the_tissue_unwinds_within_fifty_tokens_of_a_pinning_deficit_lifting():
+    """Measured: the accumulator at 4.3 when the deficit lifts, and back in band at pass 40."""
     homeostat, tissue = make()
     integral, recovered = _pin_then_release(homeostat, tissue)
 
@@ -276,13 +306,26 @@ def test_the_tissue_unwinds_within_fifty_tokens_of_a_pinning_deficit_lifting():
 
 
 def test_a_free_integrator_winds_up_and_recovers_three_times_slower():
-    """Measured: the accumulator at 113 against 3, and back in band at pass 199 against 43."""
+    """Measured: the accumulator at 95 against 4.3, and back in band at pass 137 against 40.
+
+    The free accumulator also passes the limit the conditional one may never
+    exceed -- the whole band over the integral gain, 22 here -- which is the
+    property in the module's own units; the ratios are the size of the pairing.
+    """
+    conditional, conditional_tissue = make()
+    conditional_integral, conditional_recovered = _pin_then_release(conditional, conditional_tissue)
     homeostat, tissue = make()
     pin_pid_config(homeostat, anti_windup=False, integral_limit=None)
     integral, recovered = _pin_then_release(homeostat, tissue)
 
-    assert integral > 100.0
-    assert recovered is None or recovered > 3 * ANTI_WINDUP_RECOVERY, recovered
+    band_limit = conditional.controller.config.integral_limit
+    assert conditional_recovered is not None and band_limit is not None
+    assert integral > band_limit, (integral, band_limit)
+    assert integral > 10 * conditional_integral, (integral, conditional_integral)
+    assert recovered is None or recovered > 3 * conditional_recovered, (
+        recovered,
+        conditional_recovered,
+    )
 
 
 # --- The derivative: filtered, and on the reading --------------------------------------
@@ -352,6 +395,77 @@ def test_every_cell_carries_the_same_controller_state_from_the_first_pass():
     states = {homeostat.controller.snapshot(homeostat._key(layer)) for layer in QWEN_CELLS}
     assert len(states) == 1, "one shared memory, every cell"
     assert tissue.max_d_term() < 1e-9
+
+
+# --- The blind cell: sensed, reported, and out of the shared memory (#21) --------------
+
+BLIND_DEFICIT = 0.5
+
+
+def _blind_deficit(weighting: ConsensusWeighting) -> tuple[AdaptiveHomeostat, dict[int, dict]]:
+    """Content at cell 13 alone, settled; the tissue and its per-cell status by layer."""
+    homeostat = AdaptiveHomeostat(qwen_config(), qwen_calibration(weighting=weighting))
+    tissue = MeasuredTissue(homeostat)
+    tissue.run(100)
+    tissue.content[QWEN_ACTUATORS[0]] = -BLIND_DEFICIT
+    tissue.run(300)
+    return homeostat, {cell["layer"]: cell for cell in homeostat.status()["cells"]}
+
+
+def _blind_push_bound(layer: int, kp: float, blind_error: float) -> float:
+    """What the blind cell's own proportional push can move ``layer`` by.
+
+    The push, ``kp`` times the blind error, is one actuator's; ``layer`` reads the
+    mean strength of the actuators below it through its own lift.
+    """
+    below = [actuator for actuator in QWEN_ACTUATORS if actuator < layer]
+    return QWEN_CELL_LIFTS[layer] * kp * blind_error / len(below)
+
+
+def test_a_deficit_at_the_blind_cell_alone_leaves_the_survivors_consensus_at_setpoint():
+    """Cell 13 reads half a sigma nothing can correct; the other seven no longer pay for it.
+
+    The blind cell's weight is zero, so its error is reported unchanged, the tissue
+    still senses it, and the consensus over the survivors settles at zero. What
+    remains is the blind cell's own proportional push -- 0.85 units above the other
+    actuators -- which cell 16 reads alone and the cells above read diluted over
+    the actuators below them, while the integrator trims the common strength in
+    return: the survivors spread from -0.14 sigma at 16 to +0.03 at the top, each
+    inside the bound that push implies.
+    """
+    homeostat, cells = _blind_deficit("gain")
+    kp = homeostat.gains()[0]
+    blind = cells[QWEN_ACTUATORS[0]]
+    survivors = [cells[layer] for layer in QWEN_CELLS[1:]]
+
+    assert blind["weight"] == 0.0
+    assert blind["error"] == pytest.approx(BLIND_DEFICIT, abs=1e-3)
+    assert abs(homeostat.error) < 1e-3
+    assert homeostat.sensed_error > 0.0
+    weighted = sum(c["weight"] * c["error"] for c in survivors) / sum(
+        c["weight"] for c in survivors
+    )
+    assert abs(weighted) < 1e-3
+    for cell in survivors:
+        assert abs(cell["error"]) < _blind_push_bound(cell["layer"], kp, blind["error"]), cell
+    assert blind["output"] > cells[QWEN_ACTUATORS[1]]["output"] + 0.5
+
+
+def test_the_uniform_consensus_dilutes_the_blind_deficit_over_the_survivors():
+    """The pairing: counted as one of eight, the blind error is zeroed by pushing the other seven.
+
+    The plain mean goes to zero and every survivor ends past its own setpoint, at
+    ``-blind / 7`` on average: -0.07 sigma, the dilution #6 pinned on the fixture.
+    """
+    homeostat, cells = _blind_deficit("uniform")
+    blind = cells[QWEN_ACTUATORS[0]]
+    survivors = [cells[layer] for layer in QWEN_CELLS[1:]]
+
+    assert blind["weight"] == 1.0
+    assert abs(homeostat.error) < 1e-3
+    mean_survivor_error = sum(c["error"] for c in survivors) / len(survivors)
+    assert mean_survivor_error == pytest.approx(-blind["error"] / len(survivors), rel=0.02)
+    assert all(cell["error"] < 0 for cell in survivors)
 
 
 # --- Multi-goal independence, on the wired system --------------------------------------

@@ -17,7 +17,7 @@ the stream's large resting offset.
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import cast
+from typing import Literal, cast
 
 import numpy as np
 import torch
@@ -33,6 +33,13 @@ FIRST_CALIBRATION_POSITION = 1
 SIGMA_FLOOR = 1e-6
 # Below this many passages the slow sigma is a guess and the derived gains with it.
 MIN_CALIBRATION_PASSAGES = 4
+
+# How a cell's reading enters the tissue consensus (#21). ``gain``: by its calibrated
+# gain per unit of strength, so a cell the tissue's effort cannot move -- the bottom
+# actuator, whose lift is exactly zero -- senses and reports but does not write to
+# the shared memory. ``uniform``: every live cell equally, controllable or not, the
+# rule before #21, kept so the dilution it causes can be reproduced as a pairing.
+ConsensusWeighting = Literal["gain", "uniform"]
 
 
 @dataclass(frozen=True)
@@ -69,6 +76,7 @@ class AlignmentCalibration:
     num_passages: int
     # The unit direction each cell was measured along -- what the hook must inject.
     directions: dict[int, torch.Tensor] = field(default_factory=dict, compare=False)
+    weighting: ConsensusWeighting = "gain"
 
     def __post_init__(self) -> None:
         if self.num_passages < MIN_CALIBRATION_PASSAGES:
@@ -84,10 +92,36 @@ class AlignmentCalibration:
     def setpoint_z(self, layer: int) -> float:
         return self.layers[layer].gain_z * self.reference_strength
 
+    def weight(self, layer: int) -> float:
+        """The cell's share of the consensus: its controllability under :attr:`weighting`.
+
+        A negative calibrated lift is noise on a cell the effort does not reach, or a
+        cell it moves the wrong way; either way it cannot help the tissue correct
+        anything, so it weighs nothing rather than voting against the others.
+        """
+        if self.weighting == "uniform":
+            return 1.0
+        return max(self.layers[layer].gain_z, 0.0)
+
     @property
     def gain_z(self) -> float:
-        """Tissue gain: mean cell lift per unit of strength, in each cell's own sigma."""
-        return float(np.mean([self.layers[layer].gain_z for layer in self.sensors]))
+        """Tissue gain: the consensus's lift per unit of strength, in each cell's own sigma.
+
+        The weighted mean of the cell gains under the consensus weights -- the plain
+        mean over cells under ``uniform``, ``sum(g^2) / sum(g)`` under ``gain`` --
+        which is the gain of the variable the shared integrator regulates, and so
+        the process gain the shared gains derive from. Under ``gain`` the integrator's
+        fixed point, ``sum(g_i e_i) = 0``, is the common strength that minimises the
+        sum of squared cell errors: one shared actuator setting, least-squares best
+        for the cells it can move -- given every gain non-negative, as every measured
+        calibration's is; a negative lift is excluded on :meth:`weight`'s own argument.
+        """
+        weights = [self.weight(layer) for layer in self.sensors]
+        gains = [self.layers[layer].gain_z for layer in self.sensors]
+        total = sum(weights)
+        if total == 0:
+            return float(np.mean(gains))
+        return float(sum(w * g for w, g in zip(weights, gains, strict=True)) / total)
 
     @property
     def readout_layer(self) -> int:
@@ -238,11 +272,20 @@ def calibrate_alignment(
         num_passages=len(corpus),
         directions=measured,
     )
+    wrong_way = [layer for layer in sensors if layers[layer].lift < 0]
+    if wrong_way:
+        logger.warning(
+            "Alignment calibration: negative lift at %s -- the tissue's effort moves these "
+            "cells the wrong way; they sense and report but do not enter the consensus",
+            wrong_way,
+        )
     logger.info(
-        "Alignment calibration over %d passages: cells %s, tissue gain %.4f sigma/unit, "
-        "cell setpoints %s at strength %.2f",
+        "Alignment calibration over %d passages: cells %s, gains %s sigma/unit, consensus "
+        "weights %s, tissue gain %.4f sigma/unit, cell setpoints %s at strength %.2f",
         len(corpus),
         sensors,
+        {layer: round(layers[layer].gain_z, 3) for layer in sensors},
+        {layer: round(calibration.weight(layer), 3) for layer in sensors},
         calibration.gain_z,
         {layer: round(calibration.setpoint_z(layer), 3) for layer in sensors},
         config.base_strength,

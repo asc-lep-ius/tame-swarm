@@ -22,6 +22,16 @@ against the inert loop on the same tokens -- the live loop halves the error and
 pays for it in strength -- with an absolute band no tighter than the tissue's own
 authority, not the 5% band the wired fixture meets.
 
+The tissue error here is the consensus #21 defined: each cell's error weighted by
+its calibrated gain, so the blind bottom cell (13, gain exactly zero) is reported
+and not regulated. On this fixture's eight-prompt calibration the survivors' gains
+spread from 0.48 (cell 16) to 1.68 (cell 19) and the cells disagree by several
+sigma on the same tokens, so the weighting moves the regulated number by about a
+sigma against the plain mean the tissue used to regulate; cell 13's own reading
+(-0.24 sigma over the tail) was never what moved it. The dilution #21 removes is
+a seventh of the blind error, below this tail's resolution, so the fixture and
+the measured plant carry that claim and this module records the per-cell picture.
+
 The same tokens, literally: the unsteered greedy continuation is generated once
 and every regime replays it token by token through the cache, as the plant probe
 (``steering_probe``) does. Greedy decoding under bf16 kernels is not bitwise
@@ -93,18 +103,25 @@ DAMAGED_TAIL = 40
 # as a seventh of this at the readout (measured: 0.15 sigma), below the prompt's
 # own content deficit.
 CONTENT_PUSH = -1.2
-# Measured on the seeded replay (identical across processes on the RTX 5070 Ti):
-# the inert loop +1.10 sigma over the tail, the live loop +0.15 at a strength
-# raised by 0.56; the same tokens unpushed read -0.01 inert and -0.15 live.
-RECOVERY_SIGMA = 0.6
-# The push must bite for the recovery to mean anything; measured 1.10 against this
-# floor (the unseeded fixture read 1.44 on other tokens), so a failure here says the
-# push weakened on this substrate, not that the loop improved.
+# Measured on the seeded replay (identical across processes on the RTX 5070 Ti),
+# as the gain-weighted consensus over the tail: the inert loop +2.16 sigma, the
+# live loop +0.61 at a strength raised by 0.82, so the live loop removes 72% of
+# the inert error; the same tokens unpushed read +0.70 inert and +0.22 live. (The
+# plain mean over all eight cells read +1.10 and +0.15, -0.01 and -0.15 before
+# #21, an 86% removal: the middle cells' deficit and the top cells' surplus
+# cancelled in it.) The absolute band is a fifth of the tissue setpoint: four
+# times the fixture's 5% band, on a substrate whose tail standard error is
+# already 8% of that setpoint. Measured 0.61 of 5.05 sigma, 12% (the plain mean:
+# 0.15 of 3.88, 4%).
+RECOVERY_FRACTION = 0.2
+# The push must bite for the recovery to mean anything; measured 2.16 against this
+# floor (1.10 as the plain mean), so a failure here says the push weakened on this
+# substrate, not that the loop improved.
 INERT_ERROR_SIGMA = 0.8
 STRENGTH_RISE = 0.3
 # After the top actuator is removed the survivors' strength must rise; by how much
-# is the tissue's call (measured +1.11, from 3.94 to 5.05, holding the error at
-# 0.51 sigma), so only the direction is asserted.
+# is the tissue's call (measured +1.21, from 4.00 to 5.21, with the error at 1.03
+# sigma against 2.16 inert), so only the direction is asserted.
 SURVIVOR_STRENGTH_RISE = 0.1
 SAFE_LAYERS = [14, 18, 22]
 SAFE_STRENGTH = 4.0
@@ -309,7 +326,12 @@ def content_push(system: ServedSystem, amount: float) -> Iterator[None]:
 
 
 def test_the_served_tissue_is_the_measured_one(served: ServedSystem):
-    """The calibration that runs here is #4's in shape: cells 13, 16-22, gains inside the bound."""
+    """The calibration that runs here is #4's in shape: cells 13, 16-22, gains inside the bound.
+
+    The blind cell's weight in the consensus is zero and every other cell's is its
+    gain, so the tissue gain the shared gains derive from is the gain-weighted mean
+    of the lifts -- above the plain mean, which counted the zero (#21).
+    """
     calibration = served.homeostat.calibration
     assert calibration is not None
     assert calibration.sensors == (13, 16, 17, 18, 19, 20, 21, 22)
@@ -318,6 +340,14 @@ def test_the_served_tissue_is_the_measured_one(served: ServedSystem):
     kp, ki = served.derived_gains
     limit = served.tissue.max_stable_ki()
     assert limit is not None and 0 < ki < limit and kp > 0
+
+    gains = {layer: calibration.layers[layer].gain_z for layer in calibration.sensors}
+    assert served.tissue.cell_weight(13) == 0.0
+    assert all(served.tissue.cell_weight(layer) == gains[layer] for layer in gains if layer != 13)
+    weighted = sum(gain * gain for gain in gains.values()) / sum(gains.values())
+    assert calibration.gain_z == pytest.approx(weighted)
+    assert calibration.gain_z > sum(gains.values()) / len(gains)
+    assert served.tissue.setpoint == pytest.approx(calibration.gain_z * served.config.base_strength)
 
 
 @pytest.fixture(scope="module")
@@ -331,17 +361,27 @@ def inert_under_push(served: ServedSystem) -> tuple[float, float]:
 def test_the_live_tissue_recovers_from_content_pushed_against_the_direction(
     served: ServedSystem, inert_under_push: tuple[float, float]
 ):
-    """Designed perturbation on the real plant, against the inert loop on the same tokens."""
+    """Designed perturbation on the real plant, against the inert loop on the same tokens.
+
+    Per cell over the pushed tail (sigma; inert -> live): 13 -0.24 -> -0.24, 16 +1.2
+    -> +0.8, 17 +3.5 -> +2.0, 18 +5.9 -> +4.1, 19 +4.4 -> +2.0, 20 0.0 -> -1.8, 21
+    -2.9 -> -3.7, 22 -3.1 -> -3.4: the live loop moves the high-gain middle cells
+    toward setpoint and pushes the already-over-aligned top cells further, which is
+    the least-squares compromise a single common strength can make. The blind cell
+    reads the same either way and is reported with a weight of zero.
+    """
     inert_error, inert_strength = inert_under_push
     with attached(served), content_push(served, CONTENT_PUSH):
         served.replay()
         live_error = served.tail_error()
         live_strength = served.tail_strength()
+        blind = next(cell for cell in served.tissue.status()["cells"] if cell["layer"] == 13)
 
     assert inert_error > INERT_ERROR_SIGMA, "the push must bite for the recovery to mean anything"
     assert abs(live_error) < 0.5 * abs(inert_error), (live_error, inert_error)
-    assert abs(live_error) < RECOVERY_SIGMA, (live_error, inert_error)
+    assert abs(live_error) < RECOVERY_FRACTION * served.tissue.setpoint, (live_error, inert_error)
     assert live_strength > inert_strength + STRENGTH_RISE
+    assert blind["weight"] == 0.0 and blind["alive"] and abs(blind["error"]) > 0.0
 
 
 def test_the_tissue_carries_on_after_its_top_actuator_is_removed_mid_replay(
@@ -351,12 +391,12 @@ def test_the_tissue_carries_on_after_its_top_actuator_is_removed_mid_replay(
 
     Halfway through the replay the top actuator's hook is removed. The cell leaves
     the consensus after one pass, and with it its own reading -- on these tokens
-    about -3 sigma -- so the tissue mean the survivors regulate is a different
+    about -3 sigma -- so the consensus the survivors regulate is a different
     number from before, and rises mechanically. What the damaged tissue must still
     do is act on it: the survivors raise their strength over the second half, and
     six cells live still hold the error below what the intact constant-strength
-    loop leaves (measured: +0.57 sigma at 3.94 before the removal, +0.51 at 5.05
-    after it, against +1.10 inert).
+    loop leaves (measured: +0.79 sigma at 4.00 before the removal, +1.03 at 5.21
+    after it, against +2.16 inert).
     """
     inert_error, _ = inert_under_push
     top = max(served.homeostat.actuator_layers)
