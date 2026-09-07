@@ -52,9 +52,10 @@ class HealthResponse(BaseModel):
 class CellStatus(BaseModel):
     """One layer's cell: its own reading, setpoint and controller terms.
 
-    ``weight`` is the cell's share of the tissue consensus -- its calibrated gain
-    per unit of strength -- so a cell the tissue's effort cannot move reports its
-    reading here with a weight of zero.
+    ``weight`` is the cell's share of the tissue consensus: its calibrated gain
+    per unit of strength while some actuator below it is live, and zero once none
+    is -- so a cell the tissue's effort cannot move, calibrated so or made so by
+    damage, reports its reading here with a weight of zero.
     """
 
     layer: int
@@ -75,15 +76,18 @@ class CellStatus(BaseModel):
 class PIDStatus(BaseModel):
     """One goal's tissue as its consensus over the live cells, plus every cell.
 
-    ``process_variable`` and ``error`` are the controllability-weighted means over
-    the live cells that the shared integrator regulates; ``sensed_error`` is the
-    plain mean error over the same cells, which still counts a cell nothing can
-    correct; ``setpoint`` is the nominal one over every calibrated cell, which
-    differs from the live consensus setpoint only while a controllable cell is dead.
-    ``error`` is also zero while no live cell can be moved -- ``alive_cells`` and
-    ``sensed_error`` tell that from a tissue at setpoint -- and ``p_term``,
-    ``i_term`` and ``d_term`` are plain means over the live cells, so ``p_term``
-    tracks ``kp * sensed_error`` rather than ``kp * error``.
+    ``setpoint``, ``process_variable`` and ``error`` are the controllability-weighted
+    means over the live cells that the shared integrator regulates, so ``error`` is
+    ``setpoint - process_variable`` after damage as well as before it, as long as
+    some live cell can still be moved; ``setpoint`` is the calibrated one,
+    ``gain_z`` times the reference strength, whenever every cell is live.
+    ``sensed_error`` is the plain mean error over the same cells, which still
+    counts a cell nothing can correct. While no live cell can be moved ``error``
+    is zero by its own rule, ``setpoint`` and ``process_variable`` fall back to the
+    plain means over the live cells, and ``sensed_error`` is their gap --
+    ``alive_cells`` and ``sensed_error`` tell that state from a tissue at
+    setpoint. ``p_term``, ``i_term`` and ``d_term`` are plain means over the live
+    cells, so ``p_term`` tracks ``kp * sensed_error`` rather than ``kp * error``.
     """
 
     goal: str
