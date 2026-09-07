@@ -301,6 +301,39 @@ def test_the_cell_above_a_removed_bottom_actuator_goes_blind_and_stops_voting():
     assert homeostat.setpoint == pytest.approx(nominal)
 
 
+def test_a_tissue_with_no_live_actuator_holds_its_memory_and_reports_what_it_still_senses():
+    """Every actuator dead (#22): nothing weighs, the integrator holds, the readout still reports.
+
+    With both actuators gone the readout is the only live cell and nothing live
+    injects below it, so no live cell can be moved: the consensus error is zero by
+    its own rule, ``sensed_error`` carries the readout's deficit, the tissue
+    setpoint is the readout's own -- what the cell that still senses remembers,
+    not the calibration's number -- and the shared memory holds where it was
+    until an actuator returns.
+    """
+    homeostat, tissue = make(content=-0.5, max_strength=8.0)
+    tissue.run(40)
+
+    tissue.dead.update(ACTUATORS)
+    tissue.run(5)
+    memory = homeostat.status()["i_term"]
+    tissue.run(40)
+    status = homeostat.status()
+
+    assert status["alive_cells"] == 1
+    assert status["error"] == 0.0
+    assert status["sensed_error"] == pytest.approx(homeostat.cell_setpoint(READOUT) + 0.5)
+    assert status["setpoint"] == pytest.approx(homeostat.cell_setpoint(READOUT))
+    assert status["setpoint"] != pytest.approx(homeostat.nominal_setpoint)
+    assert status["setpoint"] - status["process_variable"] == pytest.approx(status["sensed_error"])
+    assert status["i_term"] == pytest.approx(memory)
+
+    tissue.dead.clear()
+    tissue.run(3)
+    assert homeostat.status()["alive_cells"] == 3
+    assert homeostat.setpoint == pytest.approx(homeostat.nominal_setpoint)
+
+
 def test_gains_are_derived_from_the_calibration_unless_pinned():
     derived = AdaptiveHomeostat(tissue_config(), calibration=calibration())
     kp, ki = derived.gains()

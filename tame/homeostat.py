@@ -179,14 +179,22 @@ class AdaptiveHomeostat:
         """What the tissue aims at now: the consensus of the cell setpoints over the live cells.
 
         Taken under the same weights as the consensus the integrator regulates, so
-        :attr:`error` is this less the consensus reading. It is the nominal setpoint
-        whenever every cell is live, and stands in for it before the first pass and
-        while no live cell can be moved; after damage it follows the cells that
-        remain controllable (#22), because the calibrated number describes a tissue
-        that no longer exists and no cell consults it.
+        :attr:`error` is this less the consensus reading while some live cell can be
+        moved. It is the nominal setpoint whenever every cell is live; after damage
+        it follows the cells that remain controllable (#22), because the calibrated
+        number describes a tissue that no longer exists and no cell consults it.
+        While no live cell can be moved it is the plain mean of the live cells' own
+        setpoints -- what the cells that still sense remember, as the history falls
+        back to their plain reading -- with :attr:`error` zero by its own rule and
+        :attr:`sensed_error` the gap; before the first pass, the nominal one.
         """
-        consensus = self._consensus_of(self._sensing_cells(), self.cell_setpoint)
-        return self.nominal_setpoint if consensus is None else consensus
+        live = self._sensing_cells()
+        consensus = self._consensus_of(live, self.cell_setpoint)
+        if consensus is not None:
+            return consensus
+        if live:
+            return float(np.mean([self.cell_setpoint(cell) for cell in live]))
+        return self.nominal_setpoint
 
     def cell_weight(self, layer: int) -> float:
         """How much of the shared memory this cell writes: its controllability (#21, #22).
@@ -478,9 +486,7 @@ class AdaptiveHomeostat:
         def mean_of(name: str) -> float:
             return float(np.mean([cell[name] for cell in active])) if active else 0.0
 
-        consensus_pv = self._consensus_of(
-            sorted(live), lambda cell: self._pv.get(cell, self.cell_setpoint(cell))
-        )
+        consensus_pv = self._consensus_of(self._sensing_cells(), self._pv.__getitem__)
         process_variable = mean_of("process_variable") if consensus_pv is None else consensus_pv
 
         return {

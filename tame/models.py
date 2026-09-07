@@ -78,14 +78,16 @@ class PIDStatus(BaseModel):
 
     ``setpoint``, ``process_variable`` and ``error`` are the controllability-weighted
     means over the live cells that the shared integrator regulates, so ``error`` is
-    ``setpoint - process_variable`` after damage as well as before it; ``setpoint``
-    is the calibrated one, ``gain_z`` times the reference strength, whenever every
-    cell is live. ``sensed_error`` is the plain mean error over the same cells,
-    which still counts a cell nothing can correct.
-    ``error`` is also zero while no live cell can be moved -- ``alive_cells`` and
-    ``sensed_error`` tell that from a tissue at setpoint -- and ``p_term``,
-    ``i_term`` and ``d_term`` are plain means over the live cells, so ``p_term``
-    tracks ``kp * sensed_error`` rather than ``kp * error``.
+    ``setpoint - process_variable`` after damage as well as before it, as long as
+    some live cell can still be moved; ``setpoint`` is the calibrated one,
+    ``gain_z`` times the reference strength, whenever every cell is live.
+    ``sensed_error`` is the plain mean error over the same cells, which still
+    counts a cell nothing can correct. While no live cell can be moved ``error``
+    is zero by its own rule, ``setpoint`` and ``process_variable`` fall back to the
+    plain means over the live cells, and ``sensed_error`` is their gap --
+    ``alive_cells`` and ``sensed_error`` tell that state from a tissue at
+    setpoint. ``p_term``, ``i_term`` and ``d_term`` are plain means over the live
+    cells, so ``p_term`` tracks ``kp * sensed_error`` rather than ``kp * error``.
     """
 
     goal: str
