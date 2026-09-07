@@ -120,8 +120,9 @@ RECOVERY_FRACTION = 0.2
 INERT_ERROR_SIGMA = 0.8
 STRENGTH_RISE = 0.3
 # After the top actuator is removed the survivors' strength must rise; by how much
-# is the tissue's call (measured +1.21, from 4.00 to 5.21, with the error at 1.03
-# sigma against 2.16 inert), so only the direction is asserted.
+# is the tissue's call (measured +1.21, from 4.00 to 5.21, with the error at 1.23
+# sigma against 2.16 inert -- measured against the survivors' own setpoint of 5.24
+# since #22, 1.03 against the calibrated 5.05), so only the direction is asserted.
 SURVIVOR_STRENGTH_RISE = 0.1
 SAFE_LAYERS = [14, 18, 22]
 SAFE_STRENGTH = 4.0
@@ -392,11 +393,15 @@ def test_the_tissue_carries_on_after_its_top_actuator_is_removed_mid_replay(
     Halfway through the replay the top actuator's hook is removed. The cell leaves
     the consensus after one pass, and with it its own reading -- on these tokens
     about -3 sigma -- so the consensus the survivors regulate is a different
-    number from before, and rises mechanically. What the damaged tissue must still
-    do is act on it: the survivors raise their strength over the second half, and
-    six cells live still hold the error below what the intact constant-strength
-    loop leaves (measured: +0.79 sigma at 4.00 before the removal, +1.03 at 5.21
-    after it, against +2.16 inert).
+    number from before, and rises mechanically -- as does the setpoint it is
+    measured against, the survivors' own since #22 (5.24 sigma against the
+    calibrated 5.05: cell 21's gain, 0.88, is below the consensus 1.26). What the
+    damaged tissue must still do is act on it: the survivors raise their strength
+    over the second half, and six cells live still hold the error below what the
+    intact constant-strength loop leaves (measured: +0.79 sigma at 4.00 before the
+    removal, +1.23 at 5.21 after it, against +2.16 inert; +1.03 against the
+    calibrated setpoint). The removal is at the top, so every survivor keeps its
+    calibrated weight: the rule #22 added fires only below a cell.
     """
     inert_error, _ = inert_under_push
     top = max(served.homeostat.actuator_layers)
@@ -408,11 +413,17 @@ def test_the_tissue_carries_on_after_its_top_actuator_is_removed_mid_replay(
 
     with attached(served), content_push(served, CONTENT_PUSH):
         served.replay(damage_at=served.prompt_length + DAMAGE_AT, damage=remove_top_actuator)
-        alive = {cell["layer"]: cell["alive"] for cell in served.tissue.status()["cells"]}
+        cells = {cell["layer"]: cell for cell in served.tissue.status()["cells"]}
         after_error = served.tail_error(DAMAGED_TAIL)
         after_strength = served.tail_strength(DAMAGED_TAIL)
+        after_setpoint = served.tissue.setpoint
 
-    assert alive[top] is False and all(alive[layer] for layer in alive if layer != top)
+    calibration = served.tissue.calibration
+    assert calibration is not None
+    survivors = {layer: cell for layer, cell in cells.items() if layer != top}
+    assert cells[top]["alive"] is False and all(cell["alive"] for cell in survivors.values())
+    assert all(cell["weight"] == calibration.weight(layer) for layer, cell in survivors.items())
+    assert after_setpoint != pytest.approx(served.tissue.nominal_setpoint)
     assert after_strength > before["strength"] + SURVIVOR_STRENGTH_RISE
     assert abs(after_error) < abs(inert_error), (after_error, inert_error)
 
