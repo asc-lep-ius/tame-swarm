@@ -119,9 +119,23 @@ test-gpu:
   tags: [workstation, cuda]
   resource_group: gpu
   extends: .python-job
+  variables:
+    # The runner mounts the workstation's HuggingFace cache read-only at
+    # /root/.cache/huggingface. Only the hub is read from there; everything the
+    # libraries write -- datasets' arrow conversions and lock files, dynamic
+    # modules -- goes to a job-local HF_HOME, or the first load_dataset fails
+    # with a read-only file system.
+    HF_HOME: /tmp/hf-home
+    HF_HUB_CACHE: /root/.cache/huggingface/hub
   script:
     - nvidia-smi
-    - uv run pytest tests/ -x --tb=short -m gpu
+    # The real-model tests read Qwen3-1.7B from that hub; they fail rather than
+    # skip when it is missing, so say up front what the job sees.
+    - ls "$HF_HUB_CACHE" 2>/dev/null || echo "HF hub cache is not mounted into this job"
+    # #6 budgets the GPU job at 120 seconds (measured 90-98 on the RTX 5070 Ti
+    # with Qwen3-1.7B loaded from that cache); the durations make a regression
+    # against that budget visible in the job log.
+    - uv run pytest tests/ -x --tb=short -m gpu --durations=10
 
 # --- Build stage ---
 docker-build:

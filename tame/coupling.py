@@ -47,7 +47,6 @@ DEFAULT_WARMUP_STEPS = 100
 MIN_WARMUP_STEPS_FOR_RAMP = 10
 DEFAULT_MAX_COUPLING_FRACTION = 0.1
 DEFAULT_EPS = 1e-8
-SUPPORTED_COUPLING_MODES = frozenset({"perception"})
 
 
 @dataclass(frozen=True)
@@ -56,7 +55,6 @@ class SteeringCouplingConfig:
     coupling_beta: float = DEFAULT_COUPLING_BETA
     warmup_steps: int = DEFAULT_WARMUP_STEPS
     max_coupling_fraction: float = DEFAULT_MAX_COUPLING_FRACTION
-    mode: str = "perception"
     eps: float = DEFAULT_EPS
 
     def __post_init__(self) -> None:
@@ -68,9 +66,6 @@ class SteeringCouplingConfig:
             raise ValueError("warmup_steps must be positive")
         if self.max_coupling_fraction < 0.0:
             raise ValueError("max_coupling_fraction must be non-negative")
-        if self.mode not in SUPPORTED_COUPLING_MODES:
-            modes = ", ".join(sorted(SUPPORTED_COUPLING_MODES))
-            raise ValueError(f"Unsupported coupling mode '{self.mode}'. Supported modes: {modes}")
         if self.eps <= 0.0:
             raise ValueError("eps must be positive")
         if self.warmup_steps < MIN_WARMUP_STEPS_FOR_RAMP:
