@@ -12,7 +12,7 @@ this is the seam where the two meet.
 
 import logging
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 import torch
 import torch.nn as nn
@@ -60,6 +60,8 @@ class SteeringExtraction:
     # explicit override is measured by nobody and is labelled as such.
     certified: bool
     fallback_reason: str | None = None
+    # PCA separability of the two arms' reads per layer: reported, never gated on.
+    separability: dict[int, float] = field(default_factory=dict)
 
 
 def _load_pairs(
@@ -140,6 +142,7 @@ def extract_steering_vectors(
 
     extractor = SteeringVectorExtractor(model, tokenizer, resolved)
     vectors = extractor.extract_from_pairs(pairs)
+    separability = dict(extractor.last_separability)
     resolved_format = pairs[0].pair_format
     status = "certified" if certified else "UNCERTIFIED"
     for vector in vectors.values():
@@ -159,6 +162,7 @@ def extract_steering_vectors(
         pair_format=resolved_format,
         certified=certified,
         fallback_reason=fallback_reason,
+        separability=separability,
     )
 
 

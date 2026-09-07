@@ -54,5 +54,8 @@ Implementing_Multi-Scale_Competency_in_Large_Language_Models-A_Bio-Inspired_Arch
 # mutmut working tree
 mutants/
 
+# hypothesis example database (tests/test_auction_properties.py)
+.hypothesis/
+
 # ── MLflow local tracking store (#7) ───────────────────────────────────────
 mlruns/

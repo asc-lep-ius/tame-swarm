@@ -6,7 +6,6 @@ import pytest
 import torch
 
 from parity import (
-    ArmFingerprint,
     ParityError,
     assert_parity,
     data_order_fingerprint,
@@ -15,42 +14,7 @@ from parity import (
 )
 from train import TrainingConfig
 
-BASE = ArmFingerprint(
-    router="mob",
-    seed=42,
-    deterministic=True,
-    model_id="tiny",
-    dtype="float32",
-    dataset="wikitext/wikitext-2-raw-v1",
-    max_steps=400,
-    batch_size=2,
-    gradient_accumulation_steps=8,
-    max_seq_length=512,
-    learning_rate=2e-5,
-    warmup_steps=40,
-    weight_decay=0.01,
-    num_experts=4,
-    top_k=2,
-    adapter_rank=32,
-    requested_layers=(5, 6, 7),
-    use_lora=False,
-    lora_rank=16,
-    lora_alpha=32,
-    lora_dropout=0.05,
-    calibration_loss_weight=0.15,
-    exploration_rate=0.02,
-    confidence_head_learning_rate=5e-3,
-    wealth_update_frequency=1,
-    coupling_goal=None,
-    coupling_beta=0.1,
-    coupling_warmup_steps=100,
-    gradient_checkpointing=True,
-    device="cpu",
-    probe_tokens=4096,
-    eval_split="abc123",
-    data_order="def456",
-    converted_layers=3,
-)
+from .arm_fingerprints import BASE
 
 
 def _batches(seed: int, count: int = 8):
@@ -104,8 +68,8 @@ def test_dense_arm_may_convert_nothing():
         ("data_order", "different"),
         ("learning_rate", 3e-5),
         ("batch_size", 4),
-        ("coupling_goal", "truthful"),
         ("coupling_warmup_steps", 50),
+        ("coupling_beta", 0.5),
     ],
 )
 def test_any_other_difference_is_a_confound(field, value):
@@ -128,10 +92,33 @@ def test_all_disagreements_are_reported_at_once():
     assert "max_steps" in message
 
 
-def test_duplicate_routers_are_rejected():
-    """Two arms with the same gate are not a comparison, whatever else matches."""
-    with pytest.raises(ParityError, match="distinct routers"):
+def test_duplicate_arms_are_rejected():
+    """Two arms with the same gate and the same coupling are not a comparison."""
+    with pytest.raises(ParityError, match="distinct"):
         assert_parity([BASE, BASE])
+    with pytest.raises(ParityError, match="distinct"):
+        coupled = replace(BASE, coupling_goal="truthful")
+        assert_parity([coupled, coupled])
+
+
+def test_a_coupled_and_an_uncoupled_auction_arm_are_at_parity():
+    """#6's ablation: the coupling goal is the variable under test and nothing else may move."""
+    coupled = replace(BASE, coupling_goal="truthful")
+
+    assert_parity([BASE, coupled])
+    assert coupled.arm == "mob+truthful"
+    assert BASE.arm == "mob"
+
+
+def test_the_couplings_own_parameters_are_confounds_between_coupled_arms():
+    """Two coupled arms that differ in beta are a tuning comparison, not the ablation."""
+    arms = [
+        replace(BASE, coupling_goal="truthful"),
+        replace(BASE, coupling_goal="safe", coupling_beta=0.5),
+    ]
+
+    with pytest.raises(ParityError, match="coupling_beta"):
+        assert_parity(arms)
 
 
 def test_a_single_arm_is_vacuously_at_parity():

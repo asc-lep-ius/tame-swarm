@@ -38,6 +38,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from smoke_fixture import build_smoke_fixture  # noqa: E402
 
+from coupling import DEFAULT_COUPLING_BETA, DEFAULT_WARMUP_STEPS  # noqa: E402
+from parity import arm_label  # noqa: E402
 from train import TAMETrainer, TrainingConfig  # noqa: E402
 
 logger = logging.getLogger("run_seeds")
@@ -54,8 +56,12 @@ HEADLINE_METRICS = (
 )
 
 
-def run_seed(seed: int, config: TrainingConfig) -> dict[str, float]:
-    """Train one replicate to completion and return its final headline metrics.
+def run_seed(seed: int, config: TrainingConfig) -> tuple[dict[str, float], dict[str, object]]:
+    """Train one replicate to completion; its final headline metrics and its arm fingerprint.
+
+    The fingerprint travels with the summary so that ``compare_runs.py`` can refuse
+    a comparison between two groups that differ in anything but the variable under
+    test -- the same guard ``compare_routers.py`` applies within one process.
 
     Explicitly frees the model and empties CUDA's caching allocator before
     returning: this loops several full-size trainers through one process, and a
@@ -76,13 +82,15 @@ def run_seed(seed: int, config: TrainingConfig) -> dict[str, float]:
 
     final = trainer.eval_history[-1] if trainer.eval_history else {}
     result = {key: final[key] for key in HEADLINE_METRICS if key in final}
+    assert trainer.fingerprint is not None
+    fingerprint = trainer.fingerprint.as_dict()
 
     del trainer
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    return result
+    return result, fingerprint
 
 
 def aggregate(per_seed: dict[int, dict[str, float]]) -> dict[str, dict[str, float]]:
@@ -145,6 +153,20 @@ def main() -> None:
         default=True,
         help="Force deterministic kernels where one exists (default: on)",
     )
+    # The coupled arm of #6's ablation: the same auction, with the routing
+    # coupling seeded from a certified direction (#14). Everything else is shared
+    # with the uncoupled arm, which is what makes the two summaries comparable.
+    parser.add_argument(
+        "--coupling_goal",
+        type=str,
+        default=None,
+        help=(
+            "Seed the routing coupling from this goal's certified direction at its "
+            "certified layers only (default: routing stays uncoupled)"
+        ),
+    )
+    parser.add_argument("--coupling_beta", type=float, default=DEFAULT_COUPLING_BETA)
+    parser.add_argument("--coupling_warmup_steps", type=int, default=DEFAULT_WARMUP_STEPS)
     args = parser.parse_args()
 
     seeds = [int(part) for part in args.seeds.split(",")]
@@ -192,6 +214,9 @@ def main() -> None:
         gradient_checkpointing=False,
         use_lora=args.use_lora,
         deterministic=args.deterministic,
+        coupling_goal=args.coupling_goal,
+        coupling_beta=args.coupling_beta,
+        coupling_warmup_steps=args.coupling_warmup_steps,
     )
 
     # One shared MLflow store across seeds, same reasoning as compare_routers.py:
@@ -199,21 +224,27 @@ def main() -> None:
     # never show them side by side.
     os.environ.setdefault("MLFLOW_TRACKING_URI", f"file:{workspace / 'mlruns'}")
 
-    per_seed = {seed: run_seed(seed, config) for seed in seeds}
+    runs = {seed: run_seed(seed, config) for seed in seeds}
+    per_seed = {seed: metrics for seed, (metrics, _) in runs.items()}
+    fingerprints = {seed: fingerprint for seed, (_, fingerprint) in runs.items()}
     stats = aggregate(per_seed)
 
+    arm = arm_label(args.router, args.coupling_goal)
     print("\n" + format_table(stats))
-    print(f"\narm: {args.router} | seeds: {seeds} | steps: {args.steps}")
+    print(f"\narm: {arm} | seeds: {seeds} | steps: {args.steps}")
     print(f"artefacts: {workspace}")
 
     summary_path = workspace / "seed_summary.json"
     summary_path.write_text(
         json.dumps(
             {
+                "arm": arm,
                 "router": args.router,
+                "coupling_goal": args.coupling_goal,
                 "seeds": seeds,
                 "steps": args.steps,
                 "per_seed": per_seed,
+                "fingerprints": fingerprints,
                 "stats": stats,
             },
             indent=2,
