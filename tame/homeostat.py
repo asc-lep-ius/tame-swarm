@@ -14,12 +14,17 @@ controller with subordinates:
   and runs its own integrator. A cell may also be sensor-only: the readout above
   the top actuator senses and votes but injects nothing.
 - **Gap junctions.** The slow state is shared and the fast response is local. Every
-  cell's integrator accumulates the *tissue's* mean error over the live cells, so
-  all cells hold the same memory -- a coupled tissue is isopotential for slow
-  signals -- and the bottom cell, which has exactly zero gain from its own action,
-  cannot wind up on a deficit only the cells above it can correct. Each cell's
-  proportional term acts on its *own* fresh error, so a cell that senses a deficit
-  now pushes harder now, without memory and without fighting.
+  cell's integrator accumulates the *tissue's* consensus error over the live cells,
+  so all cells hold the same memory -- a coupled tissue is isopotential for slow
+  signals. Each cell writes to that memory in proportion to its controllability,
+  its calibrated gain per unit of strength (#21): the bottom cell, which has
+  exactly zero gain from any action, senses, records and reports but does not
+  vote, so it cannot wind up the tissue on a deficit no actuator can correct, and
+  the cells above it are not pushed past their own setpoints to zero a mean that
+  includes it. Each cell's proportional term acts on its *own* fresh error, so a
+  cell that senses a deficit now pushes harder now, without memory and without
+  fighting -- the bottom cell included, whose push is the earliest answer to a
+  deficit that on a residual stream reaches every cell above it.
 - **Damage.** Liveness is a property of firing, not of wiring: a cell that misses
   a pass drops out of the consensus and rejoins when it fires again. There is no
   fallback path, because the local rule *is* the rule.
@@ -34,7 +39,7 @@ the same filter as a calibrated cell.
 import logging
 import math
 from collections import deque
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import numpy as np
@@ -131,8 +136,9 @@ class AdaptiveHomeostat:
         self._pass = 0
         self._recorded_pass = 0
         self._last_layer: int | None = None
-        # The tissue's frozen consensus for the pass: ``(mean error, mean setpoint,
-        # mean reading)`` over the live cells, or None before the first pass.
+        # The tissue's frozen consensus for the pass: ``(error, setpoint, reading)``,
+        # each the controllability-weighted mean over the live cells, or None before
+        # the first pass and while no live cell can be moved.
         self._consensus: tuple[float, float, float] | None = None
 
     # --- configuration -----------------------------------------------------------
@@ -156,10 +162,38 @@ class AdaptiveHomeostat:
 
     @property
     def setpoint(self) -> float:
-        """The tissue setpoint: the mean cell setpoint, or the legacy cosine target."""
+        """The tissue setpoint: the consensus of the cell setpoints, or the legacy cosine target.
+
+        The same weights as the consensus the integrator regulates, so the tissue
+        setpoint is ``gain_z * reference_strength`` exactly as each cell's is.
+        """
         if self.calibration is None:
             return self.config.target_alignment
-        return float(np.mean([self.cell_setpoint(layer) for layer in self.cells]))
+        consensus = self._consensus_of(self.cells, self.cell_setpoint)
+        if consensus is None:
+            return float(np.mean([self.cell_setpoint(layer) for layer in self.cells]))
+        return consensus
+
+    def cell_weight(self, layer: int) -> float:
+        """How much of the shared memory this cell writes: its controllability (#21).
+
+        The bottom actuator reads content no actuator can answer -- its calibrated
+        lift is exactly zero -- so it senses, records and reports but does not move
+        the integrator; the cells above it are no longer pushed past their own
+        setpoints to zero a mean that includes an error nobody can correct. A cell
+        outside the calibration votes as one, as it did before.
+        """
+        if self.calibration is None or layer not in self.calibration.layers:
+            return 1.0
+        return self.calibration.weight(layer)
+
+    def _consensus_of(self, cells: Sequence[int], value: Callable[[int], float]) -> float | None:
+        """The controllability-weighted mean of ``value`` over ``cells``; None if nothing weighs."""
+        weights = [self.cell_weight(cell) for cell in cells]
+        total = sum(weights)
+        if total <= 0:
+            return None
+        return float(sum(w * value(cell) for w, cell in zip(weights, cells, strict=True)) / total)
 
     @property
     def filter_time_constant(self) -> float:
@@ -279,10 +313,10 @@ class AdaptiveHomeostat:
         error = setpoint - pv
         self._pv[layer], self._error[layer] = pv, error
 
-        # The controller integrates the tissue's mean error (frozen for this pass);
-        # the cell's own deviation from it enters through the proportional term only.
-        # The consensus is handed over as the tissue's mean reading against the
-        # tissue's mean setpoint, not as a single error: the error, and with it the
+        # The controller integrates the tissue's consensus error (frozen for this
+        # pass); the cell's own deviation from it enters through the proportional
+        # term only. The consensus is handed over as the consensus reading against
+        # the consensus setpoint, not as a single error: the error, and with it the
         # integral and proportional terms, is the same either way, but the
         # derivative acts on the process variable precisely so that a setpoint
         # change cannot kick it, and a setpoint folded into the process variable
@@ -315,14 +349,16 @@ class AdaptiveHomeostat:
     def _advance(self, layer: int) -> None:
         """Cells fire in layer order; a non-increasing layer opens a new pass.
 
-        The tissue's mean error is frozen here, over the cells alive at the end of
-        the previous pass, so every cell in this pass blends in the same consensus.
+        The tissue's consensus error is frozen here, over the cells alive at the end
+        of the previous pass and weighted by their controllability, so every cell in
+        this pass blends in the same consensus. With no controllable cell alive there
+        is nothing the integrator can act on and the memory holds.
         """
         if self._last_layer is None or layer <= self._last_layer:
             live = [cell for cell in self.live_cells() if cell in self._error]
-            if live:
-                mean_pv = float(np.mean([self._pv[cell] for cell in live]))
-                mean_setpoint = float(np.mean([self.cell_setpoint(cell) for cell in live]))
+            mean_pv = self._consensus_of(live, self._pv.__getitem__)
+            mean_setpoint = self._consensus_of(live, self.cell_setpoint)
+            if mean_pv is not None and mean_setpoint is not None:
                 self._consensus = (mean_setpoint - mean_pv, mean_setpoint, mean_pv)
             else:
                 self._consensus = None
@@ -346,13 +382,24 @@ class AdaptiveHomeostat:
 
     @property
     def error(self) -> float:
+        """The consensus error over the live cells: what the shared integrator drives to zero."""
+        live = [cell for cell in self.live_cells() if cell in self._error]
+        consensus = self._consensus_of(live, self._error.__getitem__)
+        return 0.0 if consensus is None else consensus
+
+    @property
+    def sensed_error(self) -> float:
+        """The plain mean error over the live cells, controllable or not: what the tissue reads."""
         live = [cell for cell in self.live_cells() if cell in self._error]
         return float(np.mean([self._error[cell] for cell in live])) if live else 0.0
 
     def _record(self) -> None:
         """One history entry per pass, updated as the pass's cells fire."""
         live = [cell for cell in self.live_cells() if cell in self._pv]
-        alignment = float(np.mean([self._pv[cell] for cell in live]))
+        consensus = self._consensus_of(live, self._pv.__getitem__)
+        alignment = (
+            float(np.mean([self._pv[cell] for cell in live])) if consensus is None else consensus
+        )
         if self._recorded_pass == self._pass and self.alignment_history:
             self.alignment_history[-1] = alignment
             self.strength_history[-1] = self.current_strength
@@ -371,6 +418,7 @@ class AdaptiveHomeostat:
             "layer": layer,
             "injects": self._injects(layer),
             "alive": layer in live,
+            "weight": self.cell_weight(layer),
             "setpoint": setpoint,
             "process_variable": pv,
             "error": setpoint - pv,
@@ -391,14 +439,20 @@ class AdaptiveHomeostat:
         def mean_of(name: str) -> float:
             return float(np.mean([cell[name] for cell in active])) if active else 0.0
 
+        consensus_pv = self._consensus_of(
+            sorted(live), lambda cell: self._pv.get(cell, self.cell_setpoint(cell))
+        )
+        process_variable = mean_of("process_variable") if consensus_pv is None else consensus_pv
+
         return {
             "goal": self.goal,
             "calibrated": self.calibrated,
             "readout_layer": self.readout_layer,
             "alive_cells": len(live),
             "setpoint": self.setpoint,
-            "process_variable": mean_of("process_variable"),
+            "process_variable": process_variable,
             "error": self.error,
+            "sensed_error": self.sensed_error,
             "p_term": mean_of("p_term"),
             "i_term": mean_of("i_term"),
             "d_term": mean_of("d_term"),

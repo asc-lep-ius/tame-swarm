@@ -9,6 +9,8 @@ to an injection is exactly the additive passthrough, so every lift the
 calibration should recover is known in closed form.
 """
 
+from dataclasses import replace
+
 import pytest
 import torch
 import torch.nn as nn
@@ -127,9 +129,12 @@ def test_per_cell_setpoints_are_the_lift_each_cell_reads_at_the_reference_streng
     assert homeostat.cell_setpoint(1) == 0.0
     assert homeostat.cell_setpoint(2) == pytest.approx(2.0)
     assert homeostat.cell_setpoint(3) == pytest.approx(4.0)
-    # The tissue's gain is the mean cell gain, which is what the shared gains derive from.
+    # The tissue's gain is the gain-weighted mean cell gain, (1 * 1 + 2 * 2) / (1 + 2),
+    # which is what the shared gains derive from; the plain mean over cells, 1.0,
+    # would count the blind cell's zero (#21). The tissue setpoint follows it.
     assert homeostat.calibration is not None
-    assert homeostat.calibration.gain_z == pytest.approx(1.0)
+    assert homeostat.calibration.gain_z == pytest.approx(5 / 3)
+    assert homeostat.setpoint == pytest.approx(homeostat.calibration.gain_z * 2.0)
 
 
 def test_tissue_settles_at_the_reference_strength_on_resting_content():
@@ -142,18 +147,21 @@ def test_tissue_settles_at_the_reference_strength_on_resting_content():
 
 
 def test_tissue_compensates_a_content_deficit_in_consensus():
-    """Every cell reads the same deficit; the tissue's mean error goes to zero, not each cell's.
+    """Every cell reads the same deficit; the consensus error goes to zero, not each cell's.
 
-    The bottom cell can never see its own effect, so its error stays; the cells above
-    it absorb the correction. With a shared integrator both actuators carry the same
-    effort, and ``2a + b = 1.5`` with ``a == b`` puts each half a unit above the reference.
+    The bottom cell can never see its own effect, so its error stays and it does not
+    vote; the cells above it absorb the correction. With a shared integrator both
+    actuators carry the same effort ``a``: cell 2 reads ``a - 0.5`` against 2, cell 3
+    reads ``2a - 0.5`` against 4, and zeroing the gain-weighted mean error,
+    ``1 (2.5 - a) + 2 (4.5 - 2a) = 0``, puts each at 2.3 -- not the 2.5 the plain
+    mean asked for, which was paying for the blind cell's unfixable half unit.
     """
     homeostat, tissue = make(content=-0.5)
     tissue.run(120)
 
     assert abs(homeostat.status()["error"]) < 2e-2
     for layer in ACTUATORS:
-        assert tissue.strengths[layer] == pytest.approx(2.5, abs=5e-2)
+        assert tissue.strengths[layer] == pytest.approx(2.3, abs=5e-2)
 
 
 def test_tissue_saturates_at_the_band_and_reports_it():
@@ -183,6 +191,41 @@ def test_local_proportional_term_pushes_where_the_deficit_is_without_winding_up(
     cells = homeostat.status()["cells"]
     assert cells[0]["i_term"] == pytest.approx(cells[1]["i_term"], abs=1e-9)
     assert abs(homeostat.status()["error"]) < 2e-2
+
+
+def test_the_blind_cell_senses_and_reports_but_does_not_write_to_the_shared_memory():
+    """A deficit only the bottom cell reads (#21): reported per cell, absent from the consensus.
+
+    A cell's weight is its calibrated gain, zero for the bottom actuator, so the
+    consensus error is zero while the tissue still reads a third of a sigma of
+    mean error, and the cells above are not pushed past their own setpoints to pay
+    for it. The blind cell's own proportional term still pushes (2.25 against 1.6
+    above it); that lifts cell 2, the integrator trims the common effort in return,
+    and the cells above spread a little either side of their setpoints rather than
+    sitting on them. Paired with the uniform consensus, which zeroes the plain mean
+    by pushing the two cells above past their setpoints by the whole blind error
+    between them.
+    """
+    homeostat, tissue = make(content={1: -1.0, 2: 0.0, 3: 0.0}, kp=0.5)
+    tissue.run(120)
+    status = homeostat.status()
+    cells = status["cells"]
+
+    assert [cell["weight"] for cell in cells] == [0.0, 1.0, 2.0]
+    assert cells[0]["error"] == pytest.approx(1.0)
+    assert abs(status["error"]) < 1e-3
+    assert status["sensed_error"] > 0.25
+    assert tissue.strengths[1] > tissue.strengths[2]
+    assert all(abs(cell["error"]) < 0.3 for cell in cells[1:])
+
+    uniform = AdaptiveHomeostat(
+        tissue_config(kp=0.5), calibration=replace(calibration(), weighting="uniform")
+    )
+    twin = Tissue(uniform, tissue.direction, {1: -1.0, 2: 0.0, 3: 0.0})
+    twin.run(120)
+    others = [cell["error"] for cell in uniform.status()["cells"][1:]]
+    assert abs(uniform.status()["error"]) < 1e-3
+    assert sum(others) == pytest.approx(-1.0, abs=2e-2)
 
 
 def test_a_removed_cell_drops_out_of_the_consensus_and_rejoins():
