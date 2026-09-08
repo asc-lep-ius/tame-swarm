@@ -70,16 +70,28 @@ class MoBConfig:
     # to 7 significant figures at 0.1x and 10x. The reward is the one quantity
     # carrying no wealth at all, so the inflow is an absolute number of credits.
     #
-    # At the shipped band, run to eight memory horizons, the economy settles
-    # stratified rather than clamped-flat: 25% of expert-steps at the ceiling, 36%
-    # at the floor, Gini 0.693, mean wealth 199. The floor is *touched* often and
-    # still does not hold up the mean -- it accounts for 2% of all surviving
-    # wealth.
+    # **The band determines nothing about who wins, and that is why all four are
+    # retained.** Run to eight memory horizons, every band swept settles into the
+    # same two-expert monopoly: top_k experts hold ~99% of the slots and the other
+    # six hold 0.002 each, which is the 2% exploration slot divided among them.
+    # Ceiling occupancy is top_k/num_experts -- 25.0% -- at every band and every
+    # decay measured, because it counts the winners and there are always top_k of
+    # them. What the band changes is only *where the six losers' wealth sits*: on
+    # the floor at [15, 750] (74% floor occupancy, 0.7% of expert-steps in the
+    # band's interior), in the interior at [37.5, 150] (0% floor, 75% interior).
+    # That moves wealth Gini from 0.693 to 0.124 and moves not one win share.
     #
-    # Sets the transient and nothing else. Holding this band and moving only the
-    # start from 25 to 750 leaves the settled Gini at 0.691/0.693/0.693/0.692 and
-    # the mean wealth at 199 in every case; the only column that moves is
-    # time-to-first-clamp, 343 steps against 1. The equilibrium is a fixed point of
+    # So Gini here is a closed form rather than a measurement: 0.693 is exactly the
+    # Gini of (750, 750, 15 x 6), which is why its spread over three seeds is
+    # +-0.000. Read it beside interior occupancy, never alone.
+    #
+    # Sets the transient, and the settled wealth *distribution* is not its to move.
+    # Holding this band and moving only the start from 25 to 750 leaves the settled
+    # Gini at 0.691/0.693/0.693/0.692 and the mean wealth at 199 in every case, and
+    # the monopoly is the same two experts on 99% of slots throughout. What does
+    # move is how much of the tail the economy spends off its bounds -- interior
+    # occupancy runs 0.7% to 24.7% across those starts -- and time-to-first-clamp,
+    # 343 steps against 1. The equilibrium is a fixed point of
     # `w = decay*w + net(w)` and is an absolute wealth, so what has to contain it
     # is the *band*, not the starting point. The constraint on this constant is
     # therefore only that it sit inside the band and away from either bound, so a
@@ -125,14 +137,15 @@ class MoBConfig:
     # also self-referential in the way #16 discounted `test_default_values_match_
     # expected` for; no production path reads this constant except the clamps.
     #
-    # What it is *not* is a cap on inequality. Swept to steady state, reducing how
-    # often wealth overturns reports always costs the ledger's spread rather than
-    # bounding it: at [37.5, 150] and this decay, overturn falls to 1.0% and Gini
-    # with it, to 0.124. The limit case is unambiguous -- at decay 1.0 every band
-    # whose bounds differ ends with 100% of expert-steps at the ceiling, Gini exactly
-    # 0.000 and overturn 0.0% -- every expert equally and maximally rich. A ceiling
-    # compresses the ledger toward a single value rather than capping a spread,
-    # which is why #16 changed no value here.
+    # What it is *not* is a lever on the monopoly. Narrowing the band to [37.5, 150]
+    # takes wealth Gini from 0.693 to 0.124 and how often wealth overturns a report
+    # from 26.6% to 1.0%, and leaves the same two experts holding 99% of the slots
+    # with the same six shut out on 0.002 -- it relocates the losers' wealth into
+    # the band's interior without readmitting them to the market. The limit case is
+    # unambiguous the other way: at decay 1.0 every band whose bounds differ ends
+    # with 100% of expert-steps at the ceiling, every expert equally and maximally
+    # rich. Neither end is a cap on inequality, which is why #16 changed no value
+    # here and #26 is about the exploration slot instead.
     max_wealth: float = 750.0
     jitter_std: float = 0.08
     reward_scale: float = 2.0

@@ -24,10 +24,13 @@ against the shared base. What the band still shapes is three things:
 time constant of ``1 / (1 - decay)`` steps and settles where inflow balances the
 leak, at the fixed point of ``w = (decay * w) + net(w)``. Because ``net`` is an
 absolute inflow, that equilibrium is an absolute wealth -- and the thing that has
-to contain it is the **band**, not ``initial_wealth``, which only decides where
-the transient starts. Holding the band at [23.7, 237.2] and moving
-``initial_wealth`` from 25 to 200 leaves the settled Gini at 0.519; holding
-``initial_wealth`` at 75 and moving the band takes it from 0.518 to 0.002.
+to contain it is the **band**. ``--start`` and ``--scale`` separate the two:
+holding the shipped band and moving only ``initial_wealth`` from 25 to 750 leaves
+the settled Gini at 0.691-0.693 and the mean wealth at 199, while sliding the
+whole band at a fixed ratio takes the settled Gini from 0.000 to 0.519. What
+``initial_wealth`` does *not* leave alone is which experts end up rich: floor
+occupancy and the overturn rate move with it, because that is a path-dependent
+selection outcome and the leaky-integrator time constant bounds only the leak.
 
 So the sweep is over (ratio, decay), with the band centred geometrically because
 the gate reads log-wealth; a separate pass slides the whole band, keeping the
@@ -92,8 +95,16 @@ MIN_STEPS = 600
 # Every steady-state statistic is read over this many final steps, so rows with
 # different budgets are still compared over the same window.
 TAIL = 500
-# Relative headroom for calling a float32 ledger "at" a bound.
-CLAMP_TOLERANCE = 1e-4
+# Relative headroom for calling a float32 ledger "at" a bound. The two bounds need
+# different tolerances and it is not a fudge: the ceiling is an attractor from
+# above, so a clamped expert sits *exactly* on it and float32 headroom is all that
+# is wanted. The floor is escaped by a hair every time an exploration win lands and
+# then decays back, so the same tolerance systematically undercounts it -- measured
+# at the shipped band, 1e-4 reads 34% where 10% reads 74%, and no floor-bound expert
+# ever exceeds 17.1 out of 750. A tenth of the floor is below any wealth an expert
+# holds a slot on and above the exploration jitter.
+CEILING_TOLERANCE = 1e-4
+FLOOR_TOLERANCE = 0.10
 
 # max_wealth / min_wealth: how many times better a poor expert's report must be to
 # overturn a rich one. 1.0 makes wealth inert in selection, which is the limit
@@ -112,10 +123,17 @@ SCALES = (7.5, 25.0, 75.0, 250.0, 750.0)
 
 
 def horizon(decay: float) -> int:
-    """Step budget for a decay: eight memory horizons, or the longest finite one."""
-    slowest = max(d for d in DECAYS if d < 1.0)
-    effective = min(decay, slowest)
-    return max(MIN_STEPS, math.ceil(HORIZONS / (1.0 - effective)))
+    """Step budget for a decay: eight memory horizons.
+
+    Only ``decay >= 1.0`` is clamped, and because it has no equilibrium to settle
+    to rather than because 2667 steps is enough for it. A ``min(decay, slowest)``
+    here would silently send 0.999 to 2.7 horizons while the legend claims eight
+    -- republishing a transient under a settled label, which is the defect the
+    horizon rule exists to remove.
+    """
+    if decay >= 1.0:
+        decay = max(d for d in DECAYS if d < 1.0)
+    return max(MIN_STEPS, math.ceil(HORIZONS / (1.0 - decay)))
 
 
 @dataclass(frozen=True)
@@ -171,6 +189,7 @@ class Reading:
     gini_spread: float
     mean_wealth: float
     floor_share: float
+    interior_occupancy: float
     overturn: float
     overturn_spread: float
     distinct_winners: float
@@ -236,66 +255,86 @@ def _charge_spy(mob) -> tuple[list[float], list[float]]:
     return collected, returned
 
 
+@dataclass
+class _Accumulator:
+    """Per-step tallies for one run, so ``measure`` stays a description of the run."""
+
+    num_experts: int
+    ceiling: float
+    floor: float
+    at_ceiling: int = 0
+    at_floor: int = 0
+    in_interior: int = 0
+    steps_to_ceiling: int | None = None
+
+    def __post_init__(self) -> None:
+        self.overturns: list[float] = []
+        self.top1s: list[float] = []
+        self.effective: list[float] = []
+        self.wins = torch.zeros(self.num_experts)
+
+    def see_clamps(self, wealth: torch.Tensor, step: int, in_tail: bool) -> None:
+        """Time-to-first-clamp is a whole-run event; occupancy is a tail rate."""
+        if self.steps_to_ceiling is None and int((wealth >= self.ceiling).sum()):
+            self.steps_to_ceiling = step + 1
+        if not in_tail:
+            return
+        self.at_ceiling += int((wealth >= self.ceiling).sum())
+        self.at_floor += int((wealth <= self.floor).sum())
+        self.in_interior += int(((wealth > self.floor) & (wealth < self.ceiling)).sum())
+
+    def see_step(self, record, stats, top_k: int) -> None:
+        self.overturns.append(_overturned(stats.confidences, stats.expert_wealth, top_k))
+        self.top1s.append(stats.routing.top1_mean.item())
+        self.effective.append(stats.routing.effective_experts.item())
+        self.wins += torch.bincount(
+            record.selected_experts.flatten(), minlength=self.num_experts
+        ).float()
+
+
 def measure(band: Band, seed: int, steps: int, share: str) -> Reading:
     config = band.config(routing_share=share)
     economy = SyntheticEconomy(shuffled(DEFAULT_COMPETENCE, seed), seed=seed, config=config)
     mob = economy.mob
     collected, returned = _charge_spy(mob)
-
-    ceiling = config.max_wealth * (1 - CLAMP_TOLERANCE)
-    floor = config.min_wealth * (1 + CLAMP_TOLERANCE)
-    at_ceiling = at_floor = 0
-    steps_to_ceiling: int | None = None
-    overturns: list[float] = []
-    top1s: list[float] = []
-    effective: list[float] = []
-    tail_wins = torch.zeros(config.num_experts)
+    tally = _Accumulator(
+        num_experts=config.num_experts,
+        ceiling=config.max_wealth * (1 - CEILING_TOLERANCE),
+        floor=config.min_wealth * (1 + FLOOR_TOLERANCE),
+    )
     tail_from = steps - TAIL
 
     for step in range(steps):
         record = economy.step()
         stats = mob.last_stats
         assert stats is not None
-
-        wealth = mob.expert_wealth
-        if int((wealth >= ceiling).sum()) and steps_to_ceiling is None:
-            steps_to_ceiling = step + 1
-        if step < tail_from:
-            continue
-
-        overturns.append(_overturned(stats.confidences, stats.expert_wealth, config.top_k))
-        top1s.append(stats.routing.top1_mean.item())
-        effective.append(stats.routing.effective_experts.item())
-        at_ceiling += int((wealth >= ceiling).sum())
-        at_floor += int((wealth <= floor).sum())
-        tail_wins += torch.bincount(
-            record.selected_experts.flatten(), minlength=config.num_experts
-        ).float()
+        in_tail = step >= tail_from
+        tally.see_clamps(mob.expert_wealth, step, in_tail)
+        if in_tail:
+            tally.see_step(record, stats, config.top_k)
 
     wealth = mob.expert_wealth
     expert_steps = TAIL * config.num_experts
-    floored = int((wealth <= floor).sum())
     return Reading(
-        ceiling_occupancy=at_ceiling / expert_steps,
-        floor_occupancy=at_floor / expert_steps,
-        steps_to_ceiling=steps_to_ceiling,
-        seeds_reaching_ceiling=int(steps_to_ceiling is not None),
+        ceiling_occupancy=tally.at_ceiling / expert_steps,
+        floor_occupancy=tally.at_floor / expert_steps,
+        steps_to_ceiling=tally.steps_to_ceiling,
+        seeds_reaching_ceiling=int(tally.steps_to_ceiling is not None),
         seeds=1,
         gini=gini(wealth),
         gini_spread=0.0,
         mean_wealth=wealth.mean().item(),
-        # What share of the surviving wealth is the floor itself rather than
-        # anything the economy paid: the direct read on "the floor holds up the
-        # mean". A lower bound on the support, since an expert above the floor may
-        # have been held up by it earlier in the run.
-        floor_share=floored * config.min_wealth / wealth.sum().item(),
-        overturn=statistics.mean(overturns),
+        # The share of surviving wealth that sits on the floor: the direct read on
+        # "does the floor hold up the mean".
+        floor_share=wealth[wealth <= tally.floor].sum().item() / wealth.sum().item(),
+        interior_occupancy=tally.in_interior / expert_steps,
+        overturn=statistics.mean(tally.overturns),
         overturn_spread=0.0,
-        distinct_winners=float((tail_wins > 0).sum()),
+        distinct_winners=float((tally.wins > 0).sum()),
         charge_per_step=statistics.mean(collected[tail_from:]),
         rebate_fraction=sum(returned[tail_from:]) / max(sum(collected[tail_from:]), 1e-12),
-        top1=statistics.mean(top1s),
-        effective_experts=statistics.mean(effective),
+        top1=statistics.mean(tally.top1s),
+        effective_experts=statistics.mean(tally.effective),
         steps=steps,
     )
 
@@ -319,6 +358,7 @@ def _aggregate(band: Band, seeds: tuple[int, ...], share: str) -> Reading:
         gini_spread=statistics.pstdev(ginis),
         mean_wealth=statistics.mean(r.mean_wealth for r in runs),
         floor_share=statistics.mean(r.floor_share for r in runs),
+        interior_occupancy=statistics.mean(r.interior_occupancy for r in runs),
         overturn=statistics.mean(overturns),
         overturn_spread=statistics.pstdev(overturns),
         distinct_winners=statistics.mean(r.distinct_winners for r in runs),
@@ -332,7 +372,7 @@ def _aggregate(band: Band, seeds: tuple[int, ...], share: str) -> Reading:
 
 HEADER = (
     f"{'band':>14} {'min':>7} {'max':>8} {'decay':>6} {'steps':>6} "
-    f"{'ceil%':>6} {'t_ceil':>10} {'floor%':>7} {'flr/W':>6} "
+    f"{'ceil%':>6} {'t_ceil':>10} {'floor%':>7} {'mid%':>6} {'flr/W':>6} "
     f"{'gini':>15} {'meanW':>8} {'overturn':>16} {'wins':>5} "
     f"{'chg/step':>9} {'rebate':>7} {'top1':>6} {'n_eff':>6}"
 )
@@ -347,11 +387,12 @@ def _row(band: Band, reading: Reading) -> str:
     # every step by construction and the four clamp columns measure the band's
     # definition rather than the economy's behaviour.
     clamps = (
-        f"{'n/a':>6} {'n/a':>10} {'n/a':>7} {'n/a':>6}"
+        f"{'n/a':>6} {'n/a':>10} {'n/a':>7} {'n/a':>6} {'n/a':>6}"
         if band.ratio == 1.0
         else (
             f"{100 * reading.ceiling_occupancy:>5.1f}% {reached:>10} "
-            f"{100 * reading.floor_occupancy:>6.1f}% {reading.floor_share:>6.2f}"
+            f"{100 * reading.floor_occupancy:>6.1f}% "
+            f"{100 * reading.interior_occupancy:>5.1f}% {reading.floor_share:>6.2f}"
         )
     )
     return (
@@ -367,7 +408,13 @@ def _row(band: Band, reading: Reading) -> str:
 
 def _legend(seeds: tuple[int, ...]) -> str:
     return (
-        f"\nRates are over the last {TAIL} steps; gini, meanW and flr/W are the final state. "
+        f"\nRates are over the last {TAIL} steps; gini, meanW and flr/W are the final "
+        f"state. `mid%` is occupancy of the\nband's interior -- near zero means the "
+        f"ledger has saturated into a lattice and its Gini is then a closed-form\n"
+        f"function of the ratio and top_k rather than a reading of the economy. The "
+        f"floor is counted within {100 * FLOOR_TOLERANCE:.0f}% of\nitself and the "
+        f"ceiling within {CEILING_TOLERANCE:g}; see CEILING_TOLERANCE for why they "
+        f"differ. "
         f"+- is the population sd over the {len(seeds)} seeds.\nThe step budget is "
         f"{HORIZONS} memory horizons 1/(1-decay), floored at {MIN_STEPS}, so rows at "
         "different decays are compared\nat the same distance from their own equilibrium; "
@@ -420,6 +467,56 @@ def sweep_start(seeds: tuple[int, ...], share: str, band: Band = SHIPPED) -> Non
     print(_legend(seeds))
 
 
+def sweep_advantage(seeds: tuple[int, ...], share: str) -> None:
+    """What report advantage competence buys, and at which horizon it was read.
+
+    The quantity ``test_the_band_ratio_bounds_the_report_advantage_demanded_of_the
+    _poorest`` compares the band's ratio against: the most competent expert's mean
+    report over the least competent one's, on the planted-competence fixture.
+
+    It exists as a mode because it is **not a constant of the fixture** and a
+    hardcoded value would be unsourced. The heads keep calibrating, so it grows
+    with the training horizon -- roughly 2.3 at the 400 steps the damage protocols
+    run, roughly 5.4 at the sweep's settled budget. Reported here with the flat
+    band beside it, because a number measured inside the equilibrium a band
+    creates would be no use as a comparison against that band's ratio.
+    """
+    print(f"\n=== report advantage competence buys, seeds {seeds}, share={share} ===\n")
+    print(f"{'horizon':>9} {'band':>10} " + " ".join(f"{'seed' + str(s):>7}" for s in seeds))
+    flat = replace(SHIPPED, min_wealth=SHIPPED.initial_wealth, max_wealth=SHIPPED.initial_wealth)
+    for steps in (400, horizon(SHIPPED.wealth_decay)):
+        for label, band in (("shipped", SHIPPED), ("flat", flat)):
+            values = [_report_advantage(band, seed, steps, share) for seed in seeds]
+            print(
+                f"{steps:>9} {label:>10} "
+                + " ".join(f"{v:>7.2f}" for v in values)
+                + f"   mean {statistics.mean(values):>5.2f}"
+            )
+    print(
+        "\nThe band's ratio is what this is compared against; at the shipped 50x it "
+        "exceeds\nevery reading here by roughly an order of magnitude, which is the "
+        "claim the test holds."
+    )
+
+
+def _report_advantage(band: Band, seed: int, steps: int, share: str) -> float:
+    """Most-competent over least-competent expert's mean report, over the tail."""
+    config = band.config(routing_share=share)
+    competence = shuffled(DEFAULT_COMPETENCE, seed)
+    best, worst = int(competence.argmax()), int(competence.argmin())
+    economy = SyntheticEconomy(competence, seed=seed, config=config)
+    window = min(TAIL, steps // 2)
+    reports = []
+    for step in range(steps):
+        economy.step()
+        if step >= steps - window:
+            stats = economy.mob.last_stats
+            assert stats is not None
+            reports.append(stats.confidences.reshape(-1, config.num_experts).mean(0))
+    mean_report = torch.stack(reports).mean(0)
+    return float(mean_report[best] / mean_report[worst])
+
+
 def sweep_recovery(candidates: list[Band], seeds: tuple[int, ...], share: str) -> None:
     """The three strict expected failures, run against each candidate band.
 
@@ -448,18 +545,26 @@ def sweep_recovery(candidates: list[Band], seeds: tuple[int, ...], share: str) -
             return f"{'PASS' if passes[0] else 'fail'} ({sum(passes)}/{len(passes)})"
 
         forced_pass = [
-            f[1] > TRACKING_AFTER_RELEASE and f[2] > REGAINED_SHARE and f[0] <= 1.0 for f in forced
+            f.tracking > TRACKING_AFTER_RELEASE
+            and f.regained > REGAINED_SHARE
+            and f.loss_ratio <= 1.0
+            for f in forced
         ]
         market_pass = [r[0] > chance for r in ruined]
         standing_pass = [r[1] > r[2] for r in ruined]
 
+        # At ratio 1 the clamp restores a zeroed wealth before anything reads it, so
+        # the ruin protocol never damages anything and its verdicts say nothing.
+        degenerate = " (no damage)" if band.ratio == 1.0 else ""
         print(
             f"{band.label:>16} {band.min_wealth:>7.1f} {band.max_wealth:>8.1f} "
             f"{band.wealth_decay:>6.3f} "
-            f"{forced[0][1]:>14.2f} {forced[0][2]:>9.2f} {forced[0][0]:>12.2f} "
+            f"{forced[0].tracking:>14.2f} {forced[0].regained:>9.2f} "
+            f"{forced[0].loss_ratio:>12.2f} "
             f"{verdict(forced_pass):>10} "
             f"{ruined[0][0]:>11.3f} {verdict(market_pass):>11} "
             f"{ruined[0][1] / max(ruined[0][2], 1e-9):>9.2f} {verdict(standing_pass):>12}"
+            f"{degenerate}"
         )
     print(
         f"\nStatistics are seed {seeds[0]}'s, which is the seed all three tests run; "
@@ -478,7 +583,12 @@ def main() -> None:
     parser.add_argument("--recovery", action="store_true", help="run the damage protocols")
     parser.add_argument("--scale", action="store_true", help="slide the whole band")
     parser.add_argument("--start", action="store_true", help="move initial_wealth alone")
-    parser.add_argument("--decay", type=float, default=SHIPPED.wealth_decay)
+    parser.add_argument(
+        "--advantage", action="store_true", help="what report advantage competence buys"
+    )
+    parser.add_argument(
+        "--decay", type=float, default=SHIPPED.wealth_decay, help="for --scale only"
+    )
     parser.add_argument(
         "--quick", action="store_true", help="with --recovery, skip the ratio x decay grid"
     )
@@ -507,6 +617,9 @@ def main() -> None:
         return
     if args.start:
         sweep_start(seeds, args.share)
+        return
+    if args.advantage:
+        sweep_advantage(seeds, args.share)
         return
 
     sweep_bands(seeds, args.share)

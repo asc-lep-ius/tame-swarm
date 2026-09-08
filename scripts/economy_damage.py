@@ -25,12 +25,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from synthetic_economy import (  # noqa: E402
     BASE_CONFIG,
     DEFAULT_COMPETENCE,
-    MoBConfig,
     SyntheticEconomy,
     pearson,
     shuffled,
 )
 
+from mob import MoBConfig  # noqa: E402
 from mob.auction import AuctionOutcome  # noqa: E402
 
 STEADY_STEPS = 200

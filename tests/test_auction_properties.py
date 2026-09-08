@@ -41,6 +41,7 @@ from mob.auction import ROUTING_SHARE_PROPORTIONAL, AuctionOutcome, VCGAuctionee
 
 from .auction_mutations import (
     first_price_payments,
+    lowered_floor,
     pre_nine_payments,
     undivided_payments,
     wealth_blind_forward,
@@ -408,11 +409,15 @@ def test_the_example_market_exercises_every_checker():
 
 # --- What the band's ratio demands of its poorest expert (#16) ------------------------
 
-# What competence actually buys in report terms, measured on the planted-competence
-# fixture at steady state: the ratio of the best expert's mean report to the worst's.
-# Not a strategy bound and not a head's expressible range -- the systematic advantage
-# a more competent expert's calibrated report carries over a less competent one.
-MEASURED_REPORT_ADVANTAGE = 4.78
+# What competence buys in report terms on the planted-competence fixture: the most
+# competent expert's mean report over the least competent one's. Re-derivable with
+# `scripts/sweep_wealth_bounds.py --advantage`, which is why it is stated as a range
+# and not a digit -- it is not a constant of the fixture. The heads keep calibrating,
+# so it grows with the training horizon: 1.9-2.7 at the 400 steps the damage
+# protocols run, 3.9-7.1 at the sweep's settled budget, over three seeds. The
+# assertions below use the *largest* reading, the one most favourable to the band, so
+# the conclusion holds at every horizon rather than at a chosen one.
+LARGEST_MEASURED_REPORT_ADVANTAGE = 7.2
 
 # The shipped band, written out rather than read from MoBConfig. A test that derives
 # its expectation from the constant it is testing passes whatever that constant says,
@@ -441,27 +446,50 @@ def test_the_band_ratio_bounds_the_report_advantage_demanded_of_the_poorest():
     Selection is ``argtopk(confidence x wealth)``, so an expert at the floor needs a
     report ``ceiling / floor`` times a rich expert's to win at all. The shipped band
     demands **50x**, and on the planted-competence fixture the advantage competence
-    actually buys is **4.8x** -- so at the shipped band wealth outranks competence by
-    an order of magnitude. That is why
+    buys is between 1.9x and 7.2x depending on how long the heads have trained -- so
+    at the shipped band wealth outranks competence by roughly an order of magnitude
+    at every horizon measured. That is why
     ``test_a_ruined_competent_expert_returns_to_the_market`` reads a win share of
-    0.002, and why #16 could not fix it by moving the bounds: closing the gap needs
-    a ratio near 5, and every band that narrow pins every expert against its ceiling
-    and drives wealth Gini to 0.000.
+    0.002, and why #16 could not fix it by moving the bounds: closing the gap needs a
+    ratio below about 7, and the sweep found every band that narrow saturating -- the
+    ledger collapses onto its two bounds and stops distinguishing anything.
 
     This pins the mechanism, not the constants -- it is a statement about ratios and
     holds at any scale. #16 deliberately did **not** manufacture a test that pins
     ``min_wealth`` itself: mutating the floor 15000x down, or 5x up, changes no
     behaviour the suite or the ruin protocol can see, and the honest record of that
-    is the comment in ``MoBConfig``, not an assertion contrived to fail.
+    is the comment in ``MoBConfig``, not an assertion contrived to fail. What
+    ``lowered_floor`` is paired with below is the *ratio* it moves, which is real.
     """
     assert _poorest_outbids_richest(SHIPPED_FLOOR, SHIPPED_CEILING, 51.0)
     assert not _poorest_outbids_richest(SHIPPED_FLOOR, SHIPPED_CEILING, 49.0)
 
-    # The finding, held as an assertion so it cannot rot into a comment: the shipped
-    # ratio demands more of a poor expert than competence supplies.
-    assert not _poorest_outbids_richest(SHIPPED_FLOOR, SHIPPED_CEILING, MEASURED_REPORT_ADVANTAGE)
-    # A ratio below what competence buys is the regime where a poor expert can win
-    # on merit -- and the sweep found every such band pinned against its ceiling.
-    assert _poorest_outbids_richest(
-        SHIPPED_CEILING / 4.0, SHIPPED_CEILING, MEASURED_REPORT_ADVANTAGE
+    # The finding, held as an assertion so it cannot rot into a comment: even the
+    # largest advantage competence was measured to buy loses at the shipped ratio.
+    assert not _poorest_outbids_richest(
+        SHIPPED_FLOOR, SHIPPED_CEILING, LARGEST_MEASURED_REPORT_ADVANTAGE
     )
+    # And what closing the gap would take: a ratio below that advantage. The sweep
+    # found every band that narrow saturating -- the ledger collapses onto its two
+    # bounds -- which is why #16 did not narrow the band to buy this.
+    assert _poorest_outbids_richest(
+        SHIPPED_CEILING / (LARGEST_MEASURED_REPORT_ADVANTAGE - 0.2),
+        SHIPPED_CEILING,
+        LARGEST_MEASURED_REPORT_ADVANTAGE,
+    )
+
+
+def test_a_lowered_floor_raises_the_advantage_demanded_past_any_report():
+    """The pairing for the ratio above: ``lowered_floor`` is a mutation of the demand.
+
+    At a floor 1000x lower the band demands 50000x, past anything any report
+    reaches, so no advantage competence could buy would let the poorest expert win.
+    The mutant moves that ratio and nothing else, which is why #16 pairs it here and
+    not with a recovery claim -- the floor's *height* was measured inert.
+    """
+    lowered = lowered_floor(MoBConfig())
+
+    assert not _poorest_outbids_richest(
+        lowered.min_wealth, lowered.max_wealth, LARGEST_MEASURED_REPORT_ADVANTAGE
+    )
+    assert not _poorest_outbids_richest(lowered.min_wealth, lowered.max_wealth, 51.0)

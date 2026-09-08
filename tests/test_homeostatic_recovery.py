@@ -520,12 +520,14 @@ def ruined():
         "it holds about one token in 300, and what it earns there barely outpaces decay at "
         "the floor -- win share 0.002 after 200 steps (in a probe on the same fixture: 34 "
         "credits with exploration off, 79 with decay off). #16 measured the band's part in "
-        "it and found none: raising the floor 5x, so the ruined expert is restored to a "
-        "full initial_wealth by the next clamp, leaves the share at 0.0012-0.0019 -- "
-        "unchanged, still a hundredfold below chance. The one band that clears chance is a "
-        "flat one, and there the protocol is degenerate rather than recovered: the clamp "
-        "restores the zeroed wealth before anything reads it, so the damage never happens. "
-        "Waits on the count-based exploration in #26."
+        "it: real but not sufficient. The floor's *height* does nothing -- raised 5x, so "
+        "the ruined expert is restored to a full initial_wealth by the next clamp, the "
+        "share stays at 0.0012-0.0019. The band's *ratio* does something: at [37.5, 150] "
+        "the share reaches 0.090, forty-five times the shipped band's 0.002, and still "
+        "short of the 0.125 chance threshold. No band in the swept grid clears it; the one "
+        "that appears to is flat, where the protocol is degenerate rather than recovered -- "
+        "the clamp restores the zeroed wealth before anything reads it, so the damage never "
+        "happens. Waits on the count-based exploration in #26."
     ),
 )
 def test_a_ruined_competent_expert_returns_to_the_market(ruined):

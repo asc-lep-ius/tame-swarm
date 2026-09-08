@@ -1517,11 +1517,12 @@ class TAMETrainer:
                     )
                 elif gini > 0.60:
                     logger.warning(
-                        f"  ⚠ High Gini ({gini:.4f}) - wealth monopoly risk. Consider "
-                        "↑min_wealth, which narrows the band's ratio. #16 measured that "
-                        "↓max_wealth does not compress the ledger, it erases it: every "
-                        "band whose ceiling binds hard enough pins every expert against "
-                        "it and drives Gini to 0"
+                        f"  ⚠ High Gini ({gini:.4f}) - wealth monopoly risk. #16 measured "
+                        "that neither bound fixes it: ↑min_wealth compresses the reported "
+                        "Gini without changing which experts win (at [187.5, 750] the same "
+                        "two hold 99% of slots at Gini 0.32), and at wealth_decay 1.0 every "
+                        "band saturates to Gini 0. Read this beside the win shares, not "
+                        "alone"
                     )
 
                 ceiling = self.mob_config.max_wealth if self.mob_config else DEFAULT_MAX_WEALTH
