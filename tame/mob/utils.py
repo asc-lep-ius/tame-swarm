@@ -23,6 +23,30 @@ def get_mob_layers(model: nn.Module) -> list[MixtureOfBidders]:
     return [module for module in model.modules() if isinstance(module, MixtureOfBidders)]
 
 
+def mob_at(block: nn.Module) -> MixtureOfBidders | None:
+    """The MoB layer this transformer block's FFN was converted into, if it was."""
+    for attribute in ("mlp", "feed_forward"):
+        candidate = getattr(block, attribute, None)
+        if isinstance(candidate, MixtureOfBidders):
+            return candidate
+    return None
+
+
+def mob_layers_by_index(model: nn.Module) -> dict[int, MixtureOfBidders]:
+    """MoB layers keyed by their block index -- the numbers the steering record names.
+
+    :func:`get_mob_layers` returns them in module order, which says nothing about
+    which block each one sits in. Everything that has to line a MoB layer up with a
+    steering layer, a certified coupling layer or a cell needs the index.
+    """
+    inner = getattr(model, "model", model)
+    blocks = getattr(inner, "layers", None)
+    if blocks is None:
+        return {}
+    found = {index: mob_at(block) for index, block in enumerate(blocks)}
+    return {index: mob for index, mob in found.items() if mob is not None}
+
+
 @contextmanager
 def frozen_economy(model: nn.Module) -> Iterator[None]:
     """Read the model without paying it, then leave the economy exactly as found.

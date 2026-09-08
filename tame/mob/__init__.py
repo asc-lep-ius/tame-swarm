@@ -26,6 +26,12 @@ from .auction import (
 from .core import MixtureOfBidders, MoBStats, apply_mob_to_model, ledger_initial_values
 from .experts import ConfidenceHead, Expert, LightweightExpert
 from .mob_config import MoBConfig
+from .routing_trace import (
+    DEFAULT_TRACE_TOKENS,
+    MIN_TOKENS_FOR_CORRELATION,
+    RoutingTrace,
+    RoutingTraceSummary,
+)
 from .softmax_router import (
     ROUTER_AUCTION,
     ROUTER_SOFTMAX,
@@ -39,6 +45,8 @@ from .utils import (
     get_total_calibration_loss,
     get_total_router_z_loss,
     load_mob_state,
+    mob_at,
+    mob_layers_by_index,
     save_mob_state,
     update_all_mob_from_loss,
 )
@@ -54,6 +62,10 @@ __all__ = [
     "ROUTER_SOFTMAX",
     "SUPPORTED_ROUTERS",
     "RoutingDiagnostics",
+    "RoutingTrace",
+    "RoutingTraceSummary",
+    "DEFAULT_TRACE_TOKENS",
+    "MIN_TOKENS_FOR_CORRELATION",
     "routing_diagnostics",
     "ROUTING_SATURATION_THRESHOLD",
     "SteeringCouplingConfig",
@@ -66,6 +78,8 @@ __all__ = [
     "apply_mob_to_model",
     "ledger_initial_values",
     "get_mob_layers",
+    "mob_at",
+    "mob_layers_by_index",
     "frozen_economy",
     "update_all_mob_from_loss",
     "get_total_calibration_loss",
