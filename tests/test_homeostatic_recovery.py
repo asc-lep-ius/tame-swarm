@@ -30,17 +30,36 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
+from economy_damage import (  # noqa: E402
+    DAMAGE_HORIZON,
+    DEAD_SHARE_CEILING,
+    LONG_FORCED_EPISODE,
+    RE_FORMATION_FACTOR,
+    REGAINED_SHARE,
+    SEEDS,
+    SHORT_FORCED_EPISODE,
+    SURVIVOR_TRACKING_FLOOR,
+    TRACKING_AFTER_RELEASE,
+    WINDOW,
+    floor_without,
+    freeze_heads,
+    release_and_measure,
+    ruin,
+    ruin_and_measure,
+    senesce,
+    steady,
+    survivors_track_competence,
+    window,
+)
 from synthetic_economy import (  # noqa: E402
     BASE_CONFIG,
     DEFAULT_COMPETENCE,
-    SyntheticEconomy,
-    pearson,
     shuffled,
 )
 
 from homeostat_calibration import ConsensusWeighting  # noqa: E402
-from mob.auction import AuctionOutcome  # noqa: E402
 
+from .auction_mutations import flat_band  # noqa: E402
 from .wired_system import (  # noqa: E402
     ACTUATORS,
     BELOW_ACTUATORS,
@@ -322,60 +341,11 @@ def test_the_calibrated_weighting_dilutes_the_new_bottom_cells_error_over_the_su
 
 
 # --- The expert economy ----------------------------------------------------------
-
-STEADY_STEPS = 200
-WINDOW = 50
-DAMAGE_HORIZON = 200
-# A market that has re-formed sits at the loss a collective born without the
-# damaged expert reaches, within this factor, and no longer routes to it.
-RE_FORMATION_FACTOR = 1.1
-DEAD_SHARE_CEILING = 0.01
-SURVIVOR_TRACKING_FLOOR = 0.5
-SEEDS = (0, 1, 2)
-
-
-def _window(economy: SyntheticEconomy, steps: int) -> tuple[float, torch.Tensor]:
-    """Mean loss and per-expert win share over ``steps`` steps."""
-    losses: list[float] = []
-    wins = torch.zeros(economy.config.num_experts)
-    for _ in range(steps):
-        record = economy.step()
-        losses.append(record.loss)
-        wins += torch.bincount(
-            record.selected_experts.flatten(), minlength=economy.config.num_experts
-        ).float()
-    return sum(losses) / len(losses), wins / wins.sum()
-
-
-def _steady(competence: torch.Tensor, seed: int, **overrides) -> tuple[SyntheticEconomy, float]:
-    config = replace(BASE_CONFIG, **overrides) if overrides else BASE_CONFIG
-    economy = SyntheticEconomy(competence, seed=seed, config=config)
-    _window(economy, STEADY_STEPS - WINDOW)
-    loss, _ = _window(economy, WINDOW)
-    return economy, loss
-
-
-def _floor_without(competence: torch.Tensor, expert: int, seed: int) -> float:
-    """The loss a collective born without ``expert`` settles at: the re-formation target."""
-    born_without = competence.clone()
-    born_without[expert] = 0.0
-    return _steady(born_without, seed)[1]
-
-
-def _survivors_track_competence(share: torch.Tensor, competence: torch.Tensor, dead: int) -> float:
-    keep = torch.tensor([index != dead for index in range(competence.numel())])
-    return pearson(share[keep], competence[keep])
-
-
-def _senesce(economy: SyntheticEconomy, expert: int) -> None:
-    """The cell is still wired and still bids; it just stops contributing anything."""
-    with torch.no_grad():
-        economy.mob.experts[expert].down_adapter_B.weight.zero_()  # type: ignore[union-attr]
-
-
-def _freeze_heads(economy: SyntheticEconomy) -> None:
-    for group in economy.optimizer.param_groups:
-        group["lr"] = 0.0
+#
+# The protocols themselves live in ``scripts/economy_damage.py`` so that #16's
+# wealth-bound sweep runs the same damage this file asserts on. The two expected
+# failures below are that sweep's acceptance criterion; a sweep with its own copy
+# of the protocol could report a flip the suite does not see.
 
 
 @pytest.mark.parametrize("seed", SEEDS)
@@ -393,16 +363,16 @@ def test_the_market_re_forms_around_a_senescent_expert(seed):
     """
     competence = shuffled(DEFAULT_COMPETENCE, seed)
     best = int(competence.argmax())
-    floor = _floor_without(competence, best, seed)
-    economy, _ = _steady(competence, seed)
+    floor = floor_without(competence, best, seed)
+    economy, _ = steady(competence, seed)
 
-    _senesce(economy, best)
-    _window(economy, DAMAGE_HORIZON - WINDOW)
-    loss, share = _window(economy, WINDOW)
+    senesce(economy, best)
+    window(economy, DAMAGE_HORIZON - WINDOW)
+    loss, share = window(economy, WINDOW)
 
     assert loss <= RE_FORMATION_FACTOR * floor, (loss, floor)
     assert float(share[best]) <= DEAD_SHARE_CEILING, float(share[best])
-    assert _survivors_track_competence(share, competence, best) > SURVIVOR_TRACKING_FLOOR
+    assert survivors_track_competence(share, competence, best) > SURVIVOR_TRACKING_FLOOR
 
 
 def test_frozen_heads_leave_the_senescent_expert_in_the_market():
@@ -415,79 +385,16 @@ def test_frozen_heads_leave_the_senescent_expert_in_the_market():
     seed = SEEDS[0]
     competence = shuffled(DEFAULT_COMPETENCE, seed)
     best = int(competence.argmax())
-    floor = _floor_without(competence, best, seed)
-    economy, _ = _steady(competence, seed)
+    floor = floor_without(competence, best, seed)
+    economy, _ = steady(competence, seed)
 
-    _senesce(economy, best)
-    _freeze_heads(economy)
-    _window(economy, DAMAGE_HORIZON - WINDOW)
-    loss, share = _window(economy, WINDOW)
+    senesce(economy, best)
+    freeze_heads(economy)
+    window(economy, DAMAGE_HORIZON - WINDOW)
+    loss, share = window(economy, WINDOW)
 
     assert loss > RE_FORMATION_FACTOR * floor
     assert float(share[best]) > DEAD_SHARE_CEILING
-
-
-class _ForcedSubset(torch.nn.Module):
-    """A gate that ignores every report and routes each token to a fixed subset of experts."""
-
-    def __init__(self, subset: list[int], top_k: int, seed: int):
-        super().__init__()
-        self.subset = torch.tensor(subset)
-        self.top_k = top_k
-        # Its own stream, so the forcing does not move the economy's draws.
-        self.generator = torch.Generator().manual_seed(seed)
-
-    def forward(self, confidences: torch.Tensor, wealth: torch.Tensor) -> AuctionOutcome:
-        batch, seq_len, num_experts = confidences.shape
-        draws = torch.stack(
-            [
-                torch.randperm(len(self.subset), generator=self.generator)[: self.top_k]
-                for _ in range(batch * seq_len)
-            ]
-        ).view(batch, seq_len, self.top_k)
-        selected = self.subset[draws]
-        weights = torch.full_like(confidences[..., : self.top_k], 1.0 / self.top_k)
-        rebates = torch.zeros_like(confidences)
-        return AuctionOutcome(selected, weights, torch.zeros_like(weights), rebates, None)
-
-
-def _force_routing(economy: SyntheticEconomy, subset: list[int], steps: int, seed: int) -> None:
-    """Route by fiat for ``steps`` steps; the forcing stream is a replicate of the seed too."""
-    gate = economy.mob.gate
-    economy.mob.gate = _ForcedSubset(subset, economy.config.top_k, seed=1000 * steps + seed)
-    try:
-        _window(economy, steps)
-    finally:
-        economy.mob.gate = gate
-
-
-SHORT_FORCED_EPISODE = 50
-LONG_FORCED_EPISODE = 150
-RELEASE_HORIZON = 150
-TRACKING_AFTER_RELEASE = 0.7
-# The best expert has regained its standing when it holds this much of the share
-# it held before the episode (0.30-0.43 of the slots, by seed).
-REGAINED_SHARE = 0.8
-
-
-def _release_and_measure(seed: int, episode: int) -> tuple[float, float, float, float]:
-    """``(loss / steady loss, routing-competence correlation, best share / its steady share)``."""
-    competence = shuffled(DEFAULT_COMPETENCE, seed)
-    best = int(competence.argmax())
-    least_competent = competence.argsort()[:3].tolist()
-    economy = SyntheticEconomy(competence, seed=seed)
-    _window(economy, STEADY_STEPS - WINDOW)
-    steady_loss, steady_share = _window(economy, WINDOW)
-
-    _force_routing(economy, least_competent, episode, seed)
-    _window(economy, RELEASE_HORIZON - WINDOW)
-    loss, share = _window(economy, WINDOW)
-    return (
-        loss / steady_loss,
-        pearson(share, competence),
-        float(share[best]) / float(steady_share[best]),
-        float(steady_share[best]),
-    )
 
 
 @pytest.mark.parametrize("seed", SEEDS)
@@ -500,7 +407,7 @@ def test_the_market_re_forms_after_routing_was_forced_onto_the_least_competent(s
     again (r 0.76-0.78 on the three seeds), the best expert holds its pre-episode
     share (1.18-1.33x it), and the loss is below its steady value (0.74-0.76x).
     """
-    loss_ratio, tracking, regained, steady_share = _release_and_measure(seed, SHORT_FORCED_EPISODE)
+    loss_ratio, tracking, regained, steady_share = release_and_measure(seed, SHORT_FORCED_EPISODE)
 
     assert steady_share > 2.0 / DEFAULT_COMPETENCE.numel(), "the fixture must have a leader"
     assert tracking > TRACKING_AFTER_RELEASE, tracking
@@ -511,28 +418,60 @@ def test_the_market_re_forms_after_routing_was_forced_onto_the_least_competent(s
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "A 150-step episode drives the incumbents to 667-746 of the 750 wealth ceiling and "
-        "the market does not re-form: at the 150-step horizon this test asserts, routing no "
-        "longer tracks competence (r -0.31 to -0.03 on the three seeds, 0.81-0.82 before), "
-        "the best expert holds 9-11% of its steady share and the loss is 2.6-3.7x steady; "
-        "at 300 steps r -0.35 to +0.16, 0.5-0.7% and 1.9-4.4x. Two candidate causes: the "
-        "ceiling, and the starved experts' heads receiving no realised-value signal during "
-        "the episode; the ceiling measurement supports the first, nothing here excludes the "
-        "second. The band is #16's."
+        "A 150-step episode drives the incumbents to the wealth ceiling and the market does "
+        "not re-form: routing no longer tracks competence (r -0.31 to -0.03 on the three "
+        "seeds, 0.81-0.82 before), the best expert holds 9-11% of its steady share and the "
+        "loss is 2.6-3.7x steady. #16 swept the band and settled which of the two candidate "
+        "causes it is: NOT the band. With wealth pinned flat -- selection on reports alone, "
+        "the auction still pricing -- the same episode still fails, and at this seed "
+        "recovers 0.37 of the steady share against 0.09 and 1.66x the loss against 2.64x "
+        "while the rank correlation does not improve at all (-0.20 against -0.03); the "
+        "companion test below pins that. So the band carries part of the damage and no band "
+        "in the swept space flips this test. What remains is the cause the old reason could "
+        "not exclude: a head is trained only on the value its own expert realises, so 150 "
+        "steps of holding no tokens leaves it with a stale report, and the uniform 2% "
+        "exploration slot re-samples it no faster for having been starved longer. Waits on "
+        "the count-based exploration in #26."
     ),
 )
 def test_the_market_re_forms_after_a_long_forced_episode():
     """The boundary of the claim above, measured: recovery depends on the episode's length."""
-    loss_ratio, tracking, regained, _ = _release_and_measure(SEEDS[0], LONG_FORCED_EPISODE)
+    loss_ratio, tracking, regained, _ = release_and_measure(SEEDS[0], LONG_FORCED_EPISODE)
 
     assert tracking > TRACKING_AFTER_RELEASE, tracking
     assert regained > REGAINED_SHARE, regained
     assert loss_ratio <= 1.0, loss_ratio
 
 
-def _ruin(economy: SyntheticEconomy, expert: int) -> None:
-    with torch.no_grad():
-        economy.mob.expert_wealth[expert] = 0.0
+def test_the_long_episode_does_not_recover_with_the_ledger_pinned_flat():
+    """#16's decomposition: how much of the damage above belongs to the wealth band.
+
+    ``flat_band`` pins ``min == max == initial``, so a constant multiplier cannot
+    reorder ``confidence x wealth`` and selection is the report ranking alone --
+    while the auction still prices, unlike ``wealth_blind_forward``, which zeroes
+    every payment and rebate too. That isolates the band rather than the whole
+    mechanism, which is what makes this an attribution and not just a second
+    failure.
+
+    Two of the three statistics improve a lot and the third does not move the way
+    a band explanation predicts: the best expert recovers 0.37 of its steady share
+    against 0.09, the loss falls to 1.66x steady from 2.64x, and the rank
+    correlation over eight experts -- the noisiest of the three -- goes the other
+    way, -0.03 to -0.20. Recovery is markedly better with the ledger out of the
+    way and still nowhere near any of the three thresholds, which is why the
+    expected failure above no longer names the band as what it waits on.
+    """
+    banded_loss, _, banded_regained, _ = release_and_measure(SEEDS[0], LONG_FORCED_EPISODE)
+    loss_ratio, tracking, regained, _ = release_and_measure(
+        SEEDS[0], LONG_FORCED_EPISODE, flat_band(BASE_CONFIG)
+    )
+
+    assert loss_ratio < banded_loss, (loss_ratio, banded_loss)
+    assert regained > banded_regained, (regained, banded_regained)
+
+    assert loss_ratio > 1.0, loss_ratio
+    assert tracking < TRACKING_AFTER_RELEASE, tracking
+    assert regained < REGAINED_SHARE, regained
 
 
 @pytest.mark.parametrize("seed", SEEDS)
@@ -546,18 +485,24 @@ def test_the_economy_re_equilibrates_after_an_experts_wealth_is_zeroed(seed):
     """
     competence = shuffled(DEFAULT_COMPETENCE, seed)
     best = int(competence.argmax())
-    floor = _floor_without(competence, best, seed)
-    economy, _ = _steady(competence, seed)
+    floor = floor_without(competence, best, seed)
+    economy, _ = steady(competence, seed)
 
-    _ruin(economy, best)
-    _window(economy, DAMAGE_HORIZON - WINDOW)
-    loss, share = _window(economy, WINDOW)
+    ruin(economy, best)
+    window(economy, DAMAGE_HORIZON - WINDOW)
+    loss, share = window(economy, WINDOW)
 
     assert loss <= RE_FORMATION_FACTOR * floor, (loss, floor)
-    assert _survivors_track_competence(share, competence, best) > SURVIVOR_TRACKING_FLOOR
+    assert survivors_track_competence(share, competence, best) > SURVIVOR_TRACKING_FLOOR
     wealth = economy.mob.expert_wealth
     assert torch.isfinite(wealth).all()
     assert wealth.min() >= BASE_CONFIG.min_wealth and wealth.max() <= BASE_CONFIG.max_wealth
+
+
+@pytest.fixture(scope="module")
+def ruined():
+    """One ruin protocol, read by the two claims below, which used to be one test."""
+    return ruin_and_measure(SEEDS[0])
 
 
 @pytest.mark.xfail(
@@ -565,20 +510,32 @@ def test_the_economy_re_equilibrates_after_an_experts_wealth_is_zeroed(seed):
     reason=(
         "A ruined but competent expert does not come back: at the default exploration rate "
         "it holds about one token in 300, and what it earns there barely outpaces decay at "
-        "the floor -- 33 credits against a median of 113 after 200 steps, win share 0.002 "
-        "(in a probe on the same fixture: 34 with exploration off, 79 with decay off). Its "
-        "return waits on #16."
+        "the floor -- win share 0.002 after 200 steps (in a probe on the same fixture: 34 "
+        "credits with exploration off, 79 with decay off). #16 measured the band's part in "
+        "it: the share only clears chance with wealth pinned flat (0.215), and is already "
+        "back to 0.063 at a band ratio of 4, so no band that leaves the ledger doing "
+        "anything fixes this. Waits on the count-based exploration in #26."
     ),
 )
-def test_a_ruined_competent_expert_returns_to_the_market():
-    seed = SEEDS[0]
-    competence = shuffled(DEFAULT_COMPETENCE, seed)
-    best = int(competence.argmax())
-    economy, _ = _steady(competence, seed)
+def test_a_ruined_competent_expert_returns_to_the_market(ruined):
+    """The claim this test is named for: it wins tokens again, at better than chance."""
+    share, _, _ = ruined
 
-    _ruin(economy, best)
-    _window(economy, DAMAGE_HORIZON - WINDOW)
-    _, share = _window(economy, WINDOW)
+    assert share > 1.0 / DEFAULT_COMPETENCE.numel()
 
-    assert float(share[best]) > 1.0 / competence.numel()
-    assert economy.mob.expert_wealth[best] > economy.mob.expert_wealth.median()
+
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "The strictly stronger claim, split out of the test above by #16: not merely back in "
+        "the market but back to its standing, out-earning four of the other seven within 200 "
+        "steps. It reads 0.29 of the median wealth at the shipped band. Kept separate because "
+        "it is the half a band can move -- it rises to 0.81 at decay 0.99 and reaches 1.00 "
+        "with wealth flat, where it is unsatisfiable by construction rather than by the "
+        "economy, every wealth being identical. Waits on #26 with the claim above."
+    ),
+)
+def test_a_ruined_competent_expert_regains_its_standing(ruined):
+    _, wealth, median = ruined
+
+    assert wealth > median
