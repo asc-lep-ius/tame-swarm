@@ -95,14 +95,22 @@ MIN_STEPS = 600
 # Every steady-state statistic is read over this many final steps, so rows with
 # different budgets are still compared over the same window.
 TAIL = 500
+# Share of the slots above which an expert counts as holding a market rather than
+# living on the exploration gift, whose expected share is
+# exploration_rate / top_k / (num_experts - top_k) -- 0.0017 at the defaults.
+REAL_WINNER_SHARE = 0.01
+
 # Relative headroom for calling a float32 ledger "at" a bound. The two bounds need
 # different tolerances and it is not a fudge: the ceiling is an attractor from
 # above, so a clamped expert sits *exactly* on it and float32 headroom is all that
 # is wanted. The floor is escaped by a hair every time an exploration win lands and
 # then decays back, so the same tolerance systematically undercounts it -- measured
-# at the shipped band, 1e-4 reads 34% where 10% reads 74%, and no floor-bound expert
-# ever exceeds 17.1 out of 750. A tenth of the floor is below any wealth an expert
-# holds a slot on and above the exploration jitter.
+# at the shipped band, 1e-4 reads 34% where 10% reads 74% and 20% reads 75.0%, the
+# structural maximum. A tenth of the floor is chosen below that plateau rather than
+# on it, so the column understates rather than flatters: a shut-out expert drifts to
+# about 17-18 out of 750 between exploration wins, which is just outside the window,
+# so a little of the residue is counted as interior. The partition is bimodal
+# regardless -- no shut-out expert comes near the ceiling.
 CEILING_TOLERANCE = 1e-4
 FLOOR_TOLERANCE = 0.10
 
@@ -193,6 +201,8 @@ class Reading:
     overturn: float
     overturn_spread: float
     distinct_winners: float
+    real_winners: float
+    top_k_share: float
     charge_per_step: float
     rebate_fraction: float
     top1: float
@@ -331,6 +341,11 @@ def measure(band: Band, seed: int, steps: int, share: str) -> Reading:
         overturn=statistics.mean(tally.overturns),
         overturn_spread=0.0,
         distinct_winners=float((tally.wins > 0).sum()),
+        # `distinct_winners` is 8.0 in every row, because the exploration slot hands
+        # every expert something. These two say whether it holds a *market*: how many
+        # experts clear 1% of the slots, and what the top_k of them hold between them.
+        real_winners=float((tally.wins / tally.wins.sum() > REAL_WINNER_SHARE).sum()),
+        top_k_share=float(torch.topk(tally.wins, config.top_k).values.sum() / tally.wins.sum()),
         charge_per_step=statistics.mean(collected[tail_from:]),
         rebate_fraction=sum(returned[tail_from:]) / max(sum(collected[tail_from:]), 1e-12),
         top1=statistics.mean(tally.top1s),
@@ -362,6 +377,8 @@ def _aggregate(band: Band, seeds: tuple[int, ...], share: str) -> Reading:
         overturn=statistics.mean(overturns),
         overturn_spread=statistics.pstdev(overturns),
         distinct_winners=statistics.mean(r.distinct_winners for r in runs),
+        real_winners=statistics.mean(r.real_winners for r in runs),
+        top_k_share=statistics.mean(r.top_k_share for r in runs),
         charge_per_step=statistics.mean(r.charge_per_step for r in runs),
         rebate_fraction=statistics.mean(r.rebate_fraction for r in runs),
         top1=statistics.mean(r.top1 for r in runs),
@@ -373,7 +390,7 @@ def _aggregate(band: Band, seeds: tuple[int, ...], share: str) -> Reading:
 HEADER = (
     f"{'band':>14} {'min':>7} {'max':>8} {'decay':>6} {'steps':>6} "
     f"{'ceil%':>6} {'t_ceil':>10} {'floor%':>7} {'mid%':>6} {'flr/W':>6} "
-    f"{'gini':>15} {'meanW':>8} {'overturn':>16} {'wins':>5} "
+    f"{'gini':>15} {'meanW':>8} {'overturn':>16} {'win>1%':>7} {'topk%':>6} "
     f"{'chg/step':>9} {'rebate':>7} {'top1':>6} {'n_eff':>6}"
 )
 
@@ -400,7 +417,7 @@ def _row(band: Band, reading: Reading) -> str:
         f"{band.wealth_decay:>6.3f} {reading.steps:>6} {clamps} "
         f"{reading.gini:>7.3f}+-{reading.gini_spread:<6.3f} {reading.mean_wealth:>8.1f} "
         f"{100 * reading.overturn:>8.1f}%+-{100 * reading.overturn_spread:<5.1f} "
-        f"{reading.distinct_winners:>5.1f} "
+        f"{reading.real_winners:>7.1f} {100 * reading.top_k_share:>5.1f}% "
         f"{reading.charge_per_step:>9.3f} {100 * reading.rebate_fraction:>6.1f}% "
         f"{reading.top1:>6.3f} {reading.effective_experts:>6.3f}"
     )

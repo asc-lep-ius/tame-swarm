@@ -155,9 +155,9 @@ METRICS_FILENAME = "metrics.jsonl"
 # Only meaningful for top_k > 1: at top_k == 1 the effective count is 1.0 and the
 # saturated fraction 1.0 by construction, and neither is a fault.
 MIN_HEALTHY_EFFECTIVE_EXPERTS = 1.5
-# Only for the ceiling-proximity warning below, when the run has no MoBConfig to
-# read (the dense arm converts no layer). MoBConfig's own default is the number
-# that matters; this exists so the diagnostic does not have to be skipped.
+# Type narrowing for the ceiling-proximity warning below, which sits inside the
+# auction arm and so always has a MoBConfig to read. MoBConfig's own default is the
+# number that matters; this keeps the diagnostic total without an assert.
 DEFAULT_MAX_WEALTH = MoBConfig().max_wealth
 
 

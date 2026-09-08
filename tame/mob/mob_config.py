@@ -70,29 +70,50 @@ class MoBConfig:
     # to 7 significant figures at 0.1x and 10x. The reward is the one quantity
     # carrying no wealth at all, so the inflow is an absolute number of credits.
     #
-    # **At this decay the band does not decide who wins, and that is why all four
-    # are retained.** Run to eight memory horizons at 0.997, every ratio swept
-    # settles into the same two-expert monopoly: top_k experts hold ~99% of the
-    # slots and each of the other six holds about 0.0016, which is the 2%
-    # exploration rate divided among the six losers. Confirmed at [15, 750],
-    # [23.7, 237.2], [37.5, 150] and [187.5, 750]. Ceiling occupancy is then
-    # top_k/num_experts -- 25.0% -- because at this decay the equilibrium sits above
-    # every ceiling swept and the two winners are the only experts clamped there.
+    # **What decides the retention: the share a shut-out expert holds is a closed
+    # form the band cannot reach.** The exploration slot is drawn uniformly over the
+    # losers *before any report is read*, so a shut-out expert's expected share is
+    # exploration_rate / top_k / (num_experts - top_k) = 0.02/2/6 = 0.0017 whatever
+    # the band is. Measured 0.0009-0.0046 across bands and seeds. No setting of
+    # these four constants can move it, which is why #16 changed none of them and
+    # #26 is about the exploration slot.
     #
-    # Both statements are the shipped decay's, not universals. Across the grid
-    # ceiling occupancy runs 0.0% to 100.0%: at 0.98 and 0.99 the equilibrium falls
-    # inside the wider bands so nothing clamps, and three to five experts clear 1%
-    # of the slots with top-2 concentration down to 0.85; at 1.0 everything pins to
-    # the ceiling. Faster decay does open the market somewhat -- and it is bounded
-    # below by the frozen-heads pairing, which is the trade recorded on wealth_decay.
+    # The concentration itself is *not* evidence of a defect, and the earlier
+    # drafts of this comment read it as though it were. On the planted-competence
+    # fixture an expert closes the same fraction of the gap on every token it holds
+    # (see scripts/synthetic_economy.py), so competence is token-independent, there
+    # is nothing to specialise on, and the efficient allocation is always the same
+    # top_k experts. A two-expert market is the *optimum* here. What the fixture can
+    # say is whether the mechanism picks the right two and whether anyone else can
+    # ever get back in -- not whether concentration is bad.
     #
-    # What the band changes at this decay is only *where the six losers' wealth
-    # sits*: on the floor at [15, 750] (74% floor occupancy, 0.7% of expert-steps in
-    # the band's interior), in the interior at [37.5, 150] (0% floor, 75% interior).
-    # That moves wealth Gini from 0.693 to 0.124 and leaves the same six shut out.
-    # It does move *which* two monopolise, and not in the narrow band's favour: at
-    # [15, 750] they are the top two by competence on all three seeds, at the
-    # narrower bands they are ranks {4,2}, {2,1}, {3,2} and {4,1}.
+    # On picking the right two the band earns its keep, and the shipped one wins:
+    # at [15, 750] the two monopolists are the top two by competence on all three
+    # seeds, while at [37.5, 150] and [23.7, 237.2] they come out as ranks {4,2},
+    # {2,1}, {3,2} and {4,1}. Narrowing the band makes the allocation *less*
+    # competence-ordered, not more.
+    #
+    # Everything else the band moves is bookkeeping. At decay 0.997 it changes only
+    # where the six losers' wealth sits: on the floor at [15, 750] (74% floor
+    # occupancy, 0.7% of expert-steps in the band's interior), in the interior at
+    # [37.5, 150] (0% floor, 75% interior). That takes wealth Gini from 0.693 to
+    # 0.124 and leaves the same six on the exploration slot.
+    #
+    # Ceiling occupancy is top_k/num_experts -- 25.0% -- at every ratio swept *at
+    # this decay*, because the equilibrium sits above every ceiling swept and the
+    # two winners are the only experts clamped there. That is the shipped decay's
+    # number, not a universal: across the grid ceiling occupancy runs 0.0% to 100.0%.
+    #
+    # The concentration column varies across the decay rows too -- three to eight
+    # experts clear 1% of the slots at 0.98 against two at 0.997 -- but that
+    # comparison is confounded and the sweep contains its own control. The budget
+    # scales with the decay (eight memory horizons), so the fast rows are also the
+    # short ones; and at ratio 1 the ledger is pinned by construction, so decay
+    # cannot act at all, yet `win>1%` still falls from 7.7 to 2.3 as the budget goes
+    # from 600 to 2667 steps. The heads keep calibrating long after the ledger has
+    # settled, so concentration tracks training time rather than decay. Anything
+    # read off a report -- concentration, overturn, the report advantage -- is not
+    # comparable across those rows.
     #
     # So Gini here is a closed form rather than a measurement: 0.693 is exactly the
     # Gini of (750, 750, 15 x 6), which is why its spread over three seeds is
@@ -141,14 +162,16 @@ class MoBConfig:
     min_wealth: float = 15.0
     # Retained as the bound on the domain over which the auction's payment
     # properties are asserted, and honestly that is all the evidence supports.
-    # Raised to 1e9 it breaks `test_payments_are_strictly_positive_whenever_a_bid_
-    # is_displaced` and both coupling property tests -- but those tests draw their
+    # Raised to 1e9 it breaks both coupling property tests and
+    # `test_payments_are_strictly_positive_whenever_a_bid_is_displaced`
+    # -- but those tests draw their
     # markets log-uniformly from `WEALTH_BAND`, which *is* this constant, so
     # widening it widens the tests' own input distribution until differencing two
     # welfare sums loses the float32 precision that keeps a displaced price above
     # zero. That is a real limit on how far apart two wealths may be, and it is
-    # also self-referential in the way #16 discounted `test_default_values_match_
-    # expected` for; no production path reads this constant except the clamps.
+    # also self-referential in the way #16 discounted the value-pinning
+    # `test_default_values_match_expected`
+    # for; no production path reads this constant except the clamps.
     #
     # What it is *not* is a lever on the monopoly. Narrowing the band to [37.5, 150]
     # takes wealth Gini from 0.693 to 0.124 and how often wealth overturns a report
