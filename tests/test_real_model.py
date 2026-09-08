@@ -196,7 +196,9 @@ def _load_model():
     return model, tokenizer
 
 
-def build_served() -> ServedSystem:
+def build_served(
+    calibration_prompts: int = CALIBRATION_PROMPTS, calibration_tokens: int = CALIBRATION_TOKENS
+) -> ServedSystem:
     """The served system as ``app.build_homeostat`` builds it, plus the seeded coupling.
 
     Seeded: the MoB conversion jitters the adapters and initialises the heads at
@@ -236,7 +238,7 @@ def build_served() -> ServedSystem:
     homeostat.add_steering_vectors(extraction.vectors)
     homeostat.estimate_capability_subspaces(model, tokenizer)
     texts = calibration_texts(
-        model, tokenizer, GOAL, num_prompts=CALIBRATION_PROMPTS, new_tokens=CALIBRATION_TOKENS
+        model, tokenizer, GOAL, num_prompts=calibration_prompts, new_tokens=calibration_tokens
     )
     homeostat.calibrate(model, tokenizer, texts=texts)
 
