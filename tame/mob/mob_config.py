@@ -55,9 +55,57 @@ class MoBConfig:
     top_k: int = 2
     hidden_dim: int = 4096
     intermediate_dim: int = 14336
+    # The four wealth constants, re-derived under the economy #9, #11 and #15 left
+    # (#16). All four are *retained*, each for a reason that was measured rather
+    # than assumed; `scripts/sweep_wealth_bounds.py` re-runs the evidence.
+    #
+    # What they still shape, now that #11 has taken wealth out of gate sharpness:
+    # selection (winners are argtopk(confidence x wealth), so the band's ratio is
+    # how much better a poor expert's report must be to overturn a rich one),
+    # price magnitude (a winner pays b_(k+1) / w_j), and rebate size.
+    #
+    # `initial_wealth` is the one that sets the operating point, not the bounds.
+    # Wealth moves by `w <- decay * w + net`, a leaky integrator that settles at
+    # `w* ~ net / (1 - decay)`, so the scale has to be chosen for the band to
+    # contain that equilibrium. Swept across two orders of magnitude at a fixed
+    # ratio, 75 is the only scale where it lands inside: at 7.5 the equilibrium is
+    # above the ceiling (96% of expert-steps pinned there, wealth Gini 0.000) and
+    # at 750 it is below the floor (58% pinned, the floor propping up 78% of all
+    # wealth). It is also the most load-bearing of the four on behaviour -- moved
+    # to 750 it breaks seven tests, the price/value crossing among them, because
+    # prices go as 1/w while rewards do not.
     initial_wealth: float = 75.0
+    # Bounded above and below by two different tests, which is what fixes it.
+    # Above: at 1.0 the ledger never forgets and the market stops re-forming --
+    # `test_the_market_re_forms_around_a_senescent_expert` and the forced-routing
+    # recovery both fail. Below: at 0.995 or 0.99, drainage alone removes a
+    # senescent expert, so `test_frozen_heads_leave_the_senescent_expert_in_the_market`
+    # fails -- the pairing that attributes the removal to the value objective
+    # collapses, because wealth decay has quietly taken over its job. 0.997 is a
+    # memory horizon of 1/(1 - decay) = 333 steps and sits between the two.
     wealth_decay: float = 0.997
+    # A guard on the price division, not an economic parameter. The auction prices
+    # an externality in the winner's own units by dividing by its wealth, which a
+    # non-positive wealth would make meaningless; __post_init__ rejects one, and
+    # this keeps every writer well clear. Under the corrected economy it does not
+    # otherwise bind -- floor occupancy is 0.0% of expert-steps at these settings,
+    # the reverse of the pre-#15 reading that had the floor load-bearing and the
+    # ceiling inert. What it *does* bound is the report advantage the market can
+    # demand of its poorest expert, held by
+    # `test_the_floor_bounds_what_a_poor_winner_can_be_charged`; before #16 nothing
+    # in the suite failed when it was lowered 15000x.
     min_wealth: float = 15.0
+    # Also a guard, and a numerical one: it is the largest wealth at which the
+    # auction's payment properties are asserted to hold. The property tests draw
+    # their markets log-uniformly from exactly this band, so raising it to 1e9
+    # breaks `test_payments_are_strictly_positive_whenever_a_bid_is_displaced` and
+    # both coupling property tests -- differencing two welfare sums that far apart
+    # loses, in float32, the precision that keeps a displaced bid's price above
+    # zero. That is what the ceiling is for, and it is not a cap on inequality. As
+    # a cap it does not work: swept, every band whose ceiling binds hard enough to
+    # lower how often wealth overturns reports does so by pinning every expert
+    # against it, which drives wealth Gini to 0.000 -- erasing the ledger rather
+    # than compressing it.
     max_wealth: float = 750.0
     jitter_std: float = 0.08
     reward_scale: float = 2.0
