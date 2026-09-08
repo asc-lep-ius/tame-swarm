@@ -18,8 +18,9 @@ metrics route calls once over at most ``maxlen`` rows. This matters more than it
 looks: on a 1.7B model a decode step is a few milliseconds spread over sixteen
 converted layers, so the cost of telemetry here is counted in kernel launches per
 layer per token, not in arithmetic. Computing the statistics eagerly measured
-2.8% of the forward pass and 7.7% of throughput; deferring them is what makes the
-trace cheap enough to leave on (``scripts/benchmark_coupling.py``).
+2.8% of the forward pass and 7.7% of throughput; deferring them brings it to 0.9%
+and 2.5%, which is what makes the trace cheap enough to leave on
+(``scripts/benchmark_coupling.py``).
 
 The trace is serve-time telemetry: :class:`~mob.core.MixtureOfBidders` records
 only outside training mode, so a training step's ``(batch, seq)`` tokens never
