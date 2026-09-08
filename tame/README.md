@@ -292,9 +292,9 @@ Mounts the local directory into the container and runs uvicorn with `--reload`.
 | `CUDA out of memory` | Model + MoB + gradients exceed VRAM | Use `--use_lora` for training; reduce `num_experts` (4 → 2) or `adapter_rank` (32 → 16) |
 | `Model download timeout` | HuggingFace Hub timeout too short | `export HF_HUB_DOWNLOAD_TIMEOUT=3600` (Linux) or `$env:HF_HUB_DOWNLOAD_TIMEOUT = 3600` (PowerShell) |
 | Wealth stays flat (Gini ≈ 0) | Experts not differentiating | Increase `jitter_std` (0.08 → 0.15), increase `reward_scale`, or train for more steps |
-| Gini > 0.6, one expert dominates | Wealth monopoly | Increase `min_wealth`, decrease `max_wealth`, or increase `wealth_decay` |
-| Mean wealth pinned at ceiling | Rewards too generous relative to decay | Decrease `reward_scale` or increase `wealth_decay` |
-| Mean wealth pinned at floor | Decay too aggressive | Decrease `wealth_decay` (0.997 → 0.999) or increase `reward_scale` |
+| Gini > 0.6, one expert dominates | Wealth monopoly | #16 measured that no band fixes this: raising `min_wealth` compresses the reported Gini without changing which experts win, and at `wealth_decay` 1.0 every band saturates to Gini 0. Read it beside the win shares |
+| Mean wealth pinned at ceiling | The equilibrium `net inflow / (1 − wealth_decay)` sits above the band | Lower `reward_scale`, or slide the band up — `initial_wealth` alone only moves the transient (#16) |
+| Mean wealth pinned at floor | The same equilibrium sits below the band | Raise `reward_scale`, or slide the band down. Reaching for `wealth_decay` costs the senescent-expert pairing below 0.997 |
 | NaN in loss or hidden states | Numerical instability in bfloat16 | Check adapter outputs; reduce `adapter_rank`; verify clamping in `LightweightExpert` |
 | Steering degrades output quality | Over-steering or capability damage | Lower `base_strength` (0.3 → 0.15); enable `orthogonal_projection` |
 | `device mismatch` or `expected meta` | `device_map="auto"` placed new MoB modules on wrong device | Re-dispatch with Accelerate is handled automatically; if it fails, check `_redispatch_model()` in `train.py` |

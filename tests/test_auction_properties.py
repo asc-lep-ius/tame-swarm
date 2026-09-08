@@ -411,13 +411,22 @@ def test_the_example_market_exercises_every_checker():
 
 # What competence buys in report terms on the planted-competence fixture: the most
 # competent expert's mean report over the least competent one's. Re-derivable with
-# `scripts/sweep_wealth_bounds.py --advantage`, which is why it is stated as a range
-# and not a digit -- it is not a constant of the fixture. The heads keep calibrating,
-# so it grows with the training horizon: 1.9-2.7 at the 400 steps the damage
-# protocols run, 3.9-7.1 at the sweep's settled budget, over three seeds. The
-# assertions below use the *largest* reading, the one most favourable to the band, so
-# the conclusion holds at every horizon rather than at a chosen one.
-LARGEST_MEASURED_REPORT_ADVANTAGE = 7.2
+# `scripts/sweep_wealth_bounds.py --advantage`, which is why these are ranges and
+# not digits -- the quantity is not a constant of the fixture. The heads keep
+# calibrating, so it grows with the training horizon.
+#
+# **Under the shipped band**, which is what this test compares against a shipped
+# band's ratio: 1.9-2.7 at the 400 steps the damage protocols run, 3.9-7.1 at the
+# sweep's settled budget, over three seeds.
+LARGEST_ADVANTAGE_UNDER_THE_SHIPPED_BAND = 7.2
+# **With the ledger pinned flat**, reported by the same mode as a control. It is
+# larger and more variable -- 2.2-2.6 at 400 steps, 2.2-15.5 settled -- because a
+# band that shuts six experts out also stops their heads calibrating, so the band
+# suppresses the very advantage it is then compared against. That is a real effect
+# and it is why the control is printed; it is *not* the number this test wants,
+# which is the advantage actually realised under the band whose ratio is in
+# question. Asserted below anyway, so the conclusion does not rest on the choice.
+LARGEST_ADVANTAGE_WITH_THE_LEDGER_FLAT = 15.6
 
 # The shipped band, written out rather than read from MoBConfig. A test that derives
 # its expectation from the constant it is testing passes whatever that constant says,
@@ -445,14 +454,14 @@ def test_the_band_ratio_bounds_the_report_advantage_demanded_of_the_poorest():
 
     Selection is ``argtopk(confidence x wealth)``, so an expert at the floor needs a
     report ``ceiling / floor`` times a rich expert's to win at all. The shipped band
-    demands **50x**, and on the planted-competence fixture the advantage competence
-    buys is between 1.9x and 7.2x depending on how long the heads have trained -- so
-    at the shipped band wealth outranks competence by roughly an order of magnitude
-    at every horizon measured. That is why
+    demands **50x**. Under that band competence buys between 1.9x and 7.2x depending
+    on how long the heads have trained, so wealth outranks it by at least 7x; with
+    the ledger removed the advantage reaches 15.5x, and 50x still exceeds that by
+    3x. Either way the demand is never met. That is why
     ``test_a_ruined_competent_expert_returns_to_the_market`` reads a win share of
     0.002, and why #16 could not fix it by moving the bounds: closing the gap needs a
-    ratio below about 7, and the sweep found every band that narrow saturating -- the
-    ledger collapses onto its two bounds and stops distinguishing anything.
+    ratio below about 7, and at the shipped decay the sweep found every band that
+    narrow settling into the same two-expert monopoly anyway.
 
     This pins the mechanism, not the constants -- it is a statement about ratios and
     holds at any scale. #16 deliberately did **not** manufacture a test that pins
@@ -464,18 +473,23 @@ def test_the_band_ratio_bounds_the_report_advantage_demanded_of_the_poorest():
     assert _poorest_outbids_richest(SHIPPED_FLOOR, SHIPPED_CEILING, 51.0)
     assert not _poorest_outbids_richest(SHIPPED_FLOOR, SHIPPED_CEILING, 49.0)
 
-    # The finding, held as an assertion so it cannot rot into a comment: even the
-    # largest advantage competence was measured to buy loses at the shipped ratio.
+    # The finding, held as an assertion so it cannot rot into a comment: the largest
+    # advantage competence buys under this band loses at this band's ratio -- and so
+    # does the larger one it buys with the ledger removed, so the conclusion does not
+    # depend on which of the two is the fair comparison.
     assert not _poorest_outbids_richest(
-        SHIPPED_FLOOR, SHIPPED_CEILING, LARGEST_MEASURED_REPORT_ADVANTAGE
+        SHIPPED_FLOOR, SHIPPED_CEILING, LARGEST_ADVANTAGE_UNDER_THE_SHIPPED_BAND
+    )
+    assert not _poorest_outbids_richest(
+        SHIPPED_FLOOR, SHIPPED_CEILING, LARGEST_ADVANTAGE_WITH_THE_LEDGER_FLAT
     )
     # And what closing the gap would take: a ratio below that advantage. The sweep
-    # found every band that narrow saturating -- the ledger collapses onto its two
-    # bounds -- which is why #16 did not narrow the band to buy this.
+    # found every band that narrow settling into the same two-expert monopoly, which
+    # is why #16 did not narrow the band to buy this.
     assert _poorest_outbids_richest(
-        SHIPPED_CEILING / (LARGEST_MEASURED_REPORT_ADVANTAGE - 0.2),
+        SHIPPED_CEILING / (LARGEST_ADVANTAGE_UNDER_THE_SHIPPED_BAND - 0.2),
         SHIPPED_CEILING,
-        LARGEST_MEASURED_REPORT_ADVANTAGE,
+        LARGEST_ADVANTAGE_UNDER_THE_SHIPPED_BAND,
     )
 
 
@@ -490,6 +504,6 @@ def test_a_lowered_floor_raises_the_advantage_demanded_past_any_report():
     lowered = lowered_floor(MoBConfig())
 
     assert not _poorest_outbids_richest(
-        lowered.min_wealth, lowered.max_wealth, LARGEST_MEASURED_REPORT_ADVANTAGE
+        lowered.min_wealth, lowered.max_wealth, LARGEST_ADVANTAGE_UNDER_THE_SHIPPED_BAND
     )
     assert not _poorest_outbids_richest(lowered.min_wealth, lowered.max_wealth, 51.0)

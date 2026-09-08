@@ -477,9 +477,13 @@ def sweep_advantage(seeds: tuple[int, ...], share: str) -> None:
     It exists as a mode because it is **not a constant of the fixture** and a
     hardcoded value would be unsourced. The heads keep calibrating, so it grows
     with the training horizon -- roughly 2.3 at the 400 steps the damage protocols
-    run, roughly 5.4 at the sweep's settled budget. Reported here with the flat
-    band beside it, because a number measured inside the equilibrium a band
-    creates would be no use as a comparison against that band's ratio.
+    run, roughly 5.4 at the sweep's settled budget.
+
+    The flat band is printed beside it as a control, and it reads *higher* at the
+    settled budget rather than lower: a band that shuts six experts out also stops
+    their heads seeing targets, so it suppresses the very advantage it is then
+    compared against. Which of the two is the fair comparison is arguable -- the
+    test asserts against both, so nothing rests on the choice.
     """
     print(f"\n=== report advantage competence buys, seeds {seeds}, share={share} ===\n")
     print(f"{'horizon':>9} {'band':>10} " + " ".join(f"{'seed' + str(s):>7}" for s in seeds))
@@ -493,9 +497,11 @@ def sweep_advantage(seeds: tuple[int, ...], share: str) -> None:
                 + f"   mean {statistics.mean(values):>5.2f}"
             )
     print(
-        "\nThe band's ratio is what this is compared against; at the shipped 50x it "
-        "exceeds\nevery reading here by roughly an order of magnitude, which is the "
-        "claim the test holds."
+        "\nThe band's ratio is what this is compared against. The shipped 50x exceeds "
+        "every reading\nhere -- by about 7x the largest under the band itself, and by "
+        "about 3x the largest with the\nledger flat, which is the control and runs "
+        "higher because a band that shuts six experts out\nalso stops their heads "
+        "calibrating. The demand is never met either way."
     )
 
 
@@ -517,6 +523,34 @@ def _report_advantage(band: Band, seed: int, steps: int, share: str) -> float:
     return float(mean_report[best] / mean_report[worst])
 
 
+def _recovery_row(band: Band, seeds: tuple[int, ...], share: str) -> str:
+    """One band's line of the damage table, verdicts on ``seeds[0]`` with a seed count."""
+    config = band.config(routing_share=share)
+    forced = [release_and_measure(seed, LONG_FORCED_EPISODE, config) for seed in seeds]
+    ruined = [ruin_and_measure(seed, config) for seed in seeds]
+    chance = 1.0 / DEFAULT_COMPETENCE.numel()
+
+    def verdict(passes: list[bool]) -> str:
+        return f"{'PASS' if passes[0] else 'fail'} ({sum(passes)}/{len(passes)})"
+
+    forced_pass = [
+        f.tracking > TRACKING_AFTER_RELEASE and f.regained > REGAINED_SHARE and f.loss_ratio <= 1.0
+        for f in forced
+    ]
+    # At ratio 1 the clamp restores a zeroed wealth before anything reads it, so the
+    # ruin protocol never damages anything and its verdicts say nothing.
+    degenerate = " (no damage)" if band.ratio == 1.0 else ""
+    return (
+        f"{band.label:>16} {band.min_wealth:>7.1f} {band.max_wealth:>8.1f} "
+        f"{band.wealth_decay:>6.3f} "
+        f"{forced[0].tracking:>14.2f} {forced[0].regained:>9.2f} "
+        f"{forced[0].loss_ratio:>12.2f} {verdict(forced_pass):>10} "
+        f"{ruined[0][0]:>11.3f} {verdict([r[0] > chance for r in ruined]):>11} "
+        f"{ruined[0][1] / max(ruined[0][2], 1e-9):>9.2f} "
+        f"{verdict([r[1] > r[2] for r in ruined]):>12}{degenerate}"
+    )
+
+
 def sweep_recovery(candidates: list[Band], seeds: tuple[int, ...], share: str) -> None:
     """The three strict expected failures, run against each candidate band.
 
@@ -535,37 +569,8 @@ def sweep_recovery(candidates: list[Band], seeds: tuple[int, ...], share: str) -
         f"{'r(share,comp)':>14} {'regained':>9} {'loss/steady':>12} {'forced':>10} "
         f"{'ruin share':>11} {'-> market':>11} {'w/median':>9} {'-> standing':>12}"
     )
-    chance = 1.0 / DEFAULT_COMPETENCE.numel()
     for band in candidates:
-        config = band.config(routing_share=share)
-        forced = [release_and_measure(seed, LONG_FORCED_EPISODE, config) for seed in seeds]
-        ruined = [ruin_and_measure(seed, config) for seed in seeds]
-
-        def verdict(passes: list[bool]) -> str:
-            return f"{'PASS' if passes[0] else 'fail'} ({sum(passes)}/{len(passes)})"
-
-        forced_pass = [
-            f.tracking > TRACKING_AFTER_RELEASE
-            and f.regained > REGAINED_SHARE
-            and f.loss_ratio <= 1.0
-            for f in forced
-        ]
-        market_pass = [r[0] > chance for r in ruined]
-        standing_pass = [r[1] > r[2] for r in ruined]
-
-        # At ratio 1 the clamp restores a zeroed wealth before anything reads it, so
-        # the ruin protocol never damages anything and its verdicts say nothing.
-        degenerate = " (no damage)" if band.ratio == 1.0 else ""
-        print(
-            f"{band.label:>16} {band.min_wealth:>7.1f} {band.max_wealth:>8.1f} "
-            f"{band.wealth_decay:>6.3f} "
-            f"{forced[0].tracking:>14.2f} {forced[0].regained:>9.2f} "
-            f"{forced[0].loss_ratio:>12.2f} "
-            f"{verdict(forced_pass):>10} "
-            f"{ruined[0][0]:>11.3f} {verdict(market_pass):>11} "
-            f"{ruined[0][1] / max(ruined[0][2], 1e-9):>9.2f} {verdict(standing_pass):>12}"
-            f"{degenerate}"
-        )
+        print(_recovery_row(band, seeds, share))
     print(
         f"\nStatistics are seed {seeds[0]}'s, which is the seed all three tests run; "
         f"(n/{len(seeds)}) counts how many\nof the swept seeds agree with that verdict. "
@@ -576,7 +581,7 @@ def sweep_recovery(candidates: list[Band], seeds: tuple[int, ...], share: str) -
     )
 
 
-def main() -> None:
+def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seeds", type=int, nargs="+", default=list(SEEDS))
     parser.add_argument("--share", default=BASE_CONFIG.routing_share)
@@ -600,7 +605,11 @@ def main() -> None:
         action="append",
         help="an extra candidate band, repeatable",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    args = _parser().parse_args()
     seeds = tuple(args.seeds)
 
     extra = [
@@ -610,17 +619,13 @@ def main() -> None:
 
     if args.recovery:
         grid = [] if args.quick else [centred(ratio, decay) for ratio in RATIOS for decay in DECAYS]
-        sweep_recovery([SHIPPED, *grid, *extra], seeds, args.share)
-        return
+        return sweep_recovery([SHIPPED, *grid, *extra], seeds, args.share)
     if args.scale:
-        sweep_scale(seeds, args.share, args.decay)
-        return
+        return sweep_scale(seeds, args.share, args.decay)
     if args.start:
-        sweep_start(seeds, args.share)
-        return
+        return sweep_start(seeds, args.share)
     if args.advantage:
-        sweep_advantage(seeds, args.share)
-        return
+        return sweep_advantage(seeds, args.share)
 
     sweep_bands(seeds, args.share)
     if args.share == ROUTING_SHARE_PROPORTIONAL:

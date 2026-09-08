@@ -70,16 +70,29 @@ class MoBConfig:
     # to 7 significant figures at 0.1x and 10x. The reward is the one quantity
     # carrying no wealth at all, so the inflow is an absolute number of credits.
     #
-    # **The band determines nothing about who wins, and that is why all four are
-    # retained.** Run to eight memory horizons, every band swept settles into the
-    # same two-expert monopoly: top_k experts hold ~99% of the slots and the other
-    # six hold 0.002 each, which is the 2% exploration slot divided among them.
-    # Ceiling occupancy is top_k/num_experts -- 25.0% -- at every band and every
-    # decay measured, because it counts the winners and there are always top_k of
-    # them. What the band changes is only *where the six losers' wealth sits*: on
-    # the floor at [15, 750] (74% floor occupancy, 0.7% of expert-steps in the
-    # band's interior), in the interior at [37.5, 150] (0% floor, 75% interior).
-    # That moves wealth Gini from 0.693 to 0.124 and moves not one win share.
+    # **At this decay the band does not decide who wins, and that is why all four
+    # are retained.** Run to eight memory horizons at 0.997, every ratio swept
+    # settles into the same two-expert monopoly: top_k experts hold ~99% of the
+    # slots and each of the other six holds about 0.0016, which is the 2%
+    # exploration rate divided among the six losers. Confirmed at [15, 750],
+    # [23.7, 237.2], [37.5, 150] and [187.5, 750]. Ceiling occupancy is then
+    # top_k/num_experts -- 25.0% -- because at this decay the equilibrium sits above
+    # every ceiling swept and the two winners are the only experts clamped there.
+    #
+    # Both statements are the shipped decay's, not universals. Across the grid
+    # ceiling occupancy runs 0.0% to 100.0%: at 0.98 and 0.99 the equilibrium falls
+    # inside the wider bands so nothing clamps, and three to five experts clear 1%
+    # of the slots with top-2 concentration down to 0.85; at 1.0 everything pins to
+    # the ceiling. Faster decay does open the market somewhat -- and it is bounded
+    # below by the frozen-heads pairing, which is the trade recorded on wealth_decay.
+    #
+    # What the band changes at this decay is only *where the six losers' wealth
+    # sits*: on the floor at [15, 750] (74% floor occupancy, 0.7% of expert-steps in
+    # the band's interior), in the interior at [37.5, 150] (0% floor, 75% interior).
+    # That moves wealth Gini from 0.693 to 0.124 and leaves the same six shut out.
+    # It does move *which* two monopolise, and not in the narrow band's favour: at
+    # [15, 750] they are the top two by competence on all three seeds, at the
+    # narrower bands they are ranks {4,2}, {2,1}, {3,2} and {4,1}.
     #
     # So Gini here is a closed form rather than a measurement: 0.693 is exactly the
     # Gini of (750, 750, 15 x 6), which is why its spread over three seeds is
@@ -139,9 +152,10 @@ class MoBConfig:
     #
     # What it is *not* is a lever on the monopoly. Narrowing the band to [37.5, 150]
     # takes wealth Gini from 0.693 to 0.124 and how often wealth overturns a report
-    # from 26.6% to 1.0%, and leaves the same two experts holding 99% of the slots
-    # with the same six shut out on 0.002 -- it relocates the losers' wealth into
-    # the band's interior without readmitting them to the market. The limit case is
+    # from 26.6% to 1.0%, and leaves two experts holding 99% of the slots with the
+    # other six shut out -- it relocates the losers' wealth into the band's interior
+    # without readmitting them, and the two it leaves in charge are a worse-chosen
+    # pair by competence than the shipped band's. The limit case is
     # unambiguous the other way: at decay 1.0 every band whose bounds differ ends
     # with 100% of expert-steps at the ceiling, every expert equally and maximally
     # rich. Neither end is a cap on inequality, which is why #16 changed no value
