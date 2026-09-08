@@ -41,6 +41,7 @@ from mob.auction import ROUTING_SHARE_PROPORTIONAL, AuctionOutcome, VCGAuctionee
 
 from .auction_mutations import (
     first_price_payments,
+    lowered_floor,
     pre_nine_payments,
     undivided_payments,
     wealth_blind_forward,
@@ -404,3 +405,43 @@ def test_truthfulness_fails_under_the_proportional_share():
 def test_the_example_market_exercises_every_checker():
     """The pairings above are only evidence if the reference auction passes on the fixture."""
     check_all(EXAMPLE, _auction(EXAMPLE))
+
+
+# --- What the floor buys (#16) -------------------------------------------------------
+
+
+def _poorest_outbids_richest(config: MoBConfig) -> bool:
+    """Does an expert at the floor with the best report beat the richest with the worst?
+
+    The two reports bracket what a confidence head produces: ``LOGIT_RANGE``'s top
+    is a trained loss-reduction estimate of order one, its bottom the near-zero
+    report a head initialises at. Run through the real gate rather than compared
+    as bids, so the answer is the auction's own.
+    """
+    reports = F.softplus(torch.tensor([LOGIT_RANGE[1], LOGIT_RANGE[0], LOGIT_RANGE[0]]))
+    wealth = torch.tensor([config.min_wealth, config.max_wealth, config.max_wealth])
+    auction = VCGAuctioneer(3, top_k=1, differentiable=False, exploration_rate=0.0)
+    auction.eval()
+    outcome = auction(reports.view(1, 1, 3), wealth)
+    return int(outcome.selected_experts[0, 0, 0]) == 0
+
+
+def test_the_floor_bounds_what_a_poor_winner_can_be_charged():
+    """``min_wealth`` is what keeps a recovering expert able to win on merit.
+
+    Selection is ``argtopk(confidence x wealth)``, so the band's ratio *is* the
+    report advantage the market demands of its poorest expert -- 50x at the shipped
+    ``[15, 750]``, against the 364x that separates the best report a head produces
+    from the worst. The floor is the half of that ratio a ruined expert sits on, so
+    it decides whether climbing back is possible at all.
+
+    Paired with the band that removes it: at a floor 1000x lower the demand becomes
+    50000x, past anything a report can cover, and the same expert cannot win however
+    good its report. Until #16 nothing in the suite failed when the floor moved,
+    which is what this test exists to fix -- the ceiling was covered by the payment
+    properties above and the floor by nothing.
+    """
+    config = MoBConfig()
+
+    assert _poorest_outbids_richest(config)
+    assert not _poorest_outbids_richest(lowered_floor(config))

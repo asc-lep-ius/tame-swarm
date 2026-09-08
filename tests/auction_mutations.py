@@ -1,15 +1,25 @@
 """Broken auctions, for pairing every mechanism property with the defect it catches.
 
-Each mutant reproduces one way the auction has been, or could be, wrong, in the
-shape ``monkeypatch.setattr(VCGAuctioneer, ...)`` expects. A property test that
-passes on the real auction and fails under the mutant that breaks it is a test;
-one that passes under both is documentation with a green checkmark.
+Each mutant reproduces one way the auction has been, or could be, wrong. A
+property test that passes on the real auction and fails under the mutant that
+breaks it is a test; one that passes under both is documentation with a green
+checkmark.
+
+Mutants come in two shapes. Most are methods, in the form
+``monkeypatch.setattr(VCGAuctioneer, ...)`` expects. The band mutants at the
+bottom are configs instead, because what the wealth bounds do cannot be removed
+by patching a method -- it is the band itself that is the mechanism. #16 added
+them after running the same experiment by hand over the whole suite and finding
+that lowering ``min_wealth`` by 15000x broke nothing: the floor was inert with
+respect to every behavioural assertion in the repository.
 """
 
 import math
+from dataclasses import replace
 
 import torch
 
+from mob import MoBConfig
 from mob.auction import AuctionOutcome
 
 
@@ -48,4 +58,38 @@ def wealth_blind_forward(self, confidences, wealth):
     weights = torch.full_like(confidences[..., : self.top_k], 1.0 / self.top_k)
     return AuctionOutcome(
         selected, weights, torch.zeros_like(weights), torch.zeros_like(confidences), None
+    )
+
+
+# --- Band mutants ------------------------------------------------------------------
+
+
+def lowered_floor(config: MoBConfig, factor: float = 1000.0) -> MoBConfig:
+    """The band with its floor dropped, leaving the price division unguarded.
+
+    What ``min_wealth`` buys is a bound on the report advantage the market can
+    demand of its poorest expert: selection is ``argtopk(confidence x wealth)``,
+    so an expert at the floor needs a report ``max_wealth / min_wealth`` times the
+    richest expert's to win at all. Dropping the floor raises that demand without
+    touching anything else, which is the one way to make a recovering expert
+    unable to climb back on merit.
+    """
+    return replace(config, min_wealth=config.min_wealth / factor)
+
+
+def flat_band(config: MoBConfig) -> MoBConfig:
+    """Every expert equally rich, so the ledger decides nothing and the auction still prices.
+
+    ``min_wealth == max_wealth == initial_wealth`` pins wealth at a constant, and a
+    constant multiplier cannot reorder ``confidence x wealth``: selection becomes
+    the report ranking alone. It is the wealth-blind arm without
+    ``wealth_blind_forward``'s side effect of zeroing every payment and rebate too,
+    which matters when the question is what the *band* costs rather than what the
+    whole auction does. #16 used it to show that the band is not what stops a
+    market re-forming after a forced episode.
+    """
+    return replace(
+        config,
+        min_wealth=config.initial_wealth,
+        max_wealth=config.initial_wealth,
     )
