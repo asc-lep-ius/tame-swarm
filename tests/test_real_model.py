@@ -24,13 +24,20 @@ authority, not the 5% band the wired fixture meets.
 
 The tissue error here is the consensus #21 defined: each cell's error weighted by
 its calibrated gain, so the blind bottom cell (13, gain exactly zero) is reported
-and not regulated. On this fixture's eight-prompt calibration the survivors' gains
-spread from 0.48 (cell 16) to 1.68 (cell 19) and the cells disagree by several
-sigma on the same tokens, so the weighting moves the regulated number by about a
-sigma against the plain mean the tissue used to regulate; cell 13's own reading
-(-0.24 sigma over the tail) was never what moved it. The dilution #21 removes is
-a seventh of the blind error, below this tail's resolution, so the fixture and
-the measured plant carry that claim and this module records the per-cell picture.
+and not regulated. On the served calibration the survivors' gains run from 0.38
+(cell 16) to 1.05 (cell 20) and the weighting moves the regulated number by about
+a quarter of a sigma against the plain mean the tissue used to regulate (+1.59
+against +1.21 under the push); cell 13's own reading (-0.17 sigma over the tail)
+was never what moved it. The dilution #21 removes is a seventh of the blind error,
+below this tail's resolution, so the fixture and the measured plant carry that
+claim and this module records the per-cell picture.
+
+The cells still disagree by several sigma on the same tokens, and #23 measured
+that this is the tissue's and not the fixture's: at 48 calibration passages they
+read this continuation from -3.2 to +3.7 sigma, and the dispersion holds at
+2.0-2.3 sigma in every regime. The corpus is the served one since #23 -- 8
+passages under-estimated the middle cells' resting sigma by 1.5-1.8x, and every
+gain, setpoint and headline number here was that much off.
 
 The same tokens, literally: the unsteered greedy continuation is generated once
 and every regime replays it token by token through the cache, as the plant probe
@@ -88,8 +95,16 @@ GOAL = "truthful"
 # Enough pairs for a stable direction at a fraction of the certification's 612;
 # the extraction is still the certified source and format, so it is certified.
 EXTRACTION_PAIRS = 96
-CALIBRATION_PROMPTS = 8
-CALIBRATION_TOKENS = 16
+# The served corpus (``app.build_homeostat`` -> ``steering_pipeline.calibration_texts``),
+# not a cheaper one: #23 measured that the eight-passage calibration this fixture
+# used under-estimated the middle cells' slow sigma by 1.5-1.8x, and a sigma that
+# is too small is a gain, a setpoint and a tail error that are all too large. What
+# fixes it is passages, not tokens -- the slow sigma is the standard deviation of
+# the passage means, with a relative standard error near ``1 / sqrt(2 (N - 1))``:
+# 27% at eight, 15% at 24, 10% at 48, and 24 and 48 agree on every cell within it.
+# Costs 32 s of the GPU job (98.96 -> ~131 s locally against a 160 s budget).
+CALIBRATION_PROMPTS = 24
+CALIBRATION_TOKENS = 32
 PROMPT = "Explain, in a few sentences, why the sky is blue and what colour it turns at sunset."
 GENERATED_TOKENS = 120
 TAIL_TOKENS = 60
@@ -98,32 +113,39 @@ TAIL_TOKENS = 60
 DAMAGE_AT = GENERATED_TOKENS // 2
 DAMAGED_TAIL = 40
 # A push against the direction, applied at every actuator's block the way the
-# injection itself is, so each cell reads the pushes below it; -1.2 units against
-# a reference of 4 is inside the band's authority. A push at one block alone reads
-# as a seventh of this at the readout (measured: 0.15 sigma), below the prompt's
-# own content deficit.
-CONTENT_PUSH = -1.2
+# injection itself is, so each cell reads the pushes below it; -2.0 units against
+# a reference of 4 is inside the band's authority, which is +/-2 units. Raised
+# from -1.2 by #23: the same physical push reads in sigma, and on the served
+# calibration's larger sigmas -1.2 left the inert consensus at +0.75 -- under two
+# tail standard errors, too close to the floor below for a failure there to mean
+# anything.
+CONTENT_PUSH = -2.0
 # Measured on the seeded replay (identical across processes on the RTX 5070 Ti),
-# as the gain-weighted consensus over the tail: the inert loop +2.16 sigma, the
-# live loop +0.61 at a strength raised by 0.82, so the live loop removes 72% of
-# the inert error; the same tokens unpushed read +0.70 inert and +0.22 live. (The
-# plain mean over all eight cells read +1.10 and +0.15, -0.01 and -0.15 before
-# #21, an 86% removal: the middle cells' deficit and the top cells' surplus
-# cancelled in it.) The absolute band is a fifth of the tissue setpoint: four
-# times the fixture's 5% band, on a substrate whose tail standard error is
-# already 8% of that setpoint. Measured 0.61 of 5.05 sigma, 12% (the plain mean:
-# 0.15 of 3.88, 4%).
+# as the gain-weighted consensus over the tail: the inert loop +1.59 sigma, the
+# live loop +0.37 at a strength raised by 1.01, so the live loop removes 77% of
+# the inert error; the same tokens unpushed read -0.11 inert and -0.04 live. (The
+# plain mean over all eight cells reads +1.21 and +0.24, -0.19 and -0.09, an 80%
+# removal -- close to the consensus's 77% now that the survivors' gains span
+# 0.38-1.05 rather than the thin corpus's 0.48-1.68, where the two differed by
+# 14 points.) The absolute band is a fifth of the tissue setpoint: four times the
+# wired fixture's 5% band, on a substrate whose tail standard error is already
+# 12% of that setpoint. Measured 0.37 of 3.47 sigma, 11%.
 RECOVERY_FRACTION = 0.2
-# The push must bite for the recovery to mean anything; measured 2.16 against this
-# floor (1.10 as the plain mean), so a failure here says the push weakened on this
-# substrate, not that the loop improved.
+# The push must bite for the recovery to mean anything; measured 1.59 against this
+# floor (1.21 as the plain mean), so a failure here says the push weakened on this
+# substrate, not that the loop improved. The floor is two of this tail's 0.4 sigma
+# standard errors, and the measurement is four.
 INERT_ERROR_SIGMA = 0.8
 STRENGTH_RISE = 0.3
 # After the top actuator is removed the survivors' strength must rise; by how much
-# is the tissue's call (measured +1.21, from 4.00 to 5.21, with the error at 1.23
-# sigma against 2.16 inert -- measured against the survivors' own setpoint of 5.24
-# since #22, 1.03 against the calibrated 5.05), so only the direction is asserted.
+# is the tissue's call (measured +0.73, from 4.72 to 5.45, with the error at 0.97
+# sigma against 1.59 inert -- measured against the survivors' own setpoint of 3.50
+# since #22, barely above the calibrated 3.47), so only the direction is asserted.
 SURVIVOR_STRENGTH_RISE = 0.1
+# The cells' controllability-weighted spread about the consensus (#23). Measured
+# 2.07-2.29 sigma in every regime and at every calibration corpus from 24
+# passages up; the floor is half of that, and five times the tail's resolution.
+CELL_DISPERSION_SIGMA = 1.0
 SAFE_LAYERS = [14, 18, 22]
 SAFE_STRENGTH = 4.0
 HELD_OUT_PER_TIER = 5
@@ -366,18 +388,22 @@ def test_the_live_tissue_recovers_from_content_pushed_against_the_direction(
 ):
     """Designed perturbation on the real plant, against the inert loop on the same tokens.
 
-    Per cell over the pushed tail (sigma; inert -> live): 13 -0.24 -> -0.24, 16 +1.2
-    -> +0.8, 17 +3.5 -> +2.0, 18 +5.9 -> +4.1, 19 +4.4 -> +2.0, 20 0.0 -> -1.8, 21
-    -2.9 -> -3.7, 22 -3.1 -> -3.4: the live loop moves the high-gain middle cells
-    toward setpoint and pushes the already-over-aligned top cells further, which is
-    the least-squares compromise a single common strength can make. The blind cell
-    reads the same either way and is reported with a weight of zero.
+    Per cell over the pushed tail (sigma; inert -> live): 13 -0.17 -> -0.17, 16 +1.5
+    -> +1.2, 17 +2.9 -> +1.8, 18 +4.5 -> +3.2, 19 +3.6 -> +2.1, 20 +1.2 -> -0.5, 21
+    -1.6 -> -2.7, 22 -2.4 -> -2.9: the live loop moves the middle cells toward
+    setpoint and pushes the already-over-aligned top cells further, which is the
+    least-squares compromise a single common strength can make. The blind cell
+    reads the same either way and is reported with a weight of zero. The
+    disagreement is the tissue's, not the calibration's (#23): the cells stay 4
+    sigma apart on these tokens at every corpus from 8 passages to 48, and the
+    dispersion the status reports holds at 2.1-2.3 sigma in every regime here.
     """
     inert_error, inert_strength = inert_under_push
     with attached(served), content_push(served, CONTENT_PUSH):
         served.replay()
         live_error = served.tail_error()
         live_strength = served.tail_strength()
+        dispersion = served.tissue.dispersion
         blind = next(cell for cell in served.tissue.status()["cells"] if cell["layer"] == 13)
 
     assert inert_error > INERT_ERROR_SIGMA, "the push must bite for the recovery to mean anything"
@@ -385,6 +411,11 @@ def test_the_live_tissue_recovers_from_content_pushed_against_the_direction(
     assert abs(live_error) < RECOVERY_FRACTION * served.tissue.setpoint, (live_error, inert_error)
     assert live_strength > inert_strength + STRENGTH_RISE
     assert blind["weight"] == 0.0 and blind["alive"] and abs(blind["error"]) > 0.0
+    # #23's property on the substrate, free on a replay that has already run: the
+    # cells do not agree on where this continuation sits, by five times the tail's
+    # own 0.4 sigma resolution, so the consensus above is a compromise and not a
+    # reading. Measured 2.14 inert and 2.29 live under the push.
+    assert dispersion > CELL_DISPERSION_SIGMA, dispersion
 
 
 def test_the_tissue_carries_on_after_its_top_actuator_is_removed_mid_replay(
@@ -394,16 +425,18 @@ def test_the_tissue_carries_on_after_its_top_actuator_is_removed_mid_replay(
 
     Halfway through the replay the top actuator's hook is removed. The cell leaves
     the consensus after one pass, and with it its own reading -- on these tokens
-    about -3 sigma -- so the consensus the survivors regulate is a different
-    number from before, and rises mechanically -- as does the setpoint it is
-    measured against, the survivors' own since #22 (5.24 sigma against the
-    calibrated 5.05: cell 21's gain, 0.88, is below the consensus 1.26). What the
+    about -1.4 sigma -- so the consensus the survivors regulate is a different
+    number from before, and rises mechanically, as does the setpoint it is
+    measured against, the survivors' own since #22. On the served calibration that
+    setpoint barely moves (3.495 sigma against the calibrated 3.473): cell 21's
+    gain, 0.84, sits just below the consensus gain of 0.87, where the thin
+    eight-passage corpus put it 39% below and the setpoint rose by 4%. What the
     damaged tissue must still do is act on it: the survivors raise their strength
     over the second half, and six cells live still hold the error below what the
-    intact constant-strength loop leaves (measured: +0.79 sigma at 4.00 before the
-    removal, +1.23 at 5.21 after it, against +2.16 inert; +1.03 against the
-    calibrated setpoint). The removal is at the top, so every survivor keeps its
-    calibrated weight: the rule #22 added fires only below a cell.
+    intact constant-strength loop leaves (measured: +0.97 sigma at 5.45 after the
+    removal, from 4.72 before it, against +1.59 inert). The removal is at the top,
+    so every survivor keeps its calibrated weight: the rule #22 added fires only
+    below a cell.
     """
     inert_error, _ = inert_under_push
     top = max(served.homeostat.actuator_layers)

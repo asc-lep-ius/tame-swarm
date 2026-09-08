@@ -132,9 +132,11 @@ test-gpu:
     # The real-model tests read Qwen3-1.7B from that hub; they fail rather than
     # skip when it is missing, so say up front what the job sees.
     - ls "$HF_HUB_CACHE" 2>/dev/null || echo "HF hub cache is not mounted into this job"
-    # #6 budgets the GPU job at 120 seconds (measured 90-98 on the RTX 5070 Ti
-    # with Qwen3-1.7B loaded from that cache); the durations make a regression
-    # against that budget visible in the job log.
+    # #6 budgeted the GPU job at 120 seconds; #23 raised it to 160 when the
+    # fixture moved onto the served 24 x 32 calibration corpus, whose 24 passages
+    # are what the per-cell sigmas converge at (measured 127 on the RTX 5070 Ti
+    # with Qwen3-1.7B loaded from that cache, against 99 on the old 8 x 16).
+    # The durations make a regression against that budget visible in the job log.
     - uv run pytest tests/ -x --tb=short -m gpu --durations=10
 
 # --- Build stage ---
