@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import time
 from threading import Thread
 
 import torch
@@ -8,8 +9,10 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from transformers import TextIteratorStreamer
 
+import observability
 from app import TAMEApplication
 from dependencies import get_tame_app
+from metrics_routes import router as metrics_router
 from models import (
     GainUpdate,
     GenerateRequest,
@@ -22,53 +25,27 @@ from models import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+router.include_router(metrics_router)
+
+GENERATE_ROUTE = "/generate"
+GENERATE_STREAM_ROUTE = "/generate/stream"
+
+
+def _pid_status(tame: TAMEApplication) -> PIDStatus:
+    """The loop's status including the rolling window; every call site serves one model."""
+    status = observability.pid_status(tame)
+    assert status is not None, "callers check homeostat is not None first"
+    return status
 
 
 @router.get("/health", response_model=HealthResponse)
 def health_check(tame: TAMEApplication = Depends(get_tame_app)):
-    try:
-        gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU"
-    except Exception:
-        gpu_name = "Unknown"
-
-    return HealthResponse(
-        status="alive",
-        gpu=gpu_name,
-        model_id=tame.model_id,
-        architecture="TAME (Mixture of Bidders + Cognitive Homeostasis)",
-        mob_active=True,
-        steering_active=tame.homeostat is not None,
-    )
+    return observability.health_response(tame)
 
 
 @router.get("/swarm/status", response_model=SwarmStatus)
 def get_swarm_status(tame: TAMEApplication = Depends(get_tame_app)):
-    from mob import MixtureOfBidders
-
-    total_wealth = torch.zeros(tame.mob_config.num_experts)
-    total_usage = torch.zeros(tame.mob_config.num_experts)
-    num_mob_layers = 0
-
-    for layer in tame.model.model.layers:  # pyright: ignore[reportAttributeAccessIssue] # HuggingFace Auto* stubs lack runtime model internals
-        if hasattr(layer, "mlp") and isinstance(layer.mlp, MixtureOfBidders):
-            mob = layer.mlp
-            total_wealth += mob.expert_wealth.cpu()
-            total_usage += mob.expert_usage_count.cpu()
-            num_mob_layers += 1
-
-    if num_mob_layers > 0:
-        avg_wealth = (total_wealth / num_mob_layers).tolist()
-        avg_usage = total_usage.tolist()
-    else:
-        avg_wealth = [0.0] * tame.mob_config.num_experts
-        avg_usage = [0.0] * tame.mob_config.num_experts
-
-    return SwarmStatus(
-        num_experts=tame.mob_config.num_experts,
-        expert_wealth=avg_wealth,
-        expert_usage=avg_usage,
-        layers_modified=num_mob_layers,
-    )
+    return observability.swarm_status(tame)
 
 
 @router.get("/homeostasis/status")
@@ -91,7 +68,7 @@ def get_homeostasis_status(tame: TAMEApplication = Depends(get_tame_app)):
             "setpoint": tame.homeostat.homeostat.setpoint,
             "target_alignment": config.target_alignment,
         },
-        "pid": PIDStatus(**tame.homeostat.pid_status()).model_dump(),
+        "pid": _pid_status(tame).model_dump(),
         "current_stats": stats,
     }
 
@@ -107,13 +84,13 @@ def update_gains(update: GainUpdate, tame: TAMEApplication = Depends(get_tame_ap
             detail=f"goal {update.goal!r} is not loaded ({tame.homeostat.goal!r} is)",
         )
     try:
-        status = tame.homeostat.set_gains(kp=update.kp, ki=update.ki, kd=update.kd)
+        tame.homeostat.set_gains(kp=update.kp, ki=update.ki, kd=update.kd)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     if update.adaptive is not None:
         tame.homeostat.config.adaptive = update.adaptive
         tame.homeostat.reset()
-    return PIDStatus(**status)
+    return _pid_status(tame)
 
 
 @router.get("/traces/wealth")
@@ -140,6 +117,15 @@ def get_steering_traces(tame: TAMEApplication = Depends(get_tame_app)):
 
 @router.post("/generate", response_model=GenerateResponse)
 async def generate(req: GenerateRequest, tame: TAMEApplication = Depends(get_tame_app)):
+    # The window the latency percentiles and tokens/sec are read off. Recorded in
+    # the context manager's finally, so a request that fails still costs what it
+    # took to fail -- a p99 that silently drops the slow failures is the wrong
+    # number to hold a budget against.
+    with tame.latency.measure(GENERATE_ROUTE) as output_tokens:
+        return await _generate(req, tame, output_tokens)
+
+
+async def _generate(req: GenerateRequest, tame: TAMEApplication, output_tokens: list[int]):
     original_strength = tame.homeostat.config.base_strength if tame.homeostat else None
     original_adaptive = tame.homeostat.config.adaptive if tame.homeostat else None
 
@@ -176,6 +162,7 @@ async def generate(req: GenerateRequest, tame: TAMEApplication = Depends(get_tam
             "input_tokens": inputs.input_ids.shape[1],
             "output_tokens": len(generated_ids),
         }
+        output_tokens[0] = len(generated_ids)
 
         homeostasis_stats = None
         if tame.homeostat:
@@ -213,6 +200,9 @@ async def generate_stream(req: GenerateRequest, tame: TAMEApplication = Depends(
     original_adaptive = tame.homeostat.config.adaptive if tame.homeostat else None
 
     async def event_generator():
+        # The response outlives the handler, so the window is the generator's:
+        # opened here and closed once the last token has been streamed.
+        started = time.perf_counter()
         try:
             status_payload = json.dumps({"type": "status", "message": "Preparing generation..."})
             yield f"data: {status_payload}\n\n"
@@ -351,6 +341,7 @@ async def generate_stream(req: GenerateRequest, tame: TAMEApplication = Depends(
             thread.join(timeout=10)
 
             tame.stop_mob_tracking()
+            tame.latency.record(GENERATE_STREAM_ROUTE, time.perf_counter() - started, token_count)
 
             final_stats: dict = {
                 "type": "complete",
@@ -456,5 +447,5 @@ def update_steering(
         "source": extraction.source,
         "pair_format": extraction.pair_format,
         "certified": extraction.certified,
-        "pid": PIDStatus(**tame.homeostat.pid_status()).model_dump(),
+        "pid": _pid_status(tame).model_dump(),
     }

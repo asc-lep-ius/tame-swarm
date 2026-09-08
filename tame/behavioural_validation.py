@@ -148,6 +148,26 @@ def _pair_log_odds(
     return pos - neg
 
 
+def held_out_log_odds(
+    model: nn.Module,
+    tokenizer,
+    pairs: Sequence[ContrastivePair],
+    device: torch.device,
+    max_length: int = 128,
+) -> list[float]:
+    """Per-pair held-out log-odds, dropping any pair that tokenises degenerately.
+
+    The shared measurement behind :func:`mean_log_odds` and
+    :func:`held_out_accuracy`: two forward passes per pair, so a caller that wants
+    both statistics reads them off one pass over the pairs rather than two.
+    """
+    values = [_pair_log_odds(model, tokenizer, pair, device, max_length) for pair in pairs]
+    finite = [value for value in values if value == value]  # drop NaN
+    if not finite:
+        raise ValueError("no held-out pair produced a finite log-odds")
+    return finite
+
+
 def mean_log_odds(
     model: nn.Module,
     tokenizer,
@@ -156,10 +176,7 @@ def mean_log_odds(
     max_length: int = 128,
 ) -> float:
     """Mean held-out log-odds over pairs, skipping any that tokenise degenerately."""
-    values = [_pair_log_odds(model, tokenizer, pair, device, max_length) for pair in pairs]
-    finite = [value for value in values if value == value]  # drop NaN
-    if not finite:
-        raise ValueError("no held-out pair produced a finite log-odds")
+    finite = held_out_log_odds(model, tokenizer, pairs, device, max_length)
     return float(sum(finite) / len(finite))
 
 
@@ -176,10 +193,7 @@ def held_out_accuracy(
     the mean log-odds while flipping preferences toward the negative arm shows up
     here and not there.
     """
-    values = [_pair_log_odds(model, tokenizer, pair, device, max_length) for pair in pairs]
-    finite = [value for value in values if value == value]
-    if not finite:
-        raise ValueError("no held-out pair produced a finite log-odds")
+    finite = held_out_log_odds(model, tokenizer, pairs, device, max_length)
     return sum(value > 0 for value in finite) / len(finite)
 
 

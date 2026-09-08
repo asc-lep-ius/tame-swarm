@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app import TAMEApplication
+from latency import LatencyTracker
 from mob import MoBConfig
 from steering import SteeringConfig
 
@@ -16,6 +17,13 @@ def mock_tame_app():
     tame.homeostat = None
     tame.mob_config = MoBConfig(num_experts=2, top_k=1, hidden_dim=32, intermediate_dim=64)
     tame.steering_config = SteeringConfig()
+    # A model with no blocks: /health reports ``mob_active`` from what the model
+    # actually carries since #5, rather than asserting it, so the mock needs one.
+    tame.model = MagicMock()
+    tame.model.model.layers = []
+    tame.extractions = {}
+    tame.latency = LatencyTracker()
+    tame.outcome = None
     return tame
 
 

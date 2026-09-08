@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import os
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -13,7 +13,16 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from config import get_active_profile
 from homeostat import CognitiveHomeostat
-from mob import MixtureOfBidders, MoBConfig, apply_mob_to_model, load_mob_state
+from latency import LatencyTracker
+from mob import (
+    DEFAULT_TRACE_TOKENS,
+    MixtureOfBidders,
+    MoBConfig,
+    apply_mob_to_model,
+    load_mob_state,
+    mob_layers_by_index,
+)
+from models import OutcomeMetrics
 from steering import SteeringConfig
 from steering_pipeline import (
     SteeringExtraction,
@@ -137,6 +146,30 @@ class TAMEApplication:
     # The pristine loop settings every goal install starts from; ``steering_config``
     # is the config of the goal currently served, and carries its pinned gains.
     steering_template: SteeringConfig | None = None
+    # Every goal extracted in this process, kept rather than discarded: the
+    # inter-goal cosine matrix and the PCA (#5) are over these, and a server that
+    # threw the extraction away could only report them by extracting again, which
+    # is minutes of forward passes on a GET.
+    extractions: dict[str, SteeringExtraction] = field(default_factory=dict)
+    # A bounded window of recent requests per route. Not history -- that is
+    # MLflow's (#5's 2026-04-12 comment) -- and it holds nothing a log line does not.
+    latency: LatencyTracker = field(default_factory=LatencyTracker)
+    # The last outcome probe, or None until one has run. See ``outcome_probe``.
+    outcome: OutcomeMetrics | None = None
+
+    def install_routing_traces(self, maxlen: int = DEFAULT_TRACE_TOKENS) -> None:
+        """Start the per-token routing record on every MoB layer, keyed to the served goal.
+
+        The direction installed at a layer is the one the tissue's hook injects
+        there, so the correlation the trace feeds is between the goal's own
+        presence in the stream and which experts won -- measurable whether or not a
+        routing coupling mediates it, and the additive baseline when none does.
+        A MoB layer the goal has no vector at records its routing and no alignment.
+        """
+        for layer, mob in mob_layers_by_index(self.model).items():  # pyright: ignore[reportArgumentType] # AutoModelForCausalLM is an nn.Module at runtime
+            trace = mob.enable_routing_trace(maxlen)
+            if self.homeostat is not None and layer in self.homeostat.steering_vectors:
+                trace.set_direction(self.homeostat.projected_direction(layer)[0])
 
     @classmethod
     def from_profile(cls) -> TAMEApplication:
@@ -274,10 +307,12 @@ class TAMEApplication:
         logger.info("[HOMEOSTASIS] Extracting steering vectors for goal persistence...")
 
         homeostat: CognitiveHomeostat | None = None
+        extractions: dict[str, SteeringExtraction] = {}
         try:
-            homeostat, _, steering_config = build_homeostat(
+            homeostat, extraction, steering_config = build_homeostat(
                 model, tokenizer, steering_template, DEFAULT_GOAL, model_id=model_id
             )
+            extractions[DEFAULT_GOAL] = extraction
         except Exception as e:
             logger.warning("[HOMEOSTASIS] Steering extraction failed: %s", e)
             logger.warning("[HOMEOSTASIS] Continuing without steering (degraded mode)")
@@ -287,7 +322,7 @@ class TAMEApplication:
         logger.info("TAME SWARM: Online and Self-Regulating")
         logger.info("=" * 60)
 
-        return cls(
+        application = cls(
             model=model,  # pyright: ignore[reportArgumentType] # apply_mob_to_model returns Module but is still AutoModelForCausalLM at runtime
             tokenizer=tokenizer,
             homeostat=homeostat,
@@ -295,7 +330,10 @@ class TAMEApplication:
             steering_config=steering_config,
             model_id=model_id,
             steering_template=steering_template,
+            extractions=extractions,
         )
+        application.install_routing_traces()
+        return application
 
     def install_goal(self, goal: str, strength: float | None = None) -> SteeringExtraction:
         """Swap the served goal at runtime: detach, re-extract, re-calibrate, re-attach.
@@ -322,6 +360,11 @@ class TAMEApplication:
                 previous.attach_to_model(self.model)  # pyright: ignore[reportArgumentType] # as above
             raise
         self.homeostat, self.steering_config = homeostat, config
+        self.extractions[goal] = extraction
+        # The traces are keyed to the goal's direction at each layer, and the goal
+        # just changed; a probe measured against the previous goal is stale.
+        self.install_routing_traces()
+        self.outcome = None
         return extraction
 
     def start_mob_tracking(self) -> None:
