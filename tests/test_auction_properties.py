@@ -41,6 +41,7 @@ from mob.auction import ROUTING_SHARE_PROPORTIONAL, AuctionOutcome, VCGAuctionee
 
 from .auction_mutations import (
     first_price_payments,
+    lowered_floor,
     pre_nine_payments,
     undivided_payments,
     wealth_blind_forward,
@@ -404,3 +405,112 @@ def test_truthfulness_fails_under_the_proportional_share():
 def test_the_example_market_exercises_every_checker():
     """The pairings above are only evidence if the reference auction passes on the fixture."""
     check_all(EXAMPLE, _auction(EXAMPLE))
+
+
+# --- What the band's ratio demands of its poorest expert (#16) ------------------------
+
+# What competence buys in report terms on the planted-competence fixture: the most
+# competent expert's mean report over the least competent one's. Re-derivable with
+# `scripts/sweep_wealth_bounds.py --advantage`, which is why these are ranges and
+# not digits -- the quantity is not a constant of the fixture. The heads keep
+# calibrating, so it grows with the training horizon.
+#
+# **Under the shipped band**, which is what this test compares against a shipped
+# band's ratio: 1.9-2.7 at the 400 steps the damage protocols run, 3.9-7.1 at the
+# sweep's settled budget, over three seeds. Stable to the digit under every BLAS
+# thread count tried, unlike the flat control below. Rounded up from the measured
+# 7.13, so it is a bound rather than a reading.
+LARGEST_ADVANTAGE_UNDER_THE_SHIPPED_BAND = 7.2
+# **With the ledger pinned flat**, reported by the same mode as a control. It runs
+# larger -- 2.2-2.6 at 400 steps, and 2.2-17.5 settled -- because a band that shuts
+# six experts out also stops their heads calibrating, so the band suppresses the
+# very advantage it is then compared against.
+#
+# It is also *numerically unstable*, which is the same effect one level down: with
+# wealth pinned, selection runs on near-tied reports, so float32 reduction order
+# flips winners and the flip compounds through which heads get trained. Measured on
+# one seed at 2667 steps, `--advantage` prints 10.7 to 17.4 depending only on the
+# BLAS thread count. The shipped arm is stable to the digit across the same range.
+# So this is a headroom bound rather than a reading, deliberately above anything
+# observed; nothing depends on its exact value, only on its being far below 50.
+LARGEST_ADVANTAGE_WITH_THE_LEDGER_FLAT = 20.0
+
+# The shipped band, written out rather than read from MoBConfig. A test that derives
+# its expectation from the constant it is testing passes whatever that constant says,
+# which is the self-reference #16 discounted `test_default_values_match_expected` for.
+SHIPPED_FLOOR, SHIPPED_CEILING = 15.0, 750.0
+
+
+def _poorest_outbids_richest(floor: float, ceiling: float, advantage: float) -> bool:
+    """Can an expert at ``floor`` outbid one at ``ceiling`` on an ``advantage``x report?
+
+    Run through the real gate rather than compared as bids, so the answer is the
+    auction's own. Selection is ``argtopk(confidence x wealth)``, so this is true
+    exactly when ``advantage > ceiling / floor``.
+    """
+    reports = torch.tensor([advantage, 1.0, 1.0])
+    wealth = torch.tensor([floor, ceiling, ceiling])
+    auction = VCGAuctioneer(3, top_k=1, differentiable=False, exploration_rate=0.0)
+    auction.eval()
+    outcome = auction(reports.view(1, 1, 3), wealth)
+    return int(outcome.selected_experts[0, 0, 0]) == 0
+
+
+def test_the_band_ratio_bounds_the_report_advantage_demanded_of_the_poorest():
+    """The band's *ratio* is the report advantage the market demands of a poor expert.
+
+    Selection is ``argtopk(confidence x wealth)``, so an expert at the floor needs a
+    report ``ceiling / floor`` times a rich expert's to win at all. The shipped band
+    demands **50x**. Under that band competence buys between 1.9x and 7.2x depending
+    on how long the heads have trained, so wealth outranks it by at least 7x; with
+    the ledger removed the advantage reaches 15.5x, and 50x still exceeds that by
+    3x. Either way the demand is never met. That is why
+    ``test_a_ruined_competent_expert_returns_to_the_market`` reads a win share of
+    0.002, and why #16 could not fix it by moving the bounds: closing the gap needs a
+    ratio below about 7, and at the shipped decay the sweep found every band that
+    narrow settling into the same two-expert monopoly anyway.
+
+    This pins the mechanism, not the constants -- it is a statement about ratios and
+    holds at any scale. #16 deliberately did **not** manufacture a test that pins
+    ``min_wealth`` itself: mutating the floor 15000x down, or 5x up, changes no
+    behaviour the suite or the ruin protocol can see, and the honest record of that
+    is the comment in ``MoBConfig``, not an assertion contrived to fail. What
+    ``lowered_floor`` is paired with below is the *ratio* it moves, which is real.
+    """
+    assert _poorest_outbids_richest(SHIPPED_FLOOR, SHIPPED_CEILING, 51.0)
+    assert not _poorest_outbids_richest(SHIPPED_FLOOR, SHIPPED_CEILING, 49.0)
+
+    # The finding, held as an assertion so it cannot rot into a comment: the largest
+    # advantage competence buys under this band loses at this band's ratio -- and so
+    # does the larger one it buys with the ledger removed, so the conclusion does not
+    # depend on which of the two is the fair comparison.
+    assert not _poorest_outbids_richest(
+        SHIPPED_FLOOR, SHIPPED_CEILING, LARGEST_ADVANTAGE_UNDER_THE_SHIPPED_BAND
+    )
+    assert not _poorest_outbids_richest(
+        SHIPPED_FLOOR, SHIPPED_CEILING, LARGEST_ADVANTAGE_WITH_THE_LEDGER_FLAT
+    )
+    # And what closing the gap would take: a ratio below that advantage. The sweep
+    # found every band that narrow settling into the same two-expert monopoly, which
+    # is why #16 did not narrow the band to buy this.
+    assert _poorest_outbids_richest(
+        SHIPPED_CEILING / (LARGEST_ADVANTAGE_UNDER_THE_SHIPPED_BAND - 0.2),
+        SHIPPED_CEILING,
+        LARGEST_ADVANTAGE_UNDER_THE_SHIPPED_BAND,
+    )
+
+
+def test_a_lowered_floor_raises_the_advantage_demanded_past_any_report():
+    """The pairing for the ratio above: ``lowered_floor`` is a mutation of the demand.
+
+    At a floor 1000x lower the band demands 50000x, past anything any report
+    reaches, so no advantage competence could buy would let the poorest expert win.
+    The mutant moves that ratio and nothing else, which is why #16 pairs it here and
+    not with a recovery claim -- the floor's *height* was measured inert.
+    """
+    lowered = lowered_floor(MoBConfig())
+
+    assert not _poorest_outbids_richest(
+        lowered.min_wealth, lowered.max_wealth, LARGEST_ADVANTAGE_UNDER_THE_SHIPPED_BAND
+    )
+    assert not _poorest_outbids_richest(lowered.min_wealth, lowered.max_wealth, 51.0)

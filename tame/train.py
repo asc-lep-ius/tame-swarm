@@ -155,6 +155,10 @@ METRICS_FILENAME = "metrics.jsonl"
 # Only meaningful for top_k > 1: at top_k == 1 the effective count is 1.0 and the
 # saturated fraction 1.0 by construction, and neither is a fault.
 MIN_HEALTHY_EFFECTIVE_EXPERTS = 1.5
+# Type narrowing for the ceiling-proximity warning below, which sits inside the
+# auction arm and so always has a MoBConfig to read. MoBConfig's own default is the
+# number that matters; this keeps the diagnostic total without an assert.
+DEFAULT_MAX_WEALTH = MoBConfig().max_wealth
 
 
 # Elements sampled from a weight to fingerprint it: enough that a re-initialised
@@ -1513,13 +1517,21 @@ class TAMETrainer:
                     )
                 elif gini > 0.60:
                     logger.warning(
-                        f"  ⚠ High Gini ({gini:.4f}) - wealth monopoly risk. "
-                        "Consider: ↑min_wealth, ↓max_wealth"
+                        f"  ⚠ High Gini ({gini:.4f}) - wealth monopoly risk. #16 measured "
+                        "that neither bound fixes it: ↑min_wealth compresses the reported "
+                        "Gini without changing which experts win (at [187.5, 750] the same "
+                        "two hold 99% of slots at Gini 0.32), and at wealth_decay 1.0 every "
+                        "band saturates to Gini 0. Read this beside the win shares, not "
+                        "alone"
                     )
 
-                if mean_wealth > 0.9 * 750:
+                ceiling = self.mob_config.max_wealth if self.mob_config else DEFAULT_MAX_WEALTH
+                if mean_wealth > 0.9 * ceiling:
                     logger.warning(
-                        f"  ⚠ Wealth near ceiling ({mean_wealth:.0f}/750) - consider ↑max_wealth"
+                        f"  ⚠ Wealth near ceiling ({mean_wealth:.0f}/{ceiling:.0f}). The "
+                        "equilibrium is net inflow / (1 - wealth_decay) and it sits above "
+                        "the band; ↓reward_scale or slide the band up. Raising max_wealth "
+                        "alone widens the ratio wealth overturns reports on"
                     )
 
                 if perf_ema < -0.3:
