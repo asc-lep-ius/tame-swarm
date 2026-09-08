@@ -125,11 +125,14 @@ class MoBConfig:
     # also self-referential in the way #16 discounted `test_default_values_match_
     # expected` for; no production path reads this constant except the clamps.
     #
-    # What it is *not* is a cap on inequality. Swept, every band whose ceiling
-    # binds hard enough to reduce how often wealth overturns reports does so by
-    # pinning every expert against it: at [37.5, 150] the ceiling holds 82% of
-    # expert-steps and wealth Gini is 0.000. The ceiling erases the ledger rather
-    # than compressing it, which is why #16 changed no value here.
+    # What it is *not* is a cap on inequality. Swept to steady state, reducing how
+    # often wealth overturns reports always costs the ledger's spread rather than
+    # bounding it: at [37.5, 150] and this decay, overturn falls to 1.0% and Gini
+    # with it, to 0.124. The limit case is unambiguous -- at decay 1.0 every band
+    # whose bounds differ ends with 100% of expert-steps at the ceiling, Gini exactly
+    # 0.000 and overturn 0.0% -- every expert equally and maximally rich. A ceiling
+    # compresses the ledger toward a single value rather than capping a spread,
+    # which is why #16 changed no value here.
     max_wealth: float = 750.0
     jitter_std: float = 0.08
     reward_scale: float = 2.0
