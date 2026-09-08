@@ -154,6 +154,11 @@ def _floor_applies(app: TAMEApplication, certification) -> str | None:
     strength, and nothing pins the model to the certified one -- and comparing a
     delta against a floor from another configuration is the same error as
     comparing it against another held-out set.
+
+    The strength check is against the *reference*, which is the dose exactly when
+    the loop is off. Under an adaptive loop the served arm moves within its band,
+    so the floor can read applicable while the dose varied around the value it was
+    measured at; the arm's ``mean_strength`` is what discloses that.
     """
     if certification.model is not None and app.model_id != certification.model:
         return f"served on {app.model_id}, certified on {certification.model}"
