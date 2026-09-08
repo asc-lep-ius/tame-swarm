@@ -417,16 +417,23 @@ def test_the_example_market_exercises_every_checker():
 #
 # **Under the shipped band**, which is what this test compares against a shipped
 # band's ratio: 1.9-2.7 at the 400 steps the damage protocols run, 3.9-7.1 at the
-# sweep's settled budget, over three seeds.
+# sweep's settled budget, over three seeds. Stable to the digit under every BLAS
+# thread count tried, unlike the flat control below. Rounded up from the measured
+# 7.13, so it is a bound rather than a reading.
 LARGEST_ADVANTAGE_UNDER_THE_SHIPPED_BAND = 7.2
-# **With the ledger pinned flat**, reported by the same mode as a control. It is
-# larger and more variable -- 2.2-2.6 at 400 steps, 2.2-15.5 settled -- because a
-# band that shuts six experts out also stops their heads calibrating, so the band
-# suppresses the very advantage it is then compared against. That is a real effect
-# and it is why the control is printed; it is *not* the number this test wants,
-# which is the advantage actually realised under the band whose ratio is in
-# question. Asserted below anyway, so the conclusion does not rest on the choice.
-LARGEST_ADVANTAGE_WITH_THE_LEDGER_FLAT = 15.6
+# **With the ledger pinned flat**, reported by the same mode as a control. It runs
+# larger -- 2.2-2.6 at 400 steps, and 2.2-17.5 settled -- because a band that shuts
+# six experts out also stops their heads calibrating, so the band suppresses the
+# very advantage it is then compared against.
+#
+# It is also *numerically unstable*, which is the same effect one level down: with
+# wealth pinned, selection runs on near-tied reports, so float32 reduction order
+# flips winners and the flip compounds through which heads get trained. Measured on
+# one seed at 2667 steps, `--advantage` prints 10.7 to 17.4 depending only on the
+# BLAS thread count. The shipped arm is stable to the digit across the same range.
+# So this is a headroom bound rather than a reading, deliberately above anything
+# observed; nothing depends on its exact value, only on its being far below 50.
+LARGEST_ADVANTAGE_WITH_THE_LEDGER_FLAT = 20.0
 
 # The shipped band, written out rather than read from MoBConfig. A test that derives
 # its expectation from the constant it is testing passes whatever that constant says,

@@ -390,7 +390,7 @@ def _aggregate(band: Band, seeds: tuple[int, ...], share: str) -> Reading:
 HEADER = (
     f"{'band':>14} {'min':>7} {'max':>8} {'decay':>6} {'steps':>6} "
     f"{'ceil%':>6} {'t_ceil':>10} {'floor%':>7} {'mid%':>6} {'flr/W':>6} "
-    f"{'gini':>15} {'meanW':>8} {'overturn':>16} {'win>1%':>7} {'topk%':>6} "
+    f"{'gini':>15} {'meanW':>8} {'overturn':>16} {'wins':>5} {'win>1%':>7} {'topk%':>6} "
     f"{'chg/step':>9} {'rebate':>7} {'top1':>6} {'n_eff':>6}"
 )
 
@@ -417,7 +417,8 @@ def _row(band: Band, reading: Reading) -> str:
         f"{band.wealth_decay:>6.3f} {reading.steps:>6} {clamps} "
         f"{reading.gini:>7.3f}+-{reading.gini_spread:<6.3f} {reading.mean_wealth:>8.1f} "
         f"{100 * reading.overturn:>8.1f}%+-{100 * reading.overturn_spread:<5.1f} "
-        f"{reading.real_winners:>7.1f} {100 * reading.top_k_share:>5.1f}% "
+        f"{reading.distinct_winners:>5.1f} {reading.real_winners:>7.1f} "
+        f"{100 * reading.top_k_share:>5.1f}% "
         f"{reading.charge_per_step:>9.3f} {100 * reading.rebate_fraction:>6.1f}% "
         f"{reading.top1:>6.3f} {reading.effective_experts:>6.3f}"
     )

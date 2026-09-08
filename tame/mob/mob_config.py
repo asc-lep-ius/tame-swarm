@@ -55,7 +55,10 @@ class MoBConfig:
     top_k: int = 2
     hidden_dim: int = 4096
     intermediate_dim: int = 14336
-    # The four wealth constants, re-derived under the economy #9, #11 and #15 left
+    # --- The four wealth constants (#16) -----------------------------------------
+    #
+    # This block covers all four; each constant's own reason follows it, starting
+    # with initial_wealth. Re-derived under the economy #9, #11 and #15 left
     # (#16). All four are *retained*; `scripts/sweep_wealth_bounds.py` re-runs the
     # evidence, and two of the reasons are that the constant does less than it
     # looks like it does.
@@ -97,7 +100,10 @@ class MoBConfig:
     # where the six losers' wealth sits: on the floor at [15, 750] (74% floor
     # occupancy, 0.7% of expert-steps in the band's interior), in the interior at
     # [37.5, 150] (0% floor, 75% interior). That takes wealth Gini from 0.693 to
-    # 0.124 and leaves the same six on the exploration slot.
+    # 0.12 and leaves the same six on the exploration slot (the top two hold 99.0%
+    # of the slots at the shipped band, 98.4% at [37.5, 150]). That row's third
+    # digit moves with BLAS reduction order -- it has the grid's widest seed
+    # spread, +-0.03 on Gini -- so it is quoted to two figures.
     #
     # Ceiling occupancy is top_k/num_experts -- 25.0% -- at every ratio swept *at
     # this decay*, because the equilibrium sits above every ceiling swept and the
@@ -111,9 +117,11 @@ class MoBConfig:
     # short ones; and at ratio 1 the ledger is pinned by construction, so decay
     # cannot act at all, yet `win>1%` still falls from 7.7 to 2.3 as the budget goes
     # from 600 to 2667 steps. The heads keep calibrating long after the ledger has
-    # settled, so concentration tracks training time rather than decay. Anything
-    # read off a report -- concentration, overturn, the report advantage -- is not
-    # comparable across those rows.
+    # settled, and the budget alone reproduces a swing as large as the one across
+    # decay rows. That does not show decay is irrelevant -- separating the two needs
+    # a decay sweep at fixed budget, which the horizon rule deliberately refuses --
+    # it shows that nothing about decay is readable off those rows. Anything taken
+    # from a report is not comparable across them.
     #
     # So Gini here is a closed form rather than a measurement: 0.693 is exactly the
     # Gini of (750, 750, 15 x 6), which is why its spread over three seeds is
