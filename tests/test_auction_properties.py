@@ -41,7 +41,6 @@ from mob.auction import ROUTING_SHARE_PROPORTIONAL, AuctionOutcome, VCGAuctionee
 
 from .auction_mutations import (
     first_price_payments,
-    lowered_floor,
     pre_nine_payments,
     undivided_payments,
     wealth_blind_forward,
@@ -407,41 +406,62 @@ def test_the_example_market_exercises_every_checker():
     check_all(EXAMPLE, _auction(EXAMPLE))
 
 
-# --- What the floor buys (#16) -------------------------------------------------------
+# --- What the band's ratio demands of its poorest expert (#16) ------------------------
+
+# What competence actually buys in report terms, measured on the planted-competence
+# fixture at steady state: the ratio of the best expert's mean report to the worst's.
+# Not a strategy bound and not a head's expressible range -- the systematic advantage
+# a more competent expert's calibrated report carries over a less competent one.
+MEASURED_REPORT_ADVANTAGE = 4.78
+
+# The shipped band, written out rather than read from MoBConfig. A test that derives
+# its expectation from the constant it is testing passes whatever that constant says,
+# which is the self-reference #16 discounted `test_default_values_match_expected` for.
+SHIPPED_FLOOR, SHIPPED_CEILING = 15.0, 750.0
 
 
-def _poorest_outbids_richest(config: MoBConfig) -> bool:
-    """Does an expert at the floor with the best report beat the richest with the worst?
+def _poorest_outbids_richest(floor: float, ceiling: float, advantage: float) -> bool:
+    """Can an expert at ``floor`` outbid one at ``ceiling`` on an ``advantage``x report?
 
-    The two reports bracket what a confidence head produces: ``LOGIT_RANGE``'s top
-    is a trained loss-reduction estimate of order one, its bottom the near-zero
-    report a head initialises at. Run through the real gate rather than compared
-    as bids, so the answer is the auction's own.
+    Run through the real gate rather than compared as bids, so the answer is the
+    auction's own. Selection is ``argtopk(confidence x wealth)``, so this is true
+    exactly when ``advantage > ceiling / floor``.
     """
-    reports = F.softplus(torch.tensor([LOGIT_RANGE[1], LOGIT_RANGE[0], LOGIT_RANGE[0]]))
-    wealth = torch.tensor([config.min_wealth, config.max_wealth, config.max_wealth])
+    reports = torch.tensor([advantage, 1.0, 1.0])
+    wealth = torch.tensor([floor, ceiling, ceiling])
     auction = VCGAuctioneer(3, top_k=1, differentiable=False, exploration_rate=0.0)
     auction.eval()
     outcome = auction(reports.view(1, 1, 3), wealth)
     return int(outcome.selected_experts[0, 0, 0]) == 0
 
 
-def test_the_floor_bounds_what_a_poor_winner_can_be_charged():
-    """``min_wealth`` is what keeps a recovering expert able to win on merit.
+def test_the_band_ratio_bounds_the_report_advantage_demanded_of_the_poorest():
+    """The band's *ratio* is the report advantage the market demands of a poor expert.
 
-    Selection is ``argtopk(confidence x wealth)``, so the band's ratio *is* the
-    report advantage the market demands of its poorest expert -- 50x at the shipped
-    ``[15, 750]``, against the 364x that separates the best report a head produces
-    from the worst. The floor is the half of that ratio a ruined expert sits on, so
-    it decides whether climbing back is possible at all.
+    Selection is ``argtopk(confidence x wealth)``, so an expert at the floor needs a
+    report ``ceiling / floor`` times a rich expert's to win at all. The shipped band
+    demands **50x**, and on the planted-competence fixture the advantage competence
+    actually buys is **4.8x** -- so at the shipped band wealth outranks competence by
+    an order of magnitude. That is why
+    ``test_a_ruined_competent_expert_returns_to_the_market`` reads a win share of
+    0.002, and why #16 could not fix it by moving the bounds: closing the gap needs
+    a ratio near 5, and every band that narrow pins every expert against its ceiling
+    and drives wealth Gini to 0.000.
 
-    Paired with the band that removes it: at a floor 1000x lower the demand becomes
-    50000x, past anything a report can cover, and the same expert cannot win however
-    good its report. Until #16 nothing in the suite failed when the floor moved,
-    which is what this test exists to fix -- the ceiling was covered by the payment
-    properties above and the floor by nothing.
+    This pins the mechanism, not the constants -- it is a statement about ratios and
+    holds at any scale. #16 deliberately did **not** manufacture a test that pins
+    ``min_wealth`` itself: mutating the floor 15000x down, or 5x up, changes no
+    behaviour the suite or the ruin protocol can see, and the honest record of that
+    is the comment in ``MoBConfig``, not an assertion contrived to fail.
     """
-    config = MoBConfig()
+    assert _poorest_outbids_richest(SHIPPED_FLOOR, SHIPPED_CEILING, 51.0)
+    assert not _poorest_outbids_richest(SHIPPED_FLOOR, SHIPPED_CEILING, 49.0)
 
-    assert _poorest_outbids_richest(config)
-    assert not _poorest_outbids_richest(lowered_floor(config))
+    # The finding, held as an assertion so it cannot rot into a comment: the shipped
+    # ratio demands more of a poor expert than competence supplies.
+    assert not _poorest_outbids_richest(SHIPPED_FLOOR, SHIPPED_CEILING, MEASURED_REPORT_ADVANTAGE)
+    # A ratio below what competence buys is the regime where a poor expert can win
+    # on merit -- and the sweep found every such band pinned against its ceiling.
+    assert _poorest_outbids_richest(
+        SHIPPED_CEILING / 4.0, SHIPPED_CEILING, MEASURED_REPORT_ADVANTAGE
+    )

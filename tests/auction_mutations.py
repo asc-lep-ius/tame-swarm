@@ -65,28 +65,42 @@ def wealth_blind_forward(self, confidences, wealth):
 
 
 def lowered_floor(config: MoBConfig, factor: float = 1000.0) -> MoBConfig:
-    """The band with its floor dropped, leaving the price division unguarded.
+    """The band with its floor dropped, which is a mutation of the *ratio*.
 
-    What ``min_wealth`` buys is a bound on the report advantage the market can
-    demand of its poorest expert: selection is ``argtopk(confidence x wealth)``,
-    so an expert at the floor needs a report ``max_wealth / min_wealth`` times the
-    richest expert's to win at all. Dropping the floor raises that demand without
-    touching anything else, which is the one way to make a recovering expert
-    unable to climb back on merit.
+    Selection is ``argtopk(confidence x wealth)``, so ``max_wealth / min_wealth``
+    is the report advantage the market demands of its poorest expert, and dropping
+    the floor raises that demand. It does not leave the price division unguarded:
+    at the default factor the floor is still ten orders of magnitude above
+    ``auction.WEALTH_EPSILON``, so the guard is weakened, not removed.
+
+    #16 measured that the floor's *height* is inert either way -- raised 5x, so
+    that a ruined expert is restored to full ``initial_wealth`` on the next clamp,
+    its win share stays at 0.0012-0.0019, a hundredfold below chance. Use this to
+    move the ratio, not to claim anything about recovery.
     """
     return replace(config, min_wealth=config.min_wealth / factor)
 
 
 def flat_band(config: MoBConfig) -> MoBConfig:
-    """Every expert equally rich, so the ledger decides nothing and the auction still prices.
+    """Every expert equally rich, so the ledger decides nothing.
 
     ``min_wealth == max_wealth == initial_wealth`` pins wealth at a constant, and a
     constant multiplier cannot reorder ``confidence x wealth``: selection becomes
-    the report ranking alone. It is the wealth-blind arm without
-    ``wealth_blind_forward``'s side effect of zeroing every payment and rebate too,
-    which matters when the question is what the *band* costs rather than what the
-    whole auction does. #16 used it to show that the band is not what stops a
-    market re-forming after a forced episode.
+    the report ranking alone.
+
+    **This removes the ledger, not merely its ratio.** Prices and rebates are still
+    computed -- unlike ``wealth_blind_forward``, which returns zeros for both -- but
+    the clamp restores every wealth to the same constant on the very next
+    settlement, so every credit collected is annihilated and none of it can reach a
+    later allocation. Read it as "the economy is switched off", not as "the band is
+    narrower". #16 used it to establish that a cause other than the ledger is
+    *sufficient* to stop a market re-forming after a forced episode; it cannot
+    apportion the damage between the two, because pinning the ledger also moves the
+    undamaged steady state it would be measured against.
+
+    Under the **ruin** protocol it is degenerate outright: ``ruin()`` zeroes an
+    expert's wealth and the clamp restores it to the constant before anything reads
+    it, so the damage never happens and the resulting win share is not a recovery.
     """
     return replace(
         config,

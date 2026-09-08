@@ -56,56 +56,80 @@ class MoBConfig:
     hidden_dim: int = 4096
     intermediate_dim: int = 14336
     # The four wealth constants, re-derived under the economy #9, #11 and #15 left
-    # (#16). All four are *retained*, each for a reason that was measured rather
-    # than assumed; `scripts/sweep_wealth_bounds.py` re-runs the evidence.
+    # (#16). All four are *retained*; `scripts/sweep_wealth_bounds.py` re-runs the
+    # evidence, and two of the reasons are that the constant does less than it
+    # looks like it does.
     #
-    # What they still shape, now that #11 has taken wealth out of gate sharpness:
-    # selection (winners are argtopk(confidence x wealth), so the band's ratio is
-    # how much better a poor expert's report must be to overturn a rich one),
-    # price magnitude (a winner pays b_(k+1) / w_j), and rebate size.
+    # What they shape, now that #11 has taken wealth out of gate sharpness:
+    # selection (winners are argtopk(confidence x wealth), so the band's *ratio* is
+    # the report advantage the market demands of its poorest expert) and, through
+    # the wealth spread, the size of the prices and rebates a given step produces.
+    # Prices and rebates are not shaped by the band's *scale*: a price is
+    # b_(k+1)/w_j with b_(k+1) itself proportional to a wealth, so it is a ratio of
+    # wealths and exactly invariant to rescaling the ledger -- measured unchanged
+    # to 7 significant figures at 0.1x and 10x. The reward is the one quantity
+    # carrying no wealth at all, so the inflow is an absolute number of credits.
     #
-    # `initial_wealth` is the one that sets the operating point, not the bounds.
-    # Wealth moves by `w <- decay * w + net`, a leaky integrator that settles at
-    # `w* ~ net / (1 - decay)`, so the scale has to be chosen for the band to
-    # contain that equilibrium. Swept across two orders of magnitude at a fixed
-    # ratio, 75 is the only scale where it lands inside: at 7.5 the equilibrium is
-    # above the ceiling (96% of expert-steps pinned there, wealth Gini 0.000) and
-    # at 750 it is below the floor (58% pinned, the floor propping up 78% of all
-    # wealth). It is also the most load-bearing of the four on behaviour -- moved
-    # to 750 it breaks seven tests, the price/value crossing among them, because
-    # prices go as 1/w while rewards do not.
+    # At the shipped band, run to eight memory horizons, the economy settles
+    # stratified rather than clamped-flat: 25% of expert-steps at the ceiling, 36%
+    # at the floor, Gini 0.693, mean wealth 199. The floor is *touched* often and
+    # still does not hold up the mean -- it accounts for 2% of all surviving
+    # wealth.
+    #
+    # Sets the transient and nothing else. Holding this band and moving only the
+    # start from 25 to 750 leaves the settled Gini at 0.691/0.693/0.693/0.692 and
+    # the mean wealth at 199 in every case; the only column that moves is
+    # time-to-first-clamp, 343 steps against 1. The equilibrium is a fixed point of
+    # `w = decay*w + net(w)` and is an absolute wealth, so what has to contain it
+    # is the *band*, not the starting point. The constraint on this constant is
+    # therefore only that it sit inside the band and away from either bound, so a
+    # run does not begin clamped: at 750 every expert starts pinned to the ceiling
+    # with a 333-step decay away from it, which is why that mutant breaks seven
+    # tests that run 200-600 steps.
     initial_wealth: float = 75.0
-    # Bounded above and below by two different tests, which is what fixes it.
-    # Above: at 1.0 the ledger never forgets and the market stops re-forming --
-    # `test_the_market_re_forms_around_a_senescent_expert` and the forced-routing
-    # recovery both fail. Below: at 0.995 or 0.99, drainage alone removes a
-    # senescent expert, so `test_frozen_heads_leave_the_senescent_expert_in_the_market`
-    # fails -- the pairing that attributes the removal to the value objective
-    # collapses, because wealth decay has quietly taken over its job. 0.997 is a
-    # memory horizon of 1/(1 - decay) = 333 steps and sits between the two.
+    # Bounded above and below by two different tests, and the margins are narrow
+    # enough to state exactly. Above: at 1.0 the ledger never forgets, and
+    # `test_the_market_re_forms_around_a_senescent_expert` fails -- on one seed of
+    # three, on the share statistic, 0.0191 against the 0.01 ceiling. Below: at
+    # 0.995 `test_frozen_heads_leave_the_senescent_expert_in_the_market` fails by
+    # 1% on the loss comparison (0.990 of its gate) while the dead expert still
+    # plainly holds the market at 4.9% of slots; only at 0.99 does drainage
+    # actually remove it, at 0.56%. So the honest statement is not "below 0.997
+    # decay does the value objective's job" but "0.997 is the nearest value at
+    # which that pairing is unambiguous" -- and the pairing is what makes #15's
+    # senescence claim attributable to the objective rather than to the ledger
+    # draining. 1/(1 - decay) = 333 steps of memory.
     wealth_decay: float = 0.997
-    # A guard on the price division, not an economic parameter. The auction prices
-    # an externality in the winner's own units by dividing by its wealth, which a
-    # non-positive wealth would make meaningless; __post_init__ rejects one, and
-    # this keeps every writer well clear. Under the corrected economy it does not
-    # otherwise bind -- floor occupancy is 0.0% of expert-steps at these settings,
-    # the reverse of the pre-#15 reading that had the floor load-bearing and the
-    # ceiling inert. What it *does* bound is the report advantage the market can
-    # demand of its poorest expert, held by
-    # `test_the_floor_bounds_what_a_poor_winner_can_be_charged`; before #16 nothing
-    # in the suite failed when it was lowered 15000x.
+    # A guard, and inert as economics -- which is the finding, not an omission.
+    # The auction prices an externality in the winner's own units by dividing by
+    # its wealth, and a non-positive wealth makes that meaningless; __post_init__
+    # rejects one and this keeps every writer clear. Beyond that it does nothing
+    # measurable: lowered 15000x, no behavioural assertion in the repository fails;
+    # raised 5x, so that a ruined expert is restored to a full initial_wealth by
+    # the next clamp, its win share stays at 0.0012-0.0019, a hundredfold below
+    # chance. Its height decides neither the healthy economy nor recovery from the
+    # one damage protocol it might have been expected to govern. What the floor
+    # does participate in is the band's *ratio*, held by
+    # `test_the_band_ratio_bounds_the_report_advantage_demanded_of_the_poorest`;
+    # no test pins this value itself, deliberately, because there is nothing true
+    # left to pin it with.
     min_wealth: float = 15.0
-    # Also a guard, and a numerical one: it is the largest wealth at which the
-    # auction's payment properties are asserted to hold. The property tests draw
-    # their markets log-uniformly from exactly this band, so raising it to 1e9
-    # breaks `test_payments_are_strictly_positive_whenever_a_bid_is_displaced` and
-    # both coupling property tests -- differencing two welfare sums that far apart
-    # loses, in float32, the precision that keeps a displaced bid's price above
-    # zero. That is what the ceiling is for, and it is not a cap on inequality. As
-    # a cap it does not work: swept, every band whose ceiling binds hard enough to
-    # lower how often wealth overturns reports does so by pinning every expert
-    # against it, which drives wealth Gini to 0.000 -- erasing the ledger rather
-    # than compressing it.
+    # Retained as the bound on the domain over which the auction's payment
+    # properties are asserted, and honestly that is all the evidence supports.
+    # Raised to 1e9 it breaks `test_payments_are_strictly_positive_whenever_a_bid_
+    # is_displaced` and both coupling property tests -- but those tests draw their
+    # markets log-uniformly from `WEALTH_BAND`, which *is* this constant, so
+    # widening it widens the tests' own input distribution until differencing two
+    # welfare sums loses the float32 precision that keeps a displaced price above
+    # zero. That is a real limit on how far apart two wealths may be, and it is
+    # also self-referential in the way #16 discounted `test_default_values_match_
+    # expected` for; no production path reads this constant except the clamps.
+    #
+    # What it is *not* is a cap on inequality. Swept, every band whose ceiling
+    # binds hard enough to reduce how often wealth overturns reports does so by
+    # pinning every expert against it: at [37.5, 150] the ceiling holds 82% of
+    # expert-steps and wealth Gini is 0.000. The ceiling erases the ledger rather
+    # than compressing it, which is why #16 changed no value here.
     max_wealth: float = 750.0
     jitter_std: float = 0.08
     reward_scale: float = 2.0

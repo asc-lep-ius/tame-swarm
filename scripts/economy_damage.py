@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+from typing import NamedTuple
 
 import torch
 
@@ -138,9 +139,26 @@ def force_routing(economy: SyntheticEconomy, subset: list[int], steps: int, seed
         economy.mob.gate = gate
 
 
-def release_and_measure(
-    seed: int, episode: int, config: MoBConfig = BASE_CONFIG
-) -> tuple[float, float, float, float]:
+class Release(NamedTuple):
+    """What a forced episode did, in ratios *and* in the units they are ratios of.
+
+    The first four fields are positional for the callers that read them by index.
+    ``steady_loss`` and ``post_loss`` are here because the ratios alone cannot be
+    compared across configurations: a band that lowers the undamaged steady state
+    lowers the denominator too, so a better ``loss_ratio`` can mean a worse market.
+    #16 hit exactly that -- pinning the ledger flat nearly doubles the steady loss,
+    so its apparently better recovery ratio is partly a shrunken denominator.
+    """
+
+    loss_ratio: float
+    tracking: float
+    regained: float
+    steady_share: float
+    steady_loss: float
+    post_loss: float
+
+
+def release_and_measure(seed: int, episode: int, config: MoBConfig = BASE_CONFIG) -> Release:
     """``(loss / steady loss, routing-competence correlation, best share / its steady share)``."""
     competence = shuffled(DEFAULT_COMPETENCE, seed)
     best = int(competence.argmax())
@@ -152,11 +170,13 @@ def release_and_measure(
     force_routing(economy, least_competent, episode, seed)
     window(economy, RELEASE_HORIZON - WINDOW)
     loss, share = window(economy, WINDOW)
-    return (
-        loss / steady_loss,
-        pearson(share, competence),
-        float(share[best]) / float(steady_share[best]),
-        float(steady_share[best]),
+    return Release(
+        loss_ratio=loss / steady_loss,
+        tracking=pearson(share, competence),
+        regained=float(share[best]) / float(steady_share[best]),
+        steady_share=float(steady_share[best]),
+        steady_loss=steady_loss,
+        post_loss=loss,
     )
 
 

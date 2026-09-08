@@ -17,8 +17,10 @@ building the face. Every recovery below is measured against the state that
 would count as no recovery, and paired with the state in which the mechanism
 that recovers is disabled: the inert loop (``kp = ki = 0``, still sensing), the
 heads frozen so no report can re-learn what a dead expert is worth, and -- for
-the two claims the current economy does not meet -- a strict expected failure
-that names the mechanism it waits on.
+the three claims the current economy does not meet -- a strict expected failure
+that names the mechanism it waits on. #16 established that none of the three
+waits on the wealth band, and split the ruin claim into the two claims of
+different strength it had been asserting under one name.
 """
 
 import sys
@@ -407,12 +409,14 @@ def test_the_market_re_forms_after_routing_was_forced_onto_the_least_competent(s
     again (r 0.76-0.78 on the three seeds), the best expert holds its pre-episode
     share (1.18-1.33x it), and the loss is below its steady value (0.74-0.76x).
     """
-    loss_ratio, tracking, regained, steady_share = release_and_measure(seed, SHORT_FORCED_EPISODE)
+    released = release_and_measure(seed, SHORT_FORCED_EPISODE)
 
-    assert steady_share > 2.0 / DEFAULT_COMPETENCE.numel(), "the fixture must have a leader"
-    assert tracking > TRACKING_AFTER_RELEASE, tracking
-    assert regained > REGAINED_SHARE, regained
-    assert loss_ratio <= 1.0, loss_ratio
+    assert released.steady_share > 2.0 / DEFAULT_COMPETENCE.numel(), (
+        "the fixture must have a leader"
+    )
+    assert released.tracking > TRACKING_AFTER_RELEASE, released.tracking
+    assert released.regained > REGAINED_SHARE, released.regained
+    assert released.loss_ratio <= 1.0, released.loss_ratio
 
 
 @pytest.mark.xfail(
@@ -421,12 +425,13 @@ def test_the_market_re_forms_after_routing_was_forced_onto_the_least_competent(s
         "A 150-step episode drives the incumbents to the wealth ceiling and the market does "
         "not re-form: routing no longer tracks competence (r -0.31 to -0.03 on the three "
         "seeds, 0.81-0.82 before), the best expert holds 9-11% of its steady share and the "
-        "loss is 2.6-3.7x steady. #16 swept the band and settled which of the two candidate "
-        "causes it is: NOT the band. With wealth pinned flat -- selection on reports alone, "
-        "the auction still pricing -- the same episode still fails, and at this seed "
-        "recovers 0.37 of the steady share against 0.09 and 1.66x the loss against 2.64x "
-        "while the rank correlation does not improve at all (-0.20 against -0.03); the "
-        "companion test below pins that. So the band carries part of the damage and no band "
+        "loss is 2.6-3.7x steady. #16 swept the band and eliminated it as *the* cause: with "
+        "the ledger pinned flat -- selection on reports alone -- the same episode still "
+        "fails every threshold, so something else suffices on its own. It could not go "
+        "further and apportion the damage, because pinning the ledger also moves the "
+        "undamaged steady state the ratios are taken against (steady loss 0.031 -> 0.057, "
+        "the leader's steady share 0.29 -> 0.18), and on absolute post-damage loss the flat "
+        "arm is worse at this seed; the rank correlation moves the wrong way too. No band "
         "in the swept space flips this test. What remains is the cause the old reason could "
         "not exclude: a head is trained only on the value its own expert realises, so 150 "
         "steps of holding no tokens leaves it with a stale report, and the uniform 2% "
@@ -436,42 +441,45 @@ def test_the_market_re_forms_after_routing_was_forced_onto_the_least_competent(s
 )
 def test_the_market_re_forms_after_a_long_forced_episode():
     """The boundary of the claim above, measured: recovery depends on the episode's length."""
-    loss_ratio, tracking, regained, _ = release_and_measure(SEEDS[0], LONG_FORCED_EPISODE)
+    released = release_and_measure(SEEDS[0], LONG_FORCED_EPISODE)
 
-    assert tracking > TRACKING_AFTER_RELEASE, tracking
-    assert regained > REGAINED_SHARE, regained
-    assert loss_ratio <= 1.0, loss_ratio
+    assert released.tracking > TRACKING_AFTER_RELEASE, released.tracking
+    assert released.regained > REGAINED_SHARE, released.regained
+    assert released.loss_ratio <= 1.0, released.loss_ratio
 
 
-def test_the_long_episode_does_not_recover_with_the_ledger_pinned_flat():
-    """#16's decomposition: how much of the damage above belongs to the wealth band.
+def test_a_cause_other_than_the_ledger_is_enough_to_stop_the_market_re_forming():
+    """#16's elimination: the wealth band is not what the expected failure waits on.
 
     ``flat_band`` pins ``min == max == initial``, so a constant multiplier cannot
-    reorder ``confidence x wealth`` and selection is the report ranking alone --
-    while the auction still prices, unlike ``wealth_blind_forward``, which zeroes
-    every payment and rebate too. That isolates the band rather than the whole
-    mechanism, which is what makes this an attribution and not just a second
-    failure.
+    reorder ``confidence x wealth`` and selection is the report ranking alone. The
+    same 150-step episode still fails every one of the three thresholds. Whatever
+    stops the market re-forming does not need the ledger's help.
 
-    Two of the three statistics improve a lot and the third does not move the way
-    a band explanation predicts: the best expert recovers 0.37 of its steady share
-    against 0.09, the loss falls to 1.66x steady from 2.64x, and the rank
-    correlation over eight experts -- the noisiest of the three -- goes the other
-    way, -0.03 to -0.20. Recovery is markedly better with the ledger out of the
-    way and still nowhere near any of the three thresholds, which is why the
-    expected failure above no longer names the band as what it waits on.
+    **This is a sufficiency result, not an apportionment, and the second block
+    below is why.** Pinning the ledger flat also moves the undamaged steady state
+    it would be measured against: the steady loss nearly doubles (0.031 -> 0.057 at
+    this seed) and the leader's steady share falls from 0.29 to 0.18. So the
+    apparently better recovery *ratio* (2.64x -> 1.66x) is partly a shrunken
+    denominator, and on absolute post-damage loss the flat arm is actually worse
+    here (0.094 against 0.080). A market that never differentiated has less to fall
+    from. The honest reading is that the ledger's contribution is not separable by
+    this experiment -- only that something else suffices.
+
+    When #26 fixes the cause, this test goes red with no expected-failure marker to
+    explain it. That is deliberate: it should be revisited then, not silently kept.
     """
-    banded_loss, _, banded_regained, _ = release_and_measure(SEEDS[0], LONG_FORCED_EPISODE)
-    loss_ratio, tracking, regained, _ = release_and_measure(
-        SEEDS[0], LONG_FORCED_EPISODE, flat_band(BASE_CONFIG)
-    )
+    flat = release_and_measure(SEEDS[0], LONG_FORCED_EPISODE, flat_band(BASE_CONFIG))
 
-    assert loss_ratio < banded_loss, (loss_ratio, banded_loss)
-    assert regained > banded_regained, (regained, banded_regained)
+    assert flat.loss_ratio > 1.0, flat.loss_ratio
+    assert flat.tracking < TRACKING_AFTER_RELEASE, flat.tracking
+    assert flat.regained < REGAINED_SHARE, flat.regained
 
-    assert loss_ratio > 1.0, loss_ratio
-    assert tracking < TRACKING_AFTER_RELEASE, tracking
-    assert regained < REGAINED_SHARE, regained
+    # The confound, asserted rather than described, so it cannot rot into a comment
+    # that stops being true.
+    banded = release_and_measure(SEEDS[0], LONG_FORCED_EPISODE)
+    assert flat.steady_loss > banded.steady_loss, (flat.steady_loss, banded.steady_loss)
+    assert flat.steady_share < banded.steady_share, (flat.steady_share, banded.steady_share)
 
 
 @pytest.mark.parametrize("seed", SEEDS)
@@ -512,9 +520,12 @@ def ruined():
         "it holds about one token in 300, and what it earns there barely outpaces decay at "
         "the floor -- win share 0.002 after 200 steps (in a probe on the same fixture: 34 "
         "credits with exploration off, 79 with decay off). #16 measured the band's part in "
-        "it: the share only clears chance with wealth pinned flat (0.215), and is already "
-        "back to 0.063 at a band ratio of 4, so no band that leaves the ledger doing "
-        "anything fixes this. Waits on the count-based exploration in #26."
+        "it and found none: raising the floor 5x, so the ruined expert is restored to a "
+        "full initial_wealth by the next clamp, leaves the share at 0.0012-0.0019 -- "
+        "unchanged, still a hundredfold below chance. The one band that clears chance is a "
+        "flat one, and there the protocol is degenerate rather than recovered: the clamp "
+        "restores the zeroed wealth before anything reads it, so the damage never happens. "
+        "Waits on the count-based exploration in #26."
     ),
 )
 def test_a_ruined_competent_expert_returns_to_the_market(ruined):
@@ -530,9 +541,12 @@ def test_a_ruined_competent_expert_returns_to_the_market(ruined):
         "The strictly stronger claim, split out of the test above by #16: not merely back in "
         "the market but back to its standing, out-earning four of the other seven within 200 "
         "steps. It reads 0.29 of the median wealth at the shipped band. Kept separate because "
-        "it is the half a band can move -- it rises to 0.81 at decay 0.99 and reaches 1.00 "
-        "with wealth flat, where it is unsatisfiable by construction rather than by the "
-        "economy, every wealth being identical. Waits on #26 with the claim above."
+        "it is the half a band can move -- it rises to 0.66-0.84 when the floor is raised "
+        "5x and reaches 1.00 with wealth flat, where it is unsatisfiable by construction "
+        "rather than by the economy, every wealth being identical. That the wealth half "
+        "moves while the win share does not is the point of the split: the band restores a "
+        "ruined expert's balance without restoring its standing in the market. Waits on #26 "
+        "with the claim above."
     ),
 )
 def test_a_ruined_competent_expert_regains_its_standing(ruined):

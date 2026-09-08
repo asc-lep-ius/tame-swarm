@@ -155,6 +155,10 @@ METRICS_FILENAME = "metrics.jsonl"
 # Only meaningful for top_k > 1: at top_k == 1 the effective count is 1.0 and the
 # saturated fraction 1.0 by construction, and neither is a fault.
 MIN_HEALTHY_EFFECTIVE_EXPERTS = 1.5
+# Only for the ceiling-proximity warning below, when the run has no MoBConfig to
+# read (the dense arm converts no layer). MoBConfig's own default is the number
+# that matters; this exists so the diagnostic does not have to be skipped.
+DEFAULT_MAX_WEALTH = MoBConfig().max_wealth
 
 
 # Elements sampled from a weight to fingerprint it: enough that a re-initialised
@@ -1513,13 +1517,20 @@ class TAMETrainer:
                     )
                 elif gini > 0.60:
                     logger.warning(
-                        f"  ⚠ High Gini ({gini:.4f}) - wealth monopoly risk. "
-                        "Consider: ↑min_wealth, ↓max_wealth"
+                        f"  ⚠ High Gini ({gini:.4f}) - wealth monopoly risk. Consider "
+                        "↑min_wealth, which narrows the band's ratio. #16 measured that "
+                        "↓max_wealth does not compress the ledger, it erases it: every "
+                        "band whose ceiling binds hard enough pins every expert against "
+                        "it and drives Gini to 0"
                     )
 
-                if mean_wealth > 0.9 * 750:
+                ceiling = self.mob_config.max_wealth if self.mob_config else DEFAULT_MAX_WEALTH
+                if mean_wealth > 0.9 * ceiling:
                     logger.warning(
-                        f"  ⚠ Wealth near ceiling ({mean_wealth:.0f}/750) - consider ↑max_wealth"
+                        f"  ⚠ Wealth near ceiling ({mean_wealth:.0f}/{ceiling:.0f}). The "
+                        "equilibrium is net inflow / (1 - wealth_decay) and it sits above "
+                        "the band; ↓reward_scale or slide the band up. Raising max_wealth "
+                        "alone widens the ratio wealth overturns reports on"
                     )
 
                 if perf_ema < -0.3:
