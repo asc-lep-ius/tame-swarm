@@ -17,6 +17,7 @@ the coupling detached, which is the comparison these are read against.
 """
 
 import logging
+import math
 import time
 from collections import deque
 from collections.abc import Iterator
@@ -38,8 +39,8 @@ def _percentile(ordered: list[float], fraction: float) -> float:
     """
     if not ordered:
         return 0.0
-    rank = max(0, min(len(ordered) - 1, int(round(fraction * (len(ordered) - 1)))))
-    return ordered[rank]
+    rank = math.ceil(fraction * len(ordered)) - 1
+    return ordered[max(0, min(len(ordered) - 1, rank))]
 
 
 class LatencyTracker:
@@ -56,7 +57,7 @@ class LatencyTracker:
         return sorted(self._requests)
 
     def record(self, route: str, seconds: float, output_tokens: int = 0) -> None:
-        """Add one completed request and log it. Never raises on a bad measurement."""
+        """Add one completed request to the window, and log it."""
         if seconds < 0:
             raise ValueError(f"seconds must be non-negative, got {seconds}")
         window = self._requests.setdefault(route, deque(maxlen=self.window))

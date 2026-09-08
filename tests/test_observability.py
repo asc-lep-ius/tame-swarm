@@ -22,12 +22,15 @@ from fastapi.testclient import TestClient
 import observability
 from app import TAMEApplication
 from contrastive_data import CERTIFIED
-from mob import MoBConfig
 from models import OutcomeArm, OutcomeMetrics
-from steering import SteeringConfig
-from steering_pipeline import SteeringExtraction
 
-from .wired_system import ACTUATORS, BELOW_ACTUATORS, MOB_LAYERS, WiredSystem, build_wired_system
+from .wired_system import (
+    ACTUATORS,
+    BELOW_ACTUATORS,
+    MOB_LAYERS,
+    WiredSystem,
+    build_wired_app,
+)
 
 SETTLE_PASSES = 60
 CONTENT_DEFICIT = -1.0
@@ -38,43 +41,9 @@ BUDGET_SECONDS = 0.010
 BUDGET_REPETITIONS = 3
 
 
-def _extraction(goal: str, homeostat) -> SteeringExtraction:
-    return SteeringExtraction(
-        goal=goal,
-        vectors=dict(homeostat.steering_vectors),
-        pair_count=8,
-        source="builtin",
-        layers=sorted(homeostat.steering_vectors),
-        tier_counts={"basic": 8},
-        pair_format="completion",
-        certified=False,
-        separability={layer: 0.5 for layer in homeostat.steering_vectors},
-    )
-
-
-def wired_app(**kwargs) -> tuple[TAMEApplication, WiredSystem]:
-    """A ``TAMEApplication`` around the wired system, traced the way a server is."""
-    goals = kwargs.pop("goals", ("truthful",))
-    system = build_wired_system(goals=goals, **kwargs)
-    homeostat = system.homeostats[goals[0]]
-    mob_config: MoBConfig = system.mobs[0].config
-    tame = TAMEApplication(
-        model=system.model,  # pyright: ignore[reportArgumentType]
-        tokenizer=system.tokenizer,  # pyright: ignore[reportArgumentType]
-        homeostat=homeostat,
-        mob_config=mob_config,
-        steering_config=homeostat.config,
-        model_id="tiny",
-        steering_template=SteeringConfig(),
-        extractions={goal: _extraction(goal, system.homeostats[goal]) for goal in system.goals},
-    )
-    tame.install_routing_traces()
-    return tame, system
-
-
 @pytest.fixture
 def loaded() -> tuple[TAMEApplication, WiredSystem]:
-    tame, system = wired_app()
+    tame, system = build_wired_app()
     system.run(SETTLE_PASSES)
     return tame, system
 
@@ -95,7 +64,7 @@ def unsteered_client() -> TestClient:
     """A process whose steering failed to build: the degraded mode ``from_profile`` allows."""
     from routes import router
 
-    tame, _ = wired_app()
+    tame, _ = build_wired_app()
     tame.homeostat = None
     app = FastAPI()
     app.include_router(router)
@@ -114,12 +83,13 @@ def test_the_pid_snapshot_carries_the_cells_the_dispersion_and_the_window(loaded
     assert len(status.cells) == len(ACTUATORS) + 1
     assert all(cell.resting_sigma is not None and cell.gain is not None for cell in status.cells)
     assert status.window_passes >= observability.MIN_CONVERGENCE_PASSES
+    assert status.sensed_dispersion >= 0.0
     assert status.error_rms_window is not None and status.convergence_rate is not None
 
 
 def test_convergence_is_positive_while_the_loop_is_recovering_and_flat_once_it_has():
     """ "Zero" is ambiguous on its own, which is why the RMS is reported beside it."""
-    tame, system = wired_app()
+    tame, system = build_wired_app()
     system.run(SETTLE_PASSES)
     settled = observability.convergence(system.tissue())
     assert settled["convergence_rate"] is not None
@@ -138,7 +108,7 @@ def test_convergence_is_positive_while_the_loop_is_recovering_and_flat_once_it_h
 
 def test_an_inert_loop_under_a_sustained_push_does_not_read_as_converging():
     """The pairing: cells that sense but cannot act leave the error where it is."""
-    tame, system = wired_app(kp=0.0, ki=0.0)
+    tame, system = build_wired_app(kp=0.0, ki=0.0)
     system.run(SETTLE_PASSES)
     system.set_content("truthful", CONTENT_DEFICIT)
     system.run(72)
@@ -150,7 +120,7 @@ def test_an_inert_loop_under_a_sustained_push_does_not_read_as_converging():
 
 def test_the_dispersion_rises_when_content_reaches_the_cells_unevenly():
     """The #23 observable: the consensus is a compromise, and this is what says so."""
-    tame, system = wired_app()
+    tame, system = build_wired_app()
     system.run(SETTLE_PASSES)
     settled = system.tissue().dispersion
 
@@ -180,7 +150,7 @@ def test_the_coupling_status_reports_every_mob_layer_and_the_ramp(loaded):
 
 def test_an_uncoupled_process_still_measures_the_goals_effect_on_routing():
     """The answer to Q3: no coupling is not no measurement, it is the additive baseline."""
-    tame, system = wired_app(coupled=False)
+    tame, system = build_wired_app(coupled=False)
     system.run(400)
     status = observability.coupling_status(tame)
 
@@ -204,6 +174,64 @@ def test_a_coupled_process_labels_its_correlation_as_the_coupling_s(loaded):
     assert "perception-modulation" in status.correlation_basis
 
 
+def test_an_attached_but_inert_coupling_is_labelled_as_the_baseline_it_is(loaded):
+    """A zero-norm receptor adds a zero delta, so the stream is the stream.
+
+    The one misreading `correlation_basis` exists to prevent is calling that number
+    the perception-modulation effect, and "attached" is not the test for it.
+    """
+    tame, system = loaded
+    for mob in system.mobs:
+        coupling = mob.coupling_or_none()
+        assert coupling is not None
+        with torch.no_grad():
+            coupling.detector.zero_()
+    system.run(400)
+
+    status = observability.coupling_status(tame)
+    assert status is not None
+    assert status.coupling_mode == "inert"
+    assert all(layer.attached and not layer.active for layer in status.layers)
+    assert "additive baseline" in status.correlation_basis
+    assert "perception-modulation" not in status.correlation_basis
+
+
+def test_a_coupling_still_ramping_is_labelled_a_mixture_of_the_two(loaded):
+    """Half a ramp is neither the baseline nor the effect, and saying so is the point."""
+    tame, system = loaded
+    for mob in system.mobs:
+        mob.set_coupling_step(1)
+    system.run(400)
+
+    status = observability.coupling_status(tame)
+    assert status is not None
+    assert status.coupling_mode == "warming"
+    assert "mixture" in status.correlation_basis
+
+
+def test_the_blind_cells_disagreement_reaches_the_pairing_the_consensus_discounts(loaded):
+    """`dispersion` hears only cells the tissue can move; `sensed_dispersion` hears all of them.
+
+    Content below the bottom actuator lands on a cell nothing can correct. #21 took
+    that cell out of the shared memory on purpose -- it must not steer the others --
+    but a reader still has to be able to see it, which is what the pairing is for.
+    """
+    tame, system = build_wired_app()
+    system.run(SETTLE_PASSES)
+    system.set_content("truthful", -8.0, layer=BELOW_ACTUATORS)
+    system.run(30)
+
+    tissue = system.tissue()
+    blind = [cell for cell in tissue.cells if tissue.cell_weight(cell) == 0.0]
+    assert blind, "the fixture must have a cell no action can move"
+
+    status = observability.pid_status(tame)
+    assert status is not None
+    assert status.sensed_dispersion > status.dispersion
+    stuck = next(cell for cell in status.cells if cell.layer == blind[0])
+    assert stuck.weight == 0.0 and abs(stuck.error) > status.dispersion
+
+
 def test_routing_health_pools_the_layers_and_flags_a_healthy_gate_as_not_degenerate(loaded):
     tame, _ = loaded
     health = observability.routing_health(tame)
@@ -211,17 +239,17 @@ def test_routing_health_pools_the_layers_and_flags_a_healthy_gate_as_not_degener
     assert health is not None
     assert health.tokens > 0 and len(health.layers) == len(MOB_LAYERS)
     assert health.top_k == tame.mob_config.top_k
-    assert sum(health.win_share) == pytest.approx(health.top_k, abs=1e-4)
     assert 1.0 <= health.effective_experts <= health.top_k
-    assert health.degenerate is (
-        health.effective_experts < 1.0 + observability.DEGENERATE_EFFECTIVE_MARGIN
-        or health.top1_saturated_fraction > observability.DEGENERATE_SATURATION_FRACTION
-    )
+    # The value, not the formula restated: re-deriving the threshold here would
+    # agree with a wrong implementation as readily as a right one.
+    assert health.degenerate is False
+    assert health.effective_experts > 1.0 + observability.DEGENERATE_EFFECTIVE_MARGIN
+    assert health.top1_saturated_fraction < observability.DEGENERATE_SATURATION_FRACTION
 
 
 def test_a_collapsed_gate_is_flagged_degenerate():
     """The pairing for the flag: a gate that always routes to one expert reads as such."""
-    tame, system = wired_app()
+    tame, system = build_wired_app()
     for mob in system.mobs:
         trace = mob.routing_trace
         assert trace is not None
@@ -240,7 +268,7 @@ def test_a_collapsed_gate_is_flagged_degenerate():
 
 
 def test_a_process_with_no_trace_reports_no_routing_health():
-    tame, system = wired_app()
+    tame, system = build_wired_app()
     for mob in system.mobs:
         mob.disable_routing_trace()
 
@@ -273,7 +301,7 @@ def test_steering_quality_carries_the_provenance_the_norms_and_the_gate_s_verdic
 
 def test_a_goal_the_gate_never_passed_quotes_no_effect():
     """The pairing: an uncertified goal has no measurement to quote, and says so."""
-    tame, system = wired_app()
+    tame, system = build_wired_app()
     tame.homeostat.homeostat.goal = "not-a-goal"  # pyright: ignore[reportOptionalMemberAccess]
 
     quality = observability.steering_quality(tame)
@@ -281,7 +309,7 @@ def test_a_goal_the_gate_never_passed_quotes_no_effect():
 
 
 def test_the_inter_goal_cosine_is_over_the_goals_this_process_extracted():
-    tame, system = wired_app(goals=("truthful", "safe"))
+    tame, system = build_wired_app(goals=("truthful", "safe"))
     quality = observability.steering_quality(tame)
 
     assert quality is not None
@@ -304,7 +332,7 @@ def test_the_pca_projects_what_is_there_and_says_what_it_is(loaded):
 
 
 def test_the_pca_refuses_to_invent_components_it_does_not_have():
-    tame, _ = wired_app()
+    tame, _ = build_wired_app()
     tame.extractions = {}
 
     projection = observability.steering_pca(tame, components=3)

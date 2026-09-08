@@ -32,9 +32,14 @@ GENERATE_STREAM_ROUTE = "/generate/stream"
 
 
 def _pid_status(tame: TAMEApplication) -> PIDStatus:
-    """The loop's status including the rolling window; every call site serves one model."""
+    """The loop's status including the rolling window; every call site serves one model.
+
+    Raises rather than asserts: ``assert`` is stripped under ``-O``, and a stripped
+    guard would serve a half-built model instead of an error.
+    """
     status = observability.pid_status(tame)
-    assert status is not None, "callers check homeostat is not None first"
+    if status is None:
+        raise HTTPException(status_code=400, detail="Steering not initialized")
     return status
 
 
@@ -87,9 +92,12 @@ def update_gains(update: GainUpdate, tame: TAMEApplication = Depends(get_tame_ap
         tame.homeostat.set_gains(kp=update.kp, ki=update.ki, kd=update.kd)
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    if update.adaptive is not None:
+    if update.adaptive is not None and update.adaptive != tame.homeostat.config.adaptive:
         tame.homeostat.config.adaptive = update.adaptive
         tame.homeostat.reset()
+        # The loop's regime just changed, so the routing window now spans two of
+        # them; `/metrics/coupling` would report their mixture as one number.
+        tame.install_routing_traces()
     return _pid_status(tame)
 
 
@@ -201,8 +209,13 @@ async def generate_stream(req: GenerateRequest, tame: TAMEApplication = Depends(
 
     async def event_generator():
         # The response outlives the handler, so the window is the generator's:
-        # opened here and closed once the last token has been streamed.
+        # opened here and closed in the finally below. A streaming request most
+        # often ends in a client disconnect, which closes the generator with
+        # GeneratorExit -- a BaseException the error handler does not catch -- and
+        # a p99 that silently drops those, and the failures with them, is the wrong
+        # number to hold a budget against.
         started = time.perf_counter()
+        token_count = 0
         try:
             status_payload = json.dumps({"type": "status", "message": "Preparing generation..."})
             yield f"data: {status_payload}\n\n"
@@ -260,7 +273,6 @@ async def generate_stream(req: GenerateRequest, tame: TAMEApplication = Depends(
             yield f"data: {json.dumps({'type': 'status', 'message': 'Generating response...'})}\n\n"
 
             full_response = ""
-            token_count = 0
             last_status_update = 0
             last_trace_update = 0
 
@@ -341,7 +353,6 @@ async def generate_stream(req: GenerateRequest, tame: TAMEApplication = Depends(
             thread.join(timeout=10)
 
             tame.stop_mob_tracking()
-            tame.latency.record(GENERATE_STREAM_ROUTE, time.perf_counter() - started, token_count)
 
             final_stats: dict = {
                 "type": "complete",
@@ -386,6 +397,7 @@ async def generate_stream(req: GenerateRequest, tame: TAMEApplication = Depends(
             yield f"data: {error_payload}\n\n"
 
         finally:
+            tame.latency.record(GENERATE_STREAM_ROUTE, time.perf_counter() - started, token_count)
             if tame.homeostat and original_strength is not None:
                 tame.homeostat.config.base_strength = original_strength
                 if original_adaptive is not None:
@@ -422,6 +434,12 @@ def update_steering(
     if tame.homeostat is None:
         raise HTTPException(status_code=400, detail="Steering not initialized")
 
+    # Same lock as the outcome probe: both take the tissue off the model and put it
+    # back, and both run in the threadpool. See metrics_routes.metrics_outcome_probe.
+    if not tame.state_lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409, detail="another probe or goal install is in flight on this process"
+        )
     try:
         extraction = tame.install_goal(goal, strength=strength)
     except ValueError as exc:
@@ -429,6 +447,8 @@ def update_steering(
     except Exception as e:
         logger.error("Steering update error: %s", e)
         raise HTTPException(status_code=500, detail="Steering update failed") from e
+    finally:
+        tame.state_lock.release()
 
     if any(value is not None for value in (kp, ki, kd)):
         try:

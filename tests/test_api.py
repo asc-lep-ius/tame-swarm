@@ -1,3 +1,4 @@
+import threading
 from unittest.mock import MagicMock
 
 import pytest
@@ -24,6 +25,9 @@ def mock_tame_app():
     tame.extractions = {}
     tame.latency = LatencyTracker()
     tame.outcome = None
+    # The real lock, not a mock: the routes that take the tissue apart use it to
+    # refuse a second caller, and a MagicMock would always "acquire".
+    tame.state_lock = threading.Lock()
     return tame
 
 

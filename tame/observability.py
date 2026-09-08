@@ -65,14 +65,23 @@ DEGENERATE_EFFECTIVE_MARGIN = 0.1
 # quite collapsed.
 DEGENERATE_SATURATION_FRACTION = 0.9
 
+# What the correlation is measuring, in the reader's hands rather than in a comment.
+# The distinction that matters is not whether a coupling is *attached* but whether
+# one is *acting*: a zero-norm receptor leaves the perceived stream equal to the
+# stream, which is the additive baseline under another name.
+_CORRELATION_BASIS = "per-token alignment with the injected goal direction against expert wins, "
 CORRELATION_BASIS_COUPLED = (
-    "per-token alignment with the injected goal direction against expert wins, "
-    "with a steering coupling attached: the perception-modulation effect"
+    _CORRELATION_BASIS + "with a steering coupling acting: the perception-modulation effect"
 )
 CORRELATION_BASIS_BASELINE = (
-    "per-token alignment with the injected goal direction against expert wins, "
-    "no coupling attached: the additive baseline a coupled arm has to beat"
+    _CORRELATION_BASIS + "with no coupling acting on the perceived stream: the additive "
+    "baseline a coupled arm has to beat"
 )
+CORRELATION_BASIS_WARMING = (
+    _CORRELATION_BASIS + "with the coupling's ramp still below its target beta: a mixture of "
+    "the additive baseline and the perception-modulation effect, not either one"
+)
+BASELINE_MODES = frozenset({"off", "inert"})
 
 
 # --- the tissue ---------------------------------------------------------------------
@@ -88,9 +97,15 @@ def convergence(tissue: AdaptiveHomeostat) -> dict[str, float | int | None]:
     autocorrelation near 0.9 whether the loop is open or closed, so an
     autocorrelation time cannot tell a converging loop from an inert one.
 
-    Read it beside ``error_rms_window``. A loop sitting on resting content at its
-    setpoint reads a rate near zero because there is nothing to converge to, and a
-    loop that is not acting at all reads the same; the RMS is what separates them.
+    Read it beside ``error_rms_window`` -- and, when that is large, beside the
+    tissue's ``output`` and ``i_term``. A rate near zero has three readings on this
+    organism, not two: the loop is settled (small RMS), the loop is not acting at
+    all, or the loop is holding the least-squares residual that a single common
+    strength cannot remove (#21), which is the designed steady state and shows a
+    large RMS just as an inert loop does. What separates the last two is actuation:
+    a loop that is not acting sits at the reference strength with no accumulated
+    integral. Both terms here are sign-blind, so a symmetric oscillation reads the
+    same as a static offset.
     The error is taken against the *current* setpoint, which after damage is the
     survivors' -- so a window spanning a removal is measured against the tissue
     that exists now, not the one that took the earlier readings.
@@ -228,13 +243,33 @@ def _mean_correlation(
     return averaged
 
 
-def coupling_status(app: TAMEApplication) -> CouplingStatus | None:
-    """Is the goal shaping which experts activate? ``None`` while steering is off."""
+def _correlation_basis(mode: str) -> str:
+    """Which of the three things the correlation is, given what the coupling is doing.
+
+    ``inert`` belongs with ``off``: a coupling whose receptor norm is zero adds a
+    zero delta, so the stream the heads read is the stream, and calling that number
+    the perception-modulation effect is the one misreading this field exists to
+    prevent.
+    """
+    if mode in BASELINE_MODES:
+        return CORRELATION_BASIS_BASELINE
+    return CORRELATION_BASIS_WARMING if mode == "warming" else CORRELATION_BASIS_COUPLED
+
+
+def coupling_status(
+    app: TAMEApplication, summaries: dict[int, RoutingTraceSummary] | None = None
+) -> CouplingStatus | None:
+    """Is the goal shaping which experts activate? ``None`` while steering is off.
+
+    ``summaries`` lets a caller that already read the traces pass them in; reading
+    them costs one device synchronisation per MoB layer, and ``system_health``
+    would otherwise pay for it twice in one request.
+    """
     if app.homeostat is None:
         return None
     layers = [_layer_coupling(layer, mob) for layer, mob in sorted(_mob_layers(app).items())]
     mode = _coupling_mode(layers)
-    summaries = _trace_summaries(app)
+    summaries = _trace_summaries(app) if summaries is None else summaries
     alignments = [
         value
         for summary in summaries.values()
@@ -250,24 +285,22 @@ def coupling_status(app: TAMEApplication) -> CouplingStatus | None:
         beta_effective_mean=(sum(betas) / len(betas)) if betas else None,
         warmup_progress=(sum(progress) / len(progress)) if progress else None,
         steering_routing_correlation=correlation,
-        correlation_basis=(
-            ""
-            if correlation is None
-            else (CORRELATION_BASIS_BASELINE if mode == "off" else CORRELATION_BASIS_COUPLED)
-        ),
+        correlation_basis=("" if correlation is None else _correlation_basis(mode)),
         goal_alignment_mean=(sum(alignments) / len(alignments)) if alignments else None,
         trace_tokens=min((summary.tokens for summary in summaries.values()), default=0),
     )
 
 
-def routing_health(app: TAMEApplication) -> RoutingHealthMetrics | None:
+def routing_health(
+    app: TAMEApplication, summaries: dict[int, RoutingTraceSummary] | None = None
+) -> RoutingHealthMetrics | None:
     """The gate's histogram over the trace window. ``None`` when no MoB layer is traced.
 
     Pooled by token count, so a layer whose window is still filling does not weigh
     as much as one that is full; the per-layer rows are there because a gate can be
     degenerate at one depth and healthy at another.
     """
-    summaries = _trace_summaries(app)
+    summaries = _trace_summaries(app) if summaries is None else summaries
     if not summaries:
         return None
     rows = [
@@ -425,7 +458,20 @@ def steering_pca(app: TAMEApplication, components: int = 2) -> PCAProjection:
 
     stacked = torch.stack(rows)
     centred = stacked - stacked.mean(dim=0, keepdim=True)
-    _, singular, right = torch.linalg.svd(centred, full_matrices=False)
+    try:
+        _, singular, right = torch.linalg.svd(centred, full_matrices=False)
+    # ``torch.linalg.LinAlgError`` subclasses RuntimeError and is not re-exported in
+    # the stubs; catching the base class needs no ignore and costs nothing here,
+    # where any failure has the same answer.
+    except RuntimeError as exc:  # pragma: no cover - LAPACK non-convergence
+        # A GET must not 500 because a decomposition did not converge; the picture
+        # is a diagnostic, and "no picture, and why" is a usable answer.
+        logger.warning("Steering PCA did not converge: %s", exc)
+        return PCAProjection(
+            components=components,
+            goals=goals,
+            note=f"the decomposition did not converge on these {len(rows)} directions ({exc})",
+        )
     variance = singular.square()
     coordinates = centred @ right[:components].T
     note = (
@@ -512,12 +558,15 @@ def system_health(app: TAMEApplication) -> SystemHealthStatus:
     outcome = app.outcome
     if outcome is not None and app.homeostat is not None and outcome.goal != app.homeostat.goal:
         outcome = outcome.model_copy(update={"stale": True})
+    # Read once and share: every summary costs a device synchronisation per MoB
+    # layer, and both builders below want the same window.
+    summaries = _trace_summaries(app)
     return SystemHealthStatus(
         health=health_response(app),
         swarm=swarm_status(app),
         pid=pid_status(app),
-        coupling=coupling_status(app),
-        routing=routing_health(app),
+        coupling=coupling_status(app, summaries),
+        routing=routing_health(app, summaries),
         steering=steering_quality(app),
         outcome=outcome,
         latency=latency_stats(app),

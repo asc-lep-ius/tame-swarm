@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
@@ -156,6 +157,13 @@ class TAMEApplication:
     latency: LatencyTracker = field(default_factory=LatencyTracker)
     # The last outcome probe, or None until one has run. See ``outcome_probe``.
     outcome: OutcomeMetrics | None = None
+    # Held by anything that detaches the hooks or re-installs the goal. Both
+    # ``install_goal`` and the outcome probe take the model apart and put it back,
+    # and both run in the threadpool because they are sync endpoints, so two of
+    # them overlapping would double-register the steering hooks (``attach_to_model``
+    # appends) or leave the economy frozen for the life of the process. Not an
+    # ``asyncio`` lock: the contending callers are threadpool workers.
+    state_lock: threading.Lock = field(default_factory=threading.Lock)
 
     def install_routing_traces(self, maxlen: int = DEFAULT_TRACE_TOKENS) -> None:
         """Start the per-token routing record on every MoB layer, keyed to the served goal.

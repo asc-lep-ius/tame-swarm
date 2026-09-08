@@ -33,9 +33,23 @@ def test_percentiles_are_of_requests_that_happened():
 
     stats = tracker.stats("/generate")
     assert stats["requests"] == 100
-    assert stats["p50_s"] == 51.0
+    assert stats["p50_s"] == 50.0
     assert stats["p95_s"] == 95.0
     assert stats["p99_s"] == 99.0
+
+
+def test_the_p99_of_a_full_window_is_the_third_slowest_request():
+    """The claim the window size is chosen for: at 256 samples p99 is a real request.
+
+    Nearest-rank, `ceil(p*n) - 1`, so the p99 of 256 is index 253 -- three requests
+    were slower. An interpolated percentile would report a duration nothing took.
+    """
+    tracker = LatencyTracker()
+    for seconds in range(WINDOW_REQUESTS):
+        tracker.record("/generate", float(seconds))
+
+    slowest = sorted(range(WINDOW_REQUESTS), reverse=True)[:3]
+    assert tracker.stats("/generate")["p99_s"] == float(slowest[-1])
 
 
 def test_throughput_is_the_windows_tokens_over_its_seconds():

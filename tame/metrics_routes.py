@@ -45,13 +45,22 @@ def _require_steering(tame: TAMEApplication) -> None:
         raise HTTPException(status_code=404, detail=STEERING_OFF)
 
 
+def _built(snapshot, what: str):
+    """A builder returned None after its precondition was checked: report it, do not assert it.
+
+    ``assert`` is stripped under ``-O``, and a stripped guard here would turn a
+    404 into a 500 from response-model validation.
+    """
+    if snapshot is None:
+        raise HTTPException(status_code=500, detail=f"{what} could not be built")
+    return snapshot
+
+
 @router.get("/pid", response_model=PIDStatus)
 def metrics_pid(tame: TameApp):
     """The tissue's consensus, every cell, and the rolling window over recent passes."""
     _require_steering(tame)
-    status = observability.pid_status(tame)
-    assert status is not None  # guarded above
-    return status
+    return _built(observability.pid_status(tame), "pid status")
 
 
 @router.get("/coupling", response_model=CouplingStatus)
@@ -63,9 +72,7 @@ def metrics_coupling(tame: TameApp):
     hooks inject, and ``correlation_basis`` labels it as the additive baseline.
     """
     _require_steering(tame)
-    status = observability.coupling_status(tame)
-    assert status is not None  # guarded above
-    return status
+    return _built(observability.coupling_status(tame), "coupling status")
 
 
 @router.get("/routing", response_model=RoutingHealthMetrics)
@@ -84,9 +91,7 @@ def metrics_routing(tame: TameApp):
 def metrics_steering_quality(tame: TameApp):
     """Provenance, norms and geometry of the served vectors, with the gate's own verdict."""
     _require_steering(tame)
-    quality = observability.steering_quality(tame)
-    assert quality is not None  # guarded above
-    return quality
+    return _built(observability.steering_quality(tame), "steering quality")
 
 
 @router.get("/steering/pca", response_model=PCAProjection)
@@ -124,6 +129,16 @@ def metrics_outcome_probe(
     the threadpool, where blocking on the GPU stalls one worker rather than the
     event loop and every other request with it.
     """
+    # The probe detaches the hooks and flips the loop's mode, and this endpoint is a
+    # sync ``def`` running in a 40-worker threadpool: two overlapping probes would
+    # double-register the steering hooks (attach is append-only) and could leave the
+    # economy frozen for the life of the process. 409 rather than queueing, so a
+    # double-click does not stack minutes of GPU work behind the first.
+    if not tame.state_lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409,
+            detail="another probe or goal install is in flight on this process",
+        )
     try:
         return probe_outcome(tame, num_pairs=num_pairs)
     except ProbeUnavailable as exc:
@@ -133,6 +148,8 @@ def metrics_outcome_probe(
     except Exception as exc:
         logger.error("Outcome probe failed: %s", exc, exc_info=True)
         raise HTTPException(status_code=500, detail="outcome probe failed") from exc
+    finally:
+        tame.state_lock.release()
 
 
 @router.get("/health", response_model=SystemHealthStatus)

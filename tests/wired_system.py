@@ -20,9 +20,11 @@ from dataclasses import dataclass, field
 import torch
 import torch.nn as nn
 
+from app import TAMEApplication
 from homeostat import AdaptiveHomeostat, CognitiveHomeostat
 from mob import MixtureOfBidders, MoBConfig, SteeringCouplingConfig, apply_mob_to_model
 from steering import SteeringConfig, SteeringVector
+from steering_pipeline import SteeringExtraction
 
 from .conftest import TINY_HIDDEN_DIM, TINY_INTERMEDIATE_DIM, TINY_VOCAB_SIZE, build_tiny_causal_lm
 from .steering_fakes import SimpleCharTokenizer
@@ -213,3 +215,46 @@ def build_wired_system(
     generator = torch.Generator().manual_seed(seed + 1)
     tokens = torch.randint(1, TINY_VOCAB_SIZE, (1, PROMPT_TOKENS), generator=generator)
     return WiredSystem(model, tokenizer, homeostats, directions, mobs, tokens, generator)
+
+
+def _extraction(goal: str, homeostat: CognitiveHomeostat) -> SteeringExtraction:
+    """The extraction record a server would have kept for this goal.
+
+    The fixture's directions are random and its "pairs" are the pangrams above, so
+    the record is uncertified -- which is the honest label, and what the metrics
+    surface has to render without inventing provenance it does not have.
+    """
+    return SteeringExtraction(
+        goal=goal,
+        vectors=dict(homeostat.steering_vectors),
+        pair_count=len(CALIBRATION_TEXTS),
+        source="builtin",
+        layers=sorted(homeostat.steering_vectors),
+        tier_counts={"basic": len(CALIBRATION_TEXTS)},
+        pair_format="completion",
+        certified=False,
+        separability={layer: 0.5 for layer in homeostat.steering_vectors},
+    )
+
+
+def build_wired_app(**kwargs) -> tuple[TAMEApplication, WiredSystem]:
+    """The wired system inside a ``TAMEApplication``, traced the way a server traces it.
+
+    Here rather than in a test module because more than one module needs it, and a
+    test importing another test module drags that module's collection along with it.
+    """
+    goals = kwargs.pop("goals", ("truthful",))
+    system = build_wired_system(goals=goals, **kwargs)
+    homeostat = system.homeostats[goals[0]]
+    application = TAMEApplication(
+        model=system.model,  # pyright: ignore[reportArgumentType] # a tiny nn.Module stands in for the HF type
+        tokenizer=system.tokenizer,  # pyright: ignore[reportArgumentType] # as above
+        homeostat=homeostat,
+        mob_config=system.mobs[0].config,
+        steering_config=homeostat.config,
+        model_id="tiny",
+        steering_template=SteeringConfig(),
+        extractions={goal: _extraction(goal, system.homeostats[goal]) for goal in system.goals},
+    )
+    application.install_routing_traces()
+    return application, system

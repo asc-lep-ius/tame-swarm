@@ -42,7 +42,7 @@ from behavioural_validation import held_out_log_odds
 from contrastive_data import ContrastivePair, certification_for, interleaved_split
 from contrastive_data import load_contrastive_dataset as load_pairs
 from evaluation import HeldOutSplit, evaluate, fingerprint_tokens
-from mob.utils import frozen_economy
+from mob.utils import frozen_economy, frozen_traces
 from models import OutcomeArm, OutcomeMetrics
 from observability import probed_at
 
@@ -93,21 +93,74 @@ def certified_held_out(goal: str, count: int) -> list[ContrastivePair]:
     _, held_out = interleaved_split(pairs, CERTIFIED_HELD_OUT)
     if not held_out:
         raise ProbeUnavailable(f"goal {goal!r}: the certified split is empty")
-    return held_out[:count]
+    # A stride over the gate's set, not its first N: the source is ordered by tier
+    # and topic, so a prefix is one block of it. Either is a subset of the certified
+    # held-out -- which is all the comparability with `random_max` requires -- but
+    # only the stride is representative of it.
+    stride = max(1, len(held_out) // count)
+    return held_out[::stride][:count]
 
 
 def _arm(
     app: TAMEApplication, pairs: list[ContrastivePair], device: torch.device
-) -> tuple[OutcomeArm, float]:
-    """One arm's mean log-odds and accuracy off a single pass over the pairs."""
+) -> tuple[OutcomeArm, list[float]]:
+    """One arm's statistics, and its per-pair log-odds so the arms can be paired.
+
+    The per-pair values are what make a 20-pair delta honest: paired against the
+    same pair in another arm, the between-pair variance -- which is most of the
+    variance, since the pairs differ in topic and difficulty -- cancels, and what
+    is left is the intervention. Taking a difference of two arms' means would keep
+    all of it, and would silently compare different subsets whenever a pair
+    tokenises degenerately in one arm and not the other.
+    """
     tissue = app.homeostat.homeostat if app.homeostat else None
     if tissue is not None:
         tissue.reset()
     values = held_out_log_odds(app.model, app.tokenizer, pairs, device)  # pyright: ignore[reportArgumentType] # AutoModelForCausalLM is an nn.Module at runtime
     mean = float(sum(values) / len(values))
     accuracy = sum(value > 0 for value in values) / len(values)
-    strength = _mean_strength(app)
-    return OutcomeArm(mean_log_odds=mean, accuracy=accuracy, mean_strength=strength), mean
+    return (
+        OutcomeArm(mean_log_odds=mean, accuracy=accuracy, mean_strength=_mean_strength(app)),
+        values,
+    )
+
+
+def _paired_delta(served: list[float], other: list[float]) -> tuple[float, float | None]:
+    """Mean paired difference and its standard error, or ``(unpaired mean gap, None)``.
+
+    ``held_out_log_odds`` drops a pair that tokenises degenerately, so two arms can
+    return different lengths. When they do the pairing is broken and the honest
+    answer is the difference of means with **no** standard error rather than a
+    number computed over mismatched pairs.
+    """
+    if len(served) != len(other):
+        return float(sum(served) / len(served) - sum(other) / len(other)), None
+    deltas = [a - b for a, b in zip(served, other, strict=True)]
+    mean = sum(deltas) / len(deltas)
+    if len(deltas) < 2:
+        return float(mean), None
+    variance = sum((delta - mean) ** 2 for delta in deltas) / (len(deltas) - 1)
+    return float(mean), float((variance / len(deltas)) ** 0.5)
+
+
+def _floor_applies(app: TAMEApplication, certification) -> str | None:
+    """Why the certification's random floor does not describe this process, if it does not.
+
+    ``certified_random_max`` was measured at one model, one set of layers and one
+    strength. A served process can differ on all three -- ``install_goal`` takes a
+    strength, and nothing pins the model to the certified one -- and comparing a
+    delta against a floor from another configuration is the same error as
+    comparing it against another held-out set.
+    """
+    if certification.model is not None and app.model_id != certification.model:
+        return f"served on {app.model_id}, certified on {certification.model}"
+    layers = tuple(sorted(app.steering_config.steering_layers))
+    if certification.layers is not None and layers != tuple(sorted(certification.layers)):
+        return f"served at layers {list(layers)}, certified at {list(certification.layers)}"
+    strength = app.steering_config.base_strength
+    if certification.strength is not None and abs(strength - certification.strength) > 1e-6:
+        return f"served at strength {strength}, certified at {certification.strength}"
+    return None
 
 
 def _mean_strength(app: TAMEApplication) -> float | None:
@@ -165,29 +218,33 @@ def probe_outcome(app: TAMEApplication, num_pairs: int = DEFAULT_PROBE_PAIRS) ->
     device = next(app.model.parameters()).device  # pyright: ignore[reportAttributeAccessIssue] # HF stubs lack .parameters()
     adaptive = app.steering_config.adaptive
 
-    with frozen_economy(app.model):  # pyright: ignore[reportArgumentType] # as above
-        served, served_log_odds = _arm(app, pairs, device)
+    # The probe's forwards are not served traffic: they must not pay the economy,
+    # and they must not enter the routing window ``/metrics/coupling`` reports as
+    # the served goal's effect -- the unsteered arm runs through the same layers.
+    with frozen_economy(app.model), frozen_traces(app.model):  # pyright: ignore[reportArgumentType] # as above
+        served, served_values = _arm(app, pairs, device)
         perplexity_steered = _perplexity(app, device)
 
-        homeostat.detach_from_model()
         try:
-            unsteered, unsteered_log_odds = _arm(app, pairs, device)
+            homeostat.detach_from_model()
+            unsteered, unsteered_values = _arm(app, pairs, device)
             perplexity_unsteered = _perplexity(app, device)
         finally:
             homeostat.attach_to_model(app.model)  # pyright: ignore[reportArgumentType] # as above
 
         constant: OutcomeArm | None = None
-        constant_log_odds: float | None = None
+        constant_values: list[float] | None = None
         if adaptive:
             app.steering_config.adaptive = False
             try:
-                constant, constant_log_odds = _arm(app, pairs, device)
+                constant, constant_values = _arm(app, pairs, device)
             finally:
-                app.steering_config.adaptive = True
+                app.steering_config.adaptive = adaptive
 
     certification = certification_for(goal)
     random_max = certification.random_max if certification else None
-    delta = served_log_odds - unsteered_log_odds
+    floor_mismatch = _floor_applies(app, certification) if certification else None
+    delta, delta_standard_error = _paired_delta(served_values, unsteered_values)
     arms = {"served": served, "unsteered": unsteered}
     if constant is not None:
         arms["constant"] = constant
@@ -195,15 +252,23 @@ def probe_outcome(app: TAMEApplication, num_pairs: int = DEFAULT_PROBE_PAIRS) ->
     outcome = OutcomeMetrics(
         goal=goal,
         probed_at=probed_at(),
-        num_pairs=len(pairs),
+        num_pairs=len(served_values),
         arms=arms,
         served_minus_unsteered_log_odds=delta,
+        served_minus_unsteered_standard_error=delta_standard_error,
         served_minus_unsteered_accuracy=served.accuracy - unsteered.accuracy,
         adaptive_minus_constant_log_odds=(
-            served_log_odds - constant_log_odds if constant_log_odds is not None else None
+            _paired_delta(served_values, constant_values)[0]
+            if constant_values is not None
+            else None
         ),
         certified_random_max=random_max,
-        beats_random=(delta > random_max) if random_max is not None else None,
+        # None, not False, when the floor was measured on a different configuration:
+        # "the comparison does not apply here" is a third answer.
+        beats_random=(
+            (delta > random_max) if random_max is not None and floor_mismatch is None else None
+        ),
+        floor_not_applicable=floor_mismatch,
         held_out_perplexity_steered=perplexity_steered,
         held_out_perplexity_unsteered=perplexity_unsteered,
         stale=False,
