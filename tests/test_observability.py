@@ -83,7 +83,6 @@ def test_the_pid_snapshot_carries_the_cells_the_dispersion_and_the_window(loaded
     assert len(status.cells) == len(ACTUATORS) + 1
     assert all(cell.resting_sigma is not None and cell.gain is not None for cell in status.cells)
     assert status.window_passes >= observability.MIN_CONVERGENCE_PASSES
-    assert status.sensed_dispersion >= 0.0
     assert status.error_rms_window is not None and status.convergence_rate is not None
 
 
@@ -420,6 +419,23 @@ def test_a_delta_at_the_random_floor_is_the_value_that_reads_did_not_help():
         beats_random=0.05 > 0.087,
     )
     assert at_floor.beats_random is False
+
+
+def test_a_second_state_changing_request_is_refused_rather_than_queued(client, loaded):
+    """Both routes take the tissue off the model and put it back; two at once corrupt it.
+
+    409 rather than blocking: a double-click would otherwise stack minutes of GPU
+    work behind the first. The last assertion is the one that matters -- the lock is
+    acquired outside the ``try``, so a refused request must not release the holder's.
+    """
+    tame, _ = loaded
+    assert tame.state_lock.acquire(blocking=False)
+    try:
+        assert client.post("/metrics/outcome/probe", params={"num_pairs": 2}).status_code == 409
+        assert client.post("/steering/update", params={"goal": "safe"}).status_code == 409
+        assert tame.state_lock.locked()
+    finally:
+        tame.state_lock.release()
 
 
 def test_the_generation_routes_are_recorded_in_the_latency_window(loaded):

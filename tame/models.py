@@ -371,15 +371,19 @@ class OutcomeMetrics(BaseModel):
     is ``None`` -- not ``False`` -- when the floor does not describe this process,
     with ``floor_not_applicable`` saying why: the floor was measured at one model,
     one set of layers and one strength, and a served process can differ on all
-    three. ``num_pairs`` defaults small enough to run inside a request, so the
-    error bars are wide: **this is a smoke number**, read with its standard error,
-    and the certification's 200-pair measurement is the one that certifies.
+    three. ``num_pairs`` is how many pairs *both* arms scored -- the n behind the
+    headline delta, which is what weighs it, and which falls below the count
+    requested when a pair yields no finite log-odds in some arm. It defaults small
+    enough to run inside a request, so the error bars are wide: **this is a smoke
+    number**, read with its standard error, and the certification's 200-pair
+    measurement is the one that certifies.
 
     ``adaptive_minus_constant_log_odds`` is #4's value test as a live contrast, and
-    it conflates two things it cannot separate: the adaptive arm may win because
-    the loop regulated, or simply because it injected more. ``mean_strength`` per
-    arm is what tells them apart -- an arm that drifted well above the constant's
-    reference strength was not measured at the same dose.
+    it carries its own standard error, because "no significant difference" is that
+    test's actual claim. It conflates two things it cannot separate: the adaptive
+    arm may win because the loop regulated, or simply because it injected more.
+    ``mean_strength`` per arm is what tells them apart -- an arm that drifted well
+    above the constant's reference strength was not measured at the same dose.
 
     ``stale`` is true once the served goal changed after the probe ran.
     """
@@ -392,6 +396,7 @@ class OutcomeMetrics(BaseModel):
     served_minus_unsteered_standard_error: float | None = None
     served_minus_unsteered_accuracy: float = 0.0
     adaptive_minus_constant_log_odds: float | None = None
+    adaptive_minus_constant_standard_error: float | None = None
     certified_random_max: float | None = None
     beats_random: bool | None = None
     floor_not_applicable: str | None = None

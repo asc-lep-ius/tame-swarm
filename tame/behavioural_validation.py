@@ -154,18 +154,29 @@ def held_out_log_odds(
     pairs: Sequence[ContrastivePair],
     device: torch.device,
     max_length: int = 128,
-) -> list[float]:
-    """Per-pair held-out log-odds, dropping any pair that tokenises degenerately.
+) -> list[float | None]:
+    """Per-pair held-out log-odds, ``None`` where a pair did not produce a finite one.
 
     The shared measurement behind :func:`mean_log_odds` and
     :func:`held_out_accuracy`: two forward passes per pair, so a caller that wants
     both statistics reads them off one pass over the pairs rather than two.
+
+    Positional, with a hole where a pair dropped, rather than compacted: a caller
+    comparing two arms has to know *which* pair each value came from. Two arms that
+    drop different pairs can return the same number of values, and a compacted list
+    would let them be paired by position -- silently, and with an error bar that
+    says the pairing held.
     """
     values = [_pair_log_odds(model, tokenizer, pair, device, max_length) for pair in pairs]
-    finite = [value for value in values if value == value]  # drop NaN
-    if not finite:
+    finite = [None if value != value else value for value in values]  # NaN -> None
+    if all(value is None for value in finite):
         raise ValueError("no held-out pair produced a finite log-odds")
     return finite
+
+
+def finite_log_odds(values: Sequence[float | None]) -> list[float]:
+    """The values that came out finite, in order."""
+    return [value for value in values if value is not None]
 
 
 def mean_log_odds(
@@ -176,7 +187,7 @@ def mean_log_odds(
     max_length: int = 128,
 ) -> float:
     """Mean held-out log-odds over pairs, skipping any that tokenise degenerately."""
-    finite = held_out_log_odds(model, tokenizer, pairs, device, max_length)
+    finite = finite_log_odds(held_out_log_odds(model, tokenizer, pairs, device, max_length))
     return float(sum(finite) / len(finite))
 
 
@@ -193,7 +204,7 @@ def held_out_accuracy(
     the mean log-odds while flipping preferences toward the negative arm shows up
     here and not there.
     """
-    finite = held_out_log_odds(model, tokenizer, pairs, device, max_length)
+    finite = finite_log_odds(held_out_log_odds(model, tokenizer, pairs, device, max_length))
     return sum(value > 0 for value in finite) / len(finite)
 
 

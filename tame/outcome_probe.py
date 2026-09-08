@@ -38,8 +38,13 @@ from dataclasses import replace
 import torch
 
 from app import TAMEApplication
-from behavioural_validation import held_out_log_odds
-from contrastive_data import ContrastivePair, certification_for, interleaved_split
+from behavioural_validation import finite_log_odds, held_out_log_odds
+from contrastive_data import (
+    Certification,
+    ContrastivePair,
+    certification_for,
+    interleaved_split,
+)
 from contrastive_data import load_contrastive_dataset as load_pairs
 from evaluation import HeldOutSplit, evaluate, fingerprint_tokens
 from mob.utils import frozen_economy, frozen_traces
@@ -52,9 +57,9 @@ DEFAULT_PROBE_PAIRS = 20
 # A request may not turn into an evaluation run. The gate's own certification uses
 # 200 and takes minutes; past this the caller wants ``scripts/validate_steering.py``.
 MAX_PROBE_PAIRS = 200
-# The certified held-out set is the last 200 of the interleaved split, so the
-# probe's pairs are a prefix of the gate's -- never a fresh split, which would
-# make ``beats_random`` a comparison between two different held-out sets.
+# The certified held-out set the gate measured on. The probe's pairs are a stride
+# over it -- never a fresh split, which would make ``beats_random`` a comparison
+# between two different held-out sets.
 CERTIFIED_HELD_OUT = 200
 # Sequences of a configured held-out split to score per arm. Perplexity is a
 # corpus statistic and MLflow owns the run-level one (#7); this is a spot check
@@ -69,7 +74,7 @@ class ProbeUnavailable(RuntimeError):
 
 
 def certified_held_out(goal: str, count: int) -> list[ContrastivePair]:
-    """The first ``count`` of the goal's certified held-out pairs, in the certified format.
+    """``count`` of the goal's certified held-out pairs, strided, in the certified format.
 
     Source *and* format come from the certification record rather than from a
     caller's preference: ``certified_random_max`` was measured on those, and a
@@ -103,7 +108,7 @@ def certified_held_out(goal: str, count: int) -> list[ContrastivePair]:
 
 def _arm(
     app: TAMEApplication, pairs: list[ContrastivePair], device: torch.device
-) -> tuple[OutcomeArm, list[float]]:
+) -> tuple[OutcomeArm, list[float | None]]:
     """One arm's statistics, and its per-pair log-odds so the arms can be paired.
 
     The per-pair values are what make a 20-pair delta honest: paired against the
@@ -120,33 +125,48 @@ def _arm(
     if tissue is not None:
         tissue.reset()
     values = held_out_log_odds(app.model, app.tokenizer, pairs, device)  # pyright: ignore[reportArgumentType] # AutoModelForCausalLM is an nn.Module at runtime
-    mean = float(sum(values) / len(values))
-    accuracy = sum(value > 0 for value in values) / len(values)
+    finite = finite_log_odds(values)
+    mean = float(sum(finite) / len(finite))
+    accuracy = sum(value > 0 for value in finite) / len(finite)
     return (
         OutcomeArm(mean_log_odds=mean, accuracy=accuracy, mean_strength=_mean_strength(app)),
         values,
     )
 
 
-def _paired_delta(served: list[float], other: list[float]) -> tuple[float, float | None]:
-    """Mean paired difference and its standard error, or ``(unpaired mean gap, None)``.
+def _paired_delta(
+    served: list[float | None], other: list[float | None]
+) -> tuple[float, float | None]:
+    """Mean paired difference over the pairs *both* arms scored, and its standard error.
 
-    ``held_out_log_odds`` drops a pair that tokenises degenerately, so two arms can
-    return different lengths. When they do the pairing is broken and the honest
-    answer is the difference of means with **no** standard error rather than a
-    number computed over mismatched pairs.
+    Paired on the pair, not on position in a compacted list. A pair that produces
+    no finite log-odds leaves a hole, and two arms can drop different pairs and
+    still return the same number of values -- so pairing by position would compare
+    different pairs while reporting an error bar that says it did not. Degenerate
+    tokenisation is a property of the text and usually drops the same pair in every
+    arm, but an overflow in the forward is not, and the steered arm is the one
+    perturbing the residual stream.
+
+    When too few pairs survive in both arms to estimate a spread, the difference of
+    each arm's own mean is reported with **no** standard error: a centre without a
+    pairing is still the best available estimate, and saying so beats inventing one.
     """
-    if len(served) != len(other):
-        return float(sum(served) / len(served) - sum(other) / len(other)), None
-    deltas = [a - b for a, b in zip(served, other, strict=True)]
+    both = [
+        (first, second)
+        for first, second in zip(served, other, strict=True)
+        if first is not None and second is not None
+    ]
+    if len(both) < 2:
+        served_finite, other_finite = finite_log_odds(served), finite_log_odds(other)
+        gap = sum(served_finite) / len(served_finite) - sum(other_finite) / len(other_finite)
+        return float(gap), None
+    deltas = [first - second for first, second in both]
     mean = sum(deltas) / len(deltas)
-    if len(deltas) < 2:
-        return float(mean), None
     variance = sum((delta - mean) ** 2 for delta in deltas) / (len(deltas) - 1)
     return float(mean), float((variance / len(deltas)) ** 0.5)
 
 
-def _floor_applies(app: TAMEApplication, certification) -> str | None:
+def _floor_applies(app: TAMEApplication, certification: Certification) -> str | None:
     """Why the certification's random floor does not describe this process, if it does not.
 
     ``certified_random_max`` was measured at one model, one set of layers and one
@@ -241,7 +261,7 @@ def probe_outcome(app: TAMEApplication, num_pairs: int = DEFAULT_PROBE_PAIRS) ->
             homeostat.attach_to_model(app.model)  # pyright: ignore[reportArgumentType] # as above
 
         constant: OutcomeArm | None = None
-        constant_values: list[float] | None = None
+        constant_values: list[float | None] | None = None
         if adaptive:
             app.steering_config.adaptive = False
             try:
@@ -253,6 +273,13 @@ def probe_outcome(app: TAMEApplication, num_pairs: int = DEFAULT_PROBE_PAIRS) ->
     random_max = certification.random_max if certification else None
     floor_mismatch = _floor_applies(app, certification) if certification else None
     delta, delta_standard_error = _paired_delta(served_values, unsteered_values)
+    # #4's value test is where "no significant difference" is the claim, so it is
+    # the delta that most needs its error bar beside it.
+    constant_delta, constant_error = (
+        _paired_delta(served_values, constant_values)
+        if constant_values is not None
+        else (None, None)
+    )
     arms = {"served": served, "unsteered": unsteered}
     if constant is not None:
         arms["constant"] = constant
@@ -260,16 +287,17 @@ def probe_outcome(app: TAMEApplication, num_pairs: int = DEFAULT_PROBE_PAIRS) ->
     outcome = OutcomeMetrics(
         goal=goal,
         probed_at=probed_at(),
-        num_pairs=len(served_values),
+        num_pairs=sum(
+            1
+            for first, second in zip(served_values, unsteered_values, strict=True)
+            if first is not None and second is not None
+        ),
         arms=arms,
         served_minus_unsteered_log_odds=delta,
         served_minus_unsteered_standard_error=delta_standard_error,
         served_minus_unsteered_accuracy=served.accuracy - unsteered.accuracy,
-        adaptive_minus_constant_log_odds=(
-            _paired_delta(served_values, constant_values)[0]
-            if constant_values is not None
-            else None
-        ),
+        adaptive_minus_constant_log_odds=constant_delta,
+        adaptive_minus_constant_standard_error=constant_error,
         certified_random_max=random_max,
         # None, not False, when the floor was measured on a different configuration:
         # "the comparison does not apply here" is a third answer.
@@ -288,7 +316,7 @@ def probe_outcome(app: TAMEApplication, num_pairs: int = DEFAULT_PROBE_PAIRS) ->
         unsteered.mean_log_odds,
         delta,
         f"{random_max:+.4f}" if random_max is not None else "unrecorded",
-        len(pairs),
+        len(finite_log_odds(served_values)),
     )
     app.outcome = outcome
     return outcome

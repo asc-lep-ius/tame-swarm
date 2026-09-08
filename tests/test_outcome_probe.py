@@ -165,14 +165,21 @@ def test_an_arm_that_raises_still_leaves_the_server_steered(monkeypatch):
     assert len(tame.homeostat._registered_hooks) == attached_before  # pyright: ignore[reportOptionalMemberAccess]
 
 
-def test_the_probe_does_not_pay_the_economy(arms):
-    """An evaluation that moved the wealth would be a training step in disguise (#12)."""
-    scripted, _ = arms
-    scripted.extend([[0.4, 0.4], [0.1, 0.1]])
+def test_the_probe_does_not_pay_the_economy(monkeypatch):
+    """An evaluation that moved the wealth would be a training step in disguise (#12).
+
+    The arms forward through the economy, so a missing ``frozen_economy`` shows.
+    """
     tame, system = _probe_app()
     wealth = [mob.expert_wealth.clone() for mob in system.mobs]
     usage = [mob.expert_usage_count.clone() for mob in system.mobs]
+    queue = [[0.4, 0.4], [0.1, 0.1]]
 
+    def arm_that_forwards(*_args, **_kwargs):
+        system.run(3)
+        return queue.pop(0)
+
+    monkeypatch.setattr(outcome_probe, "held_out_log_odds", arm_that_forwards)
     outcome_probe.probe_outcome(tame, num_pairs=2)
 
     for mob, before_wealth, before_usage in zip(system.mobs, wealth, usage, strict=True):
@@ -261,24 +268,69 @@ def test_a_paired_delta_cancels_the_between_pair_variance(floor_applies):
     assert outcome.served_minus_unsteered_standard_error == pytest.approx(0.0, abs=1e-9)
 
 
-def test_an_arm_that_dropped_a_pair_reports_no_standard_error(floor_applies):
-    """`held_out_log_odds` drops a degenerate pair, and then the pairing is broken."""
+def test_a_pair_only_one_arm_could_score_leaves_the_others_paired(floor_applies):
+    """A dropped pair is a hole, not a shortened list, so the rest still line up."""
     tame, _ = _probe_app()
 
-    outcome = _probe_with(tame, [[1.0, 1.0, 1.0], [0.0, 0.0]], num_pairs=3)
+    # The served arm produced nothing finite for the middle pair.
+    outcome = _probe_with(tame, [[1.0, None, 1.0], [0.0, 0.0, 0.0]], num_pairs=3)
+
+    assert outcome.served_minus_unsteered_log_odds == pytest.approx(1.0)
+    assert outcome.served_minus_unsteered_standard_error == pytest.approx(0.0, abs=1e-9)
+    assert outcome.num_pairs == 2, "only the pairs an arm could score are counted"
+
+
+def test_two_arms_dropping_different_pairs_are_not_paired_by_position(floor_applies):
+    """The failure the length check could not catch: same count, different pairs.
+
+    Each arm drops one pair, so both hold three finite values -- and pairing those
+    by position would compare pair 1 against pair 0 and pair 2 against pair 1,
+    reporting a standard error that says the pairing held. Only pair 2 is scored in
+    both arms, so a spread cannot be estimated and none is offered.
+    """
+    served = [None, 10.0, 20.0, 30.0]
+    unsteered = [0.0, 1.0, 2.0, None]
+    tame, _ = _probe_app()
+
+    outcome = _probe_with(tame, [served, unsteered], num_pairs=4)
+
+    # Pairs 1 and 2 are the ones both arms scored: deltas +9 and +18.
+    assert outcome.served_minus_unsteered_log_odds == pytest.approx(13.5)
+    assert outcome.served_minus_unsteered_standard_error == pytest.approx(4.5)
+    # Position-pairing would have given (10-0, 20-1, 30-2) / 3 = 19.0.
+    assert outcome.served_minus_unsteered_log_odds != pytest.approx(19.0)
+
+
+def test_a_single_shared_pair_gives_a_centre_and_no_error_bar(floor_applies):
+    """Too few pairs in both arms to estimate a spread: say the centre, invent nothing."""
+    tame, _ = _probe_app()
+
+    outcome = _probe_with(tame, [[1.0, None], [None, 0.0]], num_pairs=2)
 
     assert outcome.served_minus_unsteered_log_odds == pytest.approx(1.0)
     assert outcome.served_minus_unsteered_standard_error is None
 
 
 def test_the_probe_leaves_the_served_routing_window_untouched():
-    """The probe's unsteered arm must not become what /metrics/coupling reports."""
+    """The probe's unsteered arm must not become what /metrics/coupling reports.
+
+    Each scripted arm forwards through the traced layers, which is what makes this
+    able to fail: an arm that ran no forward could not enter the window whether or
+    not ``frozen_traces`` was there.
+    """
     tame, system = _probe_app()
     system.run(40)
     before = {id(mob): mob.routing_trace.tokens for mob in system.mobs}  # pyright: ignore[reportOptionalMemberAccess]
     assert all(tokens > 0 for tokens in before.values())
 
-    _probe_with(tame, [[0.4, 0.4], [0.1, 0.1]], num_pairs=2)
+    queue = [[0.4, 0.4], [0.1, 0.1]]
+
+    def arm_that_forwards(*_args, **_kwargs):
+        system.run(3)
+        return queue.pop(0)
+
+    with mock.patch.object(outcome_probe, "held_out_log_odds", arm_that_forwards):
+        outcome_probe.probe_outcome(tame, num_pairs=2)
 
     after = {id(mob): mob.routing_trace.tokens for mob in system.mobs}  # pyright: ignore[reportOptionalMemberAccess]
-    assert after == before
+    assert after == before, "the probe's own forwards must stay out of the served window"

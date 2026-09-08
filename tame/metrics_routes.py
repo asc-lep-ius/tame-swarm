@@ -11,7 +11,7 @@ Included into the main router rather than mounted separately so a client (and
 """
 
 import logging
-from typing import Annotated
+from typing import Annotated, TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 
@@ -39,13 +39,16 @@ TameApp = Annotated[TAMEApplication, Depends(get_tame_app)]
 
 STEERING_OFF = "steering is not active on this process"
 
+# 3.10 is the floor (pyrightconfig), so a TypeVar rather than PEP 695 syntax.
+Snapshot = TypeVar("Snapshot")
+
 
 def _require_steering(tame: TAMEApplication) -> None:
     if tame.homeostat is None:
         raise HTTPException(status_code=404, detail=STEERING_OFF)
 
 
-def _built(snapshot, what: str):
+def _built(snapshot: Snapshot | None, what: str) -> Snapshot:
     """A builder returned None after its precondition was checked: report it, do not assert it.
 
     ``assert`` is stripped under ``-O``, and a stripped guard here would turn a

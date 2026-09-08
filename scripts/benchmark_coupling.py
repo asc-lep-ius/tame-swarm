@@ -65,6 +65,9 @@ SEQUENCE = 256
 WARMUP = 5
 REPETITIONS = 20
 GENERATE_TOKENS = 128
+# A single decode's throughput moves by about two points run to run; the forward
+# figure beside it is a median of 20 and moves by under 0.2.
+THROUGHPUT_REPEATS = 3
 # #5's acceptance criterion for the coupling's share of the forward pass.
 OVERHEAD_BUDGET_PCT = 5.0
 PROMPTS = [
@@ -96,7 +99,19 @@ def median_forward_seconds(model, input_ids: torch.Tensor) -> float:
 
 
 def tokens_per_second(model, tokenizer, device) -> float:
-    """End-to-end greedy decode over the prompts: the number a user notices."""
+    """End-to-end greedy decode over the prompts: the number a user notices.
+
+    Median of ``THROUGHPUT_REPEATS`` passes over the prompt set, for the reason the
+    forward measurement takes one: a single decode has a run-to-run spread of about
+    two points here, which is wider than the gap between some of the rows this
+    table invites a reader to compare.
+    """
+    return statistics.median(
+        _one_throughput_pass(model, tokenizer, device) for _ in range(THROUGHPUT_REPEATS)
+    )
+
+
+def _one_throughput_pass(model, tokenizer, device) -> float:
     total_tokens, total_seconds = 0, 0.0
     with torch.no_grad(), frozen_economy(model):
         for prompt in PROMPTS:

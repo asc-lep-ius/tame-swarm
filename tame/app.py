@@ -173,7 +173,15 @@ class TAMEApplication:
         presence in the stream and which experts won -- measurable whether or not a
         routing coupling mediates it, and the additive baseline when none does.
         A MoB layer the goal has no vector at records its routing and no alignment.
+
+        Under the state lock: a probe running inside ``frozen_traces`` restores the
+        traces it detached on the way out, so a fresh one installed concurrently
+        would be discarded -- reinstating the mixed window this exists to prevent.
         """
+        with self.state_lock:
+            self._install_routing_traces(maxlen)
+
+    def _install_routing_traces(self, maxlen: int) -> None:
         for layer, mob in mob_layers_by_index(self.model).items():  # pyright: ignore[reportArgumentType] # AutoModelForCausalLM is an nn.Module at runtime
             trace = mob.enable_routing_trace(maxlen)
             if self.homeostat is not None and layer in self.homeostat.steering_vectors:
@@ -370,8 +378,9 @@ class TAMEApplication:
         self.homeostat, self.steering_config = homeostat, config
         self.extractions[goal] = extraction
         # The traces are keyed to the goal's direction at each layer, and the goal
-        # just changed; a probe measured against the previous goal is stale.
-        self.install_routing_traces()
+        # just changed; a probe measured against the previous goal is stale. The
+        # inner form: the caller holds the lock for the whole install.
+        self._install_routing_traces(DEFAULT_TRACE_TOKENS)
         self.outcome = None
         return extraction
 
