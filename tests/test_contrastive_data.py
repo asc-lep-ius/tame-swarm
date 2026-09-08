@@ -5,6 +5,7 @@ import torch
 
 from contrastive_data import (
     CERTIFIED,
+    CERTIFIED_MODEL,
     COMPLETION_FORMAT,
     MC_ANSWER_CUE,
     MIN_PAIRS_PER_GOAL,
@@ -568,3 +569,21 @@ def test_interleaved_split_is_the_gate_split_and_disjoint():
     assert not {id(p) for p in extract} & {id(p) for p in held}
     assert certified_source("truthful") == "truthful_qa"
     assert certified_source("deliberation") == "builtin"
+
+
+def test_every_certified_goal_records_the_gate_measurement_that_passed_it():
+    """The record carries its own verdict (#5): an effect, and the floor it cleared.
+
+    Serving these beside the vectors is what lets ``/metrics/steering/quality``
+    answer "are the vectors good" without re-running the gate -- so they have to
+    be consistent with the verdict, and with the configuration they were measured
+    at rather than some other one.
+    """
+    for goal, certification in CERTIFIED.items():
+        assert certification.effect is not None, goal
+        assert certification.random_max is not None, goal
+        assert certification.effect > certification.random_max, goal
+        if certification.control_effect is not None:
+            assert certification.effect > certification.control_effect, goal
+        assert certification.layers, goal
+        assert certification.model == CERTIFIED_MODEL, goal

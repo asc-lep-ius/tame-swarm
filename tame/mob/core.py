@@ -24,6 +24,7 @@ from .auction import (
 )
 from .experts import ConfidenceHead, Expert, LightweightExpert
 from .mob_config import MoBConfig
+from .routing_trace import DEFAULT_TRACE_TOKENS, RoutingTrace
 from .softmax_router import SoftmaxRouter
 from .wealth import ValueSummary, WealthUpdateMixin, realised_values
 
@@ -178,6 +179,9 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
             self.register_buffer(ledger, torch.full((config.num_experts,), float(value)))
 
         self.last_stats: MoBStats | None = None
+        # Serve-time only, off by default and never enabled by training. See
+        # ``enable_routing_trace`` and ``mob.routing_trace``.
+        self.routing_trace: RoutingTrace | None = None
 
         self.wealth_history: list[list[float]] = []
         self._track_wealth: bool = False
@@ -366,6 +370,14 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
             if self._track_wealth and not self._economy_frozen:
                 self.wealth_history.append(self.expert_wealth.cpu().tolist())
 
+            # The routing trace is the opposite case: a frozen forward is still a
+            # forward the gate routed, and a held-out evaluation is exactly when
+            # someone wants to see how it routed. Training is what is excluded --
+            # the trace is serve-time telemetry and a training step's tokens would
+            # fill the window with a regime nobody is asking about.
+            if self.routing_trace is not None and not self.training:
+                self.routing_trace.record(routing_weights, selected_experts, routing_hidden_states)
+
         return output
 
     def _report(
@@ -521,6 +533,10 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
     def _get_coupling(self) -> SteeringCoupling | None:
         return cast(SteeringCoupling | None, getattr(self, "coupling", None))
 
+    def coupling_or_none(self) -> SteeringCoupling | None:
+        """The attached coupling, or ``None``. What anything outside this class reads."""
+        return self._get_coupling()
+
     def routing_parameters(self) -> list[nn.Parameter]:
         """Parameters trained by nothing but the value objective, at the heads' rate.
 
@@ -654,6 +670,24 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
                     self.expert_usage_count[expert_idx] += mask.sum().float()
 
         return output
+
+    def enable_routing_trace(self, maxlen: int = DEFAULT_TRACE_TOKENS) -> RoutingTrace:
+        """Start recording what the gate does per token outside training.
+
+        Idempotent in effect but not in state: a second call replaces the window,
+        so the caller cannot end up reading a trace whose length is not the one it
+        asked for.
+        """
+        self.routing_trace = RoutingTrace(
+            self.config.num_experts,
+            self.config.top_k,
+            maxlen=maxlen,
+            device=self.expert_wealth.device,
+        )
+        return self.routing_trace
+
+    def disable_routing_trace(self) -> None:
+        self.routing_trace = None
 
     def start_tracking(self):
         self._track_wealth = True
