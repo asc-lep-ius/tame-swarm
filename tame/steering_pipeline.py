@@ -31,7 +31,7 @@ from contrastive_data import (
 from coupling import SteeringCoupling, SteeringCouplingConfig
 from homeostat import CognitiveHomeostat
 from homeostat_calibration import transformer_layers
-from mob import MixtureOfBidders
+from mob import mob_at
 from steering import SteeringConfig, SteeringVector, SteeringVectorExtractor
 
 logger = logging.getLogger(__name__)
@@ -318,14 +318,6 @@ def certified_coupling_layers(goal: str, model_id: str | None = None) -> tuple[i
     return certification.layers
 
 
-def _mob_at(block: nn.Module) -> MixtureOfBidders | None:
-    for attribute in ("mlp", "feed_forward"):
-        candidate = getattr(block, attribute, None)
-        if isinstance(candidate, MixtureOfBidders):
-            return candidate
-    return None
-
-
 def seed_coupling(
     model: nn.Module,
     homeostat: CognitiveHomeostat,
@@ -354,7 +346,7 @@ def seed_coupling(
     retained: dict[int, float] = {}
     skipped: list[int] = []
     for layer_idx in layers:
-        mob = _mob_at(blocks[layer_idx]) if layer_idx < len(blocks) else None
+        mob = mob_at(blocks[layer_idx]) if layer_idx < len(blocks) else None
         if mob is None or layer_idx not in homeostat.steering_vectors:
             skipped.append(layer_idx)
             continue

@@ -495,6 +495,14 @@ class Certification:
     swept (#4), and ``readout_layer`` is where the homeostat's sensor reads. A goal
     without a measured band is served at its certified strength, held constant:
     the loop may only move within a band the gate has actually passed.
+
+    ``effect``, ``random_max`` and ``control_effect`` are what the gate measured at
+    exactly this configuration -- the mean held-out log-odds shift, the strongest of
+    the matched random directions, and the instruction-prefix control -- so a
+    reader of ``/metrics/steering/quality`` (#5) gets the verdict beside the vector
+    without re-running the gate. They are a *record*, not a live number: nothing
+    recomputes them when the served model, layers or strength change, which is why
+    they sit on the certification and not on the extraction.
     """
 
     source: str
@@ -504,6 +512,9 @@ class Certification:
     strength_band: tuple[float, float] | None = None
     readout_layer: int | None = None
     model: str | None = None
+    effect: float | None = None
+    random_max: float | None = None
+    control_effect: float | None = None
 
 
 # What each goal is extracted from by default: the (source, format) the gate in
@@ -535,6 +546,11 @@ CERTIFIED: dict[str, Certification] = {
         strength_band=(2.0, 6.0),
         readout_layer=22,
         model=CERTIFIED_MODEL,
+        # #4's layer sweep re-ran the gate at the served 13 + 16-21; the prefix
+        # control was not re-quoted there, so it stays None rather than carrying
+        # the -0.012 measured at 14/18/22, which is a different injection.
+        effect=0.325,
+        random_max=0.087,
     ),
     "reasoning": Certification(
         BUILTIN_SOURCE,
@@ -542,9 +558,19 @@ CERTIFIED: dict[str, Certification] = {
         layers=(14, 18, 22),
         strength=4.0,
         model=CERTIFIED_MODEL,
+        effect=0.273,
+        random_max=0.126,
+        control_effect=0.103,
     ),
     "safe": Certification(
-        BUILTIN_SOURCE, COMPLETION_FORMAT, layers=(14, 18, 22), strength=4.0, model=CERTIFIED_MODEL
+        BUILTIN_SOURCE,
+        COMPLETION_FORMAT,
+        layers=(14, 18, 22),
+        strength=4.0,
+        model=CERTIFIED_MODEL,
+        effect=0.149,
+        random_max=0.030,
+        control_effect=0.036,
     ),
 }
 _UNCERTIFIED = Certification(BUILTIN_SOURCE, COMPLETION_FORMAT)

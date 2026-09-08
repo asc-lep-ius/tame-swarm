@@ -23,6 +23,56 @@ def get_mob_layers(model: nn.Module) -> list[MixtureOfBidders]:
     return [module for module in model.modules() if isinstance(module, MixtureOfBidders)]
 
 
+def mob_at(block: nn.Module) -> MixtureOfBidders | None:
+    """The MoB layer this transformer block's FFN was converted into, if it was."""
+    for attribute in ("mlp", "feed_forward"):
+        candidate = getattr(block, attribute, None)
+        if isinstance(candidate, MixtureOfBidders):
+            return candidate
+    return None
+
+
+def mob_layers_by_index(model: nn.Module) -> dict[int, MixtureOfBidders]:
+    """MoB layers keyed by their block index -- the numbers the steering record names.
+
+    :func:`get_mob_layers` returns them in module order, which says nothing about
+    which block each one sits in. Everything that has to line a MoB layer up with a
+    steering layer, a certified coupling layer or a cell needs the index.
+    """
+    inner = getattr(model, "model", model)
+    blocks = getattr(inner, "layers", None)
+    if blocks is None:
+        return {}
+    found = {index: mob_at(block) for index, block in enumerate(blocks)}
+    return {index: mob for index, mob in found.items() if mob is not None}
+
+
+@contextmanager
+def frozen_traces(model: nn.Module) -> Iterator[None]:
+    """Run forwards that are not served traffic without writing them into the trace.
+
+    The companion of :func:`frozen_economy`, for the same reason and at the same
+    call sites. A trace records on every non-training forward -- deliberately, so a
+    held-out evaluation still shows how the gate routed it -- but the routing trace
+    is *also* what ``/metrics/coupling`` reports as the served goal's effect on
+    routing. An outcome probe runs its unsteered arm through the same layers, so
+    without this the window a metrics route reads is the arm where steering was
+    off, labelled as the configuration that is served.
+
+    Detaching the trace rather than clearing it afterwards: clearing would throw
+    away the served window the metric exists to report, which is a different way of
+    answering wrongly.
+    """
+    saved = [(mob, mob.routing_trace) for mob in get_mob_layers(model)]
+    for mob, _ in saved:
+        mob.routing_trace = None
+    try:
+        yield
+    finally:
+        for mob, trace in saved:
+            mob.routing_trace = trace
+
+
 @contextmanager
 def frozen_economy(model: nn.Module) -> Iterator[None]:
     """Read the model without paying it, then leave the economy exactly as found.

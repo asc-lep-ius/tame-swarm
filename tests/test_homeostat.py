@@ -9,6 +9,7 @@ to an injection is exactly the additive passthrough, so every lift the
 calibration should recover is known in closed form.
 """
 
+import math
 from dataclasses import replace
 
 import pytest
@@ -433,6 +434,41 @@ def test_reset_clears_cells_and_histories():
     assert len(homeostat.alignment_history) == 0
     assert homeostat.controller.states == {}
     assert homeostat.current_strength == 2.0
+
+
+def test_each_cell_keeps_its_own_history_and_the_tissue_reports_their_dispersion():
+    """The consensus is a compromise, not a reading any cell takes (#23): the cells are recorded.
+
+    Every cell keeps its own reading per pass beside the consensus history, and the
+    status carries their controllability-weighted spread about the consensus error,
+    so a tissue whose consensus sits at zero while its cells read a continuation
+    sigma apart says so.
+    """
+    homeostat, tissue = make(content={1: 0.5, 2: -1.0, 3: 1.0})
+    tissue.run(5)
+
+    assert {layer: len(history) for layer, history in homeostat.cell_history.items()} == {
+        1: 5,
+        2: 5,
+        3: 5,
+    }
+    status = homeostat.status()
+    cells = {cell["layer"]: cell for cell in status["cells"]}
+    calibrated = homeostat.calibration
+    assert calibrated is not None
+    for layer, cell in cells.items():
+        assert homeostat.cell_history[layer][-1] == pytest.approx(cell["process_variable"])
+        assert cell["gain"] == pytest.approx(calibrated.layers[layer].gain_z)
+        assert cell["resting_sigma"] == pytest.approx(calibrated.layers[layer].sigma)
+    weights = {layer: cell["weight"] for layer, cell in cells.items()}
+    spread = sum(
+        weight * (cells[layer]["error"] - status["error"]) ** 2 for layer, weight in weights.items()
+    )
+    assert status["dispersion"] == pytest.approx(math.sqrt(spread / sum(weights.values())))
+    assert status["dispersion"] > 0.1
+
+    homeostat.reset()
+    assert homeostat.cell_history == {}
 
 
 def test_snapshot_round_trips_through_a_dict():
