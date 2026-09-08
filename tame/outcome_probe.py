@@ -113,6 +113,9 @@ def _arm(
     all of it, and would silently compare different subsets whenever a pair
     tokenises degenerately in one arm and not the other.
     """
+    # Each arm is measured on a fresh loop, so an arm cannot inherit the previous
+    # one's integral. The visible cost is that a probe leaves ``/metrics/pid``'s
+    # rolling window empty -- ``window_passes`` reads 0 until the next served request.
     tissue = app.homeostat.homeostat if app.homeostat else None
     if tissue is not None:
         tissue.reset()

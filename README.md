@@ -223,7 +223,7 @@ The table is the #17 certification at layers 14/18/22; [#4](#plant-characterisat
 
 **The calibration corpus, and what the cells' disagreement is (#23).** [#21](#blind-cell-consensus-21) made the per-cell picture visible and it showed the served tissue's cells reading one continuation several σ apart. Two readings were open: the GPU fixture calibrated on 8 prompts × 16 tokens against the server's 24 × 32, so either eight passages under-sample each cell's resting distribution and the spread is a fixture artefact, or the disagreement is the substrate's. Every real-model number in this README, and anything [#8](#phase-1--steering-economy-coupling) would quote, depended on which. `scripts/measure_calibration_corpus.py` builds the fixture once — same seed, extraction, subspaces and replayed continuation — and re-calibrates the tissue on each corpus in turn. **Every row below is at the same `CONTENT_PUSH = −2.0`**, so the columns are comparable with each other:
 
-| corpus | passages | σ rel. SE | generate + calibrate | tissue gain | setpoint | survivors' gains | inert+push → live+push | removed | dispersion |
+| corpus | passages | σ rel. SE | generate + calibrate | tissue gain | setpoint | survivors' gains | inert+push → live+push | removed | dispersion (inert+push) |
 |---|---:|---:|---:|---:|---:|---|---:|---:|---:|
 | 8 × 16 (the old fixture) | 8 | 27% | 7.2 s | 1.27 | 5.09 σ | 0.48–1.68 | +3.22 → +1.36 | 58% | 3.51 |
 | 8 × 32 | 8 | 27% | 12.6 s | 1.15 | 4.59 σ | 0.37–1.62 | +2.60 → +0.87 | 67% | 3.15 |

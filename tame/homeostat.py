@@ -461,6 +461,12 @@ class AdaptiveHomeostat:
         :attr:`sensed_error` is :attr:`error`'s. Zero while nothing weighs, and
         also zero when one cell weighs alone -- read it with ``alive_cells`` and
         ``sensed_dispersion``, which tell those apart.
+
+        Each term is a z-score in that cell's *own* resting sigma, and those span
+        an order of magnitude on the served tissue (0.8 at cell 13, 7.4 at cell
+        22), so "in sigma" names the unit of each term rather than one shared
+        between them. That is inherent to the consensus this is measured about,
+        which is built from the same z-scores.
         """
         cells = self._sensing_cells()
         weights = [self.cell_weight(cell) for cell in cells]

@@ -227,7 +227,10 @@ def _mean_correlation(
     Averaged rather than pooled: the layers do not see the same distribution of
     alignments (the injection enters at each actuator's block, so a cell above
     reads the pushes below it), and pooling would weight whichever layer happened
-    to have the widest spread.
+    to have the widest spread. The mean is of raw *r* rather than of Fisher-z
+    transforms, which biases it slightly toward zero; at the magnitudes this
+    reports (|r| well under 0.3) the two differ in the third decimal, and raw *r*
+    is the quantity the per-layer rows beside it show.
     """
     measured = [
         summary.goal_correlation
@@ -298,7 +301,10 @@ def routing_health(
 
     Pooled by token count, so a layer whose window is still filling does not weigh
     as much as one that is full; the per-layer rows are there because a gate can be
-    degenerate at one depth and healthy at another.
+    degenerate at one depth and healthy at another. The pooled ``tokens`` is the
+    *minimum* over layers rather than the weighted total: it answers "how much
+    evidence is behind the thinnest of these rows", which is what a reader deciding
+    whether to trust the pooled figures needs.
     """
     summaries = _trace_summaries(app) if summaries is None else summaries
     if not summaries:
