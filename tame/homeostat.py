@@ -445,22 +445,49 @@ class AdaptiveHomeostat:
 
     @property
     def dispersion(self) -> float:
-        """How far the live cells disagree: the weighted RMS of the cell errors about the consensus.
+        """The weighted RMS of the cell errors about the consensus: the residual it cannot remove.
 
         The consensus is a compromise the cells make, not a reading any one of them
         takes: on the served tissue the cells read one continuation several sigma
         apart (#23), and this is the number that says so beside an :attr:`error`
-        that may sit near zero. Under the same controllability weights as the
-        consensus, in sigma; zero while nothing weighs.
+        that may sit near zero.
+
+        Weighted by controllability, like the consensus itself, so this is the
+        disagreement **among the cells the tissue can move** -- the least-squares
+        residual a single common strength leaves. A cell nothing can move
+        contributes nothing here, exactly as it contributes nothing to the
+        consensus, which means this number cannot report the disagreement of a cell
+        that is stuck: :attr:`sensed_dispersion` is its pairing, as
+        :attr:`sensed_error` is :attr:`error`'s. Zero while nothing weighs, and
+        also zero when one cell weighs alone -- read it with ``alive_cells`` and
+        ``sensed_dispersion``, which tell those apart.
         """
         cells = self._sensing_cells()
         weights = [self.cell_weight(cell) for cell in cells]
+        return self._spread(cells, weights, self.error)
+
+    @property
+    def sensed_dispersion(self) -> float:
+        """How far every live cell disagrees, counting the ones no action can move.
+
+        The plain RMS of the live cells' errors about :attr:`sensed_error`, in
+        sigma. :attr:`dispersion` discounts a cell by its controllability because
+        the *controller* must; a reader must not. A cell whose error no action can
+        answer is the one whose reading most needs to leave this scale -- #21 took
+        it out of the shared memory precisely so that it could not silently steer
+        the others, and taking it out of the diagnostic too would hide the state
+        that rule exists to make survivable.
+        """
+        cells = self._sensing_cells()
+        return self._spread(cells, [1.0] * len(cells), self.sensed_error)
+
+    def _spread(self, cells: list[int], weights: list[float], centre: float) -> float:
         total = sum(weights)
         if total <= 0:
             return 0.0
-        consensus = self.error
         spread = sum(
-            w * (self._error[cell] - consensus) ** 2 for w, cell in zip(weights, cells, strict=True)
+            weight * (self._error[cell] - centre) ** 2
+            for weight, cell in zip(weights, cells, strict=True)
         )
         return math.sqrt(spread / total)
 
@@ -530,6 +557,7 @@ class AdaptiveHomeostat:
             "error": self.error,
             "sensed_error": self.sensed_error,
             "dispersion": self.dispersion,
+            "sensed_dispersion": self.sensed_dispersion,
             "p_term": mean_of("p_term"),
             "i_term": mean_of("i_term"),
             "d_term": mean_of("d_term"),
@@ -761,6 +789,18 @@ class CognitiveHomeostat(nn.Module):
         return self.calibration
 
     def attach_to_model(self, model: nn.Module):
+        # Whatever is already registered comes off first. Attaching is otherwise
+        # append-only, so a caller that attached twice without detaching would leave
+        # every cell with two hooks -- the injection applied twice, and the tissue
+        # sensing each pass twice -- with no error and nothing in the status to
+        # show it.
+        if self._registered_hooks:
+            logger.warning(
+                "Re-attaching over %d live hooks; removing them first",
+                len(self._registered_hooks),
+            )
+            self.detach_from_model()
+
         layers = transformer_layers(model)
         readout = self.readout_layer
         cells = {layer: True for layer in self.actuator_layers}

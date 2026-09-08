@@ -98,7 +98,17 @@ class PIDStatus(BaseModel):
     of their errors about the consensus, in sigma. The consensus is a compromise
     the cells make, not a reading any one of them takes -- on the served tissue
     they read one continuation several sigma apart (#23) -- and this is the number
-    that says so beside an ``error`` that may sit near zero.
+    that says so beside an ``error`` that may sit near zero. It is **not a target**:
+    a healthy served tissue reads 2.0-2.3 sigma, and driving it toward zero would
+    mean making the cells read alike, which no strength can do.
+
+    ``sensed_dispersion`` is its pairing, as ``sensed_error`` is ``error``'s: the
+    plain RMS over the same cells, counting the ones no action can move. The
+    weighted number is what the controller is left with; the plain one is what the
+    tissue is actually feeling. A low ``dispersion`` with a high
+    ``sensed_dispersion`` is a tissue whose stuck cells disagree loudly and whose
+    consensus cannot hear them -- and ``dispersion`` alone reads zero both when the
+    cells agree and when exactly one of them can be moved.
 
     The four ``*_window`` fields are the loop's recent behaviour rather than its
     instantaneous state, computed over the last ``window_passes`` entries of the
@@ -120,6 +130,7 @@ class PIDStatus(BaseModel):
     error: float
     sensed_error: float
     dispersion: float
+    sensed_dispersion: float = 0.0
     p_term: float
     i_term: float
     d_term: float
@@ -346,13 +357,29 @@ class OutcomeMetrics(BaseModel):
     certified fixed strength when the loop is adaptive (#4's value test) -- and
     reports the deltas.
 
+    Every delta is **paired**: the same pair is scored in each arm and the
+    differences averaged, so the between-pair variance -- most of the variance,
+    since the pairs differ in topic and difficulty -- cancels.
+    ``served_minus_unsteered_standard_error`` is the standard error of that paired
+    mean, and is ``None`` when an arm dropped a pair the others kept, which breaks
+    the pairing.
+
     ``beats_random`` compares ``served_minus_unsteered_log_odds`` against the
     certification's strongest matched random direction. **A delta at or below that
     floor is the value that reads "steering did not help"**, and it is reachable:
-    #6's coupling ablation already found the held-out effect null at 500 steps.
-    ``num_pairs`` defaults small enough to run inside a request, so the error bars
-    are wide -- this is a smoke number, and the certification's 200-pair
-    measurement is the one that certifies.
+    #6's coupling ablation already found the held-out effect null at 500 steps. It
+    is ``None`` -- not ``False`` -- when the floor does not describe this process,
+    with ``floor_not_applicable`` saying why: the floor was measured at one model,
+    one set of layers and one strength, and a served process can differ on all
+    three. ``num_pairs`` defaults small enough to run inside a request, so the
+    error bars are wide: **this is a smoke number**, read with its standard error,
+    and the certification's 200-pair measurement is the one that certifies.
+
+    ``adaptive_minus_constant_log_odds`` is #4's value test as a live contrast, and
+    it conflates two things it cannot separate: the adaptive arm may win because
+    the loop regulated, or simply because it injected more. ``mean_strength`` per
+    arm is what tells them apart -- an arm that drifted well above the constant's
+    reference strength was not measured at the same dose.
 
     ``stale`` is true once the served goal changed after the probe ran.
     """
@@ -362,10 +389,12 @@ class OutcomeMetrics(BaseModel):
     num_pairs: int
     arms: dict[str, OutcomeArm] = Field(default_factory=dict)
     served_minus_unsteered_log_odds: float
-    served_minus_unsteered_accuracy: float
+    served_minus_unsteered_standard_error: float | None = None
+    served_minus_unsteered_accuracy: float = 0.0
     adaptive_minus_constant_log_odds: float | None = None
     certified_random_max: float | None = None
     beats_random: bool | None = None
+    floor_not_applicable: str | None = None
     held_out_perplexity_steered: float | None = None
     held_out_perplexity_unsteered: float | None = None
     stale: bool = False
