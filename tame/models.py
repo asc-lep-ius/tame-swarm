@@ -55,13 +55,18 @@ class CellStatus(BaseModel):
     ``weight`` is the cell's share of the tissue consensus: its calibrated gain
     per unit of strength while some actuator below it is live, and zero once none
     is -- so a cell the tissue's effort cannot move, calibrated so or made so by
-    damage, reports its reading here with a weight of zero.
+    damage, reports its reading here with a weight of zero. resting_sigma is
+    the unit the cell's numbers are in (the slow sigma of its resting projection)
+    and gain its calibrated lift per unit of strength in that unit; both are
+    None on an uncalibrated loop.
     """
 
     layer: int
     injects: bool
     alive: bool
     weight: float
+    resting_sigma: float | None
+    gain: float | None
     setpoint: float
     process_variable: float
     error: float
@@ -88,6 +93,12 @@ class PIDStatus(BaseModel):
     ``alive_cells`` and ``sensed_error`` tell that state from a tissue at
     setpoint. ``p_term``, ``i_term`` and ``d_term`` are plain means over the live
     cells, so ``p_term`` tracks ``kp * sensed_error`` rather than ``kp * error``.
+
+    ``dispersion`` is how far the cells disagree: the controllability-weighted RMS
+    of their errors about the consensus, in sigma. The consensus is a compromise
+    the cells make, not a reading any one of them takes -- on the served tissue
+    they read one continuation several sigma apart (#23) -- and this is the number
+    that says so beside an ``error`` that may sit near zero.
     """
 
     goal: str
@@ -98,6 +109,7 @@ class PIDStatus(BaseModel):
     process_variable: float
     error: float
     sensed_error: float
+    dispersion: float
     p_term: float
     i_term: float
     d_term: float

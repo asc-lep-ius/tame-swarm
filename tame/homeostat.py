@@ -130,6 +130,9 @@ class AdaptiveHomeostat:
         self.controller = PIDController(self._pid_config())
         self.alignment_history: deque[float] = deque(maxlen=MAX_HISTORY_LENGTH)
         self.strength_history: deque[float] = deque(maxlen=MAX_HISTORY_LENGTH)
+        # Each cell's own reading per pass it fired in, beside the consensus the
+        # tissue regulates: the record that shows the cells disagreeing (#23).
+        self.cell_history: dict[int, deque[float]] = {}
         self._filtered: dict[int, float] = {}
         self._pv: dict[int, float] = {}
         self._error: dict[int, float] = {}
@@ -349,6 +352,7 @@ class AdaptiveHomeostat:
         setpoint = self.cell_setpoint(layer)
         error = setpoint - pv
         self._pv[layer], self._error[layer] = pv, error
+        self.cell_history.setdefault(layer, deque(maxlen=MAX_HISTORY_LENGTH)).append(pv)
 
         # The controller integrates the tissue's consensus error (frozen for this
         # pass); the cell's own deviation from it enters through the proportional
@@ -439,6 +443,27 @@ class AdaptiveHomeostat:
         live = self._sensing_cells()
         return float(np.mean([self._error[cell] for cell in live])) if live else 0.0
 
+    @property
+    def dispersion(self) -> float:
+        """How far the live cells disagree: the weighted RMS of the cell errors about the consensus.
+
+        The consensus is a compromise the cells make, not a reading any one of them
+        takes: on the served tissue the cells read one continuation several sigma
+        apart (#23), and this is the number that says so beside an :attr:`error`
+        that may sit near zero. Under the same controllability weights as the
+        consensus, in sigma; zero while nothing weighs.
+        """
+        cells = self._sensing_cells()
+        weights = [self.cell_weight(cell) for cell in cells]
+        total = sum(weights)
+        if total <= 0:
+            return 0.0
+        consensus = self.error
+        spread = sum(
+            w * (self._error[cell] - consensus) ** 2 for w, cell in zip(weights, cells, strict=True)
+        )
+        return math.sqrt(spread / total)
+
     def _record(self) -> None:
         """One history entry per pass, updated as the pass's cells fire.
 
@@ -464,11 +489,14 @@ class AdaptiveHomeostat:
         state = self.controller.snapshot(self._key(layer))
         setpoint = self.cell_setpoint(layer)
         pv = self._pv.get(layer, setpoint)
+        calibrated = self.calibration.layers.get(layer) if self.calibration else None
         return {
             "layer": layer,
             "injects": self._injects(layer),
             "alive": layer in live,
             "weight": self.cell_weight(layer),
+            "resting_sigma": calibrated.sigma if calibrated else None,
+            "gain": calibrated.gain_z if calibrated else None,
             "setpoint": setpoint,
             "process_variable": pv,
             "error": setpoint - pv,
@@ -501,6 +529,7 @@ class AdaptiveHomeostat:
             "process_variable": process_variable,
             "error": self.error,
             "sensed_error": self.sensed_error,
+            "dispersion": self.dispersion,
             "p_term": mean_of("p_term"),
             "i_term": mean_of("i_term"),
             "d_term": mean_of("d_term"),
@@ -559,6 +588,7 @@ class AdaptiveHomeostat:
         self.controller.reset()
         self.alignment_history = deque(maxlen=MAX_HISTORY_LENGTH)
         self.strength_history = deque(maxlen=MAX_HISTORY_LENGTH)
+        self.cell_history = {}
         self._filtered, self._pv, self._error, self._strength = {}, {}, {}, {}
         self._saturated, self._seen = {}, {}
         self._pass = 0
