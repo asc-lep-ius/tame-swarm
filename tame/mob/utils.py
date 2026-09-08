@@ -48,6 +48,32 @@ def mob_layers_by_index(model: nn.Module) -> dict[int, MixtureOfBidders]:
 
 
 @contextmanager
+def frozen_traces(model: nn.Module) -> Iterator[None]:
+    """Run forwards that are not served traffic without writing them into the trace.
+
+    The companion of :func:`frozen_economy`, for the same reason and at the same
+    call sites. A trace records on every non-training forward -- deliberately, so a
+    held-out evaluation still shows how the gate routed it -- but the routing trace
+    is *also* what ``/metrics/coupling`` reports as the served goal's effect on
+    routing. An outcome probe runs its unsteered arm through the same layers, so
+    without this the window a metrics route reads is the arm where steering was
+    off, labelled as the configuration that is served.
+
+    Detaching the trace rather than clearing it afterwards: clearing would throw
+    away the served window the metric exists to report, which is a different way of
+    answering wrongly.
+    """
+    saved = [(mob, mob.routing_trace) for mob in get_mob_layers(model)]
+    for mob, _ in saved:
+        mob.routing_trace = None
+    try:
+        yield
+    finally:
+        for mob, trace in saved:
+            mob.routing_trace = trace
+
+
+@contextmanager
 def frozen_economy(model: nn.Module) -> Iterator[None]:
     """Read the model without paying it, then leave the economy exactly as found.
 

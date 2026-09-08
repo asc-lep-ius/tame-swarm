@@ -40,6 +40,7 @@ from .softmax_router import (
 )
 from .utils import (
     frozen_economy,
+    frozen_traces,
     get_mob_layers,
     get_mob_statistics,
     get_total_calibration_loss,
@@ -81,6 +82,7 @@ __all__ = [
     "mob_at",
     "mob_layers_by_index",
     "frozen_economy",
+    "frozen_traces",
     "update_all_mob_from_loss",
     "get_total_calibration_loss",
     "get_total_router_z_loss",

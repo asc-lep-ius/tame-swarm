@@ -86,6 +86,49 @@ def test_the_window_is_bounded_and_keeps_the_most_recent_tokens():
     assert trace.summary().win_share == [1.0, 1.0, 0.0, 0.0]
 
 
+def test_a_forward_that_wraps_the_ring_keeps_every_column_on_the_same_token():
+    """The columns are split at one token or the alignment stops describing its own routing.
+
+    The branch this covers is unreachable from the other fixtures: a decode step is
+    one token and never wraps, and the wired system's 8-token passes divide the
+    default window exactly, so nothing else in the suite ever writes across the
+    seam. It shipped broken once for that reason.
+    """
+    direction = torch.eye(HIDDEN)[0]
+    trace = RoutingTrace(NUM_EXPERTS, TOP_K, maxlen=10)
+    trace.set_direction(direction)
+    filler = torch.randn(1, 8, HIDDEN)
+    trace.record(torch.full((1, 8, TOP_K), 0.5), torch.zeros(1, 8, TOP_K, dtype=torch.long), filler)
+
+    # Five tokens into a ring with two rows left: rows 8-9 take tokens 0-1 and
+    # rows 0-2 take tokens 2-4, each with its own alignment.
+    hidden = torch.zeros(1, 5, HIDDEN)
+    hidden[0, :, 0] = torch.tensor([1.0, 0.9, 0.6, 0.3, -0.1])
+    hidden[0, :, 1] = 0.1
+    experts = torch.arange(5).view(1, 5, 1).expand(1, 5, TOP_K) % NUM_EXPERTS
+    trace.record(torch.full((1, 5, TOP_K), 0.5), experts.contiguous(), hidden)
+
+    expected = (hidden[0] @ direction) / hidden[0].norm(dim=-1)
+    assert trace._alignment[8:10].tolist() == pytest.approx(expected[:2].tolist())
+    assert trace._alignment[0:3].tolist() == pytest.approx(expected[2:].tolist())
+    assert trace._experts[8:10, 0].tolist() == [0, 1]
+    assert trace._experts[0:3, 0].tolist() == [2, 3, 0]
+
+
+def test_installing_a_direction_drops_rows_recorded_without_one():
+    """Those rows carry no alignment; folding their zeros into the mean would invent one."""
+    trace = RoutingTrace(NUM_EXPERTS, TOP_K, maxlen=64)
+    trace.record(
+        torch.full((1, 8, TOP_K), 0.5),
+        torch.zeros(1, 8, TOP_K, dtype=torch.long),
+        torch.randn(1, 8, HIDDEN),
+    )
+    assert trace.tokens == 8 and trace.summary().goal_alignment_mean is None
+
+    trace.set_direction(torch.eye(HIDDEN)[0])
+    assert trace.tokens == 0
+
+
 def test_the_summary_reduces_the_window_to_the_gate_statistics():
     """``win_share`` sums to ``top_k``: every token buys ``top_k`` slots, not one."""
     trace = RoutingTrace(NUM_EXPERTS, TOP_K, maxlen=256)

@@ -108,12 +108,17 @@ class RoutingTrace:
         """
         if direction is None:
             self._direction = None
+            self.clear()
             return
         flat = direction.detach().reshape(-1).float()
         norm = flat.norm()
         if not bool(torch.isfinite(norm)) or float(norm) == 0.0:
             raise ValueError("goal direction has zero or non-finite norm")
         self._direction = (flat / norm).to(self._alignment.device)
+        # Rows recorded before a direction was installed hold no alignment; keeping
+        # them would fold a zero into the mean and the correlation as though it had
+        # been measured against this direction.
+        self.clear()
 
     def clear(self) -> None:
         self._written = 0
@@ -154,9 +159,14 @@ class RoutingTrace:
         if end <= self.maxlen:
             self._write(slice(start, end), weights, experts, alignment)
         else:
+            # Every column is split at the same token, or the alignment stops
+            # describing the routing it sits beside.
             split = self.maxlen - start
-            self._write(slice(start, self.maxlen), weights[:split], experts[:split], alignment)
-            self._write(slice(0, end - self.maxlen), weights[split:], experts[split:], alignment)
+            head, tail = (
+                (None, None) if alignment is None else (alignment[:split], alignment[split:])
+            )
+            self._write(slice(start, self.maxlen), weights[:split], experts[:split], head)
+            self._write(slice(0, end - self.maxlen), weights[split:], experts[split:], tail)
         self._next = end % self.maxlen
         self._written += count
 
@@ -167,11 +177,11 @@ class RoutingTrace:
         experts: torch.Tensor,
         alignment: torch.Tensor | None,
     ) -> None:
-        self._weights[window] = weights.to(self._weights.dtype)
-        self._experts[window] = experts.to(self._experts.dtype)
+        """Copy one contiguous run. Every argument already holds exactly ``window``'s rows."""
+        self._weights[window] = weights
+        self._experts[window] = experts
         if alignment is not None:
-            span = window.stop - window.start
-            self._alignment[window] = alignment[-span:] if alignment.shape[0] != span else alignment
+            self._alignment[window] = alignment
 
     def _alignment_of(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         """``cos(h, d)`` per token, or ``None`` when no direction is installed.
