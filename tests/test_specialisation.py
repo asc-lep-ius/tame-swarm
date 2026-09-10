@@ -37,6 +37,50 @@ def test_upcycled_experts_start_identical(tiny_mob_config):
 
     assert result.mean_cosine_distance == pytest.approx(0.0, abs=1e-6)
     assert result.mean_relative_l2 == pytest.approx(0.0, abs=1e-6)
+    # Every contribution is the zero vector: identical, not maximally different,
+    # and nothing of the output is the expert's own.
+    assert result.mean_contribution_cosine_distance == pytest.approx(0.0, abs=1e-6)
+    assert result.contribution_norm_ratio == pytest.approx(0.0, abs=1e-6)
+
+
+def test_the_output_distance_is_diluted_by_the_shared_base_and_the_contribution_is_not(
+    tiny_mob_config,
+):
+    """The reading #25 turns on: experts that scale one correction are one function.
+
+    Each expert adds ``c_i x M`` for a shared ``M`` -- the planted-competence
+    fixture's construction. Their *outputs* differ, because a shared base plus
+    differently scaled corrections are not parallel vectors, so the output metric
+    reads nonzero on a tissue with nothing to route between. Their contributions
+    are parallel, and the contribution metric says so.
+    """
+    layer = _layer(tiny_mob_config)
+    generator = torch.Generator().manual_seed(3)
+    shared_a = torch.randn(layer.experts[0].down_adapter_A.weight.shape, generator=generator)
+    shared_b = torch.randn(layer.experts[0].down_adapter_B.weight.shape, generator=generator)
+    with torch.no_grad():
+        for index, expert in enumerate(layer.experts):
+            expert.down_adapter_A.weight.copy_(shared_a)
+            expert.down_adapter_B.weight.copy_(0.05 * (index + 1) * shared_b)
+
+    result = expert_output_divergence(layer, torch.randn(64, tiny_mob_config.hidden_dim))
+
+    assert result.mean_cosine_distance > 1e-3
+    assert result.mean_contribution_cosine_distance == pytest.approx(0.0, abs=1e-5)
+    assert 0.0 < result.contribution_norm_ratio < 1.0
+
+
+def test_contributions_in_different_directions_read_as_different(tiny_mob_config):
+    layer = _layer(tiny_mob_config)
+    with torch.no_grad():
+        for expert in layer.experts:
+            expert.down_adapter_B.weight.normal_(mean=0.0, std=0.5)
+
+    result = expert_output_divergence(layer, torch.randn(64, tiny_mob_config.hidden_dim))
+
+    assert result.mean_contribution_cosine_distance > 0.1
+    assert result.mean_contribution_cosine_distance > result.mean_cosine_distance
+    assert result.max_contribution_cosine_distance >= result.min_contribution_cosine_distance
 
 
 def test_divergence_rises_when_experts_differ(tiny_mob_config):
@@ -139,11 +183,72 @@ def test_probe_reports_every_measure(
     assert set(report.as_metrics()) == {
         "spec/expert_cosine_distance",
         "spec/expert_relative_l2",
+        "spec/expert_contribution_cosine_distance",
+        "spec/expert_contribution_norm_ratio",
         "spec/routing_js_from_corpus",
         "spec/routing_kl_from_uniform",
         "spec/report_decisiveness",
         "spec/probe_tokens",
+        "routing/win_share_e0",
+        "routing/win_share_e1",
+        "routing/win_share_e2",
     }
+    assert report.goal_correlation is None, "no direction was given"
+    assert report.win_share is not None
+    assert sum(report.win_share) == pytest.approx(tiny_mob_config.top_k)
+
+
+def test_the_probe_measures_routing_against_a_goal_direction_where_one_is_given(
+    tiny_causal_lm, tiny_mob_config, fake_tokenizer, held_out_split
+):
+    """#24's offline columns: the served trace's correlation, on a training arm's probe.
+
+    A direction at block 1 only: block 2 records routing and no alignment, so the
+    layer average is block 1's own; the per-expert keys appear for every expert
+    the window could estimate and for no other.
+    """
+    model = apply_mob_to_model(tiny_causal_lm, tiny_mob_config, layers_to_modify=[1, 2])
+    direction = torch.randn(tiny_mob_config.hidden_dim)
+
+    report = probe_specialisation(
+        model,
+        held_out_split,
+        fake_tokenizer,
+        torch.device("cpu"),
+        batch_size=4,
+        probe_tokens=128,
+        divergence_tokens=32,
+        goal_directions={1: direction, 5: direction},
+    )
+
+    assert report is not None and report.goal_correlation is not None
+    assert len(report.goal_correlation) == tiny_mob_config.num_experts
+    metrics = report.as_metrics()
+    for expert, value in enumerate(report.goal_correlation):
+        key = f"routing/goal_correlation_e{expert}"
+        if value is None:
+            assert key not in metrics
+        else:
+            assert metrics[key] == value and -1.0 <= value <= 1.0
+
+
+def test_a_short_window_gives_no_correlation(
+    tiny_causal_lm, tiny_mob_config, fake_tokenizer, held_out_split
+):
+    model = apply_mob_to_model(tiny_causal_lm, tiny_mob_config, layers_to_modify=[1])
+
+    report = probe_specialisation(
+        model,
+        held_out_split,
+        fake_tokenizer,
+        torch.device("cpu"),
+        batch_size=4,
+        probe_tokens=32,
+        divergence_tokens=32,
+        goal_directions={1: torch.randn(tiny_mob_config.hidden_dim)},
+    )
+
+    assert report is not None and report.goal_correlation is None
 
 
 def test_control_arm_is_fully_report_decided(

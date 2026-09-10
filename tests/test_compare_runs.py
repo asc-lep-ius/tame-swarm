@@ -135,3 +135,20 @@ def test_a_summary_without_fingerprints_is_compared_unchecked(caplog):
         assert assert_groups_at_parity(group, _with_fingerprints(group)) is False
 
     assert any("no arm fingerprints" in record.message for record in caplog.records)
+
+
+def test_groups_measured_against_different_goals_are_refused():
+    """#24: the routing columns are a contrast only against one direction."""
+    from compare_runs import assert_same_measured_goal
+
+    group_a = _group("mob", {"routing/win_share_e0": [0.5, 0.6]})
+    group_b = _group("mob", {"routing/win_share_e0": [0.6, 0.7]})
+    group_a["trace_goal"], group_b["trace_goal"] = "truthful", "safe"
+    with pytest.raises(ParityError, match="different goals"):
+        assert_same_measured_goal(group_a, group_b)
+
+    group_b["trace_goal"] = "truthful"
+    assert_same_measured_goal(group_a, group_b)
+    # A summary written before the goal was recorded is compared as before.
+    del group_b["trace_goal"]
+    assert_same_measured_goal(group_a, group_b)

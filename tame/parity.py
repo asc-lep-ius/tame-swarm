@@ -83,6 +83,12 @@ NOT_A_CONFOUND = {
     # hashes the actual token stream an arm trains on -- a field-level check here
     # would be redundant with that hash, not a stronger guarantee than it.
     "shuffle_buffer_size": "subsumed by data_order, which hashes the actual token stream",
+    # (#24) Measurement only: the direction is read off the pristine model before
+    # any FFN is converted, by a diff of means that consumes no randomness and
+    # touches no weight, and it is used only inside the frozen held-out probe.
+    # Which goal two *groups* were measured against is checked by compare_runs.py
+    # on the summaries, because a contrast is only a contrast against one direction.
+    "trace_goal": "measurement only; read off the pristine model, used in the frozen probe",
 }
 
 

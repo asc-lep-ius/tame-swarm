@@ -41,7 +41,17 @@ from typing import Any, cast
 import torch
 
 from evaluation import HeldOutSplit
-from mob import MixtureOfBidders, frozen_economy, get_mob_layers
+from mob import (
+    MIN_TOKENS_FOR_CORRELATION,
+    LightweightExpert,
+    MixtureOfBidders,
+    RoutingTraceSummary,
+    frozen_economy,
+    get_mob_layers,
+    mean_goal_correlation,
+    mob_layers_by_index,
+    pearson_by_expert,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,12 +83,35 @@ WORD_START_MARKERS = ("▁", "Ġ")
 
 @dataclass(frozen=True)
 class DivergenceResult:
-    """How differently the experts of one layer compute, on identical inputs."""
+    """How differently the experts of one layer compute, on identical inputs.
+
+    Two readings of the same forward, and they answer different questions.
+
+    The ``*_cosine_distance`` fields compare each expert's whole **output**. With a
+    shared base that output is the base FFN plus the expert's adapters, so it is
+    diluted by everything the experts have in common: the planted-competence
+    fixture, whose experts scale one identical correction, reads 0.018 here
+    because the correction sits on a shared base, and a real model at 0.00044 may
+    be an undifferentiated tissue or a differentiated one whose adapters are one
+    percent of the stream. It cannot tell those apart.
+
+    The ``*_contribution_*`` fields compare what each expert **adds** to the shared
+    base -- the same quantity the economy prices (#15) and the only thing a routing
+    decision can choose between. Zero here means the cells are interchangeable
+    however the outputs look; on the fixture above it reads 1e-8. This is the
+    number #25's differentiation checkpoint gates on. ``contribution_norm_ratio``
+    is the dilution itself: the contribution norm over the output norm, above one when
+    the adapters oppose the base rather than shade it.
+    """
 
     mean_cosine_distance: float
     mean_relative_l2: float
     min_cosine_distance: float
     max_cosine_distance: float
+    mean_contribution_cosine_distance: float = 0.0
+    min_contribution_cosine_distance: float = 0.0
+    max_contribution_cosine_distance: float = 0.0
+    contribution_norm_ratio: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -94,20 +127,45 @@ class RoutingProfile:
 
 @dataclass(frozen=True)
 class SpecialisationReport:
+    """One arm's held-out probe, reduced.
+
+    ``goal_correlation`` and ``win_share`` are the two columns #24's routing
+    contrast is taken over, measured on this arm's probe tokens against the goal
+    direction the caller supplied (``probe_specialisation(goal_directions=...)``):
+    per expert, the Pearson correlation of a token's alignment with whether the
+    expert won a slot on it, and the expert's share of the slots -- the same two
+    statistics the served trace reports, so ``compare_runs.py`` can difference a
+    coupled arm against an uncoupled one the way the outcome probe differences
+    served against unsteered. ``None`` when no direction reached a probed layer.
+    """
+
     divergence: DivergenceResult
     profile: RoutingProfile
     report_decisiveness: float
     probe_tokens: int
+    goal_correlation: list[float | None] | None = None
+    win_share: list[float] | None = None
 
     def as_metrics(self) -> dict[str, float]:
-        return {
+        """Flat metrics. A per-expert key is absent, not zero, where the value is ``None``."""
+        metrics = {
             "spec/expert_cosine_distance": self.divergence.mean_cosine_distance,
             "spec/expert_relative_l2": self.divergence.mean_relative_l2,
+            "spec/expert_contribution_cosine_distance": (
+                self.divergence.mean_contribution_cosine_distance
+            ),
+            "spec/expert_contribution_norm_ratio": self.divergence.contribution_norm_ratio,
             "spec/routing_js_from_corpus": self.profile.mean_js_from_corpus,
             "spec/routing_kl_from_uniform": self.profile.mean_kl_from_uniform,
             "spec/report_decisiveness": self.report_decisiveness,
             "spec/probe_tokens": float(self.probe_tokens),
         }
+        for expert, value in enumerate(self.goal_correlation or []):
+            if value is not None:
+                metrics[f"routing/goal_correlation_e{expert}"] = value
+        for expert, value in enumerate(self.win_share or []):
+            metrics[f"routing/win_share_e{expert}"] = value
+        return metrics
 
 
 def token_categories(tokenizer: Any, input_ids: torch.Tensor) -> torch.Tensor:
@@ -161,39 +219,68 @@ def expert_output_divergence(
     them. That is the point: a routing-conditioned comparison measures the router,
     and this is meant to measure the experts.
     """
-    outputs = []
+    outputs: list[torch.Tensor] = []
+    contributions: list[torch.Tensor] = []
     with torch.no_grad():
         for expert in mob.experts:
             if mob.use_shared_base:
-                output = expert(
+                # The reference is the shared base alone; the expert's contribution
+                # is what the economy prices, and what routing can choose between.
+                output, reference = cast(LightweightExpert, expert).forward_with_reference(
                     hidden_states, mob.base_gate_proj, mob.base_up_proj, mob.base_down_proj
                 )
+                contributions.append((output - reference).float())
             else:
+                # A full expert shares nothing, so its whole output is its own.
                 output = expert(hidden_states)
+                contributions.append(output.float())
             outputs.append(output.float())
+
+    if len(outputs) < 2:
+        raise ValueError("Expert divergence needs at least two experts")
 
     cosine_distances: list[float] = []
     relative_l2: list[float] = []
+    contribution_distances: list[float] = []
     for i in range(len(outputs)):
         for j in range(i + 1, len(outputs)):
             first, second = outputs[i], outputs[j]
-            cosine = torch.nn.functional.cosine_similarity(first, second, dim=-1, eps=NORM_EPSILON)
-            cosine_distances.append(float((1.0 - cosine).mean().item()))
-
+            cosine_distances.append(_mean_cosine_distance(first, second))
             scale = 0.5 * (first.norm(dim=-1) + second.norm(dim=-1))
             relative_l2.append(
                 float(((first - second).norm(dim=-1) / scale.clamp_min(NORM_EPSILON)).mean().item())
             )
+            contribution_distances.append(_mean_cosine_distance(contributions[i], contributions[j]))
 
-    if not cosine_distances:
-        raise ValueError("Expert divergence needs at least two experts")
+    output_norm = torch.stack([output.norm(dim=-1) for output in outputs]).mean()
+    contribution_norm = torch.stack([added.norm(dim=-1) for added in contributions]).mean()
 
     return DivergenceResult(
         mean_cosine_distance=sum(cosine_distances) / len(cosine_distances),
         mean_relative_l2=sum(relative_l2) / len(relative_l2),
         min_cosine_distance=min(cosine_distances),
         max_cosine_distance=max(cosine_distances),
+        mean_contribution_cosine_distance=sum(contribution_distances) / len(contribution_distances),
+        min_contribution_cosine_distance=min(contribution_distances),
+        max_contribution_cosine_distance=max(contribution_distances),
+        contribution_norm_ratio=float(
+            (contribution_norm / output_norm.clamp_min(NORM_EPSILON)).item()
+        ),
     )
+
+
+def _mean_cosine_distance(first: torch.Tensor, second: torch.Tensor) -> float:
+    """Mean over tokens of ``1 - cos``, with two zero vectors counted as identical.
+
+    ``cosine_similarity`` returns 0 for a pair of zero vectors, which would read as
+    a distance of 1 -- maximally different -- exactly where the experts are most
+    alike: at upcycling every contribution is zero. A zero against a nonzero
+    vector stays at 1, which is the honest reading of one cell doing something
+    and another nothing.
+    """
+    cosine = torch.nn.functional.cosine_similarity(first, second, dim=-1, eps=NORM_EPSILON)
+    both_zero = (first.norm(dim=-1) < NORM_EPSILON) & (second.norm(dim=-1) < NORM_EPSILON)
+    return float(torch.where(both_zero, torch.zeros_like(cosine), 1.0 - cosine).mean().item())
 
 
 def _kl(p: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
@@ -303,15 +390,28 @@ class _ProbeCapture:
     selected_per_layer: list[list[torch.Tensor]]
     confidences_per_layer: list[list[torch.Tensor]]
     hidden_states: dict[int, list[torch.Tensor]]
+    # The goal direction each layer's tokens are aligned against, unit norm, keyed
+    # by ``id(mob)``; a layer no direction reaches records no alignment (#24).
+    directions: dict[int, torch.Tensor]
+    alignment_per_layer: list[list[torch.Tensor]]
+    # The batch in flight: the pre-hook writes each layer's unpadded alignment
+    # here and ``_record_layer_stats`` truncates it to the tokens still wanted.
+    batch_alignment: dict[int, torch.Tensor] = field(default_factory=dict)
     category_chunks: list[torch.Tensor] = field(default_factory=list)
     seen_tokens: int = 0
 
     @classmethod
-    def empty(cls, mob_layers: list[MixtureOfBidders]) -> "_ProbeCapture":
+    def empty(
+        cls,
+        mob_layers: list[MixtureOfBidders],
+        directions: dict[int, torch.Tensor] | None = None,
+    ) -> "_ProbeCapture":
         return cls(
             selected_per_layer=[[] for _ in mob_layers],
             confidences_per_layer=[[] for _ in mob_layers],
             hidden_states={id(mob): [] for mob in mob_layers},
+            directions=dict(directions or {}),
+            alignment_per_layer=[[] for _ in mob_layers],
         )
 
     @property
@@ -323,27 +423,36 @@ class _ProbeCapture:
 
 def _register_divergence_hooks(
     mob_layers: list[MixtureOfBidders],
-    captured: dict[int, list[torch.Tensor]],
+    capture: "_ProbeCapture",
     current_keep: list[torch.Tensor | None],
     divergence_tokens: int,
 ) -> list[Any]:
     """Capture the hidden states entering each MoB layer, minus the padded rows.
 
     A pre-hook sees a hidden-state tensor and nothing else, so the mask for the batch
-    in flight is handed to it through ``current_keep`` rather than rederived.
+    in flight is handed to it through ``current_keep`` rather than rederived. The
+    same stream is what the confidence heads read, so a layer with a goal direction
+    also records each token's alignment with it here -- every unpadded token, not
+    only the divergence prefix, since a correlation needs the whole window.
     """
 
     def make_hook(mob: MixtureOfBidders) -> Callable[..., None]:
         def hook(_module: torch.nn.Module, inputs: tuple[Any, ...]) -> None:
-            store = captured[id(mob)]
-            collected = sum(tensor.shape[0] for tensor in store)
-            if collected >= divergence_tokens:
-                return
             hidden = cast(torch.Tensor, inputs[0]).detach()
             rows = hidden.reshape(-1, hidden.shape[-1])
             keep = current_keep[0]
             if keep is not None:
                 rows = rows[keep]
+            direction = capture.directions.get(id(mob))
+            if direction is not None:
+                stream = rows.float()
+                capture.batch_alignment[id(mob)] = (
+                    (stream @ direction.to(stream.device)) / stream.norm(dim=-1).clamp_min(1e-12)
+                ).cpu()
+            store = capture.hidden_states[id(mob)]
+            collected = sum(tensor.shape[0] for tensor in store)
+            if collected >= divergence_tokens:
+                return
             store.append(rows[: divergence_tokens - collected])
 
         return hook
@@ -375,6 +484,9 @@ def _record_layer_stats(
         confidences = stats.confidences.reshape(-1, stats.confidences.shape[-1])
         capture.selected_per_layer[index].append(selected[keep][:wanted].cpu())
         capture.confidences_per_layer[index].append(confidences[keep][:wanted].cpu())
+        alignment = capture.batch_alignment.pop(id(mob), None)
+        if alignment is not None:
+            capture.alignment_per_layer[index].append(alignment[:wanted])
 
 
 def _collect_probe_data(
@@ -386,13 +498,12 @@ def _collect_probe_data(
     batch_size: int,
     probe_tokens: int,
     divergence_tokens: int,
+    directions: dict[int, torch.Tensor] | None = None,
 ) -> _ProbeCapture:
     """Run the probe split, recording only the positions the attention mask keeps."""
-    capture = _ProbeCapture.empty(mob_layers)
+    capture = _ProbeCapture.empty(mob_layers, directions)
     current_keep: list[torch.Tensor | None] = [None]
-    handles = _register_divergence_hooks(
-        mob_layers, capture.hidden_states, current_keep, divergence_tokens
-    )
+    handles = _register_divergence_hooks(mob_layers, capture, current_keep, divergence_tokens)
 
     was_training = model.training
     model.eval()
@@ -464,7 +575,66 @@ def _reduce_capture(
         profile=_pool_profiles(profiles),
         report_decisiveness=_mean(iter(decisiveness)),
         probe_tokens=capture.seen_tokens,
+        goal_correlation=_goal_correlation(capture, num_experts),
+        win_share=_win_share(capture, num_experts),
     )
+
+
+def _wins(selected: torch.Tensor, num_experts: int) -> torch.Tensor:
+    """``(tokens, num_experts)`` of 0/1: whether each expert held a slot on the token."""
+    wins = torch.zeros(selected.shape[0], num_experts)
+    wins.scatter_(1, selected.long(), 1.0)
+    return wins
+
+
+def _goal_correlation(capture: _ProbeCapture, num_experts: int) -> list[float | None] | None:
+    """The served trace's ``goal_correlation``, per layer over the probe tokens, then averaged.
+
+    Only layers that carried a direction and at least
+    ``MIN_TOKENS_FOR_CORRELATION`` tokens contribute, on the served trace's own
+    rule; the layer average is the served surface's too (``mean_goal_correlation``).
+    """
+    layers: list[RoutingTraceSummary] = []
+    for selected, alignment in zip(
+        capture.selected_per_layer, capture.alignment_per_layer, strict=True
+    ):
+        if not selected or not alignment:
+            continue
+        chosen = torch.cat(selected)
+        aligned = torch.cat(alignment)[: chosen.shape[0]]
+        if aligned.shape[0] < MIN_TOKENS_FOR_CORRELATION:
+            continue
+        correlation = pearson_by_expert(aligned, _wins(chosen[: aligned.shape[0]], num_experts))
+        layers.append(
+            RoutingTraceSummary(
+                tokens=int(aligned.shape[0]),
+                top1_mean=0.0,
+                top1_median=0.0,
+                top1_saturated_fraction=0.0,
+                effective_experts=0.0,
+                win_share=[],
+                goal_alignment_mean=float(aligned.mean()),
+                goal_correlation=correlation,
+            )
+        )
+    return mean_goal_correlation(layers, num_experts)
+
+
+def _win_share(capture: _ProbeCapture, num_experts: int) -> list[float] | None:
+    """Each expert's share of the slots over the probe tokens, averaged over the layers.
+
+    Every slot, not the top-1 winner ``routing_profiles`` counts: this pairs with
+    the served trace's ``win_share`` so the two can be read against each other,
+    and sums to ``top_k`` for the same reason.
+    """
+    shares = [
+        _wins(torch.cat(selected), num_experts).mean(dim=0)
+        for selected in capture.selected_per_layer
+        if selected
+    ]
+    if not shares:
+        return None
+    return torch.stack(shares).mean(dim=0).tolist()
 
 
 def _pool_divergence(divergences: list[DivergenceResult]) -> DivergenceResult:
@@ -473,6 +643,16 @@ def _pool_divergence(divergences: list[DivergenceResult]) -> DivergenceResult:
         mean_relative_l2=_mean(d.mean_relative_l2 for d in divergences),
         min_cosine_distance=min(d.min_cosine_distance for d in divergences),
         max_cosine_distance=max(d.max_cosine_distance for d in divergences),
+        mean_contribution_cosine_distance=_mean(
+            d.mean_contribution_cosine_distance for d in divergences
+        ),
+        min_contribution_cosine_distance=min(
+            d.min_contribution_cosine_distance for d in divergences
+        ),
+        max_contribution_cosine_distance=max(
+            d.max_contribution_cosine_distance for d in divergences
+        ),
+        contribution_norm_ratio=_mean(d.contribution_norm_ratio for d in divergences),
     )
 
 
@@ -496,11 +676,17 @@ def probe_specialisation(
     batch_size: int,
     probe_tokens: int,
     divergence_tokens: int = DIVERGENCE_PROBE_TOKENS,
+    goal_directions: dict[int, torch.Tensor] | None = None,
 ) -> SpecialisationReport | None:
     """Run the held-out probe and reduce it to one report per model.
 
     ``probe_tokens`` counts real tokens: padded positions are excluded from every
     statistic, so the number reported is the number the >=4096 floor is met with.
+
+    ``goal_directions`` maps a block index to the goal direction injected there
+    -- ``homeostat.projected_direction``, never the raw vector -- and turns on the
+    routing columns #24's contrast is taken over. A block that is not a MoB layer
+    is ignored; a MoB layer with no direction records routing and no alignment.
 
     Returns ``None`` for a model with no MoB layers -- the ``dense`` arm has no
     experts to diverge and no gate to profile, which is not a failure.
@@ -509,8 +695,23 @@ def probe_specialisation(
     if not mob_layers:
         return None
 
+    by_index = mob_layers_by_index(model)
+    directions = {
+        id(by_index[layer]): direction.detach().reshape(-1).float()
+        / direction.detach().reshape(-1).float().norm().clamp_min(1e-12)
+        for layer, direction in (goal_directions or {}).items()
+        if layer in by_index
+    }
     capture = _collect_probe_data(
-        model, mob_layers, split, tokenizer, device, batch_size, probe_tokens, divergence_tokens
+        model,
+        mob_layers,
+        split,
+        tokenizer,
+        device,
+        batch_size,
+        probe_tokens,
+        divergence_tokens,
+        directions,
     )
 
     if capture.seen_tokens == 0:
