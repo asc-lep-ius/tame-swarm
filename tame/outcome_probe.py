@@ -33,7 +33,7 @@ this cannot see is not one the surface is claiming to see.
 
 import logging
 import os
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -47,7 +47,8 @@ from contrastive_data import (
 )
 from contrastive_data import load_contrastive_dataset as load_pairs
 from evaluation import HeldOutSplit, evaluate, fingerprint_tokens
-from mob.utils import frozen_economy, frozen_traces
+from mob import RoutingTraceSummary, mean_goal_correlation
+from mob.utils import arm_traces, frozen_economy, frozen_traces
 from models import OutcomeArm, OutcomeMetrics
 from observability import probed_at
 
@@ -106,10 +107,17 @@ def certified_held_out(goal: str, count: int) -> list[ContrastivePair]:
     return held_out[::stride][:count]
 
 
-def _arm(
-    app: TAMEApplication, pairs: list[ContrastivePair], device: torch.device
-) -> tuple[OutcomeArm, list[float | None]]:
-    """One arm's statistics, and its per-pair log-odds so the arms can be paired.
+@dataclass(frozen=True)
+class _ArmRun:
+    """One arm as measured: its statistics, its per-pair log-odds, and its routing."""
+
+    arm: OutcomeArm
+    values: list[float | None]
+    routing: dict[int, RoutingTraceSummary]
+
+
+def _arm(app: TAMEApplication, pairs: list[ContrastivePair], device: torch.device) -> _ArmRun:
+    """One arm's statistics, its per-pair log-odds, and what the gate did on its tokens.
 
     The per-pair values are what make a 20-pair delta honest: paired against the
     same pair in another arm, the between-pair variance -- which is most of the
@@ -117,6 +125,10 @@ def _arm(
     is left is the intervention. Taking a difference of two arms' means would keep
     all of it, and would silently compare different subsets whenever a pair
     tokenises degenerately in one arm and not the other.
+
+    The routing is recorded into the arm's own windows (``arm_traces``): the same
+    tokens and the same goal direction as the served trace, so two arms' summaries
+    differ only in what the intervention did to the gate (#24).
     """
     # Each arm is measured on a fresh loop, so an arm cannot inherit the previous
     # one's integral. The visible cost is that a probe leaves ``/metrics/pid``'s
@@ -124,14 +136,75 @@ def _arm(
     tissue = app.homeostat.homeostat if app.homeostat else None
     if tissue is not None:
         tissue.reset()
-    values = held_out_log_odds(app.model, app.tokenizer, pairs, device)  # pyright: ignore[reportArgumentType] # AutoModelForCausalLM is an nn.Module at runtime
+    with arm_traces(app.model) as traces:  # pyright: ignore[reportArgumentType] # AutoModelForCausalLM is an nn.Module at runtime
+        values = held_out_log_odds(app.model, app.tokenizer, pairs, device)  # pyright: ignore[reportArgumentType] # as above
+        routing = {layer: trace.summary() for layer, trace in traces.items()}
     finite = finite_log_odds(values)
     mean = float(sum(finite) / len(finite))
     accuracy = sum(value > 0 for value in finite) / len(finite)
-    return (
-        OutcomeArm(mean_log_odds=mean, accuracy=accuracy, mean_strength=_mean_strength(app)),
+    return _ArmRun(
+        OutcomeArm(
+            mean_log_odds=mean,
+            accuracy=accuracy,
+            mean_strength=_mean_strength(app),
+            routing_correlation=mean_goal_correlation(routing.values(), app.mob_config.num_experts),
+            trace_tokens=min((summary.tokens for summary in routing.values()), default=0),
+        ),
         values,
+        routing,
     )
+
+
+def routing_correlation_contrast(
+    served: dict[int, RoutingTraceSummary],
+    other: dict[int, RoutingTraceSummary],
+    num_experts: int,
+) -> list[float | None] | None:
+    """Per expert, the served arm's goal-routing correlation minus the other arm's.
+
+    Differenced *per layer* and then averaged over the layers, in that order: each
+    layer's two windows hold the same tokens against the same direction, so the
+    per-layer difference is the intervention's effect at that cell, and the
+    average over cells follows the same rule the single-arm statistic uses.
+    An expert one arm could not estimate at a layer -- it won every token there
+    or none, so nothing varied -- contributes no difference at that layer; an
+    expert no layer could difference stays ``None``, not zero. ``None`` when no
+    layer carried a direction in both arms.
+    """
+    differences: list[RoutingTraceSummary] = []
+    for layer, first in served.items():
+        second = other.get(layer)
+        if second is None or first.goal_correlation is None or second.goal_correlation is None:
+            continue
+        delta = [
+            None if a is None or b is None else a - b
+            for a, b in zip(first.goal_correlation, second.goal_correlation, strict=True)
+        ]
+        differences.append(replace(first, goal_correlation=delta))
+    return mean_goal_correlation(differences, num_experts)
+
+
+def routing_win_share_contrast(
+    served: dict[int, RoutingTraceSummary], other: dict[int, RoutingTraceSummary]
+) -> list[float] | None:
+    """Per expert, the served arm's share of the slots minus the other arm's.
+
+    The shift a constant injection produces and the correlation contrast cannot
+    see: a Pearson correlation is invariant to a shift of the mean, and a cell
+    that now wins every token has no correlation at all, so the strongest possible
+    effect of the goal on routing -- the gate recruiting one set of cells on every
+    token -- reads as ``None`` above. This is that effect, per layer and then
+    averaged over the traced layers, on the same two arms. Always defined where a
+    layer was traced in both arms; ``None`` when none was.
+    """
+    per_layer = [
+        [a - b for a, b in zip(first.win_share, second.win_share, strict=True)]
+        for layer, first in served.items()
+        if (second := other.get(layer)) is not None
+    ]
+    if not per_layer:
+        return None
+    return [sum(column) / len(per_layer) for column in zip(*per_layer, strict=True)]
 
 
 def _paired_delta(
@@ -249,53 +322,61 @@ def probe_outcome(app: TAMEApplication, num_pairs: int = DEFAULT_PROBE_PAIRS) ->
     # The probe's forwards are not served traffic: they must not pay the economy,
     # and they must not enter the routing window ``/metrics/coupling`` reports as
     # the served goal's effect -- the unsteered arm runs through the same layers.
-    with frozen_economy(app.model), frozen_traces(app.model):  # pyright: ignore[reportArgumentType] # as above
-        served, served_values = _arm(app, pairs, device)
-        perplexity_steered = _perplexity(app, device)
+    # Each arm's pairs are recorded into windows of the arm's own (``_arm``), so
+    # the arms can be contrasted; the perplexity spot check is hidden from the
+    # trace outright, since nothing reads how it routed.
+    with frozen_economy(app.model):  # pyright: ignore[reportArgumentType] # as above
+        served = _arm(app, pairs, device)
+        with frozen_traces(app.model):  # pyright: ignore[reportArgumentType] # as above
+            perplexity_steered = _perplexity(app, device)
 
         try:
             homeostat.detach_from_model()
-            unsteered, unsteered_values = _arm(app, pairs, device)
-            perplexity_unsteered = _perplexity(app, device)
+            unsteered = _arm(app, pairs, device)
+            with frozen_traces(app.model):  # pyright: ignore[reportArgumentType] # as above
+                perplexity_unsteered = _perplexity(app, device)
         finally:
             homeostat.attach_to_model(app.model)  # pyright: ignore[reportArgumentType] # as above
 
-        constant: OutcomeArm | None = None
-        constant_values: list[float | None] | None = None
+        constant: _ArmRun | None = None
         if adaptive:
             app.steering_config.adaptive = False
             try:
-                constant, constant_values = _arm(app, pairs, device)
+                constant = _arm(app, pairs, device)
             finally:
                 app.steering_config.adaptive = adaptive
 
     certification = certification_for(goal)
     random_max = certification.random_max if certification else None
     floor_mismatch = _floor_applies(app, certification) if certification else None
-    delta, delta_standard_error = _paired_delta(served_values, unsteered_values)
+    delta, delta_standard_error = _paired_delta(served.values, unsteered.values)
     # #4's value test is where "no significant difference" is the claim, so it is
     # the delta that most needs its error bar beside it.
     constant_delta, constant_error = (
-        _paired_delta(served_values, constant_values)
-        if constant_values is not None
-        else (None, None)
+        _paired_delta(served.values, constant.values) if constant is not None else (None, None)
     )
-    arms = {"served": served, "unsteered": unsteered}
+    arms = {"served": served.arm, "unsteered": unsteered.arm}
     if constant is not None:
-        arms["constant"] = constant
+        arms["constant"] = constant.arm
 
     outcome = OutcomeMetrics(
         goal=goal,
         probed_at=probed_at(),
         num_pairs=sum(
             1
-            for first, second in zip(served_values, unsteered_values, strict=True)
+            for first, second in zip(served.values, unsteered.values, strict=True)
             if first is not None and second is not None
         ),
         arms=arms,
         served_minus_unsteered_log_odds=delta,
         served_minus_unsteered_standard_error=delta_standard_error,
-        served_minus_unsteered_accuracy=served.accuracy - unsteered.accuracy,
+        served_minus_unsteered_accuracy=served.arm.accuracy - unsteered.arm.accuracy,
+        served_minus_unsteered_correlation=routing_correlation_contrast(
+            served.routing, unsteered.routing, app.mob_config.num_experts
+        ),
+        served_minus_unsteered_win_share=routing_win_share_contrast(
+            served.routing, unsteered.routing
+        ),
         adaptive_minus_constant_log_odds=constant_delta,
         adaptive_minus_constant_standard_error=constant_error,
         certified_random_max=random_max,
@@ -312,11 +393,11 @@ def probe_outcome(app: TAMEApplication, num_pairs: int = DEFAULT_PROBE_PAIRS) ->
     logger.info(
         "[OUTCOME] %s: served %.4f, unsteered %.4f, delta %+.4f against random max %s on %d pairs",
         goal,
-        served.mean_log_odds,
-        unsteered.mean_log_odds,
+        served.arm.mean_log_odds,
+        unsteered.arm.mean_log_odds,
         delta,
         f"{random_max:+.4f}" if random_max is not None else "unrecorded",
-        len(finite_log_odds(served_values)),
+        len(finite_log_odds(served.values)),
     )
     app.outcome = outcome
     return outcome

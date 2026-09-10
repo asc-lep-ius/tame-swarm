@@ -25,7 +25,7 @@ import torch
 from app import TAMEApplication
 from contrastive_data import certification_for
 from homeostat import AdaptiveHomeostat
-from mob import MixtureOfBidders, RoutingTraceSummary, mob_layers_by_index
+from mob import MixtureOfBidders, RoutingTraceSummary, mean_goal_correlation, mob_layers_by_index
 from mob.auction import ROUTING_SATURATION_THRESHOLD
 from models import (
     CertifiedEffect,
@@ -222,28 +222,13 @@ def _coupling_mode(layers: list[LayerCouplingStatus]) -> str:
 def _mean_correlation(
     summaries: dict[int, RoutingTraceSummary], num_experts: int
 ) -> list[float | None] | None:
-    """Average each expert's goal-routing correlation over the layers that measured one.
+    """Per-expert goal-routing correlation averaged over the traced layers.
 
-    Averaged rather than pooled: the layers do not see the same distribution of
-    alignments (the injection enters at each actuator's block, so a cell above
-    reads the pushes below it), and pooling would weight whichever layer happened
-    to have the widest spread. The mean is of raw *r* rather than of Fisher-z
-    transforms, which biases it slightly toward zero; at the magnitudes this
-    reports (|r| well under 0.3) the two differ in the third decimal, and raw *r*
-    is the quantity the per-layer rows beside it show.
+    The averaging rule and its reasons live with the trace
+    (:func:`mob.routing_trace.mean_goal_correlation`), because the outcome probe
+    reduces each of its arms the same way before differencing them (#24).
     """
-    measured = [
-        summary.goal_correlation
-        for summary in summaries.values()
-        if summary.goal_correlation is not None
-    ]
-    if not measured:
-        return None
-    averaged: list[float | None] = []
-    for expert in range(num_experts):
-        values = [value for row in measured if (value := row[expert]) is not None]
-        averaged.append(sum(values) / len(values) if values else None)
-    return averaged
+    return mean_goal_correlation(summaries.values(), num_experts)
 
 
 def _correlation_basis(mode: str) -> str:

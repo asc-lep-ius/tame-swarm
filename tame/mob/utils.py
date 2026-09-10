@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from .core import MixtureOfBidders
+from .routing_trace import RoutingTrace
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,32 @@ def frozen_traces(model: nn.Module) -> Iterator[None]:
     finally:
         for mob, trace in saved:
             mob.routing_trace = trace
+
+
+@contextmanager
+def arm_traces(model: nn.Module) -> Iterator[dict[int, RoutingTrace]]:
+    """Record one probe arm's routing into its own windows, keyed by block index (#24).
+
+    Every traced MoB layer gets an empty sibling of its served trace -- same
+    window, same goal direction -- for the duration, and the served trace back on
+    the way out, so the arm's tokens never enter the window ``/metrics/coupling``
+    reports and the served window is not cleared either. Where
+    :func:`frozen_traces` hides forwards from the trace, this *looks* at them: the
+    yielded traces are what the arm did, to be summarised at its end and
+    differenced against the other arm's. An untraced layer stays untraced.
+    """
+    mobs = mob_layers_by_index(model)
+    served = {
+        layer: mob.routing_trace for layer, mob in mobs.items() if mob.routing_trace is not None
+    }
+    arm = {layer: trace.sibling() for layer, trace in served.items()}
+    for layer, trace in arm.items():
+        mobs[layer].routing_trace = trace
+    try:
+        yield arm
+    finally:
+        for layer, trace in served.items():
+            mobs[layer].routing_trace = trace
 
 
 @contextmanager

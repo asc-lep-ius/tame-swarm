@@ -28,6 +28,7 @@ enter it and the training hot path is untouched whether or not a trace is
 installed.
 """
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import torch
@@ -95,6 +96,26 @@ class RoutingTrace:
     def tokens(self) -> int:
         """How many tokens the window holds."""
         return min(self._written, self.maxlen)
+
+    @property
+    def direction(self) -> torch.Tensor | None:
+        """The unit direction alignment is measured against, or ``None``."""
+        return self._direction
+
+    def sibling(self) -> "RoutingTrace":
+        """An empty trace with this one's shape, window and direction, on the same device.
+
+        What an outcome probe's arm records into (#24): the arm's routing has to be
+        measured against the *same* direction as the served window, or its
+        correlation is not the served one's counterpart, and it has to be its own
+        window, or the arm would be read as served traffic.
+        """
+        twin = RoutingTrace(
+            self.num_experts, self.top_k, maxlen=self.maxlen, device=self._alignment.device
+        )
+        if self._direction is not None:
+            twin._direction = self._direction.clone()
+        return twin
 
     def set_direction(self, direction: torch.Tensor | None) -> None:
         """Install the goal direction this layer's tokens are measured against.
@@ -226,24 +247,58 @@ class RoutingTrace:
     def _correlation(
         self, alignment: torch.Tensor, wins: torch.Tensor, tokens: int
     ) -> list[float | None] | None:
-        """Pearson correlation of each expert's win indicator with the token's alignment.
-
-        ``None`` rather than zero when it cannot be estimated: no direction, too
-        short a window, or an expert that won every token or none of them -- a
-        constant column has no correlation, and reporting 0.0 there would read as
-        "the goal does not move this expert" when the truth is "nothing varied".
-        """
+        """Per-expert correlation of wins with alignment; ``None`` without a direction or window."""
         if self._direction is None or tokens < MIN_TOKENS_FOR_CORRELATION:
             return None
-        centred_alignment = alignment - alignment.mean()
-        alignment_norm = centred_alignment.norm()
-        if not bool(torch.isfinite(alignment_norm)) or float(alignment_norm) == 0.0:
-            return None
-        centred_wins = wins - wins.mean(dim=0, keepdim=True)
-        win_norms = centred_wins.norm(dim=0)
-        correlation = torch.where(
-            win_norms > 0,
-            (centred_alignment @ centred_wins) / (alignment_norm * win_norms.clamp_min(1e-12)),
-            torch.full_like(win_norms, float("nan")),
-        )
-        return [None if value != value else float(value) for value in correlation.tolist()]
+        return pearson_by_expert(alignment, wins)
+
+
+def pearson_by_expert(alignment: torch.Tensor, wins: torch.Tensor) -> list[float | None] | None:
+    """Pearson correlation of each expert's win indicator with the token's alignment.
+
+    ``alignment`` is ``(tokens,)`` and ``wins`` is ``(tokens, num_experts)`` of 0/1.
+    ``None`` rather than zero when it cannot be estimated: nothing varied in the
+    alignment, or an expert that won every token or none of them -- a constant
+    column has no correlation, and reporting 0.0 there would read as "the goal
+    does not move this expert" when the truth is "nothing varied". The same
+    arithmetic serves the served trace and the offline specialisation probe, so a
+    training arm's correlation and a served window's are the same statistic.
+    """
+    centred_alignment = alignment.float() - alignment.float().mean()
+    alignment_norm = centred_alignment.norm()
+    if not bool(torch.isfinite(alignment_norm)) or float(alignment_norm) == 0.0:
+        return None
+    centred_wins = wins.float() - wins.float().mean(dim=0, keepdim=True)
+    win_norms = centred_wins.norm(dim=0)
+    correlation = torch.where(
+        win_norms > 0,
+        (centred_alignment @ centred_wins) / (alignment_norm * win_norms.clamp_min(1e-12)),
+        torch.full_like(win_norms, float("nan")),
+    )
+    return [None if value != value else float(value) for value in correlation.tolist()]
+
+
+def mean_goal_correlation(
+    summaries: Iterable[RoutingTraceSummary], num_experts: int
+) -> list[float | None] | None:
+    """Average each expert's goal-routing correlation over the layers that measured one.
+
+    Averaged rather than pooled: the layers do not see the same distribution of
+    alignments (the injection enters at each actuator's block, so a cell above
+    reads the pushes below it), and pooling would weight whichever layer happened
+    to have the widest spread. The mean is of raw *r* rather than of Fisher-z
+    transforms, which biases it slightly toward zero; at the magnitudes this
+    reports (|r| well under 0.3) the two differ in the third decimal, and raw *r*
+    is the quantity the per-layer rows beside it show. An expert no layer could
+    estimate stays ``None``; ``None`` altogether when no layer carried a direction.
+    """
+    measured = [
+        summary.goal_correlation for summary in summaries if summary.goal_correlation is not None
+    ]
+    if not measured:
+        return None
+    averaged: list[float | None] = []
+    for expert in range(num_experts):
+        values = [value for row in measured if (value := row[expert]) is not None]
+        averaged.append(sum(values) / len(values) if values else None)
+    return averaged
