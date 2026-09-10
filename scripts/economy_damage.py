@@ -9,12 +9,15 @@ report a flip the suite does not see.
 Every protocol here takes the config it runs under, because that is the variable
 #16 sweeps. The defaults reproduce the numbers recorded in the expected-failure
 reasons, so a run at ``BASE_CONFIG`` is the baseline the sweep's rows are read
-against.
+against. Each also takes the fixture it damages (``build``): the suite's claims
+are all on the quality fixture, and ``measure_differentiated_economy.py`` runs the
+same protocols on the differentiated one (#25) so the two are the same damage.
 """
 
 from __future__ import annotations
 
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple
 
@@ -32,6 +35,14 @@ from synthetic_economy import (  # noqa: E402
 
 from mob import MoBConfig  # noqa: E402
 from mob.auction import AuctionOutcome  # noqa: E402
+
+# How a protocol builds the economy it damages: ``(competence, seed, config)``.
+Build = Callable[[torch.Tensor, int, MoBConfig], SyntheticEconomy]
+
+
+def quality_fixture(competence: torch.Tensor, seed: int, config: MoBConfig) -> SyntheticEconomy:
+    return SyntheticEconomy(competence, seed=seed, config=config)
+
 
 STEADY_STEPS = 200
 WINDOW = 50
@@ -66,22 +77,29 @@ def window(economy: SyntheticEconomy, steps: int) -> tuple[float, torch.Tensor]:
 
 
 def steady(
-    competence: torch.Tensor, seed: int, config: MoBConfig = BASE_CONFIG
+    competence: torch.Tensor,
+    seed: int,
+    config: MoBConfig = BASE_CONFIG,
+    build: Build = quality_fixture,
 ) -> tuple[SyntheticEconomy, float]:
     """An economy run to its steady state, and the loss it settled at."""
-    economy = SyntheticEconomy(competence, seed=seed, config=config)
+    economy = build(competence, seed, config)
     window(economy, STEADY_STEPS - WINDOW)
     loss, _ = window(economy, WINDOW)
     return economy, loss
 
 
 def floor_without(
-    competence: torch.Tensor, expert: int, seed: int, config: MoBConfig = BASE_CONFIG
+    competence: torch.Tensor,
+    expert: int,
+    seed: int,
+    config: MoBConfig = BASE_CONFIG,
+    build: Build = quality_fixture,
 ) -> float:
     """The loss a collective born without ``expert`` settles at: the re-formation target."""
     born_without = competence.clone()
     born_without[expert] = 0.0
-    return steady(born_without, seed, config)[1]
+    return steady(born_without, seed, config, build)[1]
 
 
 def survivors_track_competence(share: torch.Tensor, competence: torch.Tensor, dead: int) -> float:
@@ -158,12 +176,14 @@ class Release(NamedTuple):
     post_loss: float
 
 
-def release_and_measure(seed: int, episode: int, config: MoBConfig = BASE_CONFIG) -> Release:
+def release_and_measure(
+    seed: int, episode: int, config: MoBConfig = BASE_CONFIG, build: Build = quality_fixture
+) -> Release:
     """``(loss / steady loss, routing-competence correlation, best share / its steady share)``."""
     competence = shuffled(DEFAULT_COMPETENCE, seed)
     best = int(competence.argmax())
     least_competent = competence.argsort()[:3].tolist()
-    economy = SyntheticEconomy(competence, seed=seed, config=config)
+    economy = build(competence, seed, config)
     window(economy, STEADY_STEPS - WINDOW)
     steady_loss, steady_share = window(economy, WINDOW)
 
@@ -180,7 +200,9 @@ def release_and_measure(seed: int, episode: int, config: MoBConfig = BASE_CONFIG
     )
 
 
-def ruin_and_measure(seed: int, config: MoBConfig = BASE_CONFIG) -> tuple[float, float, float]:
+def ruin_and_measure(
+    seed: int, config: MoBConfig = BASE_CONFIG, build: Build = quality_fixture
+) -> tuple[float, float, float]:
     """``(best expert's win share, its wealth, the median wealth)`` after it is ruined.
 
     The two quantities ``test_a_ruined_competent_expert_returns_to_the_market``
@@ -188,7 +210,7 @@ def ruin_and_measure(seed: int, config: MoBConfig = BASE_CONFIG) -> tuple[float,
     """
     competence = shuffled(DEFAULT_COMPETENCE, seed)
     best = int(competence.argmax())
-    economy, _ = steady(competence, seed, config)
+    economy, _ = steady(competence, seed, config, build)
 
     ruin(economy, best)
     window(economy, DAMAGE_HORIZON - WINDOW)

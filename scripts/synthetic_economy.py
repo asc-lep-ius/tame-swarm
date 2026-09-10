@@ -22,6 +22,15 @@ heads cannot predict from the input, so an expert realises negative value on som
 of the tokens it holds. That is the fixture on which a report trained onto the mean
 of realised value and one trained onto its positive part *differ* -- the
 acceptance criterion for unbiased reports.
+
+That fixture is a **quality** fixture and not a **specialisation** one (#25): every
+expert scales the *same* correction, so competence is token-independent, every
+token wants the same ``top_k`` experts, and the experts' contributions are
+parallel -- their contribution cosine distance is 0 to float precision, whatever
+their wealth. :class:`DifferentiatedEconomy` is the fixture one substrate down
+from the real model's differentiation question: experts of different *types* carry
+orthogonal corrections, each token calls for one type and says so in its input,
+and competence is what an expert is worth on the tokens that call for its type.
 """
 
 from __future__ import annotations
@@ -142,6 +151,25 @@ class RunSummary:
         return pearson(self.wealth, torch.arange(self.wealth.numel()))
 
 
+# The differentiated fixture: how many correction directions the experts are
+# planted along, and how loudly a token's input says which one it calls for.
+# Four types over eight experts puts two experts on every type, so the quality
+# question (does the economy rank the two by competence?) is still asked inside
+# every type while the specialisation question is asked across them.
+DEFAULT_NUM_TYPES = 4
+# Amplitude of the type signal in the input, against unit-variance noise: how
+# legibly the field says what it calls for. A linear confidence head has to read
+# the type off the input before it can report per token, and the legibility
+# decides what the economy does with competence: at 2.0 the gate reaches half of
+# the on-type slots and in two seeds of three a type's *most competent* expert is
+# ruined -- it costs the most off-type, and it is shut out before its head has
+# learned to abstain; at 4.0 no type inverts and the market tracks competence
+# (r 0.6-0.75); at 8.0 every expert is in use and the loss sits at the oracle's
+# (``scripts/measure_differentiated_economy.py --legibility``). The default is
+# the middle regime: legible enough to rank, with the optimum still unreached.
+DEFAULT_TYPE_SIGNAL = 4.0
+
+
 class SyntheticEconomy:
     """One MoB layer with planted competence, driven step by step."""
 
@@ -202,10 +230,12 @@ class SyntheticEconomy:
         with torch.no_grad():
             base_out, base_hidden = self._base(x)
             correction = base_hidden @ self._correction.T
-            positive = torch.rand(self.batch_size, self.seq_len, generator=self.generator)
-            sign = torch.where(positive < self.positive_fraction, 1.0, -1.0).unsqueeze(-1)
-            target = base_out + sign * correction
+            target = base_out + self._sign() * correction
         return x, target
+
+    def _sign(self) -> torch.Tensor:
+        positive = torch.rand(self.batch_size, self.seq_len, generator=self.generator)
+        return torch.where(positive < self.positive_fraction, 1.0, -1.0).unsqueeze(-1)
 
     def exact_values(
         self, x: torch.Tensor, output: torch.Tensor, target: torch.Tensor, selected: torch.Tensor
@@ -299,3 +329,165 @@ class SyntheticEconomy:
             final_price=final["price"] / window,
             final_surplus=final["surplus"] / window,
         )
+
+
+class DifferentiatedEconomy(SyntheticEconomy):
+    """Planted competence that is token-dependent, on a body whose cells differ (#25).
+
+    Each expert ``i`` carries a *type* ``t(i)`` and a scalar competence ``c_i``. The
+    types have mutually orthogonal rank-``r`` correction directions ``M_t`` (one
+    orthonormal block each of a QR factor), and every expert's down adapter is
+    ``c_i x M_{t(i)} @ A`` with the same shared ``A``. Each token draws a type ``t``
+    uniformly, announces it in its input as ``type_signal x e_t`` on an orthonormal
+    input direction the confidence heads can read, and its target is the base
+    output plus the signed *type-t* correction. So expert ``i`` closes a fraction
+    ``c_i`` of the gap on the tokens that call for its type and *adds* error on
+    every other token: competence here is competence at something, and the value
+    of a slot depends on what the token in front of the cell calls for.
+
+    **The loss identity, re-derived.** With ``top_k = k`` winners ``W`` at uniform
+    share and orthonormal ``M_t``, the per-token squared error on a type-``t``
+    token is::
+
+        |T|^2 x [ (1 - (1/k) sum_{i in W, t(i) = t} c_i)^2
+                  + sum_{t' != t} ((1/k) sum_{i in W, t(i) = t'} c_i)^2 ]
+
+    where ``|T|^2 = |A h|^2`` is the size of the correction the token calls for.
+    The first term is the quality fixture's identity restricted to the on-type
+    winners; the second is new -- an off-type winner's contribution is orthogonal
+    to what the token wants, so it *costs* ``(c/k)^2 |T|^2``, more for a more
+    competent expert. The efficient allocation is therefore both slots to the
+    token's own type (two experts at 0.9 and 0.1 on-type read ``0.25 |T|^2``
+    against ``0.305 |T|^2`` for the 0.9 on-type beside a 0.1 off-type), so across a
+    corpus every type's experts are used, ranked within the type by competence,
+    while each token still routes ``top_k``. That is what the quality fixture
+    could not express, and it is why every baseline measured on it -- #15's
+    correlations, #6's recovery claims, #16's tables -- is a different number here
+    and is *not* re-measured in the suite: ``scripts/measure_differentiated_economy.py``
+    is where this fixture's numbers are read.
+
+    The expert types are shuffled away from index like the competence, and the
+    two are shuffled independently, so neither the type nor the competence can be
+    read off the initialisation's index-monotone bias.
+    """
+
+    def __init__(
+        self,
+        competence: torch.Tensor,
+        seed: int,
+        config: MoBConfig = BASE_CONFIG,
+        batch_size: int = 2,
+        seq_len: int = 16,
+        positive_fraction: float = 1.0,
+        head_learning_rate: float = 1e-2,
+        num_types: int = DEFAULT_NUM_TYPES,
+        type_signal: float = DEFAULT_TYPE_SIGNAL,
+    ):
+        if not 1 <= num_types <= competence.numel():
+            raise ValueError(f"num_types must lie in [1, {competence.numel()}], got {num_types}")
+        if num_types * config.adapter_rank > config.hidden_dim:
+            raise ValueError(
+                f"{num_types} orthogonal rank-{config.adapter_rank} corrections need a hidden "
+                f"dimension of at least {num_types * config.adapter_rank}, got {config.hidden_dim}"
+            )
+        self.num_types = num_types
+        self.type_signal = type_signal
+        # Assigned before the base class plants, since ``_plant`` reads them. The
+        # expert types cycle through the type set and are then shuffled with a
+        # generator of their own, so the assignment is fixed by the seed alone.
+        type_generator = torch.Generator().manual_seed(seed + 7919)
+        cycle = torch.arange(competence.numel()) % num_types
+        self.expert_types = cycle[torch.randperm(competence.numel(), generator=type_generator)]
+        self.last_types: torch.Tensor | None = None
+        super().__init__(
+            competence,
+            seed,
+            config=config,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            positive_fraction=positive_fraction,
+            head_learning_rate=head_learning_rate,
+        )
+
+    def _plant(self, competence: torch.Tensor) -> None:
+        config = self.config
+        rank = config.adapter_rank
+        shared_a = torch.randn(rank, config.intermediate_dim) / math.sqrt(config.intermediate_dim)
+        # One orthonormal block of ``rank`` columns per type. Orthonormal columns
+        # have unit norm, which is the quality fixture's correction scale to within
+        # a percent (``CORRECTION_STD x sqrt(hidden_dim / rank)``), so prices and
+        # rewards here are on the same scale the constants were derived on.
+        basis = torch.linalg.qr(torch.randn(config.hidden_dim, self.num_types * rank))[0]
+        self.type_corrections = torch.stack(
+            [basis[:, t * rank : (t + 1) * rank] for t in range(self.num_types)]
+        )
+        # The input direction that announces each type, orthonormal so the types
+        # are equally legible and none is louder than another.
+        self.type_inputs = torch.linalg.qr(torch.randn(config.hidden_dim, self.num_types))[0].T
+        scaling = cast(LightweightExpert, self.mob.experts[0]).scaling
+        with torch.no_grad():
+            for expert_competence, expert_type, module in zip(
+                competence.tolist(), self.expert_types.tolist(), self.mob.experts, strict=True
+            ):
+                expert = cast(LightweightExpert, module)
+                expert.gate_adapter_B.weight.zero_()
+                expert.up_adapter_B.weight.zero_()
+                expert.down_adapter_A.weight.copy_(shared_a)
+                expert.down_adapter_B.weight.copy_(
+                    expert_competence * self.type_corrections[expert_type]
+                )
+        # (types, hidden, intermediate): what a type-t token's target adds to the base.
+        self._corrections = self.type_corrections @ shared_a * scaling
+        self._correction = self._corrections[0]
+
+    def _draw(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """An input that announces its type, and the target that type calls for."""
+        types = torch.randint(
+            0, self.num_types, (self.batch_size, self.seq_len), generator=self.generator
+        )
+        x = torch.randn(
+            self.batch_size, self.seq_len, self.config.hidden_dim, generator=self.generator
+        )
+        x = x + self.type_signal * self.type_inputs[types]
+        with torch.no_grad():
+            base_out, base_hidden = self._base(x)
+            # Each token's correction along its own type's directions.
+            correction = torch.einsum("bsi,bshi->bsh", base_hidden, self._corrections[types])
+            target = base_out + self._sign() * correction
+        self.last_types = types
+        return x, target
+
+    def on_type_share(self, selected: torch.Tensor) -> float:
+        """The fraction of slots held by an expert of the token's own type.
+
+        The specialisation reading the quality fixture cannot give: chance is the
+        share of experts carrying each type, and the efficient allocation is 1.
+        """
+        assert self.last_types is not None
+        winner_types = self.expert_types[selected]
+        return float((winner_types == self.last_types.unsqueeze(-1)).float().mean())
+
+    def closed_form_loss(
+        self, x: torch.Tensor, target: torch.Tensor, selected: torch.Tensor
+    ) -> torch.Tensor:
+        """The per-token loss the identity in the class docstring predicts for ``selected``.
+
+        Exact for the fixture as built with ``positive_fraction = 1`` -- the
+        identity is written for the unflipped correction -- and what the test of
+        the identity compares the realised loss against.
+        """
+        assert self.last_types is not None
+        if self.positive_fraction != 1.0:
+            raise ValueError("the closed form is derived for positive_fraction = 1.0")
+        k = self.config.top_k
+        with torch.no_grad():
+            base_out, _ = self._base(x)
+            gap = (target - base_out).norm(dim=-1) ** 2
+            competence = self.competence[selected] / k
+            same = self.expert_types[selected] == self.last_types.unsqueeze(-1)
+            on_type = (competence * same).sum(-1)
+            off_type = torch.zeros_like(on_type)
+            for expert_type in range(self.num_types):
+                held = (self.expert_types[selected] == expert_type) & ~same
+                off_type = off_type + (competence * held).sum(-1) ** 2
+            return gap * ((1.0 - on_type) ** 2 + off_type)

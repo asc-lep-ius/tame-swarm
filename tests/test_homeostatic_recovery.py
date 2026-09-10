@@ -436,7 +436,12 @@ def test_the_market_re_forms_after_routing_was_forced_onto_the_least_competent(s
         "not exclude: a head is trained only on the value its own expert realises, so 150 "
         "steps of holding no tokens leaves it with a stale report, and the uniform 2% "
         "exploration slot re-samples it no faster for having been starved longer. Waits on "
-        "the count-based exploration in #26."
+        "the count-based exploration in #26. #25 ran the same episode on the differentiated "
+        "fixture, where the forced experts lose on three quarters of the tokens they are "
+        "handed, and it re-forms on all three seeds (loss ratio 0.96-1.02, tracking +0.58 to "
+        "+0.78): this failure needs the forced experts to profit from the forcing, which only "
+        "token-independent competence gives them. Kept on the quality fixture by name "
+        "(scripts/measure_differentiated_economy.py --recovery)."
     ),
 )
 def test_the_market_re_forms_after_a_long_forced_episode():
@@ -527,7 +532,9 @@ def ruined():
         "short of the 0.125 chance threshold. No band in the swept grid clears it; the one "
         "that appears to is flat, where the protocol is degenerate rather than recovered -- "
         "the clamp restores the zeroed wealth before anything reads it, so the damage never "
-        "happens. Waits on the count-based exploration in #26."
+        "happens. Waits on the count-based exploration in #26. Fails on the differentiated "
+        "fixture too (#25: share 0.0031, wealth 46 against a median of 326), so unlike the "
+        "long forced episode this one does not depend on the substrate."
     ),
 )
 def test_a_ruined_competent_expert_returns_to_the_market(ruined):
