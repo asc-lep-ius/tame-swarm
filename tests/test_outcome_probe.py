@@ -417,7 +417,8 @@ def test_the_contrast_reads_the_injection_recruiting_the_experts_that_lean_with_
     establishes, here as a served-minus-unsteered difference. Measured over three
     seeds: aligned experts gain 0.09-0.31 of the slots, the opposed one loses
     0.22-0.41, and the correlation contrast moves by up to 0.15-0.28 for some
-    expert. Halving the strength halves the shifts, so this is dose, not noise.
+    expert. The shifts fall with the strength (-0.38, -0.24, -0.07 for the opposed
+    expert at 0.03, 0.01 and 0.003), so this is dose, not noise.
     """
     tame, system = _probe_app(coupled=True, seed=seed, base_strength=CONTRAST_STRENGTH)
     _lean_heads_along_the_goal(system)
