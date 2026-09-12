@@ -85,7 +85,6 @@ except ImportError:
     HAS_ACCELERATE = False
     logger.warning("'accelerate' library not installed. Model re-dispatch disabled.")
 
-from app import ADAPTIVE_STEERING
 from config import get_active_profile
 from contrastive_data import certification_for
 from coupling import (
@@ -124,7 +123,7 @@ from mob import (
 from mob.experts import CONFIDENCE_INITIAL_LOGIT, ConfidenceHead
 from parity import ArmFingerprint, data_order_fingerprint, fingerprint_arm
 from specialisation import SpecialisationReport, probe_specialisation
-from steering import SteeringConfig
+from steering import ADAPTIVE_STEERING, SteeringConfig
 from steering_pipeline import (
     SteeringExtraction,
     certified_coupling_layers,
@@ -807,11 +806,16 @@ class TAMETrainer:
                 f"the field injects at strength {strength}, not the certified "
                 f"{certification.strength}"
             )
-        if self._field.config.adaptive != ADAPTIVE_STEERING:
+        if self._field.config.adaptive:
+            # Training attaches no calibration (see _attach_field), so an adaptive
+            # loop here would be #4's uncalibrated regime; and the recompute-time
+            # safety under gradient checkpointing holds for the constant loop only.
             raise RuntimeError(
-                f"the field's loop is {'adaptive' if self._field.config.adaptive else 'constant'}; "
-                f"the server's is {'adaptive' if ADAPTIVE_STEERING else 'constant'}"
+                "the field's loop is adaptive; training injects the constant, and would "
+                "need the tissue calibrated before an adaptive loop could be served into it"
             )
+        if self._field.config.adaptive != ADAPTIVE_STEERING:
+            raise RuntimeError("the field's loop is constant; the server's is adaptive")
         # A converted layer above an injecting one reads the offset in the residual
         # stream; one below reads nothing. The coupling refuses to seed nothing
         # (_seed_coupling); the field has to refuse the same way, or the run trains

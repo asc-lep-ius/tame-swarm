@@ -545,7 +545,7 @@ def test_a_field_that_is_not_the_served_injection_is_refused(smoke_fixture, tmp_
     field.config.base_strength = 1.0
 
     field.config.adaptive = True
-    with pytest.raises(RuntimeError, match="loop is adaptive; the server's is constant"):
+    with pytest.raises(RuntimeError, match="loop is adaptive; training injects the constant"):
         trainer._assert_field_as_served()
     field.config.adaptive = False
 
@@ -588,8 +588,12 @@ def test_the_field_reaches_the_gradient_under_gradient_checkpointing(
     trainer.optimizer.zero_grad()
     field.detach_from_model()
     out_of_field = trainer.train_step(batch)["loss"]
+    trainer.optimizer.zero_grad()
+    field.attach_to_model(trainer.model)
+    again = trainer.train_step(batch)["loss"]
 
     assert in_field != pytest.approx(out_of_field, abs=1e-6)
+    assert again == in_field, "the control: only the field differs between the calls"
 
 
 def test_the_field_the_coupling_and_the_probe_share_one_direction(

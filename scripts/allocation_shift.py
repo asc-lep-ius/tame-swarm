@@ -63,7 +63,7 @@ def total_variation(result_a: dict[str, float], result_b: dict[str, float]) -> f
     """
     shares_a, shares_b = win_shares(result_a), win_shares(result_b)
     if not shares_a or not shares_b:
-        raise ValueError("no win-share column is shared by the two runs")
+        raise ValueError("a run reports no win-share column")
     if set(shares_a) != set(shares_b):
         raise ValueError(
             f"the two runs report different experts: {sorted(set(shares_a) ^ set(shares_b))}"
@@ -113,10 +113,15 @@ def assert_identical_fingerprints(group_a: dict[str, Any], group_b: dict[str, An
     prints_a, prints_b = group_a.get("fingerprints") or {}, group_b.get("fingerprints") or {}
     if not prints_a or not prints_b:
         raise ValueError("a floor pair needs the arm fingerprints run_seeds.py records")
-    for seed in sorted(set(prints_a) & set(prints_b), key=str):
+    shared = sorted(set(prints_a) & set(prints_b), key=str)
+    if not shared:
+        raise ValueError("the floor pair shares no seed")
+    for seed in shared:
         if prints_a[seed] != prints_b[seed]:
             differing = sorted(
-                k for k in prints_a[seed] if prints_a[seed][k] != prints_b[seed].get(k)
+                key
+                for key in set(prints_a[seed]) | set(prints_b[seed])
+                if prints_a[seed].get(key) != prints_b[seed].get(key)
             )
             raise ValueError(
                 f"the floor pair is not a replication: seed {seed} differs on {differing}"
@@ -134,10 +139,9 @@ def format_report(
         per_seed = "  ".join(f"s{s}={v:.3f}" for s, v in shifts.items())
         return f"{label:<24}{mean:>8.3f}  [{low:.3f}, {high:.3f}]   {per_seed}"
 
+    pairs = len(contrast) if floor is None else len(excess_over_floor(contrast, floor))
     interval = (
-        f"{CONFIDENCE:.0%} bootstrap"
-        if len(contrast) >= MIN_PAIRS_FOR_COVERAGE
-        else "resampled-mean range"
+        f"{CONFIDENCE:.0%} bootstrap" if pairs >= MIN_PAIRS_FOR_COVERAGE else "resampled-mean range"
     )
     lines = [
         f"{'allocation shift (TV)':<24}{'mean':>8}  {interval:<22}per seed",
@@ -151,11 +155,10 @@ def format_report(
             "\nexcess is TV(contrast) - TV(floor), paired by seed; a range that includes "
             "zero reads 'moved no further than re-running does'."
         )
-    footer = f"({resamples} resamples over {len(contrast)} paired seeds; #35 owns the form"
-    if len(contrast) < MIN_PAIRS_FOR_COVERAGE:
+    footer = f"({resamples} resamples over {pairs} paired seeds; #35 owns the form"
+    if pairs < MIN_PAIRS_FOR_COVERAGE:
         footer += (
-            f"; at n={len(contrast)} the percentile interval is the sample range and has "
-            "no 95% coverage"
+            f"; at n={pairs} the percentile interval is the sample range and has no 95% coverage"
         )
     lines.append(footer + ")")
     return "\n".join(lines)

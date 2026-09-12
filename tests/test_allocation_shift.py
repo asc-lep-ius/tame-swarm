@@ -32,7 +32,7 @@ def test_total_variation_is_half_the_l1_distance_over_the_shared_experts():
 
 
 def test_a_run_without_win_shares_cannot_be_compared():
-    with pytest.raises(ValueError, match="no win-share column"):
+    with pytest.raises(ValueError, match="reports no win-share column"):
         total_variation({"eval/loss": 1.0}, _run(0.5, 0.5))
 
 
@@ -88,3 +88,8 @@ def test_a_floor_pair_must_be_a_replication():
         assert_identical_fingerprints(same, other)
     with pytest.raises(ValueError, match="needs the arm fingerprints"):
         assert_identical_fingerprints({}, same)
+    with pytest.raises(ValueError, match="shares no seed"):
+        assert_identical_fingerprints(same, {"fingerprints": {"7": prints["0"]}})
+    extra = {"fingerprints": {**prints, "0": {**prints["0"], "extra": 1}}}
+    with pytest.raises(ValueError, match=r"differs on \['extra'\]"):
+        assert_identical_fingerprints(same, extra)

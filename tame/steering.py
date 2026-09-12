@@ -20,6 +20,16 @@ MAX_CAPABILITY_TOKENS = 4096
 # a direction the projection was supposed to remove.
 MIN_RETAINED_NORM_FRACTION = 0.05
 
+# Whether the served tissue adapts the strength or holds the certified constant.
+# #4's value test (``scripts/characterise_plant.py``, adaptive vs constant on 100
+# held-out letter choices after a generated rationale) found no significant
+# difference (-0.18 +/- 0.29 log-odds; accuracy 0.71 -> 0.69), so the loop ships
+# calibrated and switchable (``PUT /steering/gains`` with ``adaptive``) but off by
+# default: the served system is exactly the constant-strength configuration the
+# gate certified. Lives here rather than in ``app`` because the trainer injects
+# the served configuration too (#28) and must not import the serving module.
+ADAPTIVE_STEERING = False
+
 
 @dataclass
 class SteeringConfig:
