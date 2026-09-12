@@ -16,7 +16,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 from smoke_fixture import build_smoke_fixture  # noqa: E402
 
-from mob import get_mob_layers  # noqa: E402
+from mob import get_mob_layers, mob_layers_by_index  # noqa: E402
+from mob.utils import owned_state  # noqa: E402
 from train import TAMETrainer, TrainingConfig  # noqa: E402
 
 
@@ -630,6 +631,68 @@ def test_an_uncertified_coupling_is_refused_at_construction(overrides, match):
     """The boundary, not minutes into a run with the model loaded."""
     with pytest.raises(ValueError, match=match):
         TrainingConfig(**overrides)
+
+
+# --- A checkpoint restores the arm it trained (#29) ---------------------------
+
+
+def test_a_lora_checkpoint_restores_the_experts_heads_and_coupling_it_trained(
+    smoke_fixture, tmp_path, monkeypatch
+):
+    """The round trip the issue asks for: save a PEFT-wrapped, trained MoB arm, rebuild, restore.
+
+    Every expert, head and coupling tensor comes back equal, the ledgers and the
+    LoRA attention adapters with them, and the held-out probe on the restored
+    body reproduces the pre-save report. Before #29 the checkpoint held the LoRA
+    adapters and the ledgers only.
+    """
+    from dataclasses import replace
+
+    from train import restore_checkpoint
+
+    model_id, _ = smoke_fixture
+    _certify_smoke_goal(monkeypatch, model_id, layers=(2, 3))
+    config = _config(
+        smoke_fixture,
+        tmp_path / "trained",
+        use_lora=True,
+        coupling_goal="smoke",
+        coupling_warmup_steps=1,
+        max_steps=3,
+        checkpoint_min_free_gb=0,
+    )
+    trainer = TAMETrainer(config)
+    trainer.setup()
+    trainer.train()
+    before = trainer.eval_history[-1]
+    checkpoint = Path(config.output_dir) / f"checkpoint-{config.max_steps}"
+    trained = {index: owned_state(mob) for index, mob in mob_layers_by_index(trainer.model).items()}
+    assert any(
+        bool((tensor != 0).any())
+        for state in trained.values()
+        for name, tensor in state.items()
+        if "adapter_B" in name
+    ), "training must have moved an expert, or the round trip is vacuous"
+    ledgers = {
+        index: mob.expert_wealth.clone()
+        for index, mob in mob_layers_by_index(trainer.model).items()
+    }
+
+    fresh = TAMETrainer(replace(config, output_dir=str(tmp_path / "restored")))
+    fresh.setup()
+    assert fresh.evaluate_held_out(0)["eval/loss"] != pytest.approx(before["eval/loss"], abs=1e-6)
+
+    restore_checkpoint(fresh.model, checkpoint)
+
+    for index, state in trained.items():
+        restored = owned_state(mob_layers_by_index(fresh.model)[index])
+        for name, tensor in state.items():
+            assert torch.equal(restored[name], tensor), f"block {index}: {name}"
+        assert torch.equal(mob_layers_by_index(fresh.model)[index].expert_wealth, ledgers[index])
+    after = fresh.evaluate_held_out(config.max_steps)
+    for key, value in before.items():
+        if key != "step":
+            assert after[key] == pytest.approx(value, abs=1e-6), key
 
 
 # --- The model that trains is the model that was loaded (#19) ---------------

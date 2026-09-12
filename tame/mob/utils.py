@@ -2,11 +2,21 @@ import logging
 import re
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import asdict
+from pathlib import Path
+from typing import cast
 
 import torch
 import torch.nn as nn
 
-from .core import MixtureOfBidders
+try:
+    from ..coupling import SteeringCoupling, SteeringCouplingConfig
+except ImportError:
+    if __package__ != "mob":
+        raise
+    from coupling import SteeringCoupling, SteeringCouplingConfig
+
+from .core import MixtureOfBidders, ledger_initial_values
 from .routing_trace import RoutingTrace
 
 logger = logging.getLogger(__name__)
@@ -508,3 +518,105 @@ def save_mob_state(model: nn.Module, save_path: str) -> bool:
 
     torch.save(mob_state, save_path)
     return True
+
+
+# --- the trained MoB modules (#29) ---------------------------------------------------
+
+# What a checkpoint directory calls the file holding the trained MoB modules,
+# beside ``mob_state.pt`` (the ledgers) and the base model or its LoRA adapters.
+MOB_MODULES_FILENAME = "mob_modules.pt"
+# The MoB layer's parameters that are the pretrained FFN it was upcycled from:
+# saved with the base model, not here.
+SHARED_BASE_PREFIX = "base_"
+
+
+def owned_state(mob: MixtureOfBidders) -> dict[str, torch.Tensor]:
+    """Everything training can move in a MoB layer, plus the coupling's buffers.
+
+    The complement of the two things saved elsewhere: the shared-base FFN
+    (``base_*``, the pretrained weights) and the ledgers (``mob_state.pt``). The
+    experts' adapters, the confidence heads, the gate's parameters if it has any,
+    and a coupling's receptor, direction and step -- the same set the LoRA path
+    marks trainable, which is exactly what a ``--use_lora`` checkpoint used to
+    omit.
+    """
+    ledgers = set(ledger_initial_values(mob.config))
+    return {
+        name: tensor.detach().cpu().clone()
+        for name, tensor in mob.state_dict().items()
+        if not name.startswith(SHARED_BASE_PREFIX) and name not in ledgers
+    }
+
+
+def _coupling_config(mob: MixtureOfBidders) -> dict[str, object] | None:
+    coupling = getattr(mob, "coupling", None)
+    if coupling is None:
+        return None
+    return asdict(cast(SteeringCoupling, coupling).config)
+
+
+def save_mob_modules(model: nn.Module, save_path: str | Path) -> int:
+    """Write every MoB layer's owned state, keyed by block index; the number written.
+
+    Keyed by block index rather than module order so a restore lines each
+    block's state up with the block it came from, whatever wraps the model on
+    either side (a PEFT wrapper on one, a bare model on the other).
+    """
+    by_index = mob_layers_by_index(model)
+    if not by_index:
+        return 0
+    first = next(iter(by_index.values()))
+    payload = {
+        "_config": {
+            "num_experts": first.config.num_experts,
+            "top_k": first.config.top_k,
+            "hidden_dim": first.config.hidden_dim,
+            "adapter_rank": first.config.adapter_rank,
+            "blocks": sorted(by_index),
+        },
+        "blocks": {
+            index: {"state": owned_state(mob), "coupling": _coupling_config(mob)}
+            for index, mob in by_index.items()
+        },
+    }
+    torch.save(payload, save_path)
+    return len(by_index)
+
+
+def load_mob_modules(model: nn.Module, state_path: str | Path) -> int:
+    """Restore the owned state onto a converted model, block for block; the number restored.
+
+    Strict by design: a partial restore is the silent no-op this exists to
+    remove. The model must carry exactly the saved blocks, every saved tensor
+    must land, and nothing the model owns may go unrestored. A saved coupling
+    is attached with its saved config if the model has none; a model with a
+    coupling the checkpoint lacks is refused.
+    """
+    payload = torch.load(state_path, map_location="cpu", weights_only=True)
+    by_index = mob_layers_by_index(model)
+    saved = {int(index): block for index, block in payload["blocks"].items()}
+    if sorted(saved) != sorted(by_index):
+        raise ValueError(
+            f"checkpoint holds MoB blocks {sorted(saved)}, the model has {sorted(by_index)}; "
+            "convert the same layers before restoring"
+        )
+    for index, block in saved.items():
+        mob = by_index[index]
+        coupling_config = block["coupling"]
+        if coupling_config is None and hasattr(mob, "coupling"):
+            raise ValueError(f"block {index}: the model is coupled and the checkpoint is not")
+        if coupling_config is not None and not hasattr(mob, "coupling"):
+            mob.attach_coupling(
+                block["state"]["coupling.steering_direction"],
+                SteeringCouplingConfig(**coupling_config),
+            )
+        expected_missing = set(mob.state_dict()) - set(owned_state(mob))
+        result = mob.load_state_dict(block["state"], strict=False)
+        unrestored = set(result.missing_keys) - expected_missing
+        if unrestored or result.unexpected_keys:
+            raise ValueError(
+                f"block {index}: checkpoint and model disagree on the MoB state "
+                f"(unrestored {sorted(unrestored)}, unexpected {sorted(result.unexpected_keys)})"
+            )
+    logger.info("Restored the trained MoB modules of blocks %s from %s", sorted(saved), state_path)
+    return len(saved)
