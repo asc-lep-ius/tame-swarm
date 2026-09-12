@@ -706,8 +706,9 @@ def test_a_checkpoint_that_cannot_restore_the_whole_arm_is_refused(
 
     from train import restore_checkpoint
 
-    config = _config(smoke_fixture, tmp_path / "trained", use_lora=True, max_steps=2)
-    config = replace(config, checkpoint_min_free_gb=0)
+    config = _config(
+        smoke_fixture, tmp_path / "trained", use_lora=True, max_steps=2, checkpoint_min_free_gb=0
+    )
     trainer = TAMETrainer(config)
     trainer.setup()
     trainer.train()
@@ -728,6 +729,9 @@ def test_a_checkpoint_that_cannot_restore_the_whole_arm_is_refused(
     (predates / "mob_modules.pt").unlink()
     with pytest.raises(ValueError, match="predates #29"):
         restore_checkpoint(fresh.model, predates)
+    (predates / "mob_state.pt").unlink()
+    with pytest.raises(ValueError, match="no MoB state at all"):
+        restore_checkpoint(fresh.model, predates)
 
     full = tmp_path / "full"
     full.mkdir()
@@ -739,20 +743,21 @@ def test_a_checkpoint_that_cannot_restore_the_whole_arm_is_refused(
 def test_a_dense_checkpoint_restores_nothing_and_says_nothing(smoke_fixture, tmp_path):
     from train import restore_checkpoint
 
-    config = _config(smoke_fixture, tmp_path / "dense", router="dense", use_lora=True, max_steps=2)
-    trainer = TAMETrainer(replace_min_free(config))
+    config = _config(
+        smoke_fixture,
+        tmp_path / "dense",
+        router="dense",
+        use_lora=True,
+        max_steps=2,
+        checkpoint_min_free_gb=0,
+    )
+    trainer = TAMETrainer(config)
     trainer.setup()
     trainer.train()
     checkpoint = Path(config.output_dir) / f"checkpoint-{config.max_steps}"
     assert not (checkpoint / "mob_modules.pt").exists()
 
     restore_checkpoint(trainer.model, checkpoint)
-
-
-def replace_min_free(config: TrainingConfig) -> TrainingConfig:
-    from dataclasses import replace
-
-    return replace(config, checkpoint_min_free_gb=0)
 
 
 # --- The model that trains is the model that was loaded (#19) ---------------

@@ -194,12 +194,17 @@ def restore_checkpoint(model: nn.Module, checkpoint_dir: str | Path) -> None:
         )
     modules = checkpoint_dir / MOB_MODULES_FILENAME
     if not modules.exists():
-        if mob_layers_by_index(model):
+        if not mob_layers_by_index(model):
+            return
+        if (checkpoint_dir / MOB_STATE_FILENAME).exists():
             raise ValueError(
                 f"{modules} does not exist: this checkpoint predates #29 and holds no trained "
                 "experts, heads or coupling, so it cannot restore this arm"
             )
-        return
+        raise ValueError(
+            f"{checkpoint_dir} holds no MoB state at all (a dense arm's checkpoint?); "
+            "it cannot restore a converted model"
+        )
     load_mob_modules(model, modules)
     load_mob_state(model, str(checkpoint_dir / MOB_STATE_FILENAME), strict=True)
 
