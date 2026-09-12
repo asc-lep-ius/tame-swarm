@@ -47,15 +47,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from smoke_fixture import build_smoke_fixture  # noqa: E402
 
 from parity import arm_label, assert_parity  # noqa: E402
-from train import ARM_MOB, ARMS, TAMETrainer, TrainingConfig  # noqa: E402
+from train import ARM_DENSE, ARM_MOB, ARMS, TAMETrainer, TrainingConfig  # noqa: E402
 
 logger = logging.getLogger("compare_routers")
 
 
 def run_arm(
-    router: str, config: TrainingConfig, coupling_goal: str | None = None
+    router: str,
+    config: TrainingConfig,
+    coupling_goal: str | None = None,
+    trace_goal: str | None = None,
 ) -> dict[str, object]:
-    """Train one arm to completion and return its fingerprint and final metrics."""
+    """Train one arm to completion and return its fingerprint and final metrics.
+
+    ``trace_goal`` is measured against, never coupled to, and only where there is
+    a gate to measure: the dense arm has none.
+    """
     arm = arm_label(router, coupling_goal)
     logger.info("=" * 80)
     logger.info(f"Arm: {arm}")
@@ -66,6 +73,7 @@ def run_arm(
             config,
             router=router,
             coupling_goal=coupling_goal,
+            trace_goal=trace_goal if router != ARM_DENSE else None,
             output_dir=f"{config.output_dir}/{arm}",
         )
     )
@@ -102,6 +110,7 @@ def format_table(results: list[dict[str, object]]) -> str:
         ("heldout_loss", "eval/loss"),
         ("heldout_ppl", "eval/perplexity"),
         ("cos_dist", "spec/expert_cosine_distance"),
+        ("contrib_dist", "spec/expert_contribution_cosine_distance"),
         ("routing_JS", "spec/routing_js_from_corpus"),
         ("report_dec", "spec/report_decisiveness"),
     ]
@@ -150,6 +159,15 @@ def main() -> None:
         help=(
             "Also run the auction with the routing coupling seeded from this goal's "
             "certified direction, as a fourth arm (default: the three #12 arms only)"
+        ),
+    )
+    parser.add_argument(
+        "--trace_goal",
+        type=str,
+        default=None,
+        help=(
+            "Measure every routed arm's held-out routing against this goal's certified "
+            "direction without coupling to it (#24; default: the coupling goal, or nothing)"
         ),
     )
     args = parser.parse_args()
@@ -206,7 +224,8 @@ def main() -> None:
     arms: list[tuple[str, str | None]] = [(router, None) for router in ARMS]
     if args.coupling_goal:
         arms.append((ARM_MOB, args.coupling_goal))
-    results = [run_arm(router, config, coupling_goal) for router, coupling_goal in arms]
+    trace_goal = args.trace_goal or args.coupling_goal
+    results = [run_arm(router, config, coupling_goal, trace_goal) for router, coupling_goal in arms]
     assert_parity([result["fingerprint"] for result in results])  # pyright: ignore[reportArgumentType]
 
     print("\n" + format_table(results))

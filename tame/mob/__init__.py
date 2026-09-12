@@ -31,6 +31,8 @@ from .routing_trace import (
     MIN_TOKENS_FOR_CORRELATION,
     RoutingTrace,
     RoutingTraceSummary,
+    mean_goal_correlation,
+    pearson_by_expert,
 )
 from .softmax_router import (
     ROUTER_AUCTION,
@@ -39,6 +41,7 @@ from .softmax_router import (
     SoftmaxRouter,
 )
 from .utils import (
+    arm_traces,
     frozen_economy,
     frozen_traces,
     get_mob_layers,
@@ -65,6 +68,8 @@ __all__ = [
     "RoutingDiagnostics",
     "RoutingTrace",
     "RoutingTraceSummary",
+    "mean_goal_correlation",
+    "pearson_by_expert",
     "DEFAULT_TRACE_TOKENS",
     "MIN_TOKENS_FOR_CORRELATION",
     "routing_diagnostics",
@@ -81,6 +86,7 @@ __all__ = [
     "get_mob_layers",
     "mob_at",
     "mob_layers_by_index",
+    "arm_traces",
     "frozen_economy",
     "frozen_traces",
     "update_all_mob_from_loss",

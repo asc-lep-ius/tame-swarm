@@ -39,7 +39,7 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tame"))
 
-from parity import ArmFingerprint, assert_parity  # noqa: E402
+from parity import ArmFingerprint, ParityError, assert_parity  # noqa: E402
 
 logger = logging.getLogger("compare_runs")
 
@@ -91,6 +91,24 @@ def assert_groups_at_parity(group_a: dict[str, Any], group_b: dict[str, Any]) ->
     for arm_a, arm_b in pairs:
         assert_parity([arm_a, arm_b])
     return True
+
+
+def assert_same_measured_goal(group_a: dict[str, Any], group_b: dict[str, Any]) -> None:
+    """The routing columns are a contrast only against one direction (#24).
+
+    Two groups measured against different goals -- or one measured and one not --
+    would difference correlations taken against different alignments, which is
+    not a contrast at all. A summary written before the goal was recorded carries
+    no key and is compared as before.
+    """
+    if "trace_goal" not in group_a or "trace_goal" not in group_b:
+        return
+    if group_a["trace_goal"] != group_b["trace_goal"]:
+        raise ParityError(
+            f"the groups measured routing against different goals "
+            f"({group_a['trace_goal']!r} vs {group_b['trace_goal']!r}); their routing/ "
+            "columns are not a contrast"
+        )
 
 
 def _values(group: dict[str, Any], metric: str) -> list[float]:
@@ -176,6 +194,7 @@ def main() -> None:
     label_b = args.label_b or str(group_b.get("arm") or group_b.get("router", "B"))
 
     checked = assert_groups_at_parity(group_a, group_b)
+    assert_same_measured_goal(group_a, group_b)
     comparison = compare(group_a, group_b)
     if not comparison:
         raise SystemExit(

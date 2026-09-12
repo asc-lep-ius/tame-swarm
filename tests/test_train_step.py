@@ -413,6 +413,53 @@ def test_setup_checks_that_the_seeded_state_survived_the_device_move(
         guard(trainer)
 
 
+def test_a_trace_goal_measures_routing_against_the_direction_without_coupling_to_it(
+    smoke_fixture, tmp_path, monkeypatch
+):
+    """#24's offline contrast needs the uncoupled arm measured against the same direction.
+
+    MoB at layers 1-2, certification at 2-3: the direction is kept for layer 2
+    only, no coupling is attached anywhere, and the held-out probe reports the
+    routing columns the coupled arm reports -- the win share always, and the
+    correlation for every expert the window could estimate.
+    """
+    model_id, _ = smoke_fixture
+    _certify_smoke_goal(monkeypatch, model_id, layers=(2, 3))
+    trainer = TAMETrainer(_config(smoke_fixture, tmp_path / "traced", trace_goal="smoke"))
+    trainer.setup()
+
+    assert sorted(trainer._trace_directions) == [2]
+    assert not any(hasattr(mob, "coupling") for mob in get_mob_layers(trainer.model))
+
+    measurements = trainer.evaluate_held_out(step=0)
+
+    win_share = [
+        measurements[f"routing/win_share_e{expert}"] for expert in range(trainer.config.num_experts)
+    ]
+    assert sum(win_share) == pytest.approx(trainer.config.top_k)
+    assert any(key.startswith("routing/goal_correlation_e") for key in measurements)
+
+
+def test_a_coupled_arm_measures_against_the_direction_it_is_coupled_to(
+    smoke_fixture, tmp_path, monkeypatch
+):
+    model_id, _ = smoke_fixture
+    _certify_smoke_goal(monkeypatch, model_id, layers=(2, 3))
+    trainer = TAMETrainer(
+        _config(smoke_fixture, tmp_path / "coupled-traced", coupling_goal="smoke")
+    )
+    trainer.setup()
+
+    assert trainer.config.trace_goal is None and trainer.config.coupling_goal == "smoke"
+    assert sorted(trainer._trace_directions) == [2]
+    coupling = get_mob_layers(trainer.model)[1].coupling
+    assert torch.allclose(
+        trainer._trace_directions[2],
+        coupling.steering_direction.detach().float().cpu(),
+        atol=1e-6,
+    ), "the probe aligns against exactly the direction the coupling perceives"
+
+
 def test_without_a_coupling_goal_routing_stays_uncoupled(smoke_fixture, tmp_path):
     trainer = TAMETrainer(_config(smoke_fixture, tmp_path / "plain"))
     trainer.setup()

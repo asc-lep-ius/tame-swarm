@@ -51,9 +51,24 @@ HEADLINE_METRICS = (
     "eval/loss",
     "eval/perplexity",
     "spec/expert_cosine_distance",
+    "spec/expert_contribution_cosine_distance",
+    "spec/expert_contribution_norm_ratio",
     "spec/routing_js_from_corpus",
     "spec/report_decisiveness",
 )
+# The per-expert routing columns #24's contrast is differenced over
+# (``routing/goal_correlation_e<i>``, ``routing/win_share_e<i>``); how many there
+# are depends on ``--num_experts``, so they are matched by prefix.
+HEADLINE_PREFIXES = ("routing/",)
+
+
+def headline_metrics(final: dict[str, float]) -> dict[str, float]:
+    """The metrics a summary carries: the fixed headline set plus every routing column."""
+    return {
+        key: value
+        for key, value in final.items()
+        if key in HEADLINE_METRICS or key.startswith(HEADLINE_PREFIXES)
+    }
 
 
 def run_seed(seed: int, config: TrainingConfig) -> tuple[dict[str, float], dict[str, object]]:
@@ -81,7 +96,7 @@ def run_seed(seed: int, config: TrainingConfig) -> tuple[dict[str, float], dict[
     trainer.train()
 
     final = trainer.eval_history[-1] if trainer.eval_history else {}
-    result = {key: final[key] for key in HEADLINE_METRICS if key in final}
+    result = headline_metrics(final)
     assert trainer.fingerprint is not None
     fingerprint = trainer.fingerprint.as_dict()
 
@@ -103,7 +118,8 @@ def aggregate(per_seed: dict[int, dict[str, float]]) -> dict[str, dict[str, floa
     that would misread as "measured, no spread".
     """
     stats: dict[str, dict[str, float]] = {}
-    for metric in HEADLINE_METRICS:
+    metrics = sorted({metric for result in per_seed.values() for metric in result})
+    for metric in metrics:
         values = [result[metric] for result in per_seed.values() if metric in result]
         if not values:
             continue
@@ -135,6 +151,15 @@ def main() -> None:
     parser.add_argument("--router", type=str, default="mob", choices=["mob", "softmax", "dense"])
     parser.add_argument("--seeds", type=str, default="0,1,2", help="Comma-separated seed list")
     parser.add_argument("--steps", type=int, default=60)
+    # #25's differentiation checkpoint reads the *step* at which the experts leave
+    # the upcycling floor, which a two-point curve can only bracket. Default keeps
+    # the two evaluations every run has always had.
+    parser.add_argument(
+        "--eval_steps",
+        type=int,
+        default=None,
+        help="Evaluate the held-out split every this many steps (default: steps // 2)",
+    )
     parser.add_argument("--device", type=str, default="cpu")
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--max_seq_length", type=int, default=32)
@@ -167,6 +192,17 @@ def main() -> None:
     )
     parser.add_argument("--coupling_beta", type=float, default=DEFAULT_COUPLING_BETA)
     parser.add_argument("--coupling_warmup_steps", type=int, default=DEFAULT_WARMUP_STEPS)
+    # #24's routing contrast needs both arms measured against one direction, so
+    # the uncoupled arm names the goal it is *measured* against without coupling.
+    parser.add_argument(
+        "--trace_goal",
+        type=str,
+        default=None,
+        help=(
+            "Measure held-out routing against this goal's certified direction without "
+            "coupling to it (default: the coupling goal, or nothing)"
+        ),
+    )
     args = parser.parse_args()
 
     seeds = [int(part) for part in args.seeds.split(",")]
@@ -204,7 +240,7 @@ def main() -> None:
         max_steps=args.steps,
         warmup_steps=max(1, args.steps // 10),
         max_seq_length=args.max_seq_length,
-        eval_steps=max(1, args.steps // 2),
+        eval_steps=args.eval_steps or max(1, args.steps // 2),
         save_steps=args.steps,
         log_frequency=max(1, args.steps // 4),
         held_out_sequences=args.held_out_sequences,
@@ -217,6 +253,7 @@ def main() -> None:
         coupling_goal=args.coupling_goal,
         coupling_beta=args.coupling_beta,
         coupling_warmup_steps=args.coupling_warmup_steps,
+        trace_goal=args.trace_goal,
     )
 
     # One shared MLflow store across seeds, same reasoning as compare_routers.py:
@@ -241,6 +278,7 @@ def main() -> None:
                 "arm": arm,
                 "router": args.router,
                 "coupling_goal": args.coupling_goal,
+                "trace_goal": config.trace_goal or config.coupling_goal,
                 "seeds": seeds,
                 "steps": args.steps,
                 "per_seed": per_seed,

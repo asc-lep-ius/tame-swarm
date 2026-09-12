@@ -281,6 +281,14 @@ class TrainingConfig:
     coupling_goal: str | None = None
     coupling_beta: float = DEFAULT_COUPLING_BETA
     coupling_warmup_steps: int = DEFAULT_WARMUP_STEPS
+    # The goal whose certified direction the held-out probe measures routing
+    # *against* (#24) -- the alignment column the served trace keeps -- without
+    # coupling to it. Defaults to ``coupling_goal``, so a coupled arm measures
+    # against the direction it is coupled to; an uncoupled arm needs it named,
+    # since a contrast between arms is only a contrast against one direction.
+    # Measurement only: the direction is read off the pristine model, consumes
+    # no randomness and touches no weight, so it is not part of the fingerprint.
+    trace_goal: str | None = None
 
     # LoRA (optional)
     use_lora: bool = False
@@ -382,6 +390,10 @@ class TrainingConfig:
             # after the model has loaded: the goal must be certified, at named
             # layers, on this model.
             certified_coupling_layers(self.coupling_goal, self.model_id)
+        if self.trace_goal is not None:
+            if self.router == ARM_DENSE:
+                raise ValueError("trace_goal needs a MoB layer to measure; the dense arm has none")
+            certified_coupling_layers(self.trace_goal, self.model_id)
 
         if self.checkpoint_keep_last < 0:
             raise ValueError(f"checkpoint_keep_last must be >= 0, got {self.checkpoint_keep_last}")
@@ -449,6 +461,10 @@ class TAMETrainer:
         self.held_out_split: HeldOutSplit | None = None
         self.fingerprint: ArmFingerprint | None = None
         self.eval_history: list[dict[str, Any]] = []
+        # Block index -> the direction the hooks would inject there, at every
+        # certified layer inside the converted range; what the held-out probe
+        # aligns routing against (#24). Empty when no goal is measured.
+        self._trace_directions: dict[int, torch.Tensor] = {}
         self.metrics = MetricSink(
             Path(config.output_dir) / METRICS_FILENAME,
             run_tags={"router": config.router, "seed": config.seed},
@@ -507,7 +523,21 @@ class TAMETrainer:
             # The goal direction is read off the pristine model, before any FFN is
             # replaced: that is the regime the certification was measured in, and
             # an upcycled MoB reproduces it at initialisation anyway.
-            seed = self._extract_coupling_direction() if self.config.coupling_goal else None
+            seed = (
+                self._extract_goal_direction(self.config.coupling_goal)
+                if self.config.coupling_goal
+                else None
+            )
+            measured = self.config.trace_goal or self.config.coupling_goal
+            if measured is not None:
+                # The same extraction when the measured goal is the coupled one, so
+                # the probe aligns against exactly the direction the coupling perceives.
+                trace = (
+                    seed
+                    if seed is not None and measured == self.config.coupling_goal
+                    else self._extract_goal_direction(measured)
+                )
+                self._trace_directions = self._directions_in_range(*trace)
             self._apply_mob()
             if seed is not None:
                 self._seed_coupling(*seed)
@@ -600,8 +630,8 @@ class TAMETrainer:
         self.model = apply_mob_to_model(self.model, mob_config, layers_to_modify=layers_to_modify)
         self.mob_config = mob_config
 
-    def _extract_coupling_direction(
-        self,
+    def _extract_goal_direction(
+        self, goal: str
     ) -> tuple[CognitiveHomeostat, SteeringExtraction, tuple[int, ...]]:
         """The certified goal direction at every layer it is certified at, as the hooks inject it.
 
@@ -609,10 +639,11 @@ class TAMETrainer:
         server steers with (``serving_config``, ``CognitiveHomeostat``), so what the
         routing perceives is the direction the residual stream would be pushed
         along -- not the raw vector, which reads several sigma apart from it.
+        Read-only: extraction is a diff of means over forwards and consumes no
+        randomness, so an arm that only measures against the goal stays at
+        parity with one that does not.
         """
         assert self.model is not None
-        goal = self.config.coupling_goal
-        assert goal is not None
         layers = certified_coupling_layers(goal, self.config.model_id)
         template = SteeringConfig(
             steering_layers=list(range(self.config.mob_layers_start, self.config.mob_layers_end)),
@@ -627,6 +658,26 @@ class TAMETrainer:
         if steering_config.orthogonal_projection:
             homeostat.estimate_capability_subspaces(self.model, self.tokenizer)
         return homeostat, extraction, layers
+
+    def _directions_in_range(
+        self,
+        homeostat: CognitiveHomeostat,
+        extraction: SteeringExtraction,
+        layers: tuple[int, ...],
+    ) -> dict[int, torch.Tensor]:
+        """The injected direction at each certified layer the converted range covers."""
+        requested = range(self.config.mob_layers_start, self.config.mob_layers_end)
+        directions = {
+            layer: homeostat.projected_direction(layer)[0].detach().float().cpu().clone()
+            for layer in layers
+            if layer in requested and layer in homeostat.steering_vectors
+        }
+        logger.info(
+            "Routing measured against %r at MoB layers %s (#24)",
+            extraction.goal,
+            sorted(directions),
+        )
+        return directions
 
     def _seed_coupling(
         self,
@@ -1042,6 +1093,7 @@ class TAMETrainer:
             self.device,
             batch_size=self.config.batch_size,
             probe_tokens=self.config.probe_tokens,
+            goal_directions=self._trace_directions or None,
         )
         if report is not None:
             measurements.update(report.as_metrics())
@@ -1845,6 +1897,15 @@ def main():
         default=DEFAULT_WARMUP_STEPS,
         help="Training steps over which the coupling ramps to coupling_beta",
     )
+    parser.add_argument(
+        "--trace_goal",
+        type=str,
+        default=None,
+        help=(
+            "Measure held-out routing against this goal's certified direction without "
+            "coupling to it (#24); default: the coupling goal, or nothing"
+        ),
+    )
 
     # Hardware
     parser.add_argument(
@@ -1885,6 +1946,7 @@ def main():
         coupling_goal=args.coupling_goal,
         coupling_beta=args.coupling_beta,
         coupling_warmup_steps=args.coupling_warmup_steps,
+        trace_goal=args.trace_goal,
     )
 
     # Create trainer and run

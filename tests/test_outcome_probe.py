@@ -12,6 +12,7 @@ from dataclasses import replace
 from unittest import mock
 
 import pytest
+import torch
 
 import outcome_probe
 from contrastive_data import CERTIFIED
@@ -334,3 +335,161 @@ def test_the_probe_leaves_the_served_routing_window_untouched():
 
     after = {id(mob): mob.routing_trace.tokens for mob in system.mobs}  # pyright: ignore[reportOptionalMemberAccess]
     assert after == before, "the probe's own forwards must stay out of the served window"
+
+
+# --- The routing-level contrast (#24) --------------------------------------------
+#
+# The wired fixture's served strength of 2.0 saturates the tiny model: the residual
+# it injects into is far smaller than the injection, the MoB reads the normalised
+# stream, and every cell above the bottom actuator then reads an alignment of 0.998
+# and routes to the same experts on every token, which leaves no correlation to
+# estimate. At this strength the injection moves the alignment a few tenths and the
+# gate stays contested, so both contrasts are defined in both arms.
+CONTRAST_STRENGTH = 0.03
+CONTRAST_PASSES = 60
+# The heads' lean along the goal direction, alternating in sign: experts 0 and 2 read
+# the goal as valuable, expert 1 reads it as the opposite.
+HEAD_LEAN = 0.5
+GOAL_ALIGNED = (0, 2)
+GOAL_OPPOSED = 1
+
+
+def _lean_heads_along_the_goal(system) -> None:
+    direction = system.directions["truthful"]
+    with torch.no_grad():
+        for mob in system.mobs:
+            for index, head in enumerate(mob.confidence_heads):
+                sign = HEAD_LEAN if index in GOAL_ALIGNED else -HEAD_LEAN
+                head.proj.weight[0] += sign * direction
+
+
+def _probe_replaying_the_same_tokens(tame, system):
+    """Both arms forward the *same* token sequence, as the real probe's arms score the same pairs.
+
+    ``system.run`` appends fresh tokens, so without the replay the unsteered arm
+    would continue where the served arm stopped and the two windows would differ
+    in their tokens as well as in the intervention.
+    """
+    queue = [[0.4, 0.4], [0.1, 0.1]]
+    prompt, state = system.tokens.clone(), system.generator.get_state()
+
+    def arm_that_replays(*_args, **_kwargs):
+        system.tokens = prompt.clone()
+        system.generator.set_state(state)
+        system.run(CONTRAST_PASSES)
+        return queue.pop(0)
+
+    with mock.patch.object(outcome_probe, "held_out_log_odds", arm_that_replays):
+        return outcome_probe.probe_outcome(tame, num_pairs=2)
+
+
+def test_the_contrast_is_exactly_null_when_no_cell_reads_the_injection():
+    """The pairing that proves the statistic measures the injection, not the tokens.
+
+    Every actuator but the top one is removed, so the goal is injected only at a
+    block no MoB layer sits above: the gate never sees it. The heads lean along the
+    goal direction, so the single-window correlation is far from zero in *both*
+    arms -- a specialised gate correlates with no steering at all -- and the
+    contrast between them is exactly zero, per expert, on the correlation and on
+    the win share alike.
+    """
+    tame, system = _probe_app(coupled=True, base_strength=CONTRAST_STRENGTH)
+    _lean_heads_along_the_goal(system)
+    for layer in ACTUATORS[:-1]:
+        system.kill_actuator(layer)
+
+    outcome = _probe_replaying_the_same_tokens(tame, system)
+
+    served = outcome.arms["served"].routing_correlation
+    assert served is not None and max(abs(value) for value in served if value is not None) > 0.3
+    assert outcome.arms["served"].trace_tokens > 0
+    assert outcome.served_minus_unsteered_correlation == [0.0, 0.0, 0.0]
+    assert outcome.served_minus_unsteered_win_share == [0.0, 0.0, 0.0]
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_the_contrast_reads_the_injection_recruiting_the_experts_that_lean_with_it(seed):
+    """The live pairing: the goal reaches the gate, and the contrast says which cells it recruited.
+
+    With the heads leaning along the goal, injecting it at every actuator shifts
+    the slots toward the experts that read it as valuable and away from the one
+    that reads it as the opposite -- the routing shift ``tests/test_coupling.py``
+    establishes, here as a served-minus-unsteered difference. Measured over three
+    seeds: aligned experts gain 0.09-0.31 of the slots, the opposed one loses
+    0.22-0.41, and the correlation contrast moves by up to 0.15-0.28 for some
+    expert. The shifts fall with the strength (-0.38, -0.24, -0.07 for the opposed
+    expert at 0.03, 0.01 and 0.003), so this is dose, not noise.
+    """
+    tame, system = _probe_app(coupled=True, seed=seed, base_strength=CONTRAST_STRENGTH)
+    _lean_heads_along_the_goal(system)
+
+    outcome = _probe_replaying_the_same_tokens(tame, system)
+
+    win_share = outcome.served_minus_unsteered_win_share
+    assert win_share is not None
+    assert all(win_share[expert] > 0.05 for expert in GOAL_ALIGNED), win_share
+    assert win_share[GOAL_OPPOSED] < -0.15, win_share
+    correlation = outcome.served_minus_unsteered_correlation
+    assert correlation is not None
+    assert max(abs(value) for value in correlation if value is not None) > 0.05, correlation
+
+
+def _summary(correlation, win_share=(0.5, 0.5, 1.0), tokens=100):
+    from mob import RoutingTraceSummary
+
+    return RoutingTraceSummary(
+        tokens=tokens,
+        top1_mean=0.6,
+        top1_median=0.6,
+        top1_saturated_fraction=0.0,
+        effective_experts=1.8,
+        win_share=list(win_share),
+        goal_alignment_mean=0.1,
+        goal_correlation=correlation,
+    )
+
+
+def test_an_expert_neither_arm_could_estimate_stays_none_in_the_contrast():
+    """A hole survives the difference; it does not become a zero.
+
+    Expert 2 won every token at layer 1 in the served arm and at layer 2 in the
+    unsteered arm, so no layer can difference it; expert 1 is estimable at layer 2
+    only. The single-arm form averages over the layers that measured an expert,
+    and the contrast does the same over the layers that could difference one.
+    """
+    served = {1: _summary([0.4, 0.1, None]), 2: _summary([0.2, 0.3, 0.5])}
+    unsteered = {1: _summary([0.1, None, 0.2]), 2: _summary([0.0, 0.1, None])}
+
+    contrast = outcome_probe.routing_correlation_contrast(served, unsteered, 3)
+
+    assert contrast is not None
+    assert contrast[0] == pytest.approx((0.3 + 0.2) / 2)
+    assert contrast[1] == pytest.approx(0.2)
+    assert contrast[2] is None
+
+
+def test_a_layer_with_no_direction_in_one_arm_is_left_out_of_the_contrast():
+    served = {1: _summary(None), 2: _summary([0.2, 0.3, 0.5], win_share=(0.7, 0.3, 1.0))}
+    unsteered = {1: _summary([0.1, 0.1, 0.1]), 2: _summary([0.0, 0.1, 0.5])}
+
+    assert outcome_probe.routing_correlation_contrast(served, unsteered, 3) == pytest.approx(
+        [0.2, 0.2, 0.0]
+    )
+    assert outcome_probe.routing_correlation_contrast({1: _summary(None)}, unsteered, 3) is None
+    # The win share is defined whether or not a direction was: every traced layer counts.
+    assert outcome_probe.routing_win_share_contrast(served, unsteered) == pytest.approx(
+        [0.1, -0.1, 0.0]
+    )
+    assert outcome_probe.routing_win_share_contrast({}, unsteered) is None
+
+
+def test_each_arm_records_into_its_own_window_and_the_served_trace_comes_back():
+    tame, system = _probe_app()
+    served_traces = [mob.routing_trace for mob in system.mobs]
+
+    outcome = _probe_replaying_the_same_tokens(tame, system)
+
+    assert [mob.routing_trace for mob in system.mobs] == served_traces
+    for name in ("served", "unsteered"):
+        assert outcome.arms[name].trace_tokens > 0, name
+        assert outcome.arms[name].routing_correlation is not None

@@ -340,11 +340,20 @@ class PCAProjection(BaseModel):
 
 
 class OutcomeArm(BaseModel):
-    """One arm of the outcome probe on the goal's held-out pairs."""
+    """One arm of the outcome probe on the goal's held-out pairs.
+
+    ``routing_correlation`` is the arm's own ``steering_routing_correlation``:
+    per expert, over the arm's own tokens, against the served goal direction,
+    averaged over the traced layers -- the single-window association, measured on
+    this arm rather than on served traffic. ``trace_tokens`` is the shortest
+    window it was read over.
+    """
 
     mean_log_odds: float
     accuracy: float
     mean_strength: float | None = None
+    routing_correlation: list[float | None] | None = None
+    trace_tokens: int = 0
 
 
 class OutcomeMetrics(BaseModel):
@@ -385,6 +394,28 @@ class OutcomeMetrics(BaseModel):
     ``mean_strength`` per arm is what tells them apart -- an arm that drifted well
     above the constant's reference strength was not measured at the same dose.
 
+    ``served_minus_unsteered_correlation`` is the routing-level contrast (#24): per
+    expert, the served arm's goal-routing correlation minus the unsteered arm's,
+    on the same tokens against the same direction, differing only in whether the
+    hooks were attached. ``/metrics/coupling``'s ``steering_routing_correlation``
+    is an association within one window and cannot say the goal *caused* the
+    routing -- a specialised gate correlates with no steering at all -- while this
+    is the difference between two bodies in the same environment, and can. An
+    expert whose correlation could not be estimated in either arm stays ``None``
+    here rather than becoming a zero, and the whole field is ``None`` when no
+    layer carried a direction.
+
+    ``served_minus_unsteered_win_share`` is the other half of that contrast, and
+    the half a constant injection shows up in. A Pearson correlation is invariant
+    to a shift of the mean, and a constant injection is a shift: it can move every
+    token toward the goal-aligned experts -- the shift ``tests/test_coupling.py``
+    measures -- while the correlation in each arm stays where it was, or becomes
+    undefined because an expert now wins every token. The win-share difference
+    per expert is that shift, measured on the same two arms; it is always
+    defined, and it is what says *which* experts the goal recruited. Read the two
+    together: a large win-share shift with a null correlation delta is a goal
+    that moved the whole gate rather than its sensitivity to the token.
+
     ``stale`` is true once the served goal changed after the probe ran.
     """
 
@@ -395,6 +426,8 @@ class OutcomeMetrics(BaseModel):
     served_minus_unsteered_log_odds: float
     served_minus_unsteered_standard_error: float | None = None
     served_minus_unsteered_accuracy: float = 0.0
+    served_minus_unsteered_correlation: list[float | None] | None = None
+    served_minus_unsteered_win_share: list[float] | None = None
     adaptive_minus_constant_log_odds: float | None = None
     adaptive_minus_constant_standard_error: float | None = None
     certified_random_max: float | None = None
