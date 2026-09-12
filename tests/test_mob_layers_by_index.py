@@ -8,6 +8,7 @@ reason, so the lookup reads the block index off the module name instead.
 
 from peft import LoraConfig, TaskType, get_peft_model
 
+from homeostat_calibration import transformer_layers
 from mob import apply_mob_to_model, get_mob_layers, mob_layers_by_index
 
 from .conftest import build_tiny_causal_lm
@@ -40,3 +41,14 @@ def test_layers_are_still_found_under_a_peft_wrapper(tiny_mob_config):
 
 def test_a_model_without_mob_layers_has_none(tiny_causal_lm):
     assert mob_layers_by_index(tiny_causal_lm) == {}
+
+
+def test_the_decoder_stack_is_found_under_a_peft_wrapper():
+    """The hooks attach to the same stack (#28); before this they raised under LoRA."""
+    model = build_tiny_causal_lm(4)
+    wrapped = get_peft_model(
+        model, LoraConfig(task_type=TaskType.CAUSAL_LM, r=2, target_modules=["q_proj"])
+    )
+
+    assert transformer_layers(wrapped) is transformer_layers(model)
+    assert len(transformer_layers(wrapped)) == 4

@@ -460,6 +460,124 @@ def test_a_coupled_arm_measures_against_the_direction_it_is_coupled_to(
     ), "the probe aligns against exactly the direction the coupling perceives"
 
 
+def test_steer_goal_injects_the_certified_field_as_served_through_training_and_the_probe(
+    smoke_fixture, tmp_path, monkeypatch
+):
+    """#28: the goal is present during the cells' development, and the probe reads the steered body.
+
+    Certification at layers 2-3, strength 1.0, on a LoRA-wrapped model -- the
+    wrapper that hid the MoB layers from the block lookup once (#24). The hooks
+    inject at exactly the certified layers and strength on a constant loop, the
+    injection changes what the model computes, it is still attached while the
+    held-out evaluation and the specialisation probe run, the fingerprint carries
+    it, and it comes off when training ends.
+    """
+    import train as train_module
+
+    model_id, _ = smoke_fixture
+    _certify_smoke_goal(monkeypatch, model_id, layers=(2, 3))
+    trainer = TAMETrainer(
+        _config(smoke_fixture, tmp_path / "field", steer_goal="smoke", use_lora=True, max_steps=2)
+    )
+    trainer.setup()
+
+    field = trainer._field
+    assert field is not None
+    assert sorted(layer for layer, hook in field.hooks.items() if hook.injects) == [2, 3]
+    assert field.config.base_strength == 1.0 and not field.config.adaptive
+    assert not any(hasattr(mob, "coupling") for mob in get_mob_layers(trainer.model))
+    assert sorted(trainer._trace_directions) == [2], "the probe measures against the field"
+
+    fingerprint = trainer.fingerprint
+    assert fingerprint is not None
+    assert fingerprint.steer_goal == "smoke"
+    assert fingerprint.steer_strength == 1.0
+    assert fingerprint.steer_layers == (2, 3)
+    assert fingerprint.arm == "mob@smoke"
+
+    batch = next(iter(trainer.train_dataloader))
+    with torch.no_grad():
+        steered = trainer.model(input_ids=batch["input_ids"]).logits
+        field.detach_from_model()
+        unsteered = trainer.model(input_ids=batch["input_ids"]).logits
+        field.attach_to_model(trainer.model)
+    assert not torch.allclose(steered, unsteered), "the field must reach the output"
+
+    hooks_live: list[bool] = []
+    attached = dict(field.hooks)
+
+    def live() -> bool:
+        blocks = train_module.transformer_layers(trainer.model)
+        return all(
+            any(registered is hook for registered in blocks[layer]._forward_hooks.values())
+            for layer, hook in attached.items()
+        )
+
+    evaluate = train_module.evaluate
+    probe = train_module.probe_specialisation
+    monkeypatch.setattr(
+        train_module, "evaluate", lambda *a, **k: (hooks_live.append(live()), evaluate(*a, **k))[1]
+    )
+    monkeypatch.setattr(
+        train_module,
+        "probe_specialisation",
+        lambda *a, **k: (hooks_live.append(live()), probe(*a, **k))[1],
+    )
+    assert live()
+    trainer.train()
+    assert hooks_live and all(hooks_live), "the held-out evaluation and the probe ran in the field"
+    assert not field.hooks and not live(), "the field comes off when training ends"
+
+
+def test_a_field_that_is_not_the_served_injection_is_refused(smoke_fixture, tmp_path, monkeypatch):
+    """The fingerprint says 'as served'; the check is what makes that true."""
+    model_id, _ = smoke_fixture
+    _certify_smoke_goal(monkeypatch, model_id, layers=(2, 3))
+    trainer = TAMETrainer(_config(smoke_fixture, tmp_path / "wrong-field", steer_goal="smoke"))
+    trainer.setup()
+    field = trainer._field
+    assert field is not None
+    trainer._assert_field_as_served()
+
+    field.config.base_strength = 2.0
+    with pytest.raises(RuntimeError, match="strength 2.0, not the certified 1.0"):
+        trainer._assert_field_as_served()
+    field.config.base_strength = 1.0
+
+    field.config.adaptive = True
+    with pytest.raises(RuntimeError, match="adaptive"):
+        trainer._assert_field_as_served()
+    field.config.adaptive = False
+
+    for handle in field._registered_hooks:
+        handle.remove()
+    with pytest.raises(RuntimeError, match="not registered on the decoder blocks"):
+        trainer._assert_field_as_served()
+
+
+def test_the_field_the_coupling_and_the_probe_share_one_direction(
+    smoke_fixture, tmp_path, monkeypatch
+):
+    """Field-on coupled arm: what is injected, what is perceived and what is measured coincide."""
+    model_id, _ = smoke_fixture
+    _certify_smoke_goal(monkeypatch, model_id, layers=(2, 3))
+    trainer = TAMETrainer(
+        _config(
+            smoke_fixture, tmp_path / "field-coupled", steer_goal="smoke", coupling_goal="smoke"
+        )
+    )
+    trainer.setup()
+
+    field = trainer._field
+    assert field is not None
+    coupling = get_mob_layers(trainer.model)[1].coupling
+    injected = field.projected_direction(2)[0].detach().float().cpu()
+    assert torch.allclose(coupling.steering_direction.detach().float().cpu(), injected, atol=1e-6)
+    assert torch.allclose(trainer._trace_directions[2], injected, atol=1e-6)
+    assert trainer.fingerprint is not None
+    assert trainer.fingerprint.arm == "mob+smoke@smoke"
+
+
 def test_without_a_coupling_goal_routing_stays_uncoupled(smoke_fixture, tmp_path):
     trainer = TAMETrainer(_config(smoke_fixture, tmp_path / "plain"))
     trainer.setup()
@@ -468,6 +586,8 @@ def test_without_a_coupling_goal_routing_stays_uncoupled(smoke_fixture, tmp_path
 
     assert not any(hasattr(mob, "coupling") for mob in get_mob_layers(trainer.model))
     assert trainer._coupling_measurements() == {}
+    assert trainer._field is None, "no steer goal, no field"
+    assert trainer.fingerprint is not None and trainer.fingerprint.steer_goal is None
 
 
 def test_setup_refuses_to_seed_from_a_fallback_vector(smoke_fixture, tmp_path, monkeypatch):
@@ -501,6 +621,9 @@ def test_setup_refuses_a_goal_whose_certified_layers_carry_no_mob_layer(
         ({"coupling_goal": "truthful", "router": "dense"}, "dense arm"),
         ({"coupling_goal": "truthful", "coupling_beta": 0.0}, "inert"),
         ({"coupling_beta": -0.1}, "coupling_beta"),
+        ({"steer_goal": "deliberation"}, "no certified layers"),
+        ({"steer_goal": "truthful", "model_id": "google/gemma-2-2b-it"}, "certified on"),
+        ({"steer_goal": "truthful", "router": "dense"}, "dense arm"),
     ],
 )
 def test_an_uncertified_coupling_is_refused_at_construction(overrides, match):

@@ -136,11 +136,28 @@ def unit_vector(vector: torch.Tensor) -> torch.Tensor:
     return vector if norm == 0 else vector / norm
 
 
+# How many ``.model`` attributes to descend through looking for the decoder
+# stack: a PEFT wrapper puts the transformer two deeper than a bare causal LM
+# (``base_model.model.model.layers``, reached through PEFT's attribute forwarding).
+MAX_MODEL_NESTING = 4
+
+
 def transformer_layers(model: nn.Module) -> nn.ModuleList:
-    if hasattr(model, "model") and hasattr(model.model, "layers"):
-        return cast(nn.ModuleList, getattr(model.model, "layers"))  # noqa: B009
-    if hasattr(model, "layers"):
-        return cast(nn.ModuleList, getattr(model, "layers"))  # noqa: B009
+    """The decoder stack, through however many wrappers sit above it.
+
+    A causal LM keeps it at ``model.layers``; a PEFT-wrapped one forwards
+    ``.model`` to the inner causal LM, so the stack is one ``.model`` further
+    down. Walking the wrappers is what lets the hooks attach to a LoRA training
+    arm at all -- the same wrapper hid the MoB layers from the block-index lookup
+    once (#24), silently.
+    """
+    inner: nn.Module = model
+    for _ in range(MAX_MODEL_NESTING):
+        if hasattr(inner, "layers"):
+            return cast(nn.ModuleList, getattr(inner, "layers"))  # noqa: B009
+        if not hasattr(inner, "model"):
+            break
+        inner = cast(nn.Module, getattr(inner, "model"))  # noqa: B009
     raise ValueError("Cannot find transformer layers")
 
 

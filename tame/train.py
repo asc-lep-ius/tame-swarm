@@ -86,6 +86,7 @@ except ImportError:
     logger.warning("'accelerate' library not installed. Model re-dispatch disabled.")
 
 from config import get_active_profile
+from contrastive_data import certification_for
 from coupling import (
     DEFAULT_COUPLING_BETA,
     DEFAULT_WARMUP_STEPS,
@@ -289,6 +290,17 @@ class TrainingConfig:
     # Measurement only: the direction is read off the pristine model, consumes
     # no randomness and touches no weight, so it is not part of the fingerprint.
     trace_goal: str | None = None
+    # The goal field, present during training (#28). ``steer_goal`` attaches the
+    # certified homeostat's hooks to the model exactly as the server does --
+    # constant loop, certified reference strength, certified layers, capability
+    # projection -- after MoB conversion and LoRA, and keeps them attached through
+    # every training step and every held-out probe, so the probe measures the
+    # steered body. Both earlier ablations (#6, #25) trained with the field
+    # absent: the receptor amplified a natural one-percent component of the
+    # stream and never perceived an injected goal. Unlike ``trace_goal`` this
+    # changes what is trained, so it is in the fingerprint with its strength and
+    # layers; an arm that differs on it is a different arm, not a confound.
+    steer_goal: str | None = None
 
     # LoRA (optional)
     use_lora: bool = False
@@ -394,6 +406,14 @@ class TrainingConfig:
             if self.router == ARM_DENSE:
                 raise ValueError("trace_goal needs a MoB layer to measure; the dense arm has none")
             certified_coupling_layers(self.trace_goal, self.model_id)
+        if self.steer_goal is not None:
+            if self.router == ARM_DENSE:
+                raise ValueError(
+                    "steer_goal needs a MoB layer to perceive the field; the dense arm has none"
+                )
+            # The same gate as the coupling: the field is injected only where, and
+            # on the model, the behavioural gate certified the direction.
+            certified_coupling_layers(self.steer_goal, self.model_id)
 
         if self.checkpoint_keep_last < 0:
             raise ValueError(f"checkpoint_keep_last must be >= 0, got {self.checkpoint_keep_last}")
@@ -465,6 +485,9 @@ class TAMETrainer:
         # certified layer inside the converted range; what the held-out probe
         # aligns routing against (#24). Empty when no goal is measured.
         self._trace_directions: dict[int, torch.Tensor] = {}
+        # The goal field (#28): the certified homeostat whose hooks inject during
+        # training, or None when the field is absent. See _attach_field.
+        self._field: CognitiveHomeostat | None = None
         self.metrics = MetricSink(
             Path(config.output_dir) / METRICS_FILENAME,
             run_tags={"router": config.router, "seed": config.seed},
@@ -523,21 +546,23 @@ class TAMETrainer:
             # The goal direction is read off the pristine model, before any FFN is
             # replaced: that is the regime the certification was measured in, and
             # an upcycled MoB reproduces it at initialisation anyway.
-            seed = (
-                self._extract_goal_direction(self.config.coupling_goal)
-                if self.config.coupling_goal
-                else None
-            )
-            measured = self.config.trace_goal or self.config.coupling_goal
+            # One extraction per goal, however many roles it plays: the direction
+            # the coupling perceives, the one the probe aligns against and the one
+            # the field injects are then exactly the same tensor.
+            extractions: dict[str, tuple[CognitiveHomeostat, SteeringExtraction, tuple[int, ...]]]
+            extractions = {}
+
+            def direction_of(goal: str):
+                if goal not in extractions:
+                    extractions[goal] = self._extract_goal_direction(goal)
+                return extractions[goal]
+
+            seed = direction_of(self.config.coupling_goal) if self.config.coupling_goal else None
+            measured = self.config.trace_goal or self.config.coupling_goal or self.config.steer_goal
             if measured is not None:
-                # The same extraction when the measured goal is the coupled one, so
-                # the probe aligns against exactly the direction the coupling perceives.
-                trace = (
-                    seed
-                    if seed is not None and measured == self.config.coupling_goal
-                    else self._extract_goal_direction(measured)
-                )
-                self._trace_directions = self._directions_in_range(*trace)
+                self._trace_directions = self._directions_in_range(*direction_of(measured))
+            if self.config.steer_goal is not None:
+                self._field = direction_of(self.config.steer_goal)[0]
             self._apply_mob()
             if seed is not None:
                 self._seed_coupling(*seed)
@@ -561,6 +586,13 @@ class TAMETrainer:
             self.model = self.model.to(self.device)  # pyright: ignore[reportArgumentType] # .to() overload expects Device, not torch.device
 
         self._assert_setup_invariants()
+
+        # The field goes on last, over the converted, adapted and placed model:
+        # forward hooks on the decoder blocks, which is what the server attaches to
+        # the model it serves. From here every forward -- training step, held-out
+        # evaluation, specialisation probe -- runs in the field.
+        if self._field is not None:
+            self._attach_field()
 
         # Setup optimizer
         self._setup_optimizer()
@@ -717,6 +749,76 @@ class TAMETrainer:
             self.config.coupling_warmup_steps,
             [layer for layer in requested if layer not in seeded],
         )
+
+    def _attach_field(self) -> None:
+        """Inject the goal during training exactly as the server injects it (#28).
+
+        The hooks are the served ones (``CognitiveHomeostat.attach_to_model``):
+        constant loop at the certified reference strength, the certified layers,
+        the capability projection. What the server does that this deliberately
+        does not is calibrate the tissue: calibration generates a corpus, which
+        consumes randomness and runs the inference economy, and the constant loop
+        never reads it -- with ``adaptive`` off every actuator injects
+        ``base_strength`` whether or not a calibration exists.
+        """
+        assert self.model is not None
+        assert self._field is not None
+        self._field.attach_to_model(self.model)
+        self._assert_field_as_served()
+        logger.info(
+            "Field: %r injected during training at layers %s, strength %.2f, constant "
+            "loop, readout %d (#28)",
+            self._field.goal,
+            self._field.actuator_layers,
+            self._field.config.base_strength,
+            self._field.readout_layer,
+        )
+
+    def _assert_field_as_served(self) -> None:
+        """The injection during training is the certified one -- checked, not assumed.
+
+        A field attached at the template's layers, at an adaptive strength, or on
+        a wrapper that hid the decoder stack would log as present and train
+        something other than the served configuration; each of those fails here
+        with the difference named.
+        """
+        assert self._field is not None
+        assert self.model is not None
+        goal = self.config.steer_goal
+        assert goal is not None
+        certification = certification_for(goal)
+        assert certification is not None and certification.layers is not None
+        hooks = self._field.hooks
+        injecting = sorted(layer for layer, hook in hooks.items() if hook.injects)
+        if injecting != sorted(certification.layers):
+            raise RuntimeError(
+                f"the field injects at layers {injecting}, not the certified "
+                f"{sorted(certification.layers)}"
+            )
+        strength = self._field.config.base_strength
+        if certification.strength is not None and strength != certification.strength:
+            raise RuntimeError(
+                f"the field injects at strength {strength}, not the certified "
+                f"{certification.strength}"
+            )
+        if self._field.config.adaptive:
+            raise RuntimeError("the field's loop is adaptive; training injects the constant")
+        registered = {id(hook) for hook in hooks.values()}
+        blocks = transformer_layers(self.model)
+        live = {
+            layer
+            for layer in hooks
+            if any(id(hook) in registered for hook in blocks[layer]._forward_hooks.values())
+        }
+        if live != set(hooks):
+            raise RuntimeError(
+                f"the field's hooks at layers {sorted(set(hooks) - live)} are not registered "
+                "on the decoder blocks the model runs"
+            )
+
+    def _detach_field(self) -> None:
+        if self._field is not None:
+            self._field.detach_from_model()
 
     def _named_tensors(self) -> list[tuple[str, torch.Tensor]]:
         assert self.model is not None
@@ -1062,12 +1164,17 @@ class TAMETrainer:
         # thing it is checking.
         order = data_order_fingerprint(iter(self.train_dataloader))
 
+        # The field's strength and layers are read off the attached hooks, so the
+        # fingerprint records what is injected rather than what was asked for.
+        field = self._field
         self.fingerprint = fingerprint_arm(
             self.config,
             dataset_config=self._dataset_config(),
             eval_split_fingerprint=self.held_out_split.fingerprint,
             data_order=order,
             converted_layers=len(get_mob_layers(self.model)),
+            steer_strength=field.config.base_strength if field is not None else None,
+            steer_layers=field.actuator_layers if field is not None else (),
         )
         logger.info(f"Arm fingerprint: {self.fingerprint.as_dict()}")
 
@@ -1442,6 +1549,7 @@ class TAMETrainer:
             self.evaluate_held_out(self.config.max_steps)
             self._save_checkpoint(self.config.max_steps, final=True)
         finally:
+            self._detach_field()
             self.metrics.close()
             end_tracking()
 
@@ -1907,6 +2015,16 @@ def main():
         ),
     )
 
+    parser.add_argument(
+        "--steer_goal",
+        type=str,
+        default=None,
+        help=(
+            "Inject this goal's certified direction during training, as served: constant "
+            "loop, certified strength and layers (#28; default: the field is absent)"
+        ),
+    )
+
     # Hardware
     parser.add_argument(
         "--dtype", type=str, default="bfloat16", choices=["bfloat16", "float16", "float32"]
@@ -1947,6 +2065,7 @@ def main():
         coupling_beta=args.coupling_beta,
         coupling_warmup_steps=args.coupling_warmup_steps,
         trace_goal=args.trace_goal,
+        steer_goal=args.steer_goal,
     )
 
     # Create trainer and run

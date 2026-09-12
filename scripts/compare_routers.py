@@ -57,13 +57,16 @@ def run_arm(
     config: TrainingConfig,
     coupling_goal: str | None = None,
     trace_goal: str | None = None,
+    steer_goal: str | None = None,
 ) -> dict[str, object]:
     """Train one arm to completion and return its fingerprint and final metrics.
 
     ``trace_goal`` is measured against, never coupled to, and only where there is
-    a gate to measure: the dense arm has none.
+    a gate to measure: the dense arm has none. ``steer_goal`` is injected during
+    training (#28), again only in the routed arms.
     """
-    arm = arm_label(router, coupling_goal)
+    routed = router != ARM_DENSE
+    arm = arm_label(router, coupling_goal, steer_goal if routed else None)
     logger.info("=" * 80)
     logger.info(f"Arm: {arm}")
     logger.info("=" * 80)
@@ -73,7 +76,8 @@ def run_arm(
             config,
             router=router,
             coupling_goal=coupling_goal,
-            trace_goal=trace_goal if router != ARM_DENSE else None,
+            trace_goal=trace_goal if routed else None,
+            steer_goal=steer_goal if routed else None,
             output_dir=f"{config.output_dir}/{arm}",
         )
     )
@@ -170,6 +174,15 @@ def main() -> None:
             "direction without coupling to it (#24; default: the coupling goal, or nothing)"
         ),
     )
+    parser.add_argument(
+        "--steer_goal",
+        type=str,
+        default=None,
+        help=(
+            "Inject this goal's certified direction during training in every routed arm, "
+            "as served (#28; default: the field is absent)"
+        ),
+    )
     args = parser.parse_args()
 
     workspace = (
@@ -224,8 +237,11 @@ def main() -> None:
     arms: list[tuple[str, str | None]] = [(router, None) for router in ARMS]
     if args.coupling_goal:
         arms.append((ARM_MOB, args.coupling_goal))
-    trace_goal = args.trace_goal or args.coupling_goal
-    results = [run_arm(router, config, coupling_goal, trace_goal) for router, coupling_goal in arms]
+    trace_goal = args.trace_goal or args.coupling_goal or args.steer_goal
+    results = [
+        run_arm(router, config, coupling_goal, trace_goal, args.steer_goal)
+        for router, coupling_goal in arms
+    ]
     assert_parity([result["fingerprint"] for result in results])  # pyright: ignore[reportArgumentType]
 
     print("\n" + format_table(results))
