@@ -1,4 +1,5 @@
 import logging
+import re
 from collections.abc import Iterator
 from contextlib import contextmanager
 
@@ -9,6 +10,9 @@ from .core import MixtureOfBidders
 from .routing_trace import RoutingTrace
 
 logger = logging.getLogger(__name__)
+
+# ``...layers.<index>.<ffn attribute>``: the block index in a MoB layer's qualified name.
+_BLOCK_INDEX = re.compile(r"(?:^|\.)layers\.(\d+)\.")
 
 
 def get_mob_layers(model: nn.Module) -> list[MixtureOfBidders]:
@@ -39,13 +43,23 @@ def mob_layers_by_index(model: nn.Module) -> dict[int, MixtureOfBidders]:
     :func:`get_mob_layers` returns them in module order, which says nothing about
     which block each one sits in. Everything that has to line a MoB layer up with a
     steering layer, a certified coupling layer or a cell needs the index.
+
+    Read off the module *names* rather than by walking ``model.model.layers``: a
+    PEFT wrapper puts the transformer two attributes deeper
+    (``base_model.model.model.layers``), and the walk then found nothing and
+    said so silently -- a LoRA training arm's held-out probe measured routing
+    against no direction at all (#24). The block index is the number after
+    ``layers.`` in the qualified name, whatever sits above it.
     """
-    inner = getattr(model, "model", model)
-    blocks = getattr(inner, "layers", None)
-    if blocks is None:
-        return {}
-    found = {index: mob_at(block) for index, block in enumerate(blocks)}
-    return {index: mob for index, mob in found.items() if mob is not None}
+    found: dict[int, MixtureOfBidders] = {}
+    for name, module in model.named_modules():
+        if not isinstance(module, MixtureOfBidders):
+            continue
+        match = _BLOCK_INDEX.search(name)
+        if match is None:
+            continue
+        found[int(match.group(1))] = module
+    return dict(sorted(found.items()))
 
 
 @contextmanager

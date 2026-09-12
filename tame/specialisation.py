@@ -702,6 +702,15 @@ def probe_specialisation(
         for layer, direction in (goal_directions or {}).items()
         if layer in by_index
     }
+    if goal_directions and not directions:
+        # A silent no-op here is a routing contrast against nothing: the first
+        # ablation arm ran under a PEFT wrapper the block lookup could not see.
+        logger.warning(
+            "Specialisation probe: none of the goal-direction layers %s is a MoB layer "
+            "(MoB layers: %s); routing will be measured against no direction",
+            sorted(goal_directions),
+            sorted(by_index),
+        )
     capture = _collect_probe_data(
         model,
         mob_layers,
