@@ -21,9 +21,10 @@ the number has value, MLflow is one of several places it is filed.
 
 When both summaries carry the arm fingerprints ``run_seeds.py`` records, the
 comparison first asserts parity between each seed's pair of arms -- the two groups
-may differ in the router or the coupling goal and in nothing else -- and refuses
-to print a delta whose arms disagree on anything more. A summary written before
-fingerprints were recorded is compared unchecked, and says so.
+may differ in the router, the coupling goal or the goal field (#28) and in nothing
+else -- and refuses to print a delta whose arms disagree on anything more. A
+summary written before fingerprints were recorded is compared unchecked, and says
+so; one written before the field existed reads as a field-off arm.
 
     uv run python scripts/compare_runs.py \\
         --group_a runs/mob --group_b runs/softmax
