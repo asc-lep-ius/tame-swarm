@@ -15,10 +15,17 @@ first ablation attempt for exactly this) -- the contrast is read as
 
     excess_s = TV(contrast, seed s) - TV(floor, seed s)
 
-paired by seed, with a percentile bootstrap over the paired values. An interval
+paired by seed, with a percentile bootstrap over the paired values. A range
 that includes zero reads "the contrast moved the allocation no further than
-re-running does". Three seeds give three paired values; the bootstrap over them
-is honest about that and no sharper than it (#35 owns the general form).
+re-running does". Below six paired values the 2.5th and 97.5th percentiles of
+the resampled means are the sample minimum and maximum -- at n = 3 a resample
+repeats one value with probability 1/27 -- so the interval is the per-seed
+range and carries no 95% coverage; it is labelled as a range for that reason
+(#35 owns the general form).
+
+Parity is asserted between the two groups exactly as ``compare_runs.py`` does,
+and the floor pair must be two groups at *identical* fingerprints: that is what
+makes it a floor.
 
     uv run python scripts/allocation_shift.py \\
         --group_a runs/mob --group_b runs/mob@truthful \\
@@ -34,11 +41,13 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from compare_runs import load_group  # noqa: E402
+from compare_runs import assert_groups_at_parity, load_group  # noqa: E402
 
 WIN_SHARE_PREFIX = "routing/win_share_e"
 DEFAULT_RESAMPLES = 10_000
 CONFIDENCE = 0.95
+# Below this many paired values the percentile interval is the sample range.
+MIN_PAIRS_FOR_COVERAGE = 6
 
 
 def win_shares(result: dict[str, float]) -> dict[str, float]:
@@ -46,12 +55,20 @@ def win_shares(result: dict[str, float]) -> dict[str, float]:
 
 
 def total_variation(result_a: dict[str, float], result_b: dict[str, float]) -> float:
-    """Half the L1 distance between two runs' slot allocations, over the experts both report."""
+    """Half the L1 distance between two runs' slot allocations.
+
+    Both runs must report the same experts: a run missing a column would
+    otherwise read as a smaller shift, and half-L1 over a subset of a
+    ``top_k``-mass allocation is not a total variation at all.
+    """
     shares_a, shares_b = win_shares(result_a), win_shares(result_b)
-    experts = sorted(set(shares_a) & set(shares_b))
-    if not experts:
+    if not shares_a or not shares_b:
         raise ValueError("no win-share column is shared by the two runs")
-    return sum(abs(shares_b[expert] - shares_a[expert]) for expert in experts) / 2
+    if set(shares_a) != set(shares_b):
+        raise ValueError(
+            f"the two runs report different experts: {sorted(set(shares_a) ^ set(shares_b))}"
+        )
+    return sum(abs(shares_b[expert] - shares_a[expert]) for expert in shares_a) / 2
 
 
 def paired_shifts(group_a: dict[str, Any], group_b: dict[str, Any]) -> dict[str, float]:
@@ -68,7 +85,11 @@ def paired_shifts(group_a: dict[str, Any], group_b: dict[str, Any]) -> dict[str,
 def bootstrap_mean(
     values: list[float], resamples: int = DEFAULT_RESAMPLES, seed: int = 0
 ) -> tuple[float, float, float]:
-    """Mean and its percentile bootstrap interval over ``values``, resampled with replacement."""
+    """Mean and its percentile bootstrap interval over ``values``, resampled with replacement.
+
+    At fewer than ``MIN_PAIRS_FOR_COVERAGE`` values the interval is exactly the
+    sample range; callers label it as such.
+    """
     if not values:
         raise ValueError("nothing to bootstrap")
     rng = random.Random(seed)
@@ -87,6 +108,21 @@ def excess_over_floor(contrast: dict[str, float], floor: dict[str, float]) -> di
     return {seed: contrast[seed] - floor[seed] for seed in seeds}
 
 
+def assert_identical_fingerprints(group_a: dict[str, Any], group_b: dict[str, Any]) -> None:
+    """A floor pair is two runs of one configuration: same fingerprint, seed by seed."""
+    prints_a, prints_b = group_a.get("fingerprints") or {}, group_b.get("fingerprints") or {}
+    if not prints_a or not prints_b:
+        raise ValueError("a floor pair needs the arm fingerprints run_seeds.py records")
+    for seed in sorted(set(prints_a) & set(prints_b), key=str):
+        if prints_a[seed] != prints_b[seed]:
+            differing = sorted(
+                k for k in prints_a[seed] if prints_a[seed][k] != prints_b[seed].get(k)
+            )
+            raise ValueError(
+                f"the floor pair is not a replication: seed {seed} differs on {differing}"
+            )
+
+
 def format_report(
     contrast: dict[str, float],
     floor: dict[str, float] | None,
@@ -98,8 +134,13 @@ def format_report(
         per_seed = "  ".join(f"s{s}={v:.3f}" for s, v in shifts.items())
         return f"{label:<24}{mean:>8.3f}  [{low:.3f}, {high:.3f}]   {per_seed}"
 
+    interval = (
+        f"{CONFIDENCE:.0%} bootstrap"
+        if len(contrast) >= MIN_PAIRS_FOR_COVERAGE
+        else "resampled-mean range"
+    )
     lines = [
-        f"{'allocation shift (TV)':<24}{'mean':>8}  {CONFIDENCE:.0%} bootstrap    per seed",
+        f"{'allocation shift (TV)':<24}{'mean':>8}  {interval:<22}per seed",
         "-" * 78,
         row("contrast", contrast),
     ]
@@ -107,10 +148,16 @@ def format_report(
         lines.append(row("floor (re-running)", floor))
         lines.append(row("excess over floor", excess_over_floor(contrast, floor)))
         lines.append(
-            "\nexcess is TV(contrast) - TV(floor), paired by seed; an interval that includes "
+            "\nexcess is TV(contrast) - TV(floor), paired by seed; a range that includes "
             "zero reads 'moved no further than re-running does'."
         )
-    lines.append(f"({resamples} resamples over {len(contrast)} paired seeds; #35 owns the form)")
+    footer = f"({resamples} resamples over {len(contrast)} paired seeds; #35 owns the form"
+    if len(contrast) < MIN_PAIRS_FOR_COVERAGE:
+        footer += (
+            f"; at n={len(contrast)} the percentile interval is the sample range and has "
+            "no 95% coverage"
+        )
+    lines.append(footer + ")")
     return "\n".join(lines)
 
 
@@ -127,12 +174,14 @@ def main() -> None:
     if (args.floor_a is None) != (args.floor_b is None):
         parser.error("--floor_a and --floor_b go together")
 
-    contrast = paired_shifts(load_group(Path(args.group_a)), load_group(Path(args.group_b)))
-    floor = (
-        paired_shifts(load_group(Path(args.floor_a)), load_group(Path(args.floor_b)))
-        if args.floor_a is not None
-        else None
-    )
+    group_a, group_b = load_group(Path(args.group_a)), load_group(Path(args.group_b))
+    assert_groups_at_parity(group_a, group_b)
+    contrast = paired_shifts(group_a, group_b)
+    floor = None
+    if args.floor_a is not None:
+        floor_a, floor_b = load_group(Path(args.floor_a)), load_group(Path(args.floor_b))
+        assert_identical_fingerprints(floor_a, floor_b)
+        floor = paired_shifts(floor_a, floor_b)
     print(format_report(contrast, floor, args.resamples, args.seed))
     if args.json:
         Path(args.json).write_text(json.dumps({"contrast": contrast, "floor": floor}, indent=2))

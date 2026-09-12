@@ -545,7 +545,7 @@ def test_a_field_that_is_not_the_served_injection_is_refused(smoke_fixture, tmp_
     field.config.base_strength = 1.0
 
     field.config.adaptive = True
-    with pytest.raises(RuntimeError, match="adaptive"):
+    with pytest.raises(RuntimeError, match="loop is adaptive; the server's is constant"):
         trainer._assert_field_as_served()
     field.config.adaptive = False
 
@@ -553,6 +553,43 @@ def test_a_field_that_is_not_the_served_injection_is_refused(smoke_fixture, tmp_
         handle.remove()
     with pytest.raises(RuntimeError, match="not registered on the decoder blocks"):
         trainer._assert_field_as_served()
+
+
+def test_a_field_no_mob_layer_perceives_is_refused(smoke_fixture, tmp_path, monkeypatch):
+    """Certified above every converted layer: the run would produce no routing column at all."""
+    model_id, _ = smoke_fixture
+    _certify_smoke_goal(monkeypatch, model_id, layers=(3,))
+    trainer = TAMETrainer(
+        _config(smoke_fixture, tmp_path / "unperceived", steer_goal="smoke", mob_layers_end=2)
+    )
+
+    with pytest.raises(RuntimeError, match="no MoB layer perceives the field"):
+        trainer.setup()
+
+
+def test_the_field_reaches_the_gradient_under_gradient_checkpointing(
+    smoke_fixture, tmp_path, monkeypatch
+):
+    """The real run trains with checkpointing on; the hooks must fire inside the recompute."""
+    model_id, _ = smoke_fixture
+    _certify_smoke_goal(monkeypatch, model_id, layers=(2, 3))
+    trainer = TAMETrainer(
+        _config(
+            smoke_fixture, tmp_path / "ckpt-field", steer_goal="smoke", gradient_checkpointing=True
+        )
+    )
+    trainer.setup()
+    field = trainer._field
+    assert field is not None
+    batch = next(iter(trainer.train_dataloader))
+
+    trainer.global_step = 0
+    in_field = trainer.train_step(batch)["loss"]
+    trainer.optimizer.zero_grad()
+    field.detach_from_model()
+    out_of_field = trainer.train_step(batch)["loss"]
+
+    assert in_field != pytest.approx(out_of_field, abs=1e-6)
 
 
 def test_the_field_the_coupling_and_the_probe_share_one_direction(
