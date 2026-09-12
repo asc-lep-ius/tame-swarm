@@ -20,6 +20,7 @@ from mob import (
     MixtureOfBidders,
     MoBConfig,
     apply_mob_to_model,
+    load_mob_modules,
     load_mob_state,
     mob_layers_by_index,
 )
@@ -304,6 +305,11 @@ class TAMEApplication:
         for state_path in mob_state_paths:
             if os.path.exists(state_path):
                 try:
+                    # The trained experts, heads and coupling beside the ledgers (#29);
+                    # an export that predates them serves the upcycled body, as before.
+                    modules_path = os.path.join(os.path.dirname(state_path), "mob_modules.pt")
+                    if os.path.exists(modules_path):
+                        load_mob_modules(model, modules_path)
                     loaded = load_mob_state(model, state_path, compress_wealth=compression)
                     if loaded > 0:
                         logger.info(

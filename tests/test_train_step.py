@@ -695,6 +695,66 @@ def test_a_lora_checkpoint_restores_the_experts_heads_and_coupling_it_trained(
             assert after[key] == pytest.approx(value, abs=1e-6), key
 
 
+def test_a_checkpoint_that_cannot_restore_the_whole_arm_is_refused(
+    smoke_fixture, tmp_path, monkeypatch
+):
+    """A truncated adapter file, a pre-#29 directory and a full-weight checkpoint all refuse."""
+    import shutil
+    from dataclasses import replace
+
+    from safetensors.torch import load_file, save_file
+
+    from train import restore_checkpoint
+
+    config = _config(smoke_fixture, tmp_path / "trained", use_lora=True, max_steps=2)
+    config = replace(config, checkpoint_min_free_gb=0)
+    trainer = TAMETrainer(config)
+    trainer.setup()
+    trainer.train()
+    checkpoint = Path(config.output_dir) / f"checkpoint-{config.max_steps}"
+    fresh = TAMETrainer(replace(config, output_dir=str(tmp_path / "restored")))
+    fresh.setup()
+
+    truncated = tmp_path / "truncated"
+    shutil.copytree(checkpoint, truncated)
+    adapters = load_file(str(truncated / "adapter_model.safetensors"))
+    del adapters[next(iter(adapters))]
+    save_file(adapters, str(truncated / "adapter_model.safetensors"))
+    with pytest.raises(ValueError, match="does not hold this arm's LoRA adapters"):
+        restore_checkpoint(fresh.model, truncated)
+
+    predates = tmp_path / "predates"
+    shutil.copytree(checkpoint, predates)
+    (predates / "mob_modules.pt").unlink()
+    with pytest.raises(ValueError, match="predates #29"):
+        restore_checkpoint(fresh.model, predates)
+
+    full = tmp_path / "full"
+    full.mkdir()
+    (full / "model.safetensors").touch()
+    with pytest.raises(ValueError, match="full-weight checkpoint"):
+        restore_checkpoint(fresh.model, full)
+
+
+def test_a_dense_checkpoint_restores_nothing_and_says_nothing(smoke_fixture, tmp_path):
+    from train import restore_checkpoint
+
+    config = _config(smoke_fixture, tmp_path / "dense", router="dense", use_lora=True, max_steps=2)
+    trainer = TAMETrainer(replace_min_free(config))
+    trainer.setup()
+    trainer.train()
+    checkpoint = Path(config.output_dir) / f"checkpoint-{config.max_steps}"
+    assert not (checkpoint / "mob_modules.pt").exists()
+
+    restore_checkpoint(trainer.model, checkpoint)
+
+
+def replace_min_free(config: TrainingConfig) -> TrainingConfig:
+    from dataclasses import replace
+
+    return replace(config, checkpoint_min_free_gb=0)
+
+
 # --- The model that trains is the model that was loaded (#19) ---------------
 
 

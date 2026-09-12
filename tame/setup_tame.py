@@ -159,6 +159,7 @@ def export_for_inference(checkpoint_path_str: str, export_dir_str: str = "./tame
         "adapter_config.json",
         "adapter_model.safetensors",
         "adapter_model.bin",
+        "mob_modules.pt",
         "tokenizer.json",
         "tokenizer_config.json",
         "special_tokens_map.json",

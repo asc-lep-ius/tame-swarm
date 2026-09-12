@@ -96,8 +96,19 @@ def test_the_saved_keys_do_not_depend_on_the_wrapper(tiny_mob_config, tmp_path):
     assert a["_config"] == b["_config"] and sorted(a["blocks"]) == MOB_BLOCKS
     for index in MOB_BLOCKS:
         assert sorted(a["blocks"][index]["state"]) == sorted(b["blocks"][index]["state"])
-    assert not any(name.startswith("base_") for name in a["blocks"][1]["state"])
-    assert "expert_wealth" not in a["blocks"][1]["state"], "ledgers live in mob_state.pt"
+    saved = a["blocks"][1]["state"]
+    assert not any(name.startswith("base_") for name in saved)
+    assert "expert_wealth" not in saved, "ledgers live in mob_state.pt"
+    for name in (
+        "experts.0.gate_adapter_B.weight",
+        "experts.2.down_adapter_A.weight",
+        "confidence_heads.0.proj.weight",
+        "confidence_heads.1.proj.bias",
+        "coupling.detector",
+        "coupling.steering_direction",
+        "coupling._coupling_step",
+    ):
+        assert name in saved, name
 
 
 def test_a_partial_or_mismatched_restore_is_refused(tiny_mob_config, tmp_path):
@@ -118,6 +129,21 @@ def test_a_partial_or_mismatched_restore_is_refused(tiny_mob_config, tmp_path):
     torch.save(payload, path)
     with pytest.raises(ValueError, match="unrestored"):
         load_mob_modules(_converted(tiny_mob_config, peft=False, coupled=False), path)
+
+
+def test_a_coupling_configured_differently_is_refused(tiny_mob_config, tmp_path):
+    from coupling import SteeringCouplingConfig
+
+    path = tmp_path / "mob_modules.pt"
+    save_mob_modules(_converted(tiny_mob_config, peft=False, coupled=True), path)
+    other = _converted(tiny_mob_config, peft=False, coupled=False)
+    mob_layers_by_index(other)[1].attach_coupling(
+        torch.randn(TINY_HIDDEN_DIM),
+        SteeringCouplingConfig(hidden_dim=TINY_HIDDEN_DIM, coupling_beta=0.5),
+    )
+
+    with pytest.raises(ValueError, match="report a different arm"):
+        load_mob_modules(other, path)
 
 
 def test_a_model_without_mob_layers_saves_nothing(tmp_path):

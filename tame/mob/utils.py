@@ -530,8 +530,8 @@ MOB_MODULES_FILENAME = "mob_modules.pt"
 SHARED_BASE_PREFIX = "base_"
 
 
-def owned_state(mob: MixtureOfBidders) -> dict[str, torch.Tensor]:
-    """Everything training can move in a MoB layer, plus the coupling's buffers.
+def owned_names(mob: MixtureOfBidders) -> set[str]:
+    """The state-dict names of everything training can move in a MoB layer.
 
     The complement of the two things saved elsewhere: the shared-base FFN
     (``base_*``, the pretrained weights) and the ledgers (``mob_state.pt``). The
@@ -542,9 +542,19 @@ def owned_state(mob: MixtureOfBidders) -> dict[str, torch.Tensor]:
     """
     ledgers = set(ledger_initial_values(mob.config))
     return {
+        name
+        for name in mob.state_dict()
+        if not name.startswith(SHARED_BASE_PREFIX) and name not in ledgers
+    }
+
+
+def owned_state(mob: MixtureOfBidders) -> dict[str, torch.Tensor]:
+    """The owned tensors themselves, detached and on the CPU."""
+    owned = owned_names(mob)
+    return {
         name: tensor.detach().cpu().clone()
         for name, tensor in mob.state_dict().items()
-        if not name.startswith(SHARED_BASE_PREFIX) and name not in ledgers
+        if name in owned
     }
 
 
@@ -564,6 +574,10 @@ def save_mob_modules(model: nn.Module, save_path: str | Path) -> int:
     """
     by_index = mob_layers_by_index(model)
     if not by_index:
+        if get_mob_layers(model):
+            raise ValueError(
+                "the model has MoB layers but none sits under a block index; nothing would be saved"
+            )
         return 0
     first = next(iter(by_index.values()))
     payload = {
@@ -603,14 +617,20 @@ def load_mob_modules(model: nn.Module, state_path: str | Path) -> int:
     for index, block in saved.items():
         mob = by_index[index]
         coupling_config = block["coupling"]
-        if coupling_config is None and hasattr(mob, "coupling"):
+        live_config = _coupling_config(mob)
+        if coupling_config is None and live_config is not None:
             raise ValueError(f"block {index}: the model is coupled and the checkpoint is not")
-        if coupling_config is not None and not hasattr(mob, "coupling"):
+        if coupling_config is not None and live_config is None:
             mob.attach_coupling(
                 block["state"]["coupling.steering_direction"],
                 SteeringCouplingConfig(**coupling_config),
             )
-        expected_missing = set(mob.state_dict()) - set(owned_state(mob))
+        elif coupling_config is not None and coupling_config != live_config:
+            raise ValueError(
+                f"block {index}: the checkpoint's coupling was configured {coupling_config}, "
+                f"the model's {live_config}; a restore would report a different arm"
+            )
+        expected_missing = set(mob.state_dict()) - owned_names(mob)
         result = mob.load_state_dict(block["state"], strict=False)
         unrestored = set(result.missing_keys) - expected_missing
         if unrestored or result.unexpected_keys:
