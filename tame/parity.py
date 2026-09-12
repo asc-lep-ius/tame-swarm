@@ -40,12 +40,20 @@ DATA_ORDER_PROBE_BATCHES = 8
 
 # The fields an arm is allowed to differ on -- the variables under test. ``router``
 # is #12's gate comparison; ``coupling_goal`` is #6's coupling ablation, a coupled
-# and an uncoupled auction arm at parity in everything else. The coupling's own
-# parameters (``coupling_beta``, ``coupling_warmup_steps``) are deliberately not
-# here: an uncoupled arm carries them inert, as the softmax arm carries the
-# auction-only fields, and two coupled arms that differ on them are a tuning
-# comparison rather than the ablation.
-VARYING_FIELDS = frozenset({"router", "coupling_goal"})
+# and an uncoupled auction arm at parity in everything else; ``steer_goal`` is
+# #28's field-present contrast, an arm trained in the goal field against one
+# trained without it. The coupling's own parameters (``coupling_beta``,
+# ``coupling_warmup_steps``) are deliberately not here: an uncoupled arm carries
+# them inert, as the softmax arm carries the auction-only fields, and two coupled
+# arms that differ on them are a tuning comparison rather than the ablation.
+VARYING_FIELDS = frozenset({"router", "coupling_goal", "steer_goal"})
+
+# The field's own parameters, asserted only between arms that have a field. An
+# arm without one records no strength and no layers -- they come from the goal's
+# certification, not from a default it could carry inert -- so the presence of
+# the field is ``steer_goal``'s to vary, and two field-on arms that differ on the
+# dose or the layers are #32's sweep, not the contrast.
+FIELD_FIELDS = frozenset({"steer_strength", "steer_layers"})
 
 # Reported for context, not asserted: see the module docstring on ``dense``.
 REPORTED_FIELDS = frozenset({"converted_layers"})
@@ -92,9 +100,14 @@ NOT_A_CONFOUND = {
 }
 
 
-def arm_label(router: str, coupling_goal: str | None = None) -> str:
-    """What an arm is called in tables and summaries: the gate, plus any goal it is coupled to."""
-    return router if coupling_goal is None else f"{router}+{coupling_goal}"
+def arm_label(router: str, coupling_goal: str | None = None, steer_goal: str | None = None) -> str:
+    """What an arm is called in tables and summaries.
+
+    The gate, plus the goal it is coupled to (``mob+truthful``), plus the field it
+    was trained in (``mob@truthful``, ``mob+truthful@truthful``).
+    """
+    label = router if coupling_goal is None else f"{router}+{coupling_goal}"
+    return label if steer_goal is None else f"{label}@{steer_goal}"
 
 
 class ParityError(AssertionError):
@@ -159,10 +172,16 @@ class ArmFingerprint:
     eval_split: str
     data_order: str
     converted_layers: int
+    # The goal field (#28), defaulted so that a summary recorded before the field
+    # existed still loads: a run that predates the flag was, by construction, a
+    # run with the field absent, and reads as one.
+    steer_goal: str | None = None
+    steer_strength: float | None = None
+    steer_layers: tuple[int, ...] = ()
 
     @property
     def arm(self) -> str:
-        return arm_label(self.router, self.coupling_goal)
+        return arm_label(self.router, self.coupling_goal, self.steer_goal)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -188,11 +207,16 @@ def fingerprint_arm(
     data_order: str,
     converted_layers: int,
     dataset_config: str | None = None,
+    steer_strength: float | None = None,
+    steer_layers: Sequence[int] = (),
 ) -> ArmFingerprint:
     """Build a fingerprint from a ``TrainingConfig`` and the two measured hashes.
 
     ``dataset_config`` is passed in rather than read off the config because it only
     applies to some datasets, and the caller is the one place that knows the rule.
+    ``steer_strength`` and ``steer_layers`` are what the field actually injected
+    at, read off the attached hooks rather than the certification record, so the
+    fingerprint records the injection and not the intent.
     """
     return ArmFingerprint(
         router=config.router,
@@ -231,7 +255,28 @@ def fingerprint_arm(
         eval_split=eval_split_fingerprint,
         data_order=data_order,
         converted_layers=converted_layers,
+        steer_goal=config.steer_goal,
+        steer_strength=steer_strength,
+        steer_layers=tuple(steer_layers),
     )
+
+
+def _field_disagreements(arms: Sequence[ArmFingerprint]) -> list[str]:
+    """The field's strength and layers, compared among the arms that have a field."""
+    fielded = [arm for arm in arms if arm.steer_goal is not None]
+    if len(fielded) < 2:
+        return []
+    reference = fielded[0]
+    disagreements: list[str] = []
+    for name in sorted(FIELD_FIELDS):
+        expected = getattr(reference, name)
+        for arm in fielded[1:]:
+            actual = getattr(arm, name)
+            if actual != expected:
+                disagreements.append(
+                    f"  {name}: {reference.arm}={expected!r} vs {arm.arm}={actual!r}"
+                )
+    return disagreements
 
 
 def assert_parity(arms: Sequence[ArmFingerprint]) -> None:
@@ -246,12 +291,14 @@ def assert_parity(arms: Sequence[ArmFingerprint]) -> None:
 
     labels = [arm.arm for arm in arms]
     if len(set(labels)) != len(labels):
-        raise ParityError(f"Arms must be distinct in router or coupling goal, got {labels}")
+        raise ParityError(
+            f"Arms must be distinct in router, coupling goal or steer goal, got {labels}"
+        )
 
     reference = arms[0]
     disagreements: list[str] = []
     for field in fields(ArmFingerprint):
-        if field.name in VARYING_FIELDS or field.name in REPORTED_FIELDS:
+        if field.name in VARYING_FIELDS | REPORTED_FIELDS | FIELD_FIELDS:
             continue
         expected = getattr(reference, field.name)
         for arm in arms[1:]:
@@ -260,6 +307,7 @@ def assert_parity(arms: Sequence[ArmFingerprint]) -> None:
                 disagreements.append(
                     f"  {field.name}: {reference.arm}={expected!r} vs {arm.arm}={actual!r}"
                 )
+    disagreements.extend(_field_disagreements(arms))
 
     if disagreements:
         raise ParityError(

@@ -1,11 +1,12 @@
 """Parity between arms, asserted programmatically rather than assumed."""
 
-from dataclasses import fields, replace
+from dataclasses import asdict, fields, replace
 
 import pytest
 import torch
 
 from parity import (
+    ArmFingerprint,
     ParityError,
     assert_parity,
     data_order_fingerprint,
@@ -121,6 +122,57 @@ def test_the_couplings_own_parameters_are_confounds_between_coupled_arms():
         assert_parity(arms)
 
 
+FIELD = dict(steer_goal="truthful", steer_strength=4.0, steer_layers=(13, 16, 17))
+
+
+def test_a_field_on_and_a_field_off_arm_are_at_parity():
+    """#28's contrast: the field's presence is the variable under test."""
+    fielded = replace(BASE, **FIELD)
+    coupled_fielded = replace(BASE, coupling_goal="truthful", **FIELD)
+
+    assert_parity([BASE, fielded, coupled_fielded])
+    assert fielded.arm == "mob@truthful"
+    assert coupled_fielded.arm == "mob+truthful@truthful"
+
+
+def test_two_field_on_arms_that_differ_in_the_dose_are_confounded():
+    """Two arms in fields of different strength or extent are #32's sweep, not the contrast."""
+    with pytest.raises(ParityError, match="steer_strength"):
+        assert_parity(
+            [
+                replace(BASE, **FIELD),
+                replace(BASE, coupling_goal="truthful", **{**FIELD, "steer_strength": 2.0}),
+            ]
+        )
+    with pytest.raises(ParityError, match="steer_layers"):
+        assert_parity(
+            [
+                replace(BASE, **FIELD),
+                replace(BASE, coupling_goal="truthful", **{**FIELD, "steer_layers": (13,)}),
+            ]
+        )
+
+
+def test_the_dose_is_checked_among_the_fielded_arms_whatever_the_reference():
+    """A field-off reference arm must not hide a dose difference between two field-on arms."""
+    arms = [
+        BASE,
+        replace(BASE, **FIELD),
+        replace(BASE, coupling_goal="truthful", **{**FIELD, "steer_strength": 2.0}),
+    ]
+
+    with pytest.raises(ParityError, match="steer_strength"):
+        assert_parity(arms)
+
+
+def test_a_fingerprint_recorded_before_the_field_existed_reads_as_field_off():
+    """#25's summaries predate the flag; a run without the flag was a run without the field."""
+    recorded = {key: value for key, value in asdict(BASE).items() if not key.startswith("steer_")}
+
+    assert ArmFingerprint(**recorded) == BASE
+    assert_parity([ArmFingerprint(**recorded), replace(BASE, **FIELD)])
+
+
 def test_a_single_arm_is_vacuously_at_parity():
     assert_parity([BASE])
 
@@ -207,6 +259,27 @@ def test_fingerprint_arm_reads_the_training_config():
     assert arm.eval_split == "split-hash"
     assert arm.data_order == "order-hash"
     assert arm.converted_layers == 3
+    assert arm.steer_goal is None
+    assert arm.steer_strength is None
+    assert arm.steer_layers == ()
+
+
+def test_fingerprint_arm_records_the_injection_the_field_made():
+    """The strength and layers are what was attached, not what the certification says."""
+    config = TrainingConfig(steer_goal="truthful")
+
+    arm = fingerprint_arm(
+        config,
+        eval_split_fingerprint="s",
+        data_order="d",
+        converted_layers=1,
+        steer_strength=4.0,
+        steer_layers=[13, 16],
+    )
+
+    assert arm.steer_goal == "truthful"
+    assert arm.steer_strength == 4.0
+    assert arm.steer_layers == (13, 16)
 
 
 def test_dataset_config_is_omitted_when_the_dataset_has_none():

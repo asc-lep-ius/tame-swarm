@@ -105,6 +105,23 @@ def test_groups_that_differ_only_in_the_coupling_goal_are_at_parity():
     assert assert_groups_at_parity(group_a, group_b) is True
 
 
+def test_a_field_on_group_is_at_parity_with_a_summary_recorded_before_the_field_existed():
+    """#28 against #25: the older summary carries no steer keys and reads as field-off."""
+    group_a = _with_fingerprints(_group("mob", {"eval/loss": [2.79, 2.80, 2.79]}))
+    group_a["fingerprints"] = {
+        seed: {key: value for key, value in prints.items() if not key.startswith("steer_")}
+        for seed, prints in group_a["fingerprints"].items()
+    }
+    group_b = _with_fingerprints(
+        _group("mob", {"eval/loss": [2.78, 2.79, 2.79]}),
+        steer_goal="truthful",
+        steer_strength=4.0,
+        steer_layers=(13, 16),
+    )
+
+    assert assert_groups_at_parity(group_a, group_b) is True
+
+
 def test_groups_that_differ_in_a_confound_are_refused():
     group_a = _with_fingerprints(_group("mob", {"eval/loss": [2.79, 2.80]}))
     group_b = _with_fingerprints(

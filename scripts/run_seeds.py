@@ -203,6 +203,18 @@ def main() -> None:
             "coupling to it (default: the coupling goal, or nothing)"
         ),
     )
+    # #28's field-present arms: the goal injected during training, as served.
+    # Field presence changes what is trained, so it is fingerprinted; the two
+    # field-on arms (with and without --coupling_goal) inject identically.
+    parser.add_argument(
+        "--steer_goal",
+        type=str,
+        default=None,
+        help=(
+            "Inject this goal's certified direction during training, as served: constant "
+            "loop, certified strength and layers (#28; default: the field is absent)"
+        ),
+    )
     args = parser.parse_args()
 
     seeds = [int(part) for part in args.seeds.split(",")]
@@ -254,6 +266,7 @@ def main() -> None:
         coupling_beta=args.coupling_beta,
         coupling_warmup_steps=args.coupling_warmup_steps,
         trace_goal=args.trace_goal,
+        steer_goal=args.steer_goal,
     )
 
     # One shared MLflow store across seeds, same reasoning as compare_routers.py:
@@ -266,7 +279,7 @@ def main() -> None:
     fingerprints = {seed: fingerprint for seed, (_, fingerprint) in runs.items()}
     stats = aggregate(per_seed)
 
-    arm = arm_label(args.router, args.coupling_goal)
+    arm = arm_label(args.router, args.coupling_goal, args.steer_goal)
     print("\n" + format_table(stats))
     print(f"\narm: {arm} | seeds: {seeds} | steps: {args.steps}")
     print(f"artefacts: {workspace}")
@@ -278,7 +291,8 @@ def main() -> None:
                 "arm": arm,
                 "router": args.router,
                 "coupling_goal": args.coupling_goal,
-                "trace_goal": config.trace_goal or config.coupling_goal,
+                "steer_goal": args.steer_goal,
+                "trace_goal": config.trace_goal or config.coupling_goal or config.steer_goal,
                 "seeds": seeds,
                 "steps": args.steps,
                 "per_seed": per_seed,
