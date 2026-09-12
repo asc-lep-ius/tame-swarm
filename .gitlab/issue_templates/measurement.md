@@ -5,6 +5,9 @@
      For a change to what the organism does → mechanism.
      For code that does not do what it says → defect.
      For docs, CI and tooling → task.
+     Delete the sections that do not apply; a blank section is worse than none.
+     These templates are revisited after the Phase 1.5 issues close: the first
+     seven uses decide what stays.
      ────────────────────────────────────────────────────────────────────────── -->
 
 ## Question
@@ -14,6 +17,11 @@
      Example: "Does a goal injected at the certified strength during training move
      routing toward goal-aligned experts? A win-share contrast inside one pooled
      spread says no." -->
+
+**Mode:** <!-- exploratory | confirmatory. Exploratory: a fixture sweep, a curve,
+     a look — the plan may move as it runs and the result is a hypothesis.
+     Confirmatory: the plan below is fixed before the run and the result is a
+     verdict. A GPU ablation is confirmatory; the fixture pass before it is not. -->
 
 ## What is already known, and the premise that could be wrong
 
@@ -29,7 +37,7 @@
 |---|---|
 | Substrate | <!-- real model (id, converted layers, rank, seq length) / wired tiny fixture / quality fixture / differentiated fixture (type_signal) --> |
 | Arms | <!-- what differs between arms, and what is asserted at parity (fingerprint) --> |
-| Seeds | <!-- ≥ 3 per arm for any quoted number (#13); state what that resolves --> |
+| Variation per run | <!-- which sources vary between runs — init seed, data order, the kernels that are not deterministic — and how many runs. At the ablation configuration a seed pins the data and not the trajectory, so runs, not seeds, are the unit; ≥ 3 per arm for any quoted number (#13) --> |
 | Budget | <!-- steps; and memory horizons at the decay, if the economy is read (#16) --> |
 | Command | <!-- the exact `uv run python scripts/…` invocation, so a re-run is a copy --> |
 | Code | <!-- commit SHA the numbers come from; the fingerprint does not carry it --> |
@@ -44,8 +52,23 @@
 
 ## What would falsify it
 
-<!-- The value that reads as "no", and what happens then: which constant, mechanism
-     or paper it selects. A measurement that cannot come back "no" is telemetry. -->
+<!-- One primary contrast, declared here, decides the question. Everything else is
+     reported and decides nothing: with fifteen rows the largest |delta / spread|
+     under the null is about two, so "the biggest movement" is not a result.
+     A measurement that cannot come back "no" is telemetry. -->
+
+- **Primary contrast (one):** <!-- the single number, and the value that reads "no" -->
+- **Guardrails (must not move):** <!-- what the intervention may not cost; the number that shows it did -->
+- **Secondary (reported, not decided on):** <!-- every other row in the table -->
+
+## Deviations from the plan
+
+<!-- Filled BEFORE results are read, whenever anything above changed after the
+     run started: the metric, the budget, the arms, the code. #25 changed its gate
+     metric after looking at the fixture; that was right, and it belongs here as a
+     deviation, not rewritten into the plan. Empty means the plan held. -->
+
+- 
 
 ## TAME reading
 
@@ -56,8 +79,8 @@
 
 ## Traps that apply
 
-<!-- Tick what applies; each has cost a re-run before (README, "measurement traps").
-     Add any new one this measurement is exposed to. -->
+<!-- Keep the lines that apply and delete the rest; each has cost a re-run before
+     (README, "measurement traps"). Add any new one this measurement is exposed to. -->
 
 - [ ] A fixed step budget is a different number of memory horizons at each decay
 - [ ] The two wealth clamps need different tolerances
@@ -73,7 +96,7 @@
 ## What it records
 
 - [ ] The README block (anchor: `#…`) **extended, not replaced** — the earlier number stays as the measurement it was
-- [ ] Every headline number as mean ± pooled std, the resolution stated, the run directory named
+- [ ] The primary contrast with a bootstrap interval on the paired per-run deltas; every other row as mean ± pooled std; the run directory named
 - [ ] The script and flags committed; no stored number quoted where a re-run was possible
 - [ ] The verdict, and what it selects (#8's gate row, a constant, the next measurement)
 
@@ -90,19 +113,17 @@
 - [ ] 
 - [ ] 
 
-## Affected module(s)
+## Result and decision
 
-- [ ] `tame/mob` (auction, wealth, core, routing trace)
-- [ ] `tame/homeostat`, `homeostat_calibration` (the tissue, the loop)
-- [ ] `tame/steering`, `steering_pipeline`, `contrastive_data` (directions, certification)
-- [ ] `tame/coupling` (perception modulation)
-- [ ] `tame/specialisation`, `evaluation` (held-out probe)
-- [ ] `tame/train`, `parity`, `metrics` (training arms)
-- [ ] `tame/app`, `routes`, `observability`, `outcome_probe` (served surface)
-- [ ] `scripts/` (measurement harness)
-- [ ] `tests/`
-- [ ] README / docs
-- [ ] CI
+<!-- Filled at close, in the issue, so the loop closes where the question was
+     asked: the primary contrast's value and interval, "yes" or "no", what it
+     selects, and the follow-up issues it opened. The README block carries the
+     table; this carries the verdict. -->
+
+## Touches
+
+<!-- One line: the modules and scripts this lands in, e.g. `tame/train.py`, `scripts/run_seeds.py`, README `#…`. Labels carry the type. -->
+
 
 ---
 

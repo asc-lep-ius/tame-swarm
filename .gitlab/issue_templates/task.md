@@ -4,6 +4,9 @@
      that changes neither what the organism does nor what is known about it.
      For a question a number answers → measurement. For a change to what the
      organism does → mechanism. For code that does not do what it says → defect.
+     Delete the sections that do not apply; a blank section is worse than none.
+     These templates are revisited after the Phase 1.5 issues close: the first
+     seven uses decide what stays.
      ────────────────────────────────────────────────────────────────────────── -->
 
 ## Summary
@@ -46,19 +49,10 @@ uv run pytest
 | Blocked by | <!-- #N or n/a --> |
 | Unblocks | <!-- #N or n/a --> |
 
-## Affected module(s)
+## Touches
 
-- [ ] `tame/mob` (auction, wealth, core, routing trace)
-- [ ] `tame/homeostat`, `homeostat_calibration` (the tissue, the loop)
-- [ ] `tame/steering`, `steering_pipeline`, `contrastive_data` (directions, certification)
-- [ ] `tame/coupling` (perception modulation)
-- [ ] `tame/specialisation`, `evaluation` (held-out probe)
-- [ ] `tame/train`, `parity`, `metrics` (training arms)
-- [ ] `tame/app`, `routes`, `observability`, `outcome_probe` (served surface)
-- [ ] `scripts/` (measurement harness)
-- [ ] `tests/`
-- [ ] README / docs
-- [ ] CI
+<!-- One line: the modules and scripts this lands in, e.g. `tame/train.py`, `scripts/run_seeds.py`, README `#…`. Labels carry the type. -->
+
 
 ---
 

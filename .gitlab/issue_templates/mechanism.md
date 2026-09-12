@@ -5,6 +5,9 @@
      For a question a number answers → measurement.
      For code that does not do what it says → defect.
      For docs, CI and tooling → task.
+     Delete the sections that do not apply; a blank section is worse than none.
+     These templates are revisited after the Phase 1.5 issues close: the first
+     seven uses decide what stays.
      ────────────────────────────────────────────────────────────────────────── -->
 
 ## Claim
@@ -69,6 +72,15 @@
      invites experts to farm the goal signal instead of the loss). The guard,
      and the number that would show the guard failing. -->
 
+## Guardrail metrics
+
+<!-- The numbers the mechanism may not move, each with the bound: held-out loss
+     within the injection's own cost; the term exactly zero with the field
+     absent; the quality fixture's r(wealth, competence) unchanged. A mechanism
+     that improves its own metric and moves a guardrail has not shipped. -->
+
+- 
+
 ## Out of scope
 
 - 
@@ -90,19 +102,10 @@
 - [ ] The README section for the mechanism written or extended, with the TAME reading and the number that would have falsified it
 - [ ] 
 
-## Affected module(s)
+## Touches
 
-- [ ] `tame/mob` (auction, wealth, core, routing trace)
-- [ ] `tame/homeostat`, `homeostat_calibration` (the tissue, the loop)
-- [ ] `tame/steering`, `steering_pipeline`, `contrastive_data` (directions, certification)
-- [ ] `tame/coupling` (perception modulation)
-- [ ] `tame/specialisation`, `evaluation` (held-out probe)
-- [ ] `tame/train`, `parity`, `metrics` (training arms)
-- [ ] `tame/app`, `routes`, `observability`, `outcome_probe` (served surface)
-- [ ] `scripts/` (measurement harness)
-- [ ] `tests/`
-- [ ] README / docs
-- [ ] CI
+<!-- One line: the modules and scripts this lands in, e.g. `tame/train.py`, `scripts/run_seeds.py`, README `#…`. Labels carry the type. -->
+
 
 ---
 
