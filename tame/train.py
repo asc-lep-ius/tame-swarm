@@ -136,7 +136,7 @@ from mob import (
 from mob.experts import CONFIDENCE_INITIAL_LOGIT, ConfidenceHead
 from parity import ArmFingerprint, data_order_fingerprint, fingerprint_arm
 from specialisation import SpecialisationReport, probe_specialisation
-from steering import SteeringConfig
+from steering import ADAPTIVE_STEERING, SteeringConfig
 from steering_pipeline import (
     SteeringExtraction,
     certified_coupling_layers,
@@ -638,7 +638,9 @@ class TAMETrainer:
             extractions: dict[str, tuple[CognitiveHomeostat, SteeringExtraction, tuple[int, ...]]]
             extractions = {}
 
-            def direction_of(goal: str):
+            def direction_of(
+                goal: str,
+            ) -> tuple[CognitiveHomeostat, SteeringExtraction, tuple[int, ...]]:
                 if goal not in extractions:
                     extractions[goal] = self._extract_goal_direction(goal)
                 return extractions[goal]
@@ -765,7 +767,7 @@ class TAMETrainer:
         layers = certified_coupling_layers(goal, self.config.model_id)
         template = SteeringConfig(
             steering_layers=list(range(self.config.mob_layers_start, self.config.mob_layers_end)),
-            adaptive=False,
+            adaptive=ADAPTIVE_STEERING,
         )
         steering_config = serving_config(goal, template, model_id=self.config.model_id)
         extraction = extract_steering_vectors(
@@ -845,7 +847,10 @@ class TAMETrainer:
         does not is calibrate the tissue: calibration generates a corpus, which
         consumes randomness and runs the inference economy, and the constant loop
         never reads it -- with ``adaptive`` off every actuator injects
-        ``base_strength`` whether or not a calibration exists.
+        ``base_strength`` whether or not a calibration exists. That is also what
+        makes a recompute-time second hook call under gradient checkpointing
+        harmless: the constant loop returns before it reads or steps any tissue
+        state. Training in the adaptive loop would need that revisited.
         """
         assert self.model is not None
         assert self._field is not None
@@ -888,13 +893,30 @@ class TAMETrainer:
                 f"{certification.strength}"
             )
         if self._field.config.adaptive:
-            raise RuntimeError("the field's loop is adaptive; training injects the constant")
-        registered = {id(hook) for hook in hooks.values()}
+            # Training attaches no calibration (see _attach_field), so an adaptive
+            # loop here would be #4's uncalibrated regime; and the recompute-time
+            # safety under gradient checkpointing holds for the constant loop only.
+            raise RuntimeError(
+                "the field's loop is adaptive; training injects the constant, and would "
+                "need the tissue calibrated before an adaptive loop could be served into it"
+            )
+        if self._field.config.adaptive != ADAPTIVE_STEERING:
+            raise RuntimeError("the field's loop is constant; the server's is adaptive")
+        # A converted layer above an injecting one reads the offset in the residual
+        # stream; one below reads nothing. The coupling refuses to seed nothing
+        # (_seed_coupling); the field has to refuse the same way, or the run trains
+        # to completion with no routing column -- a null by absence of measurement.
+        requested = range(self.config.mob_layers_start, self.config.mob_layers_end)
+        if not any(layer >= min(injecting) for layer in requested):
+            raise RuntimeError(
+                f"steer_goal={goal!r} injects at layers {injecting}, all above the converted "
+                f"range {requested.start}-{requested.stop - 1}: no MoB layer perceives the field"
+            )
         blocks = transformer_layers(self.model)
         live = {
             layer
-            for layer in hooks
-            if any(id(hook) in registered for hook in blocks[layer]._forward_hooks.values())
+            for layer, hook in hooks.items()
+            if any(registered is hook for registered in blocks[layer]._forward_hooks.values())
         }
         if live != set(hooks):
             raise RuntimeError(
@@ -1260,7 +1282,9 @@ class TAMETrainer:
             data_order=order,
             converted_layers=len(get_mob_layers(self.model)),
             steer_strength=field.config.base_strength if field is not None else None,
-            steer_layers=field.actuator_layers if field is not None else (),
+            steer_layers=sorted(layer for layer, hook in field.hooks.items() if hook.injects)
+            if field is not None
+            else (),
         )
         logger.info(f"Arm fingerprint: {self.fingerprint.as_dict()}")
 
