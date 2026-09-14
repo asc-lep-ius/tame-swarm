@@ -56,7 +56,15 @@ except ImportError:
     logger.warning("'datasets' library not installed. Install with: pip install datasets")
 
 try:
-    from peft import LoraConfig, TaskType, get_peft_model
+    from peft import (
+        LoraConfig,
+        PeftModel,
+        TaskType,
+        get_peft_model,
+        get_peft_model_state_dict,
+        set_peft_model_state_dict,
+    )
+    from safetensors.torch import load_file
 
     HAS_PEFT = True
 except ImportError:
@@ -106,6 +114,7 @@ from homeostat import CognitiveHomeostat
 from homeostat_calibration import transformer_layers
 from metrics import MetricSink
 from mob import (
+    MOB_MODULES_FILENAME,
     ROUTER_AUCTION,
     ROUTER_SOFTMAX,
     ROUTING_SATURATION_THRESHOLD,
@@ -117,6 +126,10 @@ from mob import (
     get_total_calibration_loss,
     get_total_router_z_loss,
     ledger_initial_values,
+    load_mob_modules,
+    load_mob_state,
+    mob_layers_by_index,
+    save_mob_modules,
     save_mob_state,
     update_all_mob_from_loss,
 )
@@ -150,6 +163,79 @@ ARM_ROUTERS = {ARM_MOB: ROUTER_AUCTION, ARM_SOFTMAX: ROUTER_SOFTMAX}
 
 HELD_OUT_SPLIT_FILENAME = "held_out_split.pt"
 METRICS_FILENAME = "metrics.jsonl"
+MOB_STATE_FILENAME = "mob_state.pt"
+LORA_ADAPTER_FILENAME = "adapter_model.safetensors"
+FULL_WEIGHTS_FILENAME = "model.safetensors"
+
+
+def restore_checkpoint(model: nn.Module, checkpoint_dir: str | Path) -> None:
+    """Put a trained LoRA arm back onto a model set up with the same config (#29).
+
+    The model is one ``TAMETrainer.setup`` built: converted at the same layers,
+    LoRA-wrapped as the arm was. What comes back is everything the arm trained --
+    the LoRA attention adapters, the MoB experts, heads and coupling, and the
+    ledgers -- so a held-out probe on the restored model reads the body that was
+    trained rather than an upcycled one wearing its wealth. Every part is
+    strict: a checkpoint that cannot restore the whole arm refuses rather than
+    restoring the part it has. A full-weight (non-LoRA) checkpoint is refused
+    for the same reason: its backbone lives in ``model.safetensors``, which
+    this does not read. A dense arm's checkpoint has nothing beyond the base
+    model and restores nothing.
+    """
+    checkpoint_dir = Path(checkpoint_dir)
+    adapter = checkpoint_dir / LORA_ADAPTER_FILENAME
+    if adapter.exists():
+        _restore_lora_adapters(model, adapter)
+    elif (checkpoint_dir / FULL_WEIGHTS_FILENAME).exists():
+        raise ValueError(
+            f"{checkpoint_dir} is a full-weight checkpoint; restore_checkpoint puts back LoRA "
+            "adapters, MoB modules and ledgers only. Load the base weights into the "
+            "converted model first."
+        )
+    modules = checkpoint_dir / MOB_MODULES_FILENAME
+    if not modules.exists():
+        if not mob_layers_by_index(model):
+            return
+        if (checkpoint_dir / MOB_STATE_FILENAME).exists():
+            raise ValueError(
+                f"{modules} does not exist: this checkpoint predates #29 and holds no trained "
+                "experts, heads or coupling, so it cannot restore this arm"
+            )
+        raise ValueError(
+            f"{checkpoint_dir} holds no MoB state at all (a dense arm's checkpoint?); "
+            "it cannot restore a converted model"
+        )
+    load_mob_modules(model, modules)
+    load_mob_state(model, str(checkpoint_dir / MOB_STATE_FILENAME), strict=True)
+
+
+def _restore_lora_adapters(model: nn.Module, adapter: Path) -> None:
+    """Every LoRA tensor the model has, and no other, must be in the file.
+
+    ``set_peft_model_state_dict`` loads non-strictly over the whole model, so a
+    tensor missing from the file is indistinguishable, in its result, from a
+    base weight that was never meant to be there; the key sets are compared
+    first so a truncated adapter file cannot restore fifteen projections and
+    leave the sixteenth at its fresh initialisation.
+    """
+    if not HAS_PEFT or not isinstance(model, PeftModel):
+        raise ValueError(
+            f"{adapter.parent} holds LoRA adapters and the model is not PEFT-wrapped; set "
+            "the arm up with use_lora=True before restoring"
+        )
+    saved = load_file(str(adapter))
+    expected = set(get_peft_model_state_dict(model))
+    if set(saved) != expected:
+        raise ValueError(
+            f"{adapter} does not hold this arm's LoRA adapters (missing "
+            f"{sorted(expected - set(saved))[:5]}, unexpected {sorted(set(saved) - expected)[:5]})"
+        )
+    result = set_peft_model_state_dict(model, saved)
+    if result is not None and result.unexpected_keys:
+        raise ValueError(
+            f"{adapter} holds LoRA tensors the model has no place for: "
+            f"{sorted(result.unexpected_keys)[:5]}"
+        )
 
 
 # Below this, top_k slots are buying less than one extra expert's worth of mixing.
@@ -1804,7 +1890,11 @@ class TAMETrainer:
 
         self.tokenizer.save_pretrained(checkpoint_str)
 
-        save_mob_state(cast(nn.Module, self.model), str(checkpoint_dir / "mob_state.pt"))
+        save_mob_state(cast(nn.Module, self.model), str(checkpoint_dir / MOB_STATE_FILENAME))
+        # The trained experts, heads and coupling (#29). ``save_pretrained`` above
+        # writes only the LoRA attention adapters under --use_lora, and the
+        # ledgers say nothing about what the experts compute.
+        save_mob_modules(cast(nn.Module, self.model), checkpoint_dir / MOB_MODULES_FILENAME)
 
         # Save training state. The fingerprint and the eval history travel with the
         # checkpoint because a comparison assembled later needs to prove parity from

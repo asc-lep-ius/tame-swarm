@@ -20,6 +20,7 @@ from mob import (
     MixtureOfBidders,
     MoBConfig,
     apply_mob_to_model,
+    load_mob_modules,
     load_mob_state,
     mob_layers_by_index,
 )
@@ -300,16 +301,26 @@ class TAMEApplication:
         for state_path in mob_state_paths:
             if os.path.exists(state_path):
                 try:
+                    # The trained experts, heads and coupling beside the ledgers (#29);
+                    # an export that predates them serves the upcycled body, as before.
+                    modules_path = os.path.join(os.path.dirname(state_path), "mob_modules.pt")
+                    restored_modules = os.path.exists(modules_path)
+                    if restored_modules:
+                        load_mob_modules(model, modules_path)
                     loaded = load_mob_state(model, state_path, compress_wealth=compression)
                     if loaded > 0:
                         logger.info(
-                            "[MORPHOGENESIS] Restored trained expert specialization from %s",
+                            "[MORPHOGENESIS] Restored the ledgers from %s and %s",
                             state_path,
+                            "the trained experts, heads and coupling from mob_modules.pt"
+                            if restored_modules
+                            else "NO trained modules (an export from before #29: the "
+                            "upcycled body wears the trained wealth)",
                         )
                     break
                 except Exception as e:
                     logger.warning(
-                        "[MORPHOGENESIS] Failed to load mob_state from %s: %s", state_path, e
+                        "[MORPHOGENESIS] Failed to restore MoB state from %s: %s", state_path, e
                     )
         else:
             logger.info(

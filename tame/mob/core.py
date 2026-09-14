@@ -506,6 +506,9 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         coupling = SteeringCoupling(coupling_config, steering_direction)
         reference_parameter = next(self.confidence_heads.parameters())
         coupling.to(device=reference_parameter.device, dtype=reference_parameter.dtype)
+        # A fresh module is in training mode; attached to a layer that is
+        # evaluating -- a restore, a served model -- it would refuse its first forward.
+        coupling.train(self.training)
         self.add_module("coupling", coupling)
         self._last_coupling_metrics = None
         return coupling

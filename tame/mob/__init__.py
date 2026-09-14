@@ -41,6 +41,7 @@ from .softmax_router import (
     SoftmaxRouter,
 )
 from .utils import (
+    MOB_MODULES_FILENAME,
     arm_traces,
     frozen_economy,
     frozen_traces,
@@ -48,9 +49,11 @@ from .utils import (
     get_mob_statistics,
     get_total_calibration_loss,
     get_total_router_z_loss,
+    load_mob_modules,
     load_mob_state,
     mob_at,
     mob_layers_by_index,
+    save_mob_modules,
     save_mob_state,
     update_all_mob_from_loss,
 )
@@ -85,6 +88,7 @@ __all__ = [
     "ledger_initial_values",
     "get_mob_layers",
     "mob_at",
+    "MOB_MODULES_FILENAME",
     "mob_layers_by_index",
     "arm_traces",
     "frozen_economy",
@@ -93,6 +97,8 @@ __all__ = [
     "get_total_calibration_loss",
     "get_total_router_z_loss",
     "get_mob_statistics",
+    "load_mob_modules",
     "load_mob_state",
+    "save_mob_modules",
     "save_mob_state",
 ]
