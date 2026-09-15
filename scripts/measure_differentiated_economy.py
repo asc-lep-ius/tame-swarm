@@ -9,7 +9,7 @@ rather than substituted for them: the suite's baselines stay on the quality
 fixture, named as such, and this script is where the differentiated fixture's
 are recorded.
 
-Three passes:
+Four passes:
 
 ``--fixture``      the #15 readings (surplus per win, r(wealth, win share),
                    r(wealth, competence)) and the specialisation readings the
@@ -236,7 +236,7 @@ def warm_up_heads(economy: SyntheticEconomy, steps: int, seed: int) -> None:
     Routing is forced uniform over *all* experts, so no report can concentrate the
     slots and nothing can be ruined while the heads are still learning to read the
     field; the heads still train on the value objective, which is the whole point.
-    The ledger is restored after every step, so what the warmup carries into the
+    The wealth ledger is restored after every step, so what the warmup carries into the
     economy is perception and not a market position -- the economy that follows
     starts from the wealth every cell was born with, as the unwarmed arm does.
 

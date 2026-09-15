@@ -159,9 +159,9 @@ def test_the_warmup_lets_every_head_see_every_type_without_moving_the_ledger():
 
     Routing forced uniform over all eight experts means every head is trained on
     tokens of every type, so none can be shut out before it has learned to read
-    the field; and the ledger it hands to the economy is the one every cell was
+    the field; and the wealth ledger it hands to the economy is the one every cell was
     born with, so what carries forward is perception and not a market position.
-    A nonzero ``expert_performance_ema`` is the record that a cell held slots.
+    ``expert_usage_count`` is the warmup's own slot tally, since nothing restores it.
     """
     economy = DifferentiatedEconomy(shuffled(DEFAULT_COMPETENCE, 0), seed=0, type_signal=2.0)
     gate = economy.mob.gate
@@ -174,7 +174,11 @@ def test_the_warmup_lets_every_head_see_every_type_without_moving_the_ledger():
 
     assert torch.equal(economy.mob.expert_wealth, ledger), economy.mob.expert_wealth
     assert economy.mob.gate is gate, "the forced gate outlived the warmup"
-    assert bool((economy.mob.expert_performance_ema != 0).all()), "a cell sat out the warmup"
+    # Uniform over eight experts is 0.125 of the slots each; the unforced gate leaves
+    # its least-used expert at 0.03 over the same 20 steps, so this is what pins the
+    # forcing and not just that every cell won something.
+    usage = economy.mob.expert_usage_count
+    assert float((usage / usage.sum()).min()) > 0.10, usage
     assert any(
         not torch.equal(before, after.detach())
         for before, after in zip(reports, economy.mob.confidence_heads.parameters(), strict=True)
@@ -198,9 +202,11 @@ def _run(seed: int, warmup: int | None, steps: int = 20) -> tuple[list[torch.Ten
 def test_a_zero_step_warmup_is_the_recorded_arm_bit_for_bit():
     """The warmup steps are additional: warm 0 has to be the run #25 recorded.
 
-    A warmup that consumed any of the economy's own draws -- or any of its
-    budget -- would make every warmed row incomparable with the baseline it is
-    read against, which is the whole contrast. The 50-step arm is here to show
+    Warm 0 consumes nothing: the same token draws, the same winners and the same
+    ledger as the arm #25 recorded, so the warmed rows are read against the
+    baseline they claim. A nonzero warmup does draw its tokens from the economy's
+    own stream; what it must never spend is the economy's budget. The 50-step
+    arm is here to show
     the comparison can fail: a warmup that ran and changed nothing would pass
     the first assertion for the wrong reason.
     """
