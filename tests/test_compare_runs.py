@@ -16,7 +16,17 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
-from compare_runs import assert_groups_at_parity, compare  # noqa: E402
+from compare_runs import (  # noqa: E402
+    assert_groups_at_parity,
+    bootstrap_mean,
+    compare,
+    declared_primary,
+    expected_largest_under_null,
+    format_primary,
+    format_table,
+    multiplicity_line,
+    paired_deltas,
+)
 
 from parity import ParityError  # noqa: E402
 
@@ -169,3 +179,114 @@ def test_groups_measured_against_different_goals_are_refused():
     # A summary written before the goal was recorded is compared as before.
     del group_b["trace_goal"]
     assert_same_measured_goal(group_a, group_b)
+
+
+def test_paired_deltas_are_b_minus_a_on_the_seeds_both_groups_measured():
+    group_a = _group("mob", {"eval/loss": [2.80, 2.75, 2.90]})
+    group_b = _group("mob", {"eval/loss": [2.70, 2.70, 2.70]})
+    # A seed only group B trained is not a pair; neither is a metric only it reported.
+    group_b["per_seed"][3] = {"eval/loss": 2.5}
+    del group_a["per_seed"][2]["eval/loss"]
+
+    deltas = paired_deltas(group_a, group_b, "eval/loss")
+
+    assert deltas == {0: pytest.approx(-0.10), 1: pytest.approx(-0.05)}
+    assert paired_deltas(group_a, group_b, "eval/perplexity") == {}
+
+
+def test_the_primary_interval_is_the_bootstrap_over_the_hand_computed_deltas():
+    """Six pairs: enough for the interval to be named a 95% bootstrap."""
+    group_a = _group("mob", {"eval/loss": [2.80, 2.75, 2.90, 2.85, 2.70, 2.95]})
+    group_b = _group("mob", {"eval/loss": [2.70, 2.70, 2.75, 2.80, 2.65, 2.80]})
+
+    deltas = paired_deltas(group_a, group_b, "eval/loss")
+    report = format_primary("eval/loss", deltas, "mob", "mob@truthful", resamples=2000, seed=1)
+
+    expected = [-0.10, -0.05, -0.15, -0.05, -0.05, -0.15]
+    assert list(deltas.values()) == pytest.approx(expected)
+    mean, low, high = bootstrap_mean(expected, resamples=2000, seed=1)
+    assert f"mean {mean:+.5f}" in report
+    assert f"[{low:+.5f}, {high:+.5f}]" in report
+    assert "95% bootstrap" in report
+    assert "no 95% coverage" not in report
+    assert "s0=-0.10000" in report
+
+
+def test_below_six_pairs_the_interval_is_named_a_range_not_a_95_percent_interval():
+    """At n=3 the percentile interval *is* the sample range (#28 already said so)."""
+    group_a = _group("mob", {"eval/loss": [2.80, 2.75, 2.90]})
+    group_b = _group("mob", {"eval/loss": [2.70, 2.70, 2.75]})
+
+    report = format_primary(
+        "eval/loss", paired_deltas(group_a, group_b, "eval/loss"), "a", "b", resamples=2000
+    )
+
+    assert "resampled-mean range" in report
+    assert "95% bootstrap" not in report
+    assert "at n=3 the percentile interval is the sample range" in report
+
+
+def test_under_three_pairs_prints_the_centre_and_says_there_is_no_interval():
+    group_a = _group("mob", {"eval/loss": [2.80, 2.75]})
+    group_b = _group("mob", {"eval/loss": [2.70, 2.70]})
+
+    report = format_primary(
+        "eval/loss", paired_deltas(group_a, group_b, "eval/loss"), "a", "b", resamples=2000
+    )
+
+    assert "mean -0.07500" in report
+    assert "no interval at n=2" in report
+    assert "[" not in report
+
+
+def test_the_expected_largest_null_row_matches_the_half_normal_order_statistic():
+    """Checked against a 200k-draw simulation: 0.798 at N=1, 2.051 at N=15."""
+    assert expected_largest_under_null(1) == pytest.approx(math.sqrt(2 / math.pi), abs=1e-4)
+    assert expected_largest_under_null(15) == pytest.approx(2.051, abs=1e-3)
+    assert expected_largest_under_null(50) == pytest.approx(2.510, abs=1e-3)
+    # More rows can only make the largest of them bigger.
+    assert expected_largest_under_null(2) > expected_largest_under_null(1)
+    with pytest.raises(ValueError, match="no rows"):
+        expected_largest_under_null(0)
+
+
+def test_the_table_prints_its_row_count_beside_the_null_maximum_for_that_count():
+    """#25's reading: 1.6 spreads on one of fifteen rows is what fifteen null rows give."""
+    values = {f"routing/goal_correlation_e{i}": [0.1 * i, 0.2 * i, 0.15 * i] for i in range(15)}
+    group_a = _group("mob", values)
+    group_b = _group("mob", {metric: [v + 0.01 for v in vs] for metric, vs in values.items()})
+
+    line = multiplicity_line(compare(group_a, group_b))
+
+    assert "15 row(s)" in line
+    assert f"{expected_largest_under_null(15):.2f}" in line
+    assert line in format_table(compare(group_a, group_b), "mob", "mob@truthful")
+
+
+def test_an_undeclared_primary_prints_nothing_and_a_declared_one_travels_with_the_data():
+    group_a = _group("mob", {"eval/loss": [2.79, 2.80]})
+    group_b = _group("mob", {"eval/loss": [2.78, 2.79]})
+
+    assert declared_primary(group_a, group_b) is None
+    assert declared_primary(group_a, group_b, "eval/perplexity") == "eval/perplexity"
+
+    # run_seeds.py --primary writes the declaration into one or both summaries.
+    group_b["primary"] = "eval/loss"
+    assert declared_primary(group_a, group_b) == "eval/loss"
+    group_a["primary"] = "eval/loss"
+    assert declared_primary(group_a, group_b) == "eval/loss"
+    # The flag still overrides a declaration.
+    assert declared_primary(group_a, group_b, "spec/report_decisiveness") == (
+        "spec/report_decisiveness"
+    )
+
+
+def test_groups_declaring_different_primaries_adopt_neither(caplog):
+    group_a = _group("mob", {"eval/loss": [2.79, 2.80]})
+    group_b = _group("mob", {"eval/loss": [2.78, 2.79]})
+    group_a["primary"], group_b["primary"] = "eval/loss", "spec/report_decisiveness"
+
+    with caplog.at_level("WARNING", logger="compare_runs"):
+        assert declared_primary(group_a, group_b) is None
+
+    assert any("different primary metrics" in record.message for record in caplog.records)

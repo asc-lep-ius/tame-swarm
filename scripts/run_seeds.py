@@ -215,6 +215,18 @@ def main() -> None:
             "loop, certified strength and layers (#28; default: the field is absent)"
         ),
     )
+    # #35: the metric this sweep is to be read on, declared before it is read.
+    # It travels in the summary so compare_runs.py puts the interval on the
+    # contrast that was chosen in advance rather than the largest row found.
+    parser.add_argument(
+        "--primary",
+        type=str,
+        default=None,
+        help=(
+            "Declare the one metric a comparison against this group is read on "
+            "(default: none declared, and compare_runs.py prints no primary block)"
+        ),
+    )
     args = parser.parse_args()
 
     seeds = [int(part) for part in args.seeds.split(",")]
@@ -280,8 +292,14 @@ def main() -> None:
     stats = aggregate(per_seed)
 
     arm = arm_label(args.router, args.coupling_goal, args.steer_goal)
+    if args.primary is not None and args.primary not in stats:
+        logger.warning(
+            f"the declared primary metric {args.primary!r} is not among the metrics this "
+            f"sweep measured ({sorted(stats)}); it is recorded as declared, but no "
+            "comparison will find it"
+        )
     print("\n" + format_table(stats))
-    print(f"\narm: {arm} | seeds: {seeds} | steps: {args.steps}")
+    print(f"\narm: {arm} | seeds: {seeds} | steps: {args.steps} | primary: {args.primary}")
     print(f"artefacts: {workspace}")
 
     summary_path = workspace / "seed_summary.json"
@@ -295,6 +313,7 @@ def main() -> None:
                 "trace_goal": config.trace_goal or config.coupling_goal or config.steer_goal,
                 "seeds": seeds,
                 "steps": args.steps,
+                "primary": args.primary,
                 "per_seed": per_seed,
                 "fingerprints": fingerprints,
                 "stats": stats,
