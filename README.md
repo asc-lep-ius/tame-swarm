@@ -582,6 +582,42 @@ pooled replicate spread (the noise floor), and the delta in units of that
 spread — a `delta/std` well under 1 is not distinguishable from re-running the
 same configuration.
 
+**How a comparison is read ([#35](https://gitlab.hephaestus/mipkovich/tame-swarm/-/issues/35)).**
+One metric is the primary contrast and it is named *before* the comparison is
+run — `run_seeds.py --primary eval/loss` records it in `seed_summary.json`, so
+the declaration travels with the data and `compare_runs.py` picks it up without
+being told again:
+
+```bash
+uv run python scripts/compare_runs.py \
+    --group_a runs/mob --group_b runs/mob@truthful --primary eval/loss
+```
+
+The primary prints as the paired per-seed deltas (B minus A at a shared seed,
+which is the stratification: the seed fixes the data order, so its two runs
+differ only in the arm), their mean, and a percentile bootstrap over those
+paired values. The interval is named for what it is at the count in hand: a 95%
+bootstrap interval above six pairs, the **resampled-mean range** at three to
+five — at `n=3` the 2.5th and 97.5th percentiles of the resampled means *are*
+the sample minimum and maximum, so there is no 95% coverage to claim — and
+below three, the centre alone with no interval. Every other row on the table is
+secondary: a direction to follow up, not a result to quote.
+
+Which is what the table's **multiplicity line** is for. It prints the row count,
+the largest `|delta/std|` among those rows, and what a table that size is
+expected to produce when nothing moved at all — the mean of the largest of N
+standard normal draws in absolute value, 1.88 at 10 rows, 2.05 at 15, 2.51 at
+50. [#25](#differentiation-checkpoint-25)'s fifteen-row ablation quoted 1.6
+pooled spreads on one expert's correlation as its largest movement; that is
+*below* what fifteen null rows hand you for free, and the line puts the two
+numbers side by side at the moment the biggest row is read rather than in a
+write-up afterwards. It is a reference point and not a threshold — the rows are
+not independent (the per-expert win shares sum to `top_k`) and a pooled std from
+three seeds has heavier tails than a normal, both of which push the real null
+maximum above it. Correcting across metrics is deliberately *not* done: the
+declared primary is what the comparison rests on, and a correction would only be
+needed if the secondaries were being read as results.
+
 **Noise floor.** Measured by running one configuration three times at a fixed
 step budget and reading the spread `run_seeds.py` reports. Current number —
 `mob`, Qwen3-1.7B, 500 steps, adapter rank 32, 16 converted layers, wikitext-2,
