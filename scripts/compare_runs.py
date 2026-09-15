@@ -337,7 +337,7 @@ def format_primary(
     """The primary contrast: the paired per-seed deltas, their mean, and an interval.
 
     The interval is a percentile bootstrap over the paired values, and is named
-    for what it is at the count in hand -- a 95% interval only above
+    for what it is at the count in hand -- a 95% interval at
     ``MIN_PAIRS_FOR_COVERAGE`` pairs or more, the range of the resampled means
     below that, and no interval at all below ``MIN_PAIRS_FOR_INTERVAL``, where the
     centre is all there is to print.

@@ -611,17 +611,19 @@ standard normal draws in absolute value, 1.88 at 10 rows, 2.05 at 15, 2.51 at
 pooled spreads on one expert's correlation as its largest movement; that is
 *below* what fifteen null rows hand you for free, and the line puts the two
 numbers side by side at the moment the biggest row is read rather than in a
-write-up afterwards. It is a reference point and not a threshold, and a conservative
-one — the rows are not independent (the per-expert win shares sum to `top_k`)
+write-up afterwards. It is a reference point and not a threshold, and a
+conservative one — the rows are not independent (the per-expert win shares sum
+to `top_k`)
 and `delta/pooled_std` at three seeds per arm is not a standard normal but
 roughly `√(2/3)·t₄`, whose heavier tails put the real maximum well above it.
 Simulating the statistic `compare_runs.py` actually computes, at this project's
 own three seeds per arm, gives **2.34 / 2.67 / 3.86** at 10 / 15 / 50 rows
 against the 1.88 / 2.05 / 2.51 it prints. So a row that clears the printed line
 has not yet cleared the null three seeds produce; the line is a floor on what
-noise gives you for free, not a bar that promises anything. Correcting across metrics is deliberately *not* done: the
-declared primary is what the comparison rests on, and a correction would only be
-needed if the secondaries were being read as results.
+noise gives you for free, not a bar that promises anything. Correcting across
+metrics is deliberately *not* done: the declared primary is what the comparison
+rests on, and a correction would only be needed if the secondaries were being
+read as results.
 
 **Noise floor.** Measured by running one configuration three times at a fixed
 step budget and reading the spread `run_seeds.py` reports. Current number —
