@@ -290,3 +290,14 @@ def test_groups_declaring_different_primaries_adopt_neither(caplog):
         assert declared_primary(group_a, group_b) is None
 
     assert any("different primary metrics" in record.message for record in caplog.records)
+
+
+def test_the_multiplicity_line_survives_an_infinite_row_and_an_empty_table():
+    """A nonzero delta over zero spread is the biggest row there is, and prints as one."""
+    group_a = _group("mob", {"eval/loss": [1.0, 1.0, 1.0]})
+    group_b = _group("softmax", {"eval/loss": [2.0, 2.0, 2.0]})
+
+    line = multiplicity_line(compare(group_a, group_b))
+
+    assert "observed inf (eval/loss)" in line
+    assert multiplicity_line({}) == "multiplicity: no rows compared"

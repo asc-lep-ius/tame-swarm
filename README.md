@@ -597,8 +597,8 @@ The primary prints as the paired per-seed deltas (B minus A at a shared seed,
 which is the stratification: the seed fixes the data order, so its two runs
 differ only in the arm), their mean, and a percentile bootstrap over those
 paired values. The interval is named for what it is at the count in hand: a 95%
-bootstrap interval above six pairs, the **resampled-mean range** at three to
-five — at `n=3` the 2.5th and 97.5th percentiles of the resampled means *are*
+bootstrap interval at six pairs or more, the **resampled-mean range** at three
+to five — at `n=3` the 2.5th and 97.5th percentiles of the resampled means *are*
 the sample minimum and maximum, so there is no 95% coverage to claim — and
 below three, the centre alone with no interval. Every other row on the table is
 secondary: a direction to follow up, not a result to quote.
@@ -611,10 +611,15 @@ standard normal draws in absolute value, 1.88 at 10 rows, 2.05 at 15, 2.51 at
 pooled spreads on one expert's correlation as its largest movement; that is
 *below* what fifteen null rows hand you for free, and the line puts the two
 numbers side by side at the moment the biggest row is read rather than in a
-write-up afterwards. It is a reference point and not a threshold — the rows are
-not independent (the per-expert win shares sum to `top_k`) and a pooled std from
-three seeds has heavier tails than a normal, both of which push the real null
-maximum above it. Correcting across metrics is deliberately *not* done: the
+write-up afterwards. It is a reference point and not a threshold, and a conservative
+one — the rows are not independent (the per-expert win shares sum to `top_k`)
+and `delta/pooled_std` at three seeds per arm is not a standard normal but
+roughly `√(2/3)·t₄`, whose heavier tails put the real maximum well above it.
+Simulating the statistic `compare_runs.py` actually computes, at this project's
+own three seeds per arm, gives **2.34 / 2.67 / 3.86** at 10 / 15 / 50 rows
+against the 1.88 / 2.05 / 2.51 it prints. So a row that clears the printed line
+has not yet cleared the null three seeds produce; the line is a floor on what
+noise gives you for free, not a bar that promises anything. Correcting across metrics is deliberately *not* done: the
 declared primary is what the comparison rests on, and a correction would only be
 needed if the secondaries were being read as results.
 

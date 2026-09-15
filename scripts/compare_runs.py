@@ -237,10 +237,15 @@ def expected_largest_under_null(rows: int, upper: float = 12.0, steps: int = 24_
 
     which Simpson's rule evaluates to three decimals against a 200k-draw
     simulation (2.051 at N = 15), and unlike a simulation prints the same number
-    on every machine. It is a reference point rather than a threshold: the rows
-    are not independent -- the per-expert win shares sum to ``top_k`` -- and a
-    pooled std from three seeds per group has heavier tails than a normal, both
-    of which push the real null maximum above this.
+    on every machine. It is a reference point rather than a threshold, and a
+    conservative one: the rows are not independent -- the per-expert win shares
+    sum to ``top_k`` -- and ``delta/pooled_std`` at three seeds per group is not
+    a standard normal but roughly sqrt(2/3) t_4, whose heavier tails put the
+    real maximum well above this. Simulating the statistic ``compare`` actually
+    computes, at three seeds per arm, gives 2.34 / 2.67 / 3.86 at 10 / 15 / 50
+    rows against the 1.88 / 2.05 / 2.51 printed here. The half-normal is what
+    #35 specified and what the number below is; a row that clears *it* has not
+    yet cleared the null this project's own sample size produces.
     """
     if rows < 1:
         raise ValueError("no rows to take a maximum over")
@@ -265,6 +270,8 @@ def multiplicity_line(comparison: dict[str, dict[str, float]]) -> str:
     largest row is read, rather than in a write-up afterwards.
     """
     rows = len(comparison)
+    if not rows:
+        return "multiplicity: no rows compared"
     largest_metric, largest = max(
         comparison.items(), key=lambda item: abs(item[1]["delta_over_std"])
     )
@@ -331,8 +338,8 @@ def format_primary(
 
     The interval is a percentile bootstrap over the paired values, and is named
     for what it is at the count in hand -- a 95% interval only above
-    ``MIN_PAIRS_FOR_COVERAGE`` pairs, the range of the resampled means below
-    that, and no interval at all below ``MIN_PAIRS_FOR_INTERVAL``, where the
+    ``MIN_PAIRS_FOR_COVERAGE`` pairs or more, the range of the resampled means
+    below that, and no interval at all below ``MIN_PAIRS_FOR_INTERVAL``, where the
     centre is all there is to print.
     """
     pairs = len(deltas)
