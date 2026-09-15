@@ -23,10 +23,19 @@ Three passes:
 ``--recovery``     the damage protocols the suite asserts on the quality fixture
                    (``scripts/economy_damage.py``: senescence, the forced
                    episodes, ruin), run unchanged on the differentiated fixture.
+``--warmup``       the same readings after a perception warmup of the given
+                   lengths: the heads trained on the value objective with routing
+                   forced uniform and the ledger frozen, before the economy runs
+                   its recorded budget. This separates the two readings of the
+                   ruin of the most competent cell (#34) -- a *developmental
+                   order* in which selection precedes perception, or the *value
+                   asymmetry* that punishes a competent cell hardest per off-type
+                   token, which no ordering can remove.
 
 Run:  uv run python scripts/measure_differentiated_economy.py
       uv run python scripts/measure_differentiated_economy.py --legibility
       uv run python scripts/measure_differentiated_economy.py --recovery
+      uv run python scripts/measure_differentiated_economy.py --legibility --warmup 0,50,200
 """
 
 from __future__ import annotations
@@ -47,6 +56,7 @@ from economy_damage import (  # noqa: E402
     SHORT_FORCED_EPISODE,
     WINDOW,
     Build,
+    ForcedSubset,
     floor_without,
     quality_fixture,
     release_and_measure,
@@ -73,6 +83,11 @@ STEPS = 600
 TAIL = 100
 LEGIBILITY = (2.0, 4.0, 8.0)
 BUDGETS = (600, 2000)
+# The warmup is asked at the legibility where the inversion is observed and at the
+# one where it is not, so a warmup that removes the inversion can be told apart
+# from one that moves every row. 8.0 is left out: nothing inverts there to remove.
+WARMUP_LEGIBILITY = (2.0, 4.0)
+DEFAULT_WARMUPS = (0, 50, 200)
 
 
 def differentiated_fixture(
@@ -215,6 +230,56 @@ def legibility_pass() -> None:
     )
 
 
+def warm_up_heads(economy: SyntheticEconomy, steps: int, seed: int) -> None:
+    """Let every head see every token type before any cell can be shut out (#34).
+
+    Routing is forced uniform over *all* experts, so no report can concentrate the
+    slots and nothing can be ruined while the heads are still learning to read the
+    field; the heads still train on the value objective, which is the whole point.
+    The ledger is restored after every step, so what the warmup carries into the
+    economy is perception and not a market position -- the economy that follows
+    starts from the wealth every cell was born with, as the unwarmed arm does.
+
+    The post-warmup budget is unchanged: these steps are *additional*, and a
+    warmup arm is a longer run, not a reallocated one.
+    """
+    if steps <= 0:
+        return
+    everyone = list(range(economy.config.num_experts))
+    gate = economy.mob.gate
+    # Its own stream, keyed by length and seed as ``force_routing``'s is, so the
+    # forcing never replicates the draws of the economy it precedes.
+    economy.mob.gate = ForcedSubset(everyone, economy.config.top_k, seed=1000 * steps + seed)
+    ledger = economy.mob.expert_wealth.detach().clone()
+    try:
+        for _ in range(steps):
+            economy.step()
+            with torch.no_grad():
+                economy.mob.expert_wealth.copy_(ledger)
+    finally:
+        economy.mob.gate = gate
+
+
+def warmup_pass(warmups: tuple[int, ...]) -> None:
+    print(HEADER.replace("fixture        ", "signal   warm  "))
+    print("-" * len(HEADER))
+    for signal in WARMUP_LEGIBILITY:
+        for steps in warmups:
+            for seed in SEEDS:
+                economy = DifferentiatedEconomy(
+                    shuffled(DEFAULT_COMPETENCE, seed), seed=seed, type_signal=signal
+                )
+                warm_up_heads(economy, steps, seed)
+                print(_row(read(economy, f"{signal:<8.1f} {steps:<5}", seed)))
+    print(
+        f"\nwarm: steps of forced-uniform routing with the ledger frozen before the"
+        f" economy's {STEPS}; warm 0 is the recorded arm. The primary reading is"
+        " inverted at type_signal 2.0: 0 of 3 seeds says the ruin of the most"
+        " competent expert is an ordering effect, 2 of 3 says it is the value"
+        " asymmetry and no warmup can remove it, 1 of 3 decides nothing."
+    )
+
+
 def recovery_pass() -> None:
     for name, build in (("quality", quality_fixture), ("differentiated", differentiated_fixture)):
         print(f"\n== {name} fixture ==")
@@ -251,18 +316,49 @@ def _senescence(build: Build) -> None:
         )
 
 
+def warmup_lengths(value: str) -> tuple[int, ...]:
+    """``"0,50,200"`` -> ``(0, 50, 200)``: the warmup arms to run, in order."""
+    lengths = []
+    for part in value.split(","):
+        try:
+            steps = int(part)
+        except ValueError as error:
+            raise argparse.ArgumentTypeError(
+                f"warmup lengths must be integers, got {part!r}"
+            ) from error
+        if steps < 0:
+            raise argparse.ArgumentTypeError(f"warmup lengths must be >= 0, got {steps}")
+        lengths.append(steps)
+    return tuple(lengths)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--fixture", action="store_true", help="The per-seed readings (default)")
     parser.add_argument("--legibility", action="store_true")
     parser.add_argument("--recovery", action="store_true")
+    parser.add_argument(
+        "--warmup",
+        type=warmup_lengths,
+        nargs="?",
+        const=DEFAULT_WARMUPS,
+        default=None,
+        metavar="STEPS[,STEPS...]",
+        help=(
+            "Perception-warmup arms, comma separated, at type_signal "
+            f"{' and '.join(str(signal) for signal in WARMUP_LEGIBILITY)}"
+            f" (default {','.join(str(steps) for steps in DEFAULT_WARMUPS)})"
+        ),
+    )
     args = parser.parse_args()
-    if not (args.legibility or args.recovery):
+    if not (args.legibility or args.recovery or args.warmup is not None):
         args.fixture = True
     if args.fixture:
         fixture_pass()
     if args.legibility:
         legibility_pass()
+    if args.warmup is not None:
+        warmup_pass(args.warmup)
     if args.recovery:
         recovery_pass()
 
