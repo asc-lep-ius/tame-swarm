@@ -11,6 +11,7 @@ competent *on it*. Every threshold here was measured first
 the suite's other baselines stay on the quality fixture by design.
 """
 
+import argparse
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -20,6 +21,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
+from measure_differentiated_economy import warm_up_heads, warmup_lengths  # noqa: E402
 from synthetic_economy import (  # noqa: E402
     BASE_CONFIG,
     DEFAULT_COMPETENCE,
@@ -150,3 +152,74 @@ def test_the_fixture_refuses_a_shape_it_cannot_plant():
         DifferentiatedEconomy(
             DEFAULT_COMPETENCE, seed=0, config=replace(BASE_CONFIG, hidden_dim=16)
         )
+
+
+def test_the_warmup_lets_every_head_see_every_type_without_moving_the_ledger():
+    """What a perception warmup is, in the two things it must do and the one it must not (#34).
+
+    Routing forced uniform over all eight experts means every head is trained on
+    tokens of every type, so none can be shut out before it has learned to read
+    the field; and the ledger it hands to the economy is the one every cell was
+    born with, so what carries forward is perception and not a market position.
+    A nonzero ``expert_performance_ema`` is the record that a cell held slots.
+    """
+    economy = DifferentiatedEconomy(shuffled(DEFAULT_COMPETENCE, 0), seed=0, type_signal=2.0)
+    gate = economy.mob.gate
+    ledger = economy.mob.expert_wealth.clone()
+    reports = [
+        parameter.detach().clone() for parameter in economy.mob.confidence_heads.parameters()
+    ]
+
+    warm_up_heads(economy, 20, seed=0)
+
+    assert torch.equal(economy.mob.expert_wealth, ledger), economy.mob.expert_wealth
+    assert economy.mob.gate is gate, "the forced gate outlived the warmup"
+    assert bool((economy.mob.expert_performance_ema != 0).all()), "a cell sat out the warmup"
+    assert any(
+        not torch.equal(before, after.detach())
+        for before, after in zip(reports, economy.mob.confidence_heads.parameters(), strict=True)
+    ), "the heads did not train on the value objective"
+
+
+def _run(seed: int, warmup: int | None, steps: int = 20) -> tuple[list[torch.Tensor], torch.Tensor]:
+    """One arm, built and run end to end: every step's winners, and the ledger it ends at.
+
+    Built and run in one call because ``SyntheticEconomy`` seeds the *global*
+    generator at construction and the gate's exploration draws from it, so two
+    arms stepped side by side share a stream and diverge for that reason alone.
+    Sequential runs are what the measurement script does and what compares.
+    """
+    economy = DifferentiatedEconomy(shuffled(DEFAULT_COMPETENCE, seed), seed=seed, type_signal=2.0)
+    if warmup is not None:
+        warm_up_heads(economy, warmup, seed=seed)
+    return [economy.step().selected_experts for _ in range(steps)], economy.mob.expert_wealth
+
+
+def test_a_zero_step_warmup_is_the_recorded_arm_bit_for_bit():
+    """The warmup steps are additional: warm 0 has to be the run #25 recorded.
+
+    A warmup that consumed any of the economy's own draws -- or any of its
+    budget -- would make every warmed row incomparable with the baseline it is
+    read against, which is the whole contrast. The 50-step arm is here to show
+    the comparison can fail: a warmup that ran and changed nothing would pass
+    the first assertion for the wrong reason.
+    """
+    unwarmed_winners, unwarmed_wealth = _run(1, warmup=None)
+    zero_winners, zero_wealth = _run(1, warmup=0)
+    warmed_winners, _ = _run(1, warmup=50)
+
+    for zero, unwarmed in zip(zero_winners, unwarmed_winners, strict=True):
+        assert torch.equal(zero, unwarmed)
+    assert torch.equal(zero_wealth, unwarmed_wealth)
+    assert any(
+        not torch.equal(warmed, unwarmed)
+        for warmed, unwarmed in zip(warmed_winners, unwarmed_winners, strict=True)
+    ), "a 50-step warmup left the economy it precedes untouched"
+
+
+def test_the_warmup_flag_refuses_a_length_it_cannot_run():
+    assert warmup_lengths("0,50,200") == (0, 50, 200)
+    with pytest.raises(argparse.ArgumentTypeError, match="integers"):
+        warmup_lengths("0,fifty")
+    with pytest.raises(argparse.ArgumentTypeError, match=">= 0"):
+        warmup_lengths("-50")
