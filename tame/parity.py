@@ -25,11 +25,15 @@ still fails the check.
 
 import hashlib
 import logging
+import subprocess
 from collections.abc import Iterable, Sequence
 from dataclasses import asdict, dataclass, fields
+from pathlib import Path
 from typing import Any
 
 import torch
+
+from determinism import DETERMINISM_OFF, DETERMINISM_STRICT
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +61,13 @@ FIELD_FIELDS = frozenset({"steer_strength", "steer_layers"})
 
 # Reported for context, not asserted: see the module docstring on ``dense``.
 REPORTED_FIELDS = frozenset({"converted_layers"})
+
+# The code that produced the arm (#31): the git SHA and whether the tree was
+# dirty. Not asserted by ``assert_parity`` -- arms built in one process share a
+# SHA by construction, and between two recorded groups it is ``code_drift`` that
+# decides, because there a *missing* SHA (every summary recorded before #31) has
+# to count as drift, which a field-equality check would read as agreement.
+CODE_FIELDS = frozenset({"code_sha", "code_dirty"})
 
 # ``TrainingConfig`` fields the fingerprint folds into a derived field instead of
 # copying: the dataset name and its config become one string, and the layer bounds
@@ -112,6 +123,37 @@ def arm_label(router: str, coupling_goal: str | None = None, steer_goal: str | N
 
 class ParityError(AssertionError):
     """Raised when two arms differ on something other than the router."""
+
+
+class CodeDriftError(ParityError):
+    """Raised when two recorded groups cannot be shown to have run the same code."""
+
+
+def code_identity(repo: Path | None = None) -> tuple[str | None, bool | None]:
+    """The git SHA of the code that is about to run, and whether the tree is dirty.
+
+    ``(None, None)`` when git cannot say -- no repository, no binary -- so the
+    fingerprint records that nothing is known rather than a placeholder that
+    could match another placeholder. A dirty tree is recorded rather than hidden:
+    the SHA of a dirty tree identifies no code, and #25's two attempts ran
+    different code and fingerprinted equal for exactly that reason.
+    """
+    cwd = repo or Path(__file__).resolve().parent
+
+    def git(*args: str) -> str | None:
+        try:
+            result = subprocess.run(
+                ["git", *args], cwd=cwd, capture_output=True, text=True, timeout=5, check=False
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    sha = git("rev-parse", "HEAD")
+    if not sha:
+        return None, None
+    status = git("status", "--porcelain")
+    return sha, (bool(status) if status is not None else None)
 
 
 def data_order_fingerprint(
@@ -178,6 +220,13 @@ class ArmFingerprint:
     steer_goal: str | None = None
     steer_strength: float | None = None
     steer_layers: tuple[int, ...] = ()
+    # #31. ``deterministic`` stays the bool every recorded summary carries, so a
+    # legacy fingerprint loads; ``strict_determinism`` is the third state, and a
+    # run recorded before it existed was, by construction, a ``warn`` run. The
+    # code identity defaults to "unknown", which ``code_drift`` treats as drift.
+    strict_determinism: bool = False
+    code_sha: str | None = None
+    code_dirty: bool | None = None
 
     @property
     def arm(self) -> str:
@@ -209,6 +258,7 @@ def fingerprint_arm(
     dataset_config: str | None = None,
     steer_strength: float | None = None,
     steer_layers: Sequence[int] = (),
+    code: tuple[str | None, bool | None] = (None, None),
 ) -> ArmFingerprint:
     """Build a fingerprint from a ``TrainingConfig`` and the two measured hashes.
 
@@ -216,12 +266,15 @@ def fingerprint_arm(
     applies to some datasets, and the caller is the one place that knows the rule.
     ``steer_strength`` and ``steer_layers`` are what the field actually injected
     at, read off the attached hooks rather than the certification record, so the
-    fingerprint records the injection and not the intent.
+    fingerprint records the injection and not the intent. ``code`` is
+    ``code_identity()`` as read by the trainer, so a fingerprint built in a test
+    does not depend on the state of the tree the test runs in.
     """
+    code_sha, code_dirty = code
     return ArmFingerprint(
         router=config.router,
         seed=config.seed,
-        deterministic=config.deterministic,
+        deterministic=config.deterministic != DETERMINISM_OFF,
         model_id=config.model_id,
         dtype=config.dtype,
         dataset=f"{config.dataset_name}/{dataset_config}"
@@ -258,6 +311,9 @@ def fingerprint_arm(
         steer_goal=config.steer_goal,
         steer_strength=steer_strength,
         steer_layers=tuple(steer_layers),
+        strict_determinism=config.deterministic == DETERMINISM_STRICT,
+        code_sha=code_sha,
+        code_dirty=code_dirty,
     )
 
 
@@ -298,7 +354,7 @@ def assert_parity(arms: Sequence[ArmFingerprint]) -> None:
     reference = arms[0]
     disagreements: list[str] = []
     for field in fields(ArmFingerprint):
-        if field.name in VARYING_FIELDS | REPORTED_FIELDS | FIELD_FIELDS:
+        if field.name in VARYING_FIELDS | REPORTED_FIELDS | FIELD_FIELDS | CODE_FIELDS:
             continue
         expected = getattr(reference, field.name)
         for arm in arms[1:]:
@@ -321,3 +377,26 @@ def assert_parity(arms: Sequence[ArmFingerprint]) -> None:
         f"layers={len(reference.requested_layers)}, rank={reference.adapter_rank}, "
         f"eval split={reference.eval_split}, data order={reference.data_order}"
     )
+
+
+def code_drift(arms: Sequence[ArmFingerprint]) -> list[str]:
+    """Why these arms cannot be shown to have run one code; empty when they can.
+
+    Three reasons, each its own line: a fingerprint with no SHA (every summary
+    recorded before #31, which is what "legacy counts as drift" means), a dirty
+    tree behind any SHA, and more than one SHA among the arms. The caller decides
+    whether drift is refused or merely said; this only names it.
+    """
+    reasons: list[str] = []
+    missing = [arm.arm for arm in arms if arm.code_sha is None]
+    if missing:
+        reasons.append(
+            f"  no code SHA recorded for {sorted(set(missing))} (a summary from before #31)"
+        )
+    dirty = sorted({arm.code_sha[:9] for arm in arms if arm.code_sha and arm.code_dirty})
+    if dirty:
+        reasons.append(f"  dirty tree at {dirty}: the SHA identifies no code")
+    shas = sorted({arm.code_sha[:9] for arm in arms if arm.code_sha})
+    if len(shas) > 1:
+        reasons.append(f"  different code: {shas}")
+    return reasons

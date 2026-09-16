@@ -50,7 +50,13 @@ from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tame"))
 
-from parity import ArmFingerprint, ParityError, assert_parity  # noqa: E402
+from parity import (  # noqa: E402
+    ArmFingerprint,
+    CodeDriftError,
+    ParityError,
+    assert_parity,
+    code_drift,
+)
 
 logger = logging.getLogger("compare_runs")
 
@@ -113,6 +119,50 @@ def assert_groups_at_parity(group_a: dict[str, Any], group_b: dict[str, Any]) ->
     for arm_a, arm_b in pairs:
         assert_parity([arm_a, arm_b])
     return True
+
+
+def load_fingerprints(group: dict[str, Any]) -> list[ArmFingerprint]:
+    """Every fingerprint a summary carries; empty when it carries none, or another schema's."""
+    prints = group.get("fingerprints") or {}
+    try:
+        return [ArmFingerprint(**value) for value in prints.values()]
+    except TypeError as exc:
+        logger.warning(
+            "a summary's fingerprints do not match this version's schema (%s); its code "
+            "identity cannot be read",
+            exc,
+        )
+        return []
+
+
+def assert_same_code(
+    group_a: dict[str, Any], group_b: dict[str, Any], allow_drift: bool = False
+) -> str:
+    """Refuse two groups that cannot be shown to have run one code (#31); else say what it was.
+
+    #25's two attempts ran different code, fingerprinted equal, and were read as a
+    replication. A missing SHA is drift: every summary recorded before #31 has
+    none, and comparing it unlabelled is exactly the reading that went wrong. With
+    ``allow_drift`` the reasons are logged and returned as the label the table
+    prints under itself, so the comparison is made and never made silently.
+    """
+    prints_a, prints_b = load_fingerprints(group_a), load_fingerprints(group_b)
+    reasons: list[str] = []
+    if not prints_a or not prints_b:
+        reasons.append("  a summary carries no arm fingerprints, so no code SHA (before #6)")
+    reasons.extend(code_drift(prints_a + prints_b))
+    if not reasons:
+        sha = next(arm.code_sha for arm in prints_a if arm.code_sha)
+        return f"code: one SHA across both groups ({sha[:9]}, clean tree)"
+    detail = "\n".join(reasons)
+    if not allow_drift:
+        raise CodeDriftError(
+            "the groups cannot be shown to have run the same code, so every delta could be "
+            "the code and not the arm:\n" + detail + "\n"
+            "pass --allow-code-drift to compare anyway, with the drift printed beside the table"
+        )
+    logger.warning("code drift allowed by --allow-code-drift:\n%s", detail)
+    return "code: DRIFT, allowed by --allow-code-drift:\n" + detail
 
 
 def assert_same_measured_goal(group_a: dict[str, Any], group_b: dict[str, Any]) -> None:
@@ -387,6 +437,15 @@ def main() -> None:
     parser.add_argument(
         "--bootstrap_seed", type=int, default=0, help="The bootstrap's own RNG seed"
     )
+    parser.add_argument(
+        "--allow-code-drift",
+        action="store_true",
+        help=(
+            "Compare two groups that did not provably run the same code (different SHAs, a "
+            "dirty tree, or a summary from before the SHA was recorded), with the drift "
+            "printed beside the table (default: refused)"
+        ),
+    )
     args = parser.parse_args()
 
     group_a = load_group(Path(args.group_a))
@@ -395,6 +454,7 @@ def main() -> None:
     label_b = args.label_b or str(group_b.get("arm") or group_b.get("router", "B"))
 
     checked = assert_groups_at_parity(group_a, group_b)
+    code_line = assert_same_code(group_a, group_b, allow_drift=args.allow_code_drift)
     assert_same_measured_goal(group_a, group_b)
     comparison = compare(group_a, group_b)
     if not comparison:
@@ -432,6 +492,7 @@ def main() -> None:
         if checked
         else "parity between the arms: NOT asserted (no fingerprints in a summary)"
     )
+    print(code_line)
 
 
 if __name__ == "__main__":

@@ -39,6 +39,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from smoke_fixture import build_smoke_fixture  # noqa: E402
 
 from coupling import DEFAULT_COUPLING_BETA, DEFAULT_WARMUP_STEPS  # noqa: E402
+from determinism import DETERMINISM_MODES, DETERMINISM_WARN  # noqa: E402
 from parity import arm_label  # noqa: E402
 from train import TAMETrainer, TrainingConfig  # noqa: E402
 
@@ -172,11 +173,18 @@ def main() -> None:
     parser.add_argument(
         "--layers", type=str, default="1:3", help="MoB layer range as start:end (exclusive)"
     )
+    # #31: warn lets the attention backward through non-deterministic and the
+    # replicate below measures what that costs; strict reproduces bitwise.
     parser.add_argument(
         "--deterministic",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Force deterministic kernels where one exists (default: on)",
+        type=str,
+        choices=DETERMINISM_MODES,
+        default=DETERMINISM_WARN,
+        help=(
+            "warn: deterministic kernels where one exists, the rest logged; strict: the "
+            "rest refused and the attention backward made deterministic; off: torch's "
+            "defaults (default: warn)"
+        ),
     )
     # The coupled arm of #6's ablation: the same auction, with the routing
     # coupling seeded from a certified direction (#14). Everything else is shared

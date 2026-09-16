@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 from compare_runs import (  # noqa: E402
     assert_groups_at_parity,
+    assert_same_code,
     bootstrap_mean,
     compare,
     declared_primary,
@@ -28,7 +29,7 @@ from compare_runs import (  # noqa: E402
     paired_deltas,
 )
 
-from parity import ParityError  # noqa: E402
+from parity import CodeDriftError, ParityError  # noqa: E402
 
 from .arm_fingerprints import BASE  # noqa: E402
 
@@ -301,3 +302,67 @@ def test_the_multiplicity_line_survives_an_infinite_row_and_an_empty_table():
 
     assert "observed inf (eval/loss)" in line
     assert multiplicity_line({}) == "multiplicity: no rows compared"
+
+
+SHA_A, SHA_B = "a" * 40, "b" * 40
+
+
+def _at_code(group: dict, sha: str | None, dirty: bool | None = False) -> dict:
+    return _with_fingerprints(group, code_sha=sha, code_dirty=dirty)
+
+
+def test_two_groups_at_one_clean_sha_pass_the_code_check_and_say_so():
+    group_a = _at_code(_group("mob", {"eval/loss": [2.79, 2.80]}), SHA_A)
+    group_b = _at_code(_group("mob", {"eval/loss": [2.78, 2.79]}), SHA_A)
+
+    line = assert_same_code(group_a, group_b)
+
+    assert "one SHA across both groups (aaaaaaaaa, clean tree)" in line
+
+
+def test_groups_at_different_shas_are_refused_by_default():
+    """#25's two attempts: different code, equal fingerprints, read as a replication."""
+    group_a = _at_code(_group("mob", {"eval/loss": [2.79, 2.80]}), SHA_A)
+    group_b = _at_code(_group("mob", {"eval/loss": [2.78, 2.79]}), SHA_B)
+
+    with pytest.raises(CodeDriftError, match="different code"):
+        assert_same_code(group_a, group_b)
+
+
+def test_a_summary_recorded_before_the_sha_counts_as_drift():
+    """Every run dir under ~/tame-runs is legacy: no SHA is not the same SHA."""
+    legacy = _with_fingerprints(_group("mob", {"eval/loss": [2.79, 2.80]}))
+    legacy["fingerprints"] = {
+        seed: {k: v for k, v in prints.items() if not k.startswith("code_")}
+        for seed, prints in legacy["fingerprints"].items()
+    }
+    current = _at_code(_group("mob", {"eval/loss": [2.78, 2.79]}), SHA_A)
+
+    with pytest.raises(CodeDriftError, match="no code SHA recorded"):
+        assert_same_code(legacy, current)
+    with pytest.raises(CodeDriftError, match="no code SHA recorded"):
+        assert_same_code(legacy, legacy)
+    # Older still: a summary with no fingerprints at all.
+    with pytest.raises(CodeDriftError, match="no arm fingerprints"):
+        assert_same_code(_group("mob", {"eval/loss": [2.79, 2.80]}), current)
+
+
+def test_a_dirty_tree_counts_as_drift_even_at_one_sha():
+    group_a = _at_code(_group("mob", {"eval/loss": [2.79, 2.80]}), SHA_A)
+    group_b = _at_code(_group("mob", {"eval/loss": [2.78, 2.79]}), SHA_A, dirty=True)
+
+    with pytest.raises(CodeDriftError, match="dirty tree"):
+        assert_same_code(group_a, group_b)
+
+
+def test_allow_code_drift_compares_and_prints_the_drift_beside_the_table(caplog):
+    group_a = _at_code(_group("mob", {"eval/loss": [2.79, 2.80]}), SHA_A)
+    group_b = _at_code(_group("mob", {"eval/loss": [2.78, 2.79]}), SHA_B)
+
+    with caplog.at_level("WARNING", logger="compare_runs"):
+        line = assert_same_code(group_a, group_b, allow_drift=True)
+
+    assert line.startswith("code: DRIFT, allowed by --allow-code-drift")
+    assert "different code: ['aaaaaaaaa', 'bbbbbbbbb']" in line
+    assert any("code drift allowed" in record.message for record in caplog.records)
+

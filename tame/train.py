@@ -101,7 +101,13 @@ from coupling import (
     SteeringCoupling,
     SteeringCouplingConfig,
 )
-from determinism import configure_determinism, seed_worker
+from determinism import (
+    DETERMINISM_MODES,
+    DETERMINISM_WARN,
+    configure_determinism,
+    seed_worker,
+    validate_determinism_mode,
+)
 from evaluation import (
     DEFAULT_HELD_OUT_SEQUENCES,
     SOURCE_TRAIN_HOLDOUT,
@@ -134,7 +140,7 @@ from mob import (
     update_all_mob_from_loss,
 )
 from mob.experts import CONFIDENCE_INITIAL_LOGIT, ConfidenceHead
-from parity import ArmFingerprint, data_order_fingerprint, fingerprint_arm
+from parity import ArmFingerprint, code_identity, data_order_fingerprint, fingerprint_arm
 from specialisation import SpecialisationReport, probe_specialisation
 from steering import ADAPTIVE_STEERING, SteeringConfig
 from steering_pipeline import (
@@ -435,14 +441,16 @@ class TrainingConfig:
     held_out_sequences: int = DEFAULT_HELD_OUT_SEQUENCES
     probe_tokens: int = 4096
 
-    # Reproducibility (#13). ``deterministic`` forces deterministic kernels
-    # (torch.use_deterministic_algorithms, cuDNN, cuBLAS workspace) wherever one
-    # exists and logs the rest as a known variance source rather than silently
-    # accepting it -- see determinism.py. ``shuffle_buffer_size`` seeds a bounded
-    # shuffle of the streaming dataset; 0 keeps the current unshuffled, already
-    # order-deterministic stream.
+    # Reproducibility (#13, #31). ``deterministic`` is one of DETERMINISM_MODES:
+    # ``warn`` forces deterministic kernels (torch.use_deterministic_algorithms,
+    # cuDNN, cuBLAS workspace) wherever one exists and logs the rest as a known
+    # variance source; ``strict`` refuses the rest and makes the attention
+    # backward deterministic too, at a throughput cost the README states;
+    # ``off`` is torch's defaults -- see determinism.py. ``shuffle_buffer_size``
+    # seeds a bounded shuffle of the streaming dataset; 0 keeps the current
+    # unshuffled, already order-deterministic stream.
     seed: int = 42
-    deterministic: bool = True
+    deterministic: str = DETERMINISM_WARN
     shuffle_buffer_size: int = 0
 
     def __post_init__(self) -> None:
@@ -511,6 +519,8 @@ class TrainingConfig:
 
         if self.shuffle_buffer_size < 0:
             raise ValueError(f"shuffle_buffer_size must be >= 0, got {self.shuffle_buffer_size}")
+
+        validate_determinism_mode(self.deterministic)
 
 
 class TAMETrainer:
@@ -1285,6 +1295,7 @@ class TAMETrainer:
             steer_layers=sorted(layer for layer, hook in field.hooks.items() if hook.injects)
             if field is not None
             else (),
+            code=code_identity(),
         )
         logger.info(f"Arm fingerprint: {self.fingerprint.as_dict()}")
 
@@ -2071,12 +2082,17 @@ def main():
         ),
     )
 
-    # Reproducibility (#13)
+    # Reproducibility (#13, #31)
     parser.add_argument(
         "--deterministic",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Force deterministic kernels where one exists; log the rest (default: on)",
+        type=str,
+        choices=DETERMINISM_MODES,
+        default=DETERMINISM_WARN,
+        help=(
+            "warn: deterministic kernels where one exists, the rest logged; strict: the "
+            "rest refused and the attention backward made deterministic, at a throughput "
+            "cost; off: torch's defaults (default: warn)"
+        ),
     )
     parser.add_argument(
         "--shuffle_buffer_size",

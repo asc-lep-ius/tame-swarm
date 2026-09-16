@@ -51,7 +51,7 @@ def _config(smoke_fixture: tuple[str, str], output_dir: Path, **overrides) -> Tr
         dtype="float32",
         gradient_checkpointing=False,
         seed=0,
-        deterministic=True,
+        deterministic="warn",
     )
     settings.update(overrides)
     return TrainingConfig(**settings)
