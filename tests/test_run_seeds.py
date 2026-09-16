@@ -9,9 +9,13 @@ import math
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent.parent / "tame"))
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
-from run_seeds import aggregate, format_table, replication_std  # noqa: E402
+import run_seeds  # noqa: E402
+from run_seeds import aggregate, format_table, measure_replication, replication_std  # noqa: E402
+
+from train import TrainingConfig  # noqa: E402
 
 
 def test_the_floor_is_the_sample_std_of_one_seed_run_twice():
@@ -39,3 +43,43 @@ def test_the_table_carries_the_floor_only_when_one_was_measured():
     assert "repl_std" in with_floor.splitlines()[0]
     assert with_floor.splitlines()[2].endswith("0.00130")
     assert unmeasured_metric.splitlines()[2].endswith("n/a")
+
+
+def test_a_replicate_that_fails_leaves_the_floor_unmeasured_not_the_sweep_lost(monkeypatch):
+    """The replicate is the (N+1)th trainer in the process; if it dies, the N
+    seeds already measured still get their summary."""
+
+    def dies(seed, config, replicate=False):
+        raise RuntimeError("Cannot copy out of meta tensor")
+
+    monkeypatch.setattr(run_seeds, "run_seed", dies)
+
+    metrics, floor, error = measure_replication(0, TrainingConfig(), {"eval/loss": 2.79}, {"a": 1})
+
+    assert (metrics, floor) == (None, None)
+    assert error == "the replicate of seed 0 failed: Cannot copy out of meta tensor"
+
+
+def test_a_replicate_that_is_a_different_arm_is_not_a_floor(monkeypatch):
+    """A commit during the sweep changes the SHA the replicate fingerprints under;
+    the pair's spread is then code and arm, and is recorded as no floor at all."""
+    monkeypatch.setattr(
+        run_seeds, "run_seed", lambda seed, config, replicate=False: ({"eval/loss": 2.81}, {"a": 2})
+    )
+
+    metrics, floor, error = measure_replication(0, TrainingConfig(), {"eval/loss": 2.79}, {"a": 1})
+
+    assert metrics == {"eval/loss": 2.81}
+    assert floor is None
+    assert error is not None and error.startswith("the replicate of seed 0 is not the same arm")
+
+
+def test_the_floor_is_measured_when_the_replicate_is_the_same_arm(monkeypatch):
+    monkeypatch.setattr(
+        run_seeds, "run_seed", lambda seed, config, replicate=False: ({"eval/loss": 2.81}, {"a": 1})
+    )
+
+    metrics, floor, error = measure_replication(0, TrainingConfig(), {"eval/loss": 2.79}, {"a": 1})
+
+    assert (metrics, error) == ({"eval/loss": 2.81}, None)
+    assert floor == replication_std({"eval/loss": 2.79}, {"eval/loss": 2.81})

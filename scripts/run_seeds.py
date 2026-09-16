@@ -126,6 +126,34 @@ def run_seed(
     return result, fingerprint
 
 
+def measure_replication(
+    seed: int, config: TrainingConfig, first_metrics: dict[str, float], first_fingerprint: dict
+) -> tuple[dict[str, float] | None, dict[str, float] | None, str | None]:
+    """Run ``seed`` a second time; its metrics, the floor, and why there is none.
+
+    The replicate is the last full-size trainer in a process that has already
+    run every seed, so it is the one most exposed to the meta-device failure
+    ``run_seed`` describes, and its fingerprint is re-read from git, so a commit
+    made during a multi-hour sweep makes it a different arm. Neither may cost the
+    seeds already measured: a floor that could not be measured is recorded as
+    unmeasured (``compare_runs.py`` prints ``n/a``) and the summary is still
+    written.
+    """
+    try:
+        metrics, fingerprint = run_seed(seed, config, replicate=True)
+    except Exception as exc:
+        logger.error(f"the replicate of seed {seed} failed; the floor is unmeasured: {exc}")
+        return None, None, f"the replicate of seed {seed} failed: {exc}"
+    if fingerprint != first_fingerprint:
+        why = (
+            f"the replicate of seed {seed} is not the same arm as its first run, so its "
+            f"spread is not a run-to-run floor: {first_fingerprint} vs {fingerprint}"
+        )
+        logger.error(why)
+        return metrics, None, why
+    return metrics, replication_std(first_metrics, metrics), None
+
+
 def aggregate(per_seed: dict[int, dict[str, float]]) -> dict[str, dict[str, float]]:
     """Mean and (sample) standard deviation per metric, over whichever seeds have it.
 
@@ -351,15 +379,11 @@ def main() -> None:
     replicate_seed = seeds[0] if args.replicate else None
     replicate_metrics: dict[str, float] | None = None
     replication: dict[str, float] | None = None
+    replication_error: str | None = None
     if replicate_seed is not None:
-        replicate_metrics, replicate_fingerprint = run_seed(replicate_seed, config, replicate=True)
-        if replicate_fingerprint != fingerprints[replicate_seed]:
-            raise RuntimeError(
-                f"the replicate of seed {replicate_seed} is not the same arm as its first run; "
-                f"its spread is not a run-to-run floor: {fingerprints[replicate_seed]} vs "
-                f"{replicate_fingerprint}"
-            )
-        replication = replication_std(per_seed[replicate_seed], replicate_metrics)
+        replicate_metrics, replication, replication_error = measure_replication(
+            replicate_seed, config, per_seed[replicate_seed], fingerprints[replicate_seed]
+        )
 
     arm = arm_label(args.router, args.coupling_goal, args.steer_goal)
     if args.primary is not None and args.primary not in stats:
@@ -370,12 +394,15 @@ def main() -> None:
         )
     print("\n" + format_table(stats, replication))
     print(f"\narm: {arm} | seeds: {seeds} | steps: {args.steps} | primary: {args.primary}")
-    print(
-        f"replicate: seed {replicate_seed} run twice under --deterministic {args.deterministic}; "
-        "repl_std is the pair's sample std, the run-to-run floor"
-        if replicate_seed is not None
-        else "replicate: none (--no-replicate); the run-to-run floor is not measured"
-    )
+    if replicate_seed is None:
+        print("replicate: none (--no-replicate); the run-to-run floor is not measured")
+    elif replication_error is not None:
+        print(f"replicate: seed {replicate_seed} unmeasured -- {replication_error}")
+    else:
+        print(
+            f"replicate: seed {replicate_seed} run twice under --deterministic "
+            f"{args.deterministic}; repl_std is the pair's sample std, the run-to-run floor"
+        )
     print(f"artefacts: {workspace}")
 
     summary_path = workspace / "seed_summary.json"
@@ -394,8 +421,10 @@ def main() -> None:
                 "fingerprints": fingerprints,
                 "stats": stats,
                 "replicate_seed": replicate_seed,
+                # Raw provenance, read by nothing: it lets the floor be recomputed.
                 "replicate": replicate_metrics,
                 "replication_std": replication,
+                "replication_error": replication_error,
             },
             indent=2,
         )

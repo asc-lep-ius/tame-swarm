@@ -386,11 +386,13 @@ def assert_parity(arms: Sequence[ArmFingerprint]) -> None:
 def code_drift(arms: Sequence[ArmFingerprint]) -> list[str]:
     """Why these arms cannot be shown to have run one code; empty when they can.
 
-    Four reasons, each its own line: a fingerprint with no SHA (every summary
+    Five reasons, each its own line: a fingerprint with no SHA (every summary
     recorded before #31, which is what "legacy counts as drift" means), a dirty
-    tree behind any SHA, more than one SHA among the arms, and strict and warn
-    arms side by side (different attention-backward kernels). The caller decides
-    whether drift is refused or merely said; this only names it.
+    tree behind any SHA, a SHA whose tree state git could not read (unknown is
+    not clean, by the same rule that makes a missing SHA drift), more than one
+    SHA among the arms, and strict and warn arms side by side (different
+    attention-backward kernels). The caller decides whether drift is refused or
+    merely said; this only names it.
     """
     reasons: list[str] = []
     if len({arm.strict_determinism for arm in arms}) > 1:
@@ -406,6 +408,9 @@ def code_drift(arms: Sequence[ArmFingerprint]) -> list[str]:
     dirty = sorted({arm.code_sha[:9] for arm in arms if arm.code_sha and arm.code_dirty})
     if dirty:
         reasons.append(f"  dirty tree at {dirty}: the SHA identifies no code")
+    unknown = sorted({arm.code_sha[:9] for arm in arms if arm.code_sha and arm.code_dirty is None})
+    if unknown:
+        reasons.append(f"  tree state unknown at {unknown}: git could not say whether it was dirty")
     shas = sorted({arm.code_sha[:9] for arm in arms if arm.code_sha})
     if len(shas) > 1:
         reasons.append(f"  different code: {shas}")

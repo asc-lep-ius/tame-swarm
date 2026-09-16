@@ -18,6 +18,7 @@ from smoke_fixture import build_smoke_fixture  # noqa: E402
 
 from mob import get_mob_layers, mob_layers_by_index  # noqa: E402
 from mob.utils import owned_state  # noqa: E402
+from parity import code_identity  # noqa: E402
 from train import TAMETrainer, TrainingConfig  # noqa: E402
 
 
@@ -495,6 +496,9 @@ def test_steer_goal_injects_the_certified_field_as_served_through_training_and_t
     assert fingerprint.steer_strength == 1.0
     assert fingerprint.steer_layers == (2, 3)
     assert fingerprint.arm == "mob@smoke"
+    # #31: dropping `code=code_identity()` from the trainer's fingerprint_arm call
+    # would record code_sha null on every run and read as permanent drift.
+    assert (fingerprint.code_sha, fingerprint.code_dirty) == code_identity()
 
     batch = next(iter(trainer.train_dataloader))
     with torch.no_grad():

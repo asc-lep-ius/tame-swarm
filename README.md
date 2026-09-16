@@ -592,14 +592,18 @@ deterministic path and refuses any op with no deterministic form; nothing
 refuses at the ablation configuration, and the test runs Qwen3-1.7B, LoRA rank
 32, layers 6:22, 512 tokens for 50 micro-steps twice under `strict` and asserts
 `train/loss` and `eval/loss` bitwise identical (131 seconds for the pair on the
-RTX 5070 Ti inside the full `gpu` job, 127 alone). The cost is about five percent per micro-step — 0.456 s against
+RTX 5070 Ti inside the full `gpu` job). The cost is about five percent per micro-step — 0.456 s against
 0.433 s under `warn`, the mean of two 50-step runs each at that configuration —
 and `strict` is the default from #31 on: **new arms, #32's included, are
 recorded under `strict`**; every real-model arm before it ([#6](#integration-tests-6),
 [#13](#phase-05--mechanism-correction), #25, [#28](#field-present-coupling-28))
 ran under `warn`. *The floor.* `run_seeds.py --replicate` (on by default) runs
-the first seed a second time and writes the pair's sample std as
-`replication_std`; `compare_runs.py` quotes it as `repl_std` beside every delta.
+the first seed a second time, in the same process after the other seeds, and
+writes the pair's sample std as `replication_std`; `compare_runs.py` quotes it
+as `repl_std` beside every delta. Under `warn` that is a lower bound on the
+floor between separate invocations, which is what #25 measured; a replicate
+that fails or fingerprints as a different arm is recorded as no floor, and the
+seeds already measured keep their summary.
 Measured at the ablation configuration over 50 micro-steps: under `warn` the two
 runs' `train/loss` already differ at step 12, `eval/loss` reads 3.12081 against
 3.12029 (`repl_std` 0.00037), an expert's win share moves by up to 0.015
@@ -903,7 +907,7 @@ Run the full test suite inside the same CUDA container used by the app — no lo
 docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
 ```
 
-About 798 tests across 44 modules covering auction properties (hand-built and hypothesis-drawn), the value definition and exploration slot, wealth dynamics, gradient checkpointing, steering, the tissue on the measured plant, recovery from designed and undesigned damage, the metrics surface and its builders' 10 ms budget, the routing trace, the outcome probe, API endpoints, config, and experts; three strict expected failures record claims the economy does not yet meet ([#6](#integration-tests-6), re-attributed by [#16](#wealth-bounds-16) and split there into the two claims of different strength they had been asserting under one name). `-m slow` adds the 5000-step gate-stationarity run; `-m gpu` the bitwise-determinism check and the real-model integration tests, which load Qwen3-1.7B from the local HuggingFace cache (267 seconds on the RTX 5070 Ti, against a 300-second budget: 120 at [#6](#integration-tests-6), 160 when [#23](#calibration-corpus-23) moved the fixture onto the served calibration corpus, 300 when [#31](#run-to-run-31) put the determinism pair at the ablation configuration — 131 of the 267 — beside the real-model suite); without the cache they skip on a developer's machine and fail under CI.
+About 846 tests across 46 modules covering auction properties (hand-built and hypothesis-drawn), the value definition and exploration slot, wealth dynamics, gradient checkpointing, steering, the tissue on the measured plant, recovery from designed and undesigned damage, the metrics surface and its builders' 10 ms budget, the routing trace, the outcome probe, API endpoints, config, and experts; three strict expected failures record claims the economy does not yet meet ([#6](#integration-tests-6), re-attributed by [#16](#wealth-bounds-16) and split there into the two claims of different strength they had been asserting under one name). `-m slow` adds the 5000-step gate-stationarity run; `-m gpu` the bitwise-determinism check and the real-model integration tests, which load Qwen3-1.7B from the local HuggingFace cache (267 seconds on the RTX 5070 Ti, against a 300-second budget: 120 at [#6](#integration-tests-6), 160 when [#23](#calibration-corpus-23) moved the fixture onto the served calibration corpus, 300 when [#31](#run-to-run-31) put the determinism pair at the ablation configuration — 131 of the 267 — beside the real-model suite); without the cache they skip on a developer's machine and fail under CI.
 
 ### Key Concepts for Contributors
 

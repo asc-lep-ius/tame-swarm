@@ -367,6 +367,23 @@ def test_code_drift_names_missing_dirty_and_differing_shas():
     assert "different code: ['aaaaaaaaa', 'bbbbbbbbb']" in reasons
 
 
+def test_a_sha_whose_tree_state_is_unknown_is_drift_not_a_clean_tree():
+    """``code_identity`` returns ``(sha, None)`` when ``rev-parse`` succeeds and
+    ``git status`` does not (an ``index.lock`` from a concurrent command); that
+    arm must not read as clean, or ``compare_runs`` prints a tree state it never
+    saw."""
+    reasons = code_drift(
+        [
+            replace(BASE, code_sha="a" * 40, code_dirty=False),
+            replace(BASE, router="softmax", code_sha="a" * 40, code_dirty=None),
+        ]
+    )
+
+    assert reasons == [
+        "  tree state unknown at ['aaaaaaaaa']: git could not say whether it was dirty"
+    ]
+
+
 def test_a_fingerprint_recorded_before_the_sha_reads_as_unknown_code():
     """Every summary under ~/tame-runs predates #31: it must load, and it must not
     claim a SHA it does not have."""
