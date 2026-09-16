@@ -3,8 +3,9 @@ out is re-sampled faster the longer it has been shut out, over N steps every
 expert holds at least one token, and the uniform draw -- the inert state --
 re-samples a starved expert no faster than a merely unlucky one.
 
-The draw reads a ledger of settled steps since each expert last held a token,
-which no report writes, so the O(exploration_rate) deviation bound is kept: one
+The draw reads a ledger of settled steps since each expert last held a token.
+No report in the token's own auction writes it; a report can only lose now to
+be staler later, and the O(exploration_rate) deviation bound covers that: one
 explored token carries one gift, so no expert's chance of it on any token
 exceeds the rate whatever the weights."""
 
@@ -60,7 +61,6 @@ def test_the_uniform_draw_re_samples_a_starved_expert_no_faster():
 
 
 def test_the_staleness_draw_is_the_uniform_draw_when_nothing_is_stale():
-    torch.manual_seed(3)
     staleness = torch.zeros(NUM_EXPERTS)
     weighted = _gift_share("staleness", staleness)
     uniform = _gift_share("uniform", staleness)
@@ -117,7 +117,7 @@ def test_over_n_steps_every_expert_holds_a_token():
             steps_until_held = step
             break
 
-    assert steps_until_held is not None, "expert 3 never held a token in 200 steps"
+    assert steps_until_held is not None and steps_until_held < 20, steps_until_held
     assert mob.expert_usage_count[3].item() >= 1.0
 
 

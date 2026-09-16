@@ -94,9 +94,11 @@ LEDGER_BUFFERS = (
     "expert_usage_count",
     "expert_baseline_loss",
     "expert_performance_ema",
-    # Settled steps since each expert last held a token (#38): what the
+    # Settled forwards since each expert last held a token (#38): what the
     # staleness exploration draw reads. Kept here rather than on the gate so a
     # forced-routing episode, which swaps the gate out, still ages the starved.
+    # Written by every forward that moves the ledgers, serving included, on the
+    # same gate as the usage counts.
     "expert_steps_since_held",
 )
 

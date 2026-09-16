@@ -161,11 +161,13 @@ class VCGAuctioneer(nn.Module):
 
     What this does to the incentive claim, exactly. Whether a token is explored,
     and which slot, is drawn before any report is read; which loser receives it
-    reads no report either: under ``"uniform"`` every loser is equally likely,
-    under ``"staleness"`` (#38, the default) a loser's weight is one plus the
-    settled steps since it last held a token, a ledger the layer keeps and no
-    report writes. A loser therefore cannot raise its chance of the gift by any
-    report, and a winner can only reach the lottery by giving up its win.
+    reads no report in this token's auction: under ``"uniform"`` every loser is
+    equally likely, under ``"staleness"`` (#38, the default) a loser's weight is
+    one plus the settled steps since it last held a token, a ledger the layer
+    keeps and only the allocation writes. A loser therefore cannot raise its
+    chance of *this* gift by any report, and a winner can only reach the lottery
+    by giving up its win; what a report can do is lose now to be staler later,
+    which the bound below covers.
     Drawing the slot uniformly is what removes the deviation a fixed last
     slot would create -- a marginal winner overreporting into a slot that is never
     displaced, at an unchanged price. What remains is that a winner faces a
@@ -184,8 +186,10 @@ class VCGAuctioneer(nn.Module):
     deviation is still worth at most ``rate x value`` -- now against a forgone
     win on every token spent farming it, where under the uniform draw the
     stalest loser's chance was ``rate / (n - k)``. The weights read the ledger
-    and never a report. ``tests/constitution/test_reentry.py`` pins the bound
-    at a starved deviator.
+    and never a report of the token being allocated. A loser whose uniform is
+    exactly zero keys at ``-inf`` and ties with the winners, at probability
+    ``2^-24`` per draw; any other loser out-ranks it, so it is not a case.
+    ``tests/constitution/test_reentry.py`` pins the bound at a starved deviator.
     """
 
     def __init__(
