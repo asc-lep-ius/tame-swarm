@@ -47,10 +47,17 @@ DATA_ORDER_PROBE_BATCHES = 8
 # and an uncoupled auction arm at parity in everything else; ``steer_goal`` is
 # #28's field-present contrast, an arm trained in the goal field against one
 # trained without it. The coupling's own parameters (``coupling_beta``,
-# ``coupling_warmup_steps``) are deliberately not here: an uncoupled arm carries
-# them inert, as the softmax arm carries the auction-only fields, and two coupled
-# arms that differ on them are a tuning comparison rather than the ablation.
+# ``coupling_warmup_steps``) are deliberately not here: two coupled arms that
+# differ on them are a tuning comparison rather than the ablation. They are
+# asserted among the coupled arms only (``COUPLING_FIELDS``): an uncoupled arm
+# carries them inert, as the softmax arm carries the auction-only fields, and
+# #32 reads each dose against the one uncoupled reference.
 VARYING_FIELDS = frozenset({"router", "coupling_goal", "steer_goal"})
+
+# The coupling's own parameters, asserted only between arms that have a
+# coupling. An uncoupled arm has no dose; a default it carries inert must not
+# refuse #32's sweep, where every coupled arm is read against the uncoupled one.
+COUPLING_FIELDS = frozenset({"coupling_beta", "coupling_warmup_steps"})
 
 # The field's own parameters, asserted only between arms that have a field. An
 # arm without one records no strength and no layers -- they come from the goal's
@@ -325,22 +332,35 @@ def fingerprint_arm(
     )
 
 
-def _field_disagreements(arms: Sequence[ArmFingerprint]) -> list[str]:
-    """The field's strength and layers, compared among the arms that have a field."""
-    fielded = [arm for arm in arms if arm.steer_goal is not None]
-    if len(fielded) < 2:
+def _disagreements_among(
+    arms: Sequence[ArmFingerprint], names: Iterable[str], label: str
+) -> list[str]:
+    """Fields compared only among ``arms``, the ones that carry them live."""
+    if len(arms) < 2:
         return []
-    reference = fielded[0]
+    reference = arms[0]
     disagreements: list[str] = []
-    for name in sorted(FIELD_FIELDS):
+    for name in sorted(names):
         expected = getattr(reference, name)
-        for arm in fielded[1:]:
+        for arm in arms[1:]:
             actual = getattr(arm, name)
             if actual != expected:
                 disagreements.append(
-                    f"  {name}: {reference.arm}={expected!r} vs {arm.arm}={actual!r}"
+                    f"  {name}: {reference.arm}={expected!r} vs {arm.arm}={actual!r} ({label})"
                 )
     return disagreements
+
+
+def _field_disagreements(arms: Sequence[ArmFingerprint]) -> list[str]:
+    """The field's strength and layers, compared among the arms that have a field."""
+    fielded = [arm for arm in arms if arm.steer_goal is not None]
+    return _disagreements_among(fielded, FIELD_FIELDS, "among the field-on arms")
+
+
+def _coupling_disagreements(arms: Sequence[ArmFingerprint]) -> list[str]:
+    """The coupling's dose and warmup, compared among the arms that have a coupling."""
+    coupled = [arm for arm in arms if arm.coupling_goal is not None]
+    return _disagreements_among(coupled, COUPLING_FIELDS, "among the coupled arms")
 
 
 def assert_parity(arms: Sequence[ArmFingerprint]) -> None:
@@ -362,7 +382,9 @@ def assert_parity(arms: Sequence[ArmFingerprint]) -> None:
     reference = arms[0]
     disagreements: list[str] = []
     for field in fields(ArmFingerprint):
-        if field.name in VARYING_FIELDS | REPORTED_FIELDS | FIELD_FIELDS | DRIFT_FIELDS:
+        if field.name in (
+            VARYING_FIELDS | REPORTED_FIELDS | FIELD_FIELDS | COUPLING_FIELDS | DRIFT_FIELDS
+        ):
             continue
         expected = getattr(reference, field.name)
         for arm in arms[1:]:
@@ -372,6 +394,7 @@ def assert_parity(arms: Sequence[ArmFingerprint]) -> None:
                     f"  {field.name}: {reference.arm}={expected!r} vs {arm.arm}={actual!r}"
                 )
     disagreements.extend(_field_disagreements(arms))
+    disagreements.extend(_coupling_disagreements(arms))
 
     if disagreements:
         raise ParityError(

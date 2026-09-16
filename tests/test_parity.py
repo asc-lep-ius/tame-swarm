@@ -73,8 +73,6 @@ def test_dense_arm_may_convert_nothing():
         ("data_order", "different"),
         ("learning_rate", 3e-5),
         ("batch_size", 4),
-        ("coupling_warmup_steps", 50),
-        ("coupling_beta", 0.5),
     ],
 )
 def test_any_other_difference_is_a_confound(field, value):
@@ -127,6 +125,29 @@ def test_the_couplings_own_parameters_are_confounds_between_coupled_arms():
 
 
 FIELD = dict(steer_goal="truthful", steer_strength=4.0, steer_layers=(13, 16, 17))
+
+
+def test_an_uncoupled_reference_has_no_dose():
+    """#32's sweep: each coupled arm is read against the one uncoupled arm, whose
+    ``coupling_beta`` is a default it carries inert. Before this the sweep's two
+    new arms were refused against #28's reference for a dose it never applied."""
+    uncoupled = replace(BASE, **FIELD)
+    for beta in (0.3, 1.0):
+        assert_parity(
+            [uncoupled, replace(BASE, coupling_goal="truthful", coupling_beta=beta, **FIELD)]
+        )
+
+
+def test_the_dose_is_checked_among_the_coupled_arms_whatever_the_reference():
+    """An uncoupled reference must not hide a dose difference between two coupled arms."""
+    arms = [
+        replace(BASE, **FIELD),
+        replace(BASE, coupling_goal="truthful", coupling_beta=0.1, **FIELD),
+        replace(BASE, coupling_goal="safe", coupling_beta=0.3, **FIELD),
+    ]
+
+    with pytest.raises(ParityError, match="coupling_beta"):
+        assert_parity(arms)
 
 
 def test_a_field_on_and_a_field_off_arm_are_at_parity():
