@@ -360,8 +360,10 @@ def test_the_market_re_forms_around_a_senescent_expert(seed):
     next-most-competent experts: within 200 steps the loss sits at the floor a
     collective born without that expert reaches (measured 0.76-0.96x it on the
     three seeds -- below it, since the survivors have had 200 more steps than
-    that collective), the dead cell holds under 1% of the slots (0.001-0.006),
-    and the survivors' routing still tracks their competence (r 0.61-0.82).
+    that collective), the dead cell holds under 2% of the slots (0.0016-0.0137
+    since #38's staleness draw re-samples it as one of the stalest; 0.001-0.006
+    under the uniform draw), and the survivors' routing still tracks their
+    competence (r 0.61-0.82).
     """
     competence = shuffled(DEFAULT_COMPETENCE, seed)
     best = int(competence.argmax())
@@ -435,11 +437,16 @@ def test_the_market_re_forms_after_routing_was_forced_onto_the_least_competent(s
         "in the swept space flips this test. What remains is the cause the old reason could "
         "not exclude: a head is trained only on the value its own expert realises, so 150 "
         "steps of holding no tokens leaves it with a stale report, and the uniform 2% "
-        "exploration slot re-samples it no faster for having been starved longer. Waits on "
-        "the count-based exploration in #26. #25 ran the same episode on the differentiated "
-        "fixture, where the forced experts lose on three quarters of the tokens they are "
-        "handed, and it re-forms on all three seeds (loss ratio 0.96-1.02, tracking +0.58 to "
-        "+0.78): this failure needs the forced experts to profit from the forcing, which only "
+        "exploration slot re-samples it no faster for having been starved longer. #38 keyed "
+        "the draw on staleness and it does NOT flip this: after the episode five of eight "
+        "experts are starved alike, so the gifts still divide evenly among them, and the "
+        "released market reads tracking +0.05/-0.30/-0.29, regained 0.15/0.06/0.14 and loss "
+        "2.4-4.0x steady on the three seeds. What remains is the other channel #26 named, "
+        "the setpoint ledger, which is a mode of #40. #25 ran the same episode on the "
+        "differentiated fixture, where the forced experts lose on three quarters of the tokens "
+        "they are handed, and it re-forms on all three seeds (loss ratio 0.96-1.02, tracking "
+        "+0.58 to +0.78): this failure needs the forced experts to profit from the forcing, "
+        "which only "
         "token-independent competence gives them. Kept on the quality fixture by name "
         "(scripts/measure_differentiated_economy.py --recovery)."
     ),
@@ -532,7 +539,11 @@ def ruined():
         "short of the 0.125 chance threshold. No band in the swept grid clears it; the one "
         "that appears to is flat, where the protocol is degenerate rather than recovered -- "
         "the clamp restores the zeroed wealth before anything reads it, so the damage never "
-        "happens. Waits on the count-based exploration in #26. Fails on the differentiated "
+        "happens. #38's staleness draw does not flip it either: the ruined expert is one of "
+        "six shut-out experts all equally starved, so its share reads 0.0016-0.0031 across "
+        "the seeds (0.002 under the uniform draw) and the gift alone does not out-earn decay "
+        "at the floor. The other channel #26 named, the setpoint ledger, is a mode of #40. "
+        "Fails on the differentiated "
         "fixture too (#25: share 0.0031, wealth 46 against a median of 326), so unlike the "
         "long forced episode this one does not depend on the substrate."
     ),
@@ -554,8 +565,9 @@ def test_a_ruined_competent_expert_returns_to_the_market(ruined):
         "5x and reaches 1.00 with wealth flat, where it is unsatisfiable by construction "
         "rather than by the economy, every wealth being identical. That the wealth half "
         "moves while the win share does not is the point of the split: the band restores a "
-        "ruined expert's balance without restoring its standing in the market. Waits on #26 "
-        "with the claim above."
+        "ruined expert's balance without restoring its standing in the market. Under #38's "
+        "staleness draw it reads 0.30-0.50 of the median; waits on #40's setpoint ledger with "
+        "the claim above."
     ),
 )
 def test_a_ruined_competent_expert_regains_its_standing(ruined):

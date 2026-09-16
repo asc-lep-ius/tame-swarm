@@ -75,6 +75,7 @@ class WealthUpdateMixin:
     expert_usage_count: torch.Tensor
     expert_baseline_loss: torch.Tensor
     expert_performance_ema: torch.Tensor
+    expert_steps_since_held: torch.Tensor
     _cached_selected_experts: torch.Tensor | None
     _cached_routing_weights: torch.Tensor | None
     _cached_confidences: torch.Tensor | None

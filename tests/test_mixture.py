@@ -120,6 +120,10 @@ def test_save_load_roundtrip(tmp_path, tiny_config):
     original_wealth = mob.expert_wealth.clone()
     original_ema = mob.expert_performance_ema.clone()
     original_baseline = mob.expert_baseline_loss.clone()
+    # #38's staleness ledger travels with the others; a value the fresh layer
+    # cannot have, so the assertion below is not vacuous.
+    mob.expert_steps_since_held[0] = 3.0
+    original_staleness = mob.expert_steps_since_held.clone()
 
     model = FakeModel(mob)
     save_path = str(tmp_path / "mob_state.pt")
@@ -132,6 +136,7 @@ def test_save_load_roundtrip(tmp_path, tiny_config):
     assert torch.allclose(mob2.expert_wealth, original_wealth, atol=1e-5)
     assert torch.allclose(mob2.expert_performance_ema, original_ema, atol=1e-5)
     assert torch.allclose(mob2.expert_baseline_loss, original_baseline, atol=1e-5)
+    assert torch.equal(mob2.expert_steps_since_held, original_staleness)
 
 
 def test_load_state_strict_mismatch(tmp_path, tiny_config):

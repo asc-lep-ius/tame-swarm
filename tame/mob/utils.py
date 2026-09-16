@@ -447,6 +447,15 @@ def load_mob_state(
             if usage.shape == mob.expert_usage_count.shape:
                 mob.expert_usage_count.copy_(usage)
 
+        # A checkpoint from before #38 carries no staleness ledger; the layer then
+        # starts at rest, which is what the uniform draw those runs used amounts to.
+        if "steps_since_held" in state:
+            staleness = torch.tensor(
+                state["steps_since_held"], device=device, dtype=mob.expert_steps_since_held.dtype
+            )
+            if staleness.shape == mob.expert_steps_since_held.shape:
+                mob.expert_steps_since_held.copy_(staleness)
+
         loaded += 1
 
     if loaded > 0:
@@ -514,6 +523,7 @@ def save_mob_state(model: nn.Module, save_path: str) -> bool:
             "performance_ema": mob.expert_performance_ema.cpu().tolist(),
             "baseline_loss": mob.expert_baseline_loss.cpu().tolist(),
             "usage_count": mob.expert_usage_count.cpu().tolist(),
+            "steps_since_held": mob.expert_steps_since_held.cpu().tolist(),
         }
 
     torch.save(mob_state, save_path)

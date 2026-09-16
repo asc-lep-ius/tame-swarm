@@ -2,7 +2,12 @@ import logging
 from dataclasses import MISSING, Field, dataclass, fields
 from typing import Any
 
-from .auction import ROUTING_SHARE_UNIFORM, SUPPORTED_ROUTING_SHARES
+from .auction import (
+    EXPLORATION_DRAW_STALENESS,
+    ROUTING_SHARE_UNIFORM,
+    SUPPORTED_EXPLORATION_DRAWS,
+    SUPPORTED_ROUTING_SHARES,
+)
 from .softmax_router import ROUTER_AUCTION, SUPPORTED_ROUTERS
 
 logger = logging.getLogger(__name__)
@@ -32,6 +37,7 @@ AUCTION_ONLY_FIELDS = (
     "routing_temperature",
     "use_differentiable_routing",
     "exploration_rate",
+    "exploration_draw",
     # Reached only below the has_economy early return in update_wealth_from_loss, so
     # under the softmax gate the cached loss stays None and the trainer adds zero.
     "confidence_calibration_weight",
@@ -79,7 +85,9 @@ class MoBConfig:
     # exploration_rate / top_k / (num_experts - top_k) = 0.02/2/6 = 0.0017 whatever
     # the band is. Measured 0.0009-0.0046 across bands and seeds. No setting of
     # these four constants can move it, which is why #16 changed none of them and
-    # #26 is about the exploration slot.
+    # #26 is about the exploration slot. Since #38 the draw is weighted by
+    # staleness, and 0.0017 is the floor a shut-out expert's share cannot fall
+    # below rather than the share it holds.
     #
     # The concentration itself is *not* evidence of a defect, and the earlier
     # drafts of this comment read it as though it were. On the planted-competence
@@ -231,6 +239,11 @@ class MoBConfig:
     # 300, enough for every head to keep a target every step at a real batch
     # size, while displacing the marginal winner on 2% of tokens.
     exploration_rate: float = 0.02
+    # Which loser the explored slot goes to (#38). "staleness" weights each loser
+    # by one plus the settled steps since it last held a token, so a starved
+    # expert is re-sampled faster than a merely unlucky one -- the constitution's
+    # re-entry property. "uniform" is what every arm before #38 ran under.
+    exploration_draw: str = EXPLORATION_DRAW_STALENESS
     # Which gate turns reports into an allocation. "auction" is MoB. "softmax" is
     # the #12 control arm: the same confidence heads, softmaxed, with the whole
     # economy switched off -- no wealth read, no payment, no rebate, no value
@@ -280,6 +293,12 @@ class MoBConfig:
 
         if not 0.0 <= self.exploration_rate < 1.0:
             raise ValueError(f"exploration_rate must lie in [0, 1), got {self.exploration_rate}")
+
+        if self.exploration_draw not in SUPPORTED_EXPLORATION_DRAWS:
+            draws = ", ".join(sorted(SUPPORTED_EXPLORATION_DRAWS))
+            raise ValueError(
+                f"Unsupported exploration draw '{self.exploration_draw}'. Supported: {draws}"
+            )
 
         if self.routing_share not in SUPPORTED_ROUTING_SHARES:
             shares = ", ".join(sorted(SUPPORTED_ROUTING_SHARES))
