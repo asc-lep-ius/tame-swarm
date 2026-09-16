@@ -17,11 +17,8 @@ first ablation attempt for exactly this) -- the contrast is read as
 
 paired by seed, with a percentile bootstrap over the paired values. A range
 that includes zero reads "the contrast moved the allocation no further than
-re-running does". Below six paired values the 2.5th and 97.5th percentiles of
-the resampled means are the sample minimum and maximum -- at n = 3 a resample
-repeats one value with probability 1/27 -- so the interval is the per-seed
-range and carries no 95% coverage; it is labelled as a range for that reason
-(#35 owns the general form).
+re-running does". The bootstrap itself, and the count below which its interval
+is a range rather than a 95% interval, live in ``compare_runs`` (#35).
 
 Parity is asserted between the two groups exactly as ``compare_runs.py`` does,
 and the floor pair must be two groups at *identical* fingerprints: that is what
@@ -34,20 +31,22 @@ makes it a floor.
 
 import argparse
 import json
-import random
 import sys
 from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from compare_runs import assert_groups_at_parity, load_group  # noqa: E402
+from compare_runs import (  # noqa: E402
+    CONFIDENCE,
+    DEFAULT_RESAMPLES,
+    MIN_PAIRS_FOR_COVERAGE,
+    assert_groups_at_parity,
+    bootstrap_mean,
+    load_group,
+)
 
 WIN_SHARE_PREFIX = "routing/win_share_e"
-DEFAULT_RESAMPLES = 10_000
-CONFIDENCE = 0.95
-# Below this many paired values the percentile interval is the sample range.
-MIN_PAIRS_FOR_COVERAGE = 6
 
 
 def win_shares(result: dict[str, float]) -> dict[str, float]:
@@ -80,24 +79,6 @@ def paired_shifts(group_a: dict[str, Any], group_b: dict[str, Any]) -> dict[str,
         seed: total_variation(group_a["per_seed"][seed], group_b["per_seed"][seed])
         for seed in seeds
     }
-
-
-def bootstrap_mean(
-    values: list[float], resamples: int = DEFAULT_RESAMPLES, seed: int = 0
-) -> tuple[float, float, float]:
-    """Mean and its percentile bootstrap interval over ``values``, resampled with replacement.
-
-    At fewer than ``MIN_PAIRS_FOR_COVERAGE`` values the interval is exactly the
-    sample range; callers label it as such.
-    """
-    if not values:
-        raise ValueError("nothing to bootstrap")
-    rng = random.Random(seed)
-    means = sorted(sum(rng.choice(values) for _ in values) / len(values) for _ in range(resamples))
-    tail = (1 - CONFIDENCE) / 2
-    low = means[int(tail * (resamples - 1))]
-    high = means[int((1 - tail) * (resamples - 1))]
-    return sum(values) / len(values), low, high
 
 
 def excess_over_floor(contrast: dict[str, float], floor: dict[str, float]) -> dict[str, float]:
