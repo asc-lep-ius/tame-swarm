@@ -135,7 +135,10 @@ test-gpu:
     # #6 budgeted the GPU job at 120 seconds; #23 raised it to 160 when the
     # fixture moved onto the served 24 x 32 calibration corpus, whose 24 passages
     # are what the per-cell sigmas converge at (measured 127 on the RTX 5070 Ti
-    # with Qwen3-1.7B loaded from that cache, against 99 on the old 8 x 16).
+    # with Qwen3-1.7B loaded from that cache, against 99 on the old 8 x 16);
+    # #31 raised it to 300 when the determinism gate moved onto the ablation
+    # configuration -- Qwen3-1.7B, LoRA, 16 layers, 50 micro-steps, run twice
+    # under strict -- which is 131 of the 267 the whole job now measures.
     # The durations make a regression against that budget visible in the job log.
     - uv run pytest tests/ -x --tb=short -m gpu --durations=10
 

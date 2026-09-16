@@ -18,6 +18,15 @@ Every seed shares one config except the seed itself -- unlike ``compare_routers.
 there is nothing here to assert parity *between*: the point of this harness is the
 spread a fixed configuration produces on its own, which is exactly what a fixed
 seed across arms is supposed to remove.
+
+It did not remove all of it (#31). Under ``--deterministic warn``, the mode every
+arm before #31 ran under, the attention backward is non-deterministic, so one
+seed run twice is two trajectories; the between-seed spread above already
+contains that, but nothing said how much of it was run-to-run. ``--replicate``
+(on by default) runs the first seed a second time and records the pair's spread
+as ``replication_std``, which ``compare_runs.py`` quotes beside every delta.
+Under ``--deterministic strict``, the default since #31, the pair is bitwise
+identical and the floor reads zero -- which is then the check that it still does.
 """
 
 import argparse
@@ -39,6 +48,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from smoke_fixture import build_smoke_fixture  # noqa: E402
 
 from coupling import DEFAULT_COUPLING_BETA, DEFAULT_WARMUP_STEPS  # noqa: E402
+from determinism import DETERMINISM_DEFAULT, DETERMINISM_MODES  # noqa: E402
 from parity import arm_label  # noqa: E402
 from train import TAMETrainer, TrainingConfig  # noqa: E402
 
@@ -71,8 +81,15 @@ def headline_metrics(final: dict[str, float]) -> dict[str, float]:
     }
 
 
-def run_seed(seed: int, config: TrainingConfig) -> tuple[dict[str, float], dict[str, object]]:
-    """Train one replicate to completion; its final headline metrics and its arm fingerprint.
+def run_seed(
+    seed: int, config: TrainingConfig, replicate: bool = False
+) -> tuple[dict[str, float], dict[str, object]]:
+    """Train one seed to completion; its final headline metrics and its arm fingerprint.
+
+    A ``replicate`` is the same seed again in its own output directory, so it
+    rebuilds its held-out split and re-hashes its data order rather than reading
+    the first run's -- the fingerprint equality the caller asserts is then a
+    measurement and not a copy.
 
     The fingerprint travels with the summary so that ``compare_runs.py`` can refuse
     a comparison between two groups that differ in anything but the variable under
@@ -87,11 +104,12 @@ def run_seed(seed: int, config: TrainingConfig) -> tuple[dict[str, float], dict[
     "Cannot copy out of meta tensor". Reproduced empirically: seed 0 of a real
     Qwen3-1.7B sweep saved cleanly, seed 1 (same process, no cleanup) did not.
     """
+    run_name = f"seed{seed}-replicate" if replicate else f"seed{seed}"
     logger.info("=" * 80)
-    logger.info(f"Seed: {seed}")
+    logger.info(f"Seed: {seed}" + (" (replicate: the run-to-run floor)" if replicate else ""))
     logger.info("=" * 80)
 
-    trainer = TAMETrainer(replace(config, seed=seed, output_dir=f"{config.output_dir}/seed{seed}"))
+    trainer = TAMETrainer(replace(config, seed=seed, output_dir=f"{config.output_dir}/{run_name}"))
     trainer.setup()
     trainer.train()
 
@@ -106,6 +124,34 @@ def run_seed(seed: int, config: TrainingConfig) -> tuple[dict[str, float], dict[
         torch.cuda.empty_cache()
 
     return result, fingerprint
+
+
+def measure_replication(
+    seed: int, config: TrainingConfig, first_metrics: dict[str, float], first_fingerprint: dict
+) -> tuple[dict[str, float] | None, dict[str, float] | None, str | None]:
+    """Run ``seed`` a second time; its metrics, the floor, and why there is none.
+
+    The replicate is the last full-size trainer in a process that has already
+    run every seed, so it is the one most exposed to the meta-device failure
+    ``run_seed`` describes, and its fingerprint is re-read from git, so a commit
+    made during a multi-hour sweep makes it a different arm. Neither may cost the
+    seeds already measured: a floor that could not be measured is recorded as
+    unmeasured (``compare_runs.py`` prints ``n/a``) and the summary is still
+    written.
+    """
+    try:
+        metrics, fingerprint = run_seed(seed, config, replicate=True)
+    except Exception as exc:
+        logger.error(f"the replicate of seed {seed} failed; the floor is unmeasured: {exc}")
+        return None, None, f"the replicate of seed {seed} failed: {exc}"
+    if fingerprint != first_fingerprint:
+        why = (
+            f"the replicate of seed {seed} is not the same arm as its first run, so its "
+            f"spread is not a run-to-run floor: {first_fingerprint} vs {fingerprint}"
+        )
+        logger.error(why)
+        return metrics, None, why
+    return metrics, replication_std(first_metrics, metrics), None
 
 
 def aggregate(per_seed: dict[int, dict[str, float]]) -> dict[str, dict[str, float]]:
@@ -133,12 +179,33 @@ def aggregate(per_seed: dict[int, dict[str, float]]) -> dict[str, dict[str, floa
     return stats
 
 
-def format_table(stats: dict[str, dict[str, float]]) -> str:
+def replication_std(first: dict[str, float], second: dict[str, float]) -> dict[str, float]:
+    """The run-to-run floor per metric: the sample std of one seed's two runs.
+
+    Two values have one degree of freedom, so the sample std is |a - b| / sqrt(2)
+    -- the same estimator ``aggregate`` uses across seeds, at n = 2, which is what
+    lets ``compare_runs.py`` pool it with the between-seed spread on one footing.
+    """
+    return {
+        metric: abs(first[metric] - second[metric]) / math.sqrt(2)
+        for metric in sorted(first)
+        if metric in second
+    }
+
+
+def format_table(
+    stats: dict[str, dict[str, float]], replication: dict[str, float] | None = None
+) -> str:
     header = f"{'metric':<32}{'mean':>12}{'std':>12}{'n':>4}"
+    if replication is not None:
+        header += f"{'repl_std':>12}"
     lines = [header, "-" * len(header)]
     for metric, values in stats.items():
         std_str = f"{values['std']:>12.5f}" if not math.isnan(values["std"]) else f"{'n=1':>12}"
-        lines.append(f"{metric:<32}{values['mean']:>12.5f}{std_str}{values['n']:>4.0f}")
+        line = f"{metric:<32}{values['mean']:>12.5f}{std_str}{values['n']:>4.0f}"
+        if replication is not None:
+            line += f"{replication[metric]:>12.5f}" if metric in replication else f"{'n/a':>12}"
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -172,11 +239,19 @@ def main() -> None:
     parser.add_argument(
         "--layers", type=str, default="1:3", help="MoB layer range as start:end (exclusive)"
     )
+    # #31: strict reproduces bitwise; warn lets the attention backward through
+    # non-deterministic, and the replicate below measures what that costs.
     parser.add_argument(
         "--deterministic",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Force deterministic kernels where one exists (default: on)",
+        type=str,
+        choices=DETERMINISM_MODES,
+        default=DETERMINISM_DEFAULT,
+        help=(
+            "strict: every kernel deterministic or the run refuses, bitwise reproducible at "
+            "about five percent per step; warn: the mode every arm before #31 ran under, the "
+            "attention backward left non-deterministic and logged; off: torch's defaults "
+            f"(default: {DETERMINISM_DEFAULT})"
+        ),
     )
     # The coupled arm of #6's ablation: the same auction, with the routing
     # coupling seeded from a certified direction (#14). Everything else is shared
@@ -213,6 +288,16 @@ def main() -> None:
         help=(
             "Inject this goal's certified direction during training, as served: constant "
             "loop, certified strength and layers (#28; default: the field is absent)"
+        ),
+    )
+    # #31: the run-to-run floor, measured rather than assumed absent.
+    parser.add_argument(
+        "--replicate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Run the first seed a second time and record the pair's spread as "
+            "replication_std, the run-to-run floor compare_runs.py quotes (default: on)"
         ),
     )
     # #35: the metric this sweep is to be read on, declared before it is read.
@@ -291,6 +376,15 @@ def main() -> None:
     fingerprints = {seed: fingerprint for seed, (_, fingerprint) in runs.items()}
     stats = aggregate(per_seed)
 
+    replicate_seed = seeds[0] if args.replicate else None
+    replicate_metrics: dict[str, float] | None = None
+    replication: dict[str, float] | None = None
+    replication_error: str | None = None
+    if replicate_seed is not None:
+        replicate_metrics, replication, replication_error = measure_replication(
+            replicate_seed, config, per_seed[replicate_seed], fingerprints[replicate_seed]
+        )
+
     arm = arm_label(args.router, args.coupling_goal, args.steer_goal)
     if args.primary is not None and args.primary not in stats:
         logger.warning(
@@ -298,8 +392,17 @@ def main() -> None:
             f"sweep measured ({sorted(stats)}); it is recorded as declared, but no "
             "comparison will find it"
         )
-    print("\n" + format_table(stats))
+    print("\n" + format_table(stats, replication))
     print(f"\narm: {arm} | seeds: {seeds} | steps: {args.steps} | primary: {args.primary}")
+    if replicate_seed is None:
+        print("replicate: none (--no-replicate); the run-to-run floor is not measured")
+    elif replication_error is not None:
+        print(f"replicate: seed {replicate_seed} unmeasured -- {replication_error}")
+    else:
+        print(
+            f"replicate: seed {replicate_seed} run twice under --deterministic "
+            f"{args.deterministic}; repl_std is the pair's sample std, the run-to-run floor"
+        )
     print(f"artefacts: {workspace}")
 
     summary_path = workspace / "seed_summary.json"
@@ -317,6 +420,11 @@ def main() -> None:
                 "per_seed": per_seed,
                 "fingerprints": fingerprints,
                 "stats": stats,
+                "replicate_seed": replicate_seed,
+                # Raw provenance, read by nothing: it lets the floor be recomputed.
+                "replicate": replicate_metrics,
+                "replication_std": replication,
+                "replication_error": replication_error,
             },
             indent=2,
         )
