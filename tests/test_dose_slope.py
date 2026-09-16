@@ -37,3 +37,20 @@ def test_per_seed_slopes_pair_the_doses_by_seed_and_drop_unshared_seeds():
 def test_no_shared_seed_is_refused():
     with pytest.raises(ValueError, match="share no seed"):
         per_seed_slopes({0.1: {"0": 0.1}, 0.3: {"1": 0.1}})
+
+
+def test_the_cap_column_reads_the_last_record_and_refuses_a_missing_run(tmp_path):
+    from dose_slope import cap_readings
+
+    run = tmp_path / "runs" / "seed0"
+    run.mkdir(parents=True)
+    (run / "metrics.jsonl").write_text(
+        '{"coupling/delta_fraction_max": 0.05, "coupling/delta_fraction_mean": 0.01}\n'
+        '{"coupling/delta_fraction_max": 0.1006, "coupling/delta_fraction_mean": 0.094}\n'
+    )
+
+    assert cap_readings(tmp_path, ["0"]) == {
+        "0": {"coupling/delta_fraction_max": 0.1006, "coupling/delta_fraction_mean": 0.094}
+    }
+    with pytest.raises(FileNotFoundError, match="seed 1"):
+        cap_readings(tmp_path, ["0", "1"])

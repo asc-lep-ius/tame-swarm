@@ -35,6 +35,7 @@ from compare_runs import (  # noqa: E402
     DEFAULT_RESAMPLES,
     MIN_PAIRS_FOR_COVERAGE,
     assert_groups_at_parity,
+    assert_same_code,
     bootstrap_mean,
 )
 
@@ -69,7 +70,11 @@ def loss_deltas(reference: dict[str, Any], arm: dict[str, Any]) -> dict[str, flo
 
 
 def pooled_loss_spread(reference: dict[str, Any], arm: dict[str, Any]) -> float:
-    """The pooled seed spread ``compare_runs`` reads a loss delta against."""
+    """The pooled seed spread ``compare_runs`` reads a loss delta against.
+
+    The RMS of the two groups' seed stds, which is ``compare_runs``' df-weighted
+    pooled std when both groups ran the same number of seeds, as a sweep does.
+    """
     spreads = [
         g["stats"]["eval/loss"]["std"]
         for g in (reference, arm)
@@ -85,7 +90,10 @@ def cap_readings(group_dir: Path, seeds: list[str]) -> dict[str, dict[str, float
         last: dict[str, float] = {}
         metrics = group_dir / "runs" / f"seed{seed}" / "metrics.jsonl"
         if not metrics.exists():
-            continue
+            raise FileNotFoundError(
+                f"{metrics} is missing, so the cap column cannot be read for seed {seed}; "
+                "the cap guardrail is part of the primary's reading, not optional"
+            )
         for line in metrics.read_text().splitlines():
             last.update(json.loads(line))
         readings[seed] = {key: last[key] for key in CAP_KEYS if key in last}
@@ -107,6 +115,11 @@ def main() -> None:
     parser.add_argument(
         "--cap", type=float, default=None, help="max_coupling_fraction the arms ran under"
     )
+    parser.add_argument(
+        "--allow-code-drift",
+        action="store_true",
+        help="compare across code SHAs or against a summary without one, and print the drift",
+    )
     parser.add_argument("--resamples", type=int, default=DEFAULT_RESAMPLES)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--json", type=str, default=None)
@@ -119,8 +132,10 @@ def main() -> None:
     for spec in args.arm:
         beta, _, path = spec.partition("=")
         arms[float(beta)] = (Path(path), load_group(Path(path)))
-    for _, group in arms.values():
+    code_lines: dict[float, str] = {}
+    for beta, (_, group) in arms.items():
         assert_groups_at_parity(reference, group)
+        code_lines[beta] = assert_same_code(reference, group, allow_drift=args.allow_code_drift)
 
     shifts = {beta: paired_shifts(reference, group) for beta, (_, group) in arms.items()}
     floor = None
@@ -159,6 +174,9 @@ def main() -> None:
         "  an interval that includes zero reads 'no dose recruits'; the excess column says "
         "whether any dose moved the allocation further than re-running"
     )
+    print()
+    for beta in sorted(arms):
+        print(f"beta {beta} {code_lines[beta]}")
     print()
     if args.cap is not None:
         print(f"cap: max_coupling_fraction = {args.cap}")
