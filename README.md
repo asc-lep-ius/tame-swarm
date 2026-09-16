@@ -29,7 +29,13 @@ In the TAME framework, intelligence isn't a "thing" you have; it's a collective 
 
 **Cognitive Homeostasis** represents the Bioelectric Target Pattern. Just as an embryo "knows" to build a face even if the cells are scrambled, our steering vectors act as a "moral and logical pH balance," pulling the swarm back to its goal-state whenever the stochasticity of the auction drifts too far. The controller dynamically adjusts injection strength based on how far the model's latent representation has drifted from the target.
 
-> In this architecture, "alignment" is a homeostatic state the system is physically incapable of leaving for long.
+> The homeostat holds a certified direction at a measured setpoint. It is a controller on a tool, and the project says so.
+
+**Which goal the project pursues.** Of the three things a system like this could be built for — a more capable model, a sentient system, or a testbed — this project is the third: a **cognition vehicle**, a testbed for whether a system whose continuation depends on its own performance shows the behavioural signatures of agency, measured against control arms. It is not a capability project. Making a sentient system is not on the roadmap; the developmental protocol that would follow a positive result is recorded as a possible later phase ([#49](https://gitlab.hephaestus/mipkovich/tame-swarm/-/issues/49)) and nothing more. The plan that fixes this is [`docs/phase-2-stakes-plan.md`](docs/phase-2-stakes-plan.md).
+
+<a name="what-this-project-does-not-claim"></a>
+
+**What this project does not claim.** By the project's own criterion — a recurrent loop whose setpoint bears on the system's continuation — the current system is not a candidate for sentience: nothing at the organism scale depends on its performance, and the loops it does run regulate a projection onto a direction someone else chose. Language output is behaviour, never testimony; nothing the model says about itself is evidence about experience. Any signature reported in [Phase 2](#phase-2--stakes) is a preregistered behavioural contrast between a coupled arm and its controls, and a claim about behaviour under stakes, not about experience. The vocabulary of mind and life in this document is the research programme's hypothesis space, named so that a reader can see what is being tested.
 
 ---
 
@@ -101,7 +107,7 @@ The substantive difference from a learned router is *where the training signal c
   On a language model the same statistics are logged every step as `auction/mean_realised_value`, `auction/mean_report` and `auction/mean_win_surplus`, so the symptom cannot hide again; a 200-step Qwen3-1.7B run is the only real-model reading so far and is reported under [Reproducibility](#reproducibility). **No reserve price.** With unbiased reports the auction's individual rationality already makes every winner's expected surplus non-negative, and at upcycling every value is exactly zero, so a reserve would let nobody win and therefore nobody train. **What the fixture also shows** is that with real value to allocate on, one or two experts reach `max_wealth` within a few hundred steps and the wealth multiplier then overturns better reports from poorer experts — wealth decides the top-1 winner on 26.6% ± 5.9 of tokens at the shipped band, settled. [#16](#wealth-bounds-16) re-derived the band against that and retained all four constants, because no band changes the outcome that matters: a shut-out expert's share is fixed by the exploration rate at `exploration_rate/top_k/(n − top_k)` = 0.0017 and no band can reach it, while narrowing the band only moves the shut-out experts' wealth off the floor without readmitting them.
 - **Quasi-linear wealth.** Wealth moves by `reward − payment` with a *single* coefficient, derived from `reward_scale`, the path's reward multiplier and `top_k` rather than fitted. `payment_scale` survives only as a dimensionless deviation from that balanced point, defaulting to `1.0`. Quasi-linearity is a precondition of every VCG result, and one coefficient per side is what it means.
 - **The report is a value estimate, not a probability.** `ConfidenceHead` emits `softplus(logits)` — a non-negative, unbounded estimate of the loss reduction the expert expects to deliver. A bid of ~0 is how an expert abstains. A sigmoid report would be capped at 1.0 while the reward it predicts is not, so "win when report > price" and "profit when value > price" could not coincide.
-- **Three wealth-update paths** exist today: loss-based feedback (training, primary), local output-quality proxy (inference), and participation-based (fallback). [Phase 2](#phase-2--economy-stabilisation) will unify these into a single parameterised mechanism.
+- **Three wealth-update paths** exist today: loss-based feedback (training, primary), local output-quality proxy (inference), and participation-based (fallback). [#40](https://gitlab.hephaestus/mipkovich/tame-swarm/-/issues/40) ([Phase 2](#phase-2--stakes)) unifies these into one `WealthUpdater` the organism's budget ledger is an instance of.
 - **Gate-swap baseline.** `routing_share="proportional"` restores an own-bid-weighted gate as the comparison arm for [#12](#phase-05--mechanism-correction). It is *not* incentive compatible — a winner can enlarge its own share of the output while its price stays fixed — which is the single property the swap is meant to isolate.
 - **The baseline gate reads relative wealth, never its scale.** A winner's share is `bid ** (1 / routing_temperature)` normalised over the winners, i.e. a softmax over `log(confidence) + log(wealth)`. The earlier gate took a softmax over the bids themselves, and softmax is not scale invariant: measured at default initialisation over `softplus` reports, its top-1 weight had median ≈0.99 at `initial_wealth` and 1.000 at `max_wealth`, and across the configured wealth band its effective expert count was **1.000** — `top_k=2` paying for two experts and using one. Because the absolute wealth scale drifts as the economy runs, that made gate sharpness a moving confound in every number read through it, the Phase 1 coupling ablation included. In the log domain a uniform rescaling of all wealth is a constant shift that softmax absorbs exactly, so only *relative* wealth reaches the gate. Verified invariant to under 2e-7 — float32 rounding on the log — across sixteen orders of magnitude of wealth scale, and stationary over a 5000-step run: top-1 median moves ≤0.0085 and effective expert count ≤0.0017 between step 500 and step 5000 — two-fifths and one-sixth of the drift the test admits — against ≤0.153 and ≤0.164 for the gate it replaced. `routing_temperature` defaults to `1.0` and is scale invariant at every setting — exactly in the algebra, and measured under 1e-6 in float32 down to `tau=0.1` — so sharpness is a choice rather than, as the raw bid scale was, a side effect.
 - **What the gate actually did is logged, not inferred.** Every forward records the realised top-1 routing weight (mean, median, fraction above 0.99) and `exp(entropy(routing_weights))` — the number of experts the output was genuinely mixed from — and `get_mob_statistics` aggregates them beside the wealth figures. `top_k` is a configuration; the effective expert count is the outcome, and it is the statistic that would have surfaced the saturation above without anyone going looking for it.
@@ -414,11 +420,11 @@ Across the full grid — 26 bands, ratios 1–50 and decays 0.98–1.0 — **no 
 | Module | Purpose | Phase | Status |
 |--------|---------|-------|--------|
 | **Steering–Economy Coupling** | Goal state shapes expert routing, not just post-hoc correction | [Phase 1](#phase-1--steering-economy-coupling) | Mechanism done ([#14](#coupling-activation-14)); effect null at 500 steps ([#6](#integration-tests-6)), at 2000 ([#25](#differentiation-checkpoint-25)) and with the field present ([#28](#field-present-coupling-28)) |
-| **Economy Stabilisation** | Unified wealth dynamics with formal stability guarantees | [Phase 2](#phase-2--economy-stabilisation) | Planned |
+| **Stakes** | A cell's, then the organism's, continuation depends on its own performance; the preregistered signatures read against control arms | [Phase 2](#phase-2--stakes) | Planned ([#36](https://gitlab.hephaestus/mipkovich/tame-swarm/-/issues/36)–[#47](https://gitlab.hephaestus/mipkovich/tame-swarm/-/issues/47)) |
 | **Concept-Level Agency** | Chunk-level routing + per-expert memory within forward pass | [Phase 3](#phase-3--concept-level-agency) | Planned |
 | **Multi-Scale Hierarchy** | Inter-layer wealth coupling + hierarchical VCG auction | [Phase 4](#phase-4--multi-scale-hierarchy) | Planned |
 | **Recurrent Memory (RMT)** | Persistent "bioelectric" state across segments — infinite context | [Phase 5](#phase-5--persistent-memory-gap-junctions) | Planned |
-| **Allostasis** | Meta-controller that adapts homeostatic setpoints under sustained pressure | [Phase 5](#phase-5--persistent-memory-gap-junctions) | Planned |
+| **Allostasis** | The viability core adapts plasticity, exploration and the steering setpoints to hold the organism's margins | [Phase 2](#phase-2--stakes), [#42](https://gitlab.hephaestus/mipkovich/tame-swarm/-/issues/42) | Planned |
 
 The system currently has two decoupled modules (MoB body, Steering mind) operating at token granularity within a single context window. The [full roadmap](#roadmap) lays out the path from this foundation to the complete TAME vision: coupled body–mind dynamics, stable economy, concept-level agency, multi-scale hierarchy, and persistent memory with allostatic stress response.
 
@@ -1082,11 +1088,11 @@ This project implements ideas from the following research areas:
 | Regeneration: function re-forms after damage nobody planned for | A senescent expert is removed by its own head learning it is worth nothing and the loss returns to the born-without floor; a short forced-routing episode is undone; an actuator removed mid-generation leaves the consensus and the survivors carry its effort | The economy half is measured as task loss on the planted-competence fixture; the tissue half as the regulated variable, on the fixture and the real model ([#6](#integration-tests-6)). A long forced episode and a ruined expert do **not** recover — and in the *undamaged* economy at the shipped constants six of eight experts already hold the exploration slot alone (~0.002 of the slots each), so the collective doing the regenerating is two cells. [#16](#wealth-bounds-16) eliminated the wealth band as the cause — with the ledger pinned flat the episode still fails every threshold, and no band in a 26-band sweep flips it — leaving a head that learns only from the tokens it holds and is never re-sampled after a lock-out, [#26](https://gitlab.hephaestus/mipkovich/tame-swarm/-/issues/26) |
 | Cells respond to the local gradient of the organism's stress field, not to the organism's goal | An expert's value is its contribution against the loss gradient at its own layer; a head senses only what the organism projects onto its token | Implemented ([#15](#phase-05--mechanism-correction)) |
 | Stochastic cell fate keeps every lineage sampling its environment | The auction's exploration slot: an unpaid slot for a random loser on 2% of training tokens, drawn before any report is read | Implemented ([#15](#phase-05--mechanism-correction)); [#16](#wealth-bounds-16) measured that it is also the **ceiling** on a shut-out expert's share, not just its floor — `exploration_rate / top_k / (n − top_k)` = 0.0017, and because the draw is uniform it re-samples an expert starved for 150 steps no faster than one starved for one. That is [#26](https://gitlab.hephaestus/mipkovich/tame-swarm/-/issues/26) |
-| Metabolic homeostasis (energy regulation) | Unified wealth economy with formal stability analysis | Phase 2 |
+| Metabolic homeostasis (energy regulation) | One ledger class for cells and organism, with the stability analysis; a graded budget with a floor and dormancy | Phase 2 ([#40](https://gitlab.hephaestus/mipkovich/tame-swarm/-/issues/40), [#43](https://gitlab.hephaestus/mipkovich/tame-swarm/-/issues/43)) |
 | Organ-level agency (not single-cell reflexes) | Chunk-level VCG routing with per-expert working memory | Phase 3 |
 | Multi-scale nested agents (cells → tissues → organs) | Inter-layer wealth coupling + hierarchical auction | Phase 4 |
 | Gap junctions synchronising bioelectric state | Recurrent Memory Transformer (RMT) for persistent internal state | Phase 5 |
-| HPA axis / stress response (allostasis) | Meta-controller adapting steering setpoints under pressure | Phase 5 |
+| HPA axis / stress response (allostasis) | The viability core: a tissue over viability margins acting on plasticity, exploration and the steering setpoints | Phase 2 ([#42](https://gitlab.hephaestus/mipkovich/tame-swarm/-/issues/42)) |
 
 ---
 
@@ -1106,7 +1112,7 @@ Phase 0.5: Mechanism Correction + Baselines               ◐ IN PROGRESS
 Phase 1: Steering ↔ Economy Coupling → Better Contrastive Data → PID Controller
     │
     ▼
-Phase 2: Stability Analysis → Unified Wealth Updater
+Phase 2: Stakes — Constitution → Expert-Level Dial → Viability Core → Organism-Level Dial
     │
     ▼
 Phase 3: Chunk-Level Routing → Expert Memory
@@ -1115,7 +1121,7 @@ Phase 3: Chunk-Level Routing → Expert Memory
 Phase 4: Inter-Layer Coupling → Hierarchical Auction
     │
     ▼
-Phase 5: RMT Gap Junctions → Allostasis
+Phase 5: RMT Gap Junctions
 ```
 
 ### Completed
@@ -1197,18 +1203,30 @@ This is the **single highest-impact architectural change**. Currently MoB and St
 
 ---
 
-<a name="phase-2--economy-stabilisation"></a>
+<a name="phase-2--stakes"></a>
 
-### Phase 2 — Economy Stabilisation
+### Phase 2 — Stakes
 
-*"An economy with hand-tuned magic numbers is a planned economy; planned economies collapse."*
+*"A measurement that cannot come back 'no' is telemetry."*
+
+Phase 1 left the coupling null three times: a goal the cells are shown and never paid for does not recruit them ([#28](#field-present-coupling-28)). Phase 2 asks the question the nulls select. Does a system whose continuation depends on its own performance behave differently from one whose does not? The dial is one switch, `persistence_coupling: value | decoupled`, built once for the experts and reused for the whole; every signature, control and stopping rule is fixed in writing before the first run. The plan is [`docs/phase-2-stakes-plan.md`](docs/phase-2-stakes-plan.md); the milestone is *Phase 2: Stakes*.
 
 | Task | Description | Status |
 |------|-------------|--------|
-| **2a. Formal stability analysis** | Fixed-point analysis on decay × reward equilibrium, eigenvalue analysis for oscillation conditions, empirical Gini-stability mapping | Not started |
-| **2b. Unified wealth updater** | Merge the three wealth-update paths (`update_wealth_from_loss`, `_update_wealth_local_quality`, `_update_wealth_participation`) into a single `WealthUpdater` class with a pluggable reward signal | Not started |
+| **2a. Goal statement ([#36](https://gitlab.hephaestus/mipkovich/tame-swarm/-/issues/36))** | This README states which goal the project pursues, retires the sentence that was true only of a tool, and says what the project does not claim | Done |
+| **2b. Preregistration ([#37](https://gitlab.hephaestus/mipkovich/tame-swarm/-/issues/37))** | `docs/preregistration.md`: four signatures at the cell scale, both positions' predictions, the controls (decoupled, shuffled-value, ≥ 3 runs per arm, the multiplicity line), the stopping rules copied verbatim into #44 before it runs | Not started |
+| **2c. The constitution ([#38](https://gitlab.hephaestus/mipkovich/tame-swarm/-/issues/38), folds in [#26](https://gitlab.hephaestus/mipkovich/tame-swarm/-/issues/26))** | Strategyproof payment, balanced rebate, a welfare floor and re-entry as one named test group; a staleness-keyed exploration draw so no cell is permanently excluded | Not started |
+| **2d. Expert-level stakes dial ([#39](https://gitlab.hephaestus/mipkovich/tame-swarm/-/issues/39))** | `value` (today's economy) vs `decoupled` (pinned wealth, uniform re-entry, a shadow ledger) vs `shuffled`, on the fixture then the differentiated body; if #32 is null, [#33](https://gitlab.hephaestus/mipkovich/tame-swarm/-/issues/33)'s goal term is the `value` arm's value definition | Not started |
+| **2e. One ledger class ([#40](https://gitlab.hephaestus/mipkovich/tame-swarm/-/issues/40))** | The three wealth-update paths become one `WealthUpdater` with the fixed-point and oscillation analysis, so the organism's budget ledger is an instance of the class the experts use. Absorbs the former 2a and 2b | Not started |
+| **2f. A newer held-out stream ([#41](https://gitlab.hephaestus/mipkovich/tame-swarm/-/issues/41))** | A rotating held-out stream newer than the last update, evaluation that costs budget, canaries | Not started |
+| **2g. The viability core ([#42](https://gitlab.hephaestus/mipkovich/tame-swarm/-/issues/42))** | The homeostat tissue with viability margins against a frozen copy as its regulated variables, acting on plasticity, exploration rate and the steering setpoints. Absorbs the former 5b (allostasis) | Not started |
+| **2h. A budget ledger for the whole ([#43](https://gitlab.hephaestus/mipkovich/tame-swarm/-/issues/43))** | Graded compute from the viability band, with a floor and dormancy rather than deletion | Not started |
+| **2i. Organism-level stakes dial ([#44](https://gitlab.hephaestus/mipkovich/tame-swarm/-/issues/44))** | The same dial applied to the organism's budget, run last, under the preregistered stopping rules | Not started |
+| **2j. Report channel, readiness register, deference ([#45](https://gitlab.hephaestus/mipkovich/tame-swarm/-/issues/45), [#46](https://gitlab.hephaestus/mipkovich/tame-swarm/-/issues/46), [#47](https://gitlab.hephaestus/mipkovich/tame-swarm/-/issues/47))** | A non-linguistic report channel; which autonomies the core gets, on what evidence, and the human-channel rule; setpoints held as beliefs with a correction channel and asking as a budgeted action | Not started |
 
-**Why after Phase 1:** Steering–economy coupling changes the wealth dynamics. Stabilising before coupling would require re-doing the analysis.
+Two stubs sit outside the milestone: [#48](https://gitlab.hephaestus/mipkovich/tame-swarm/-/issues/48) (the same economy and core on a small clean substrate) and [#49](https://gitlab.hephaestus/mipkovich/tame-swarm/-/issues/49) (the developmental protocol Phase 2 deliberately leaves out).
+
+**Why after Phase 1:** the coupling nulls are what select this question. **Why before Phase 3:** memory amplifies whatever dynamics exist; chunk-level routing and expert memory, and lineage selection after them, are only worth building on a body whose dynamics under stakes have been measured.
 
 ---
 
@@ -1225,7 +1243,7 @@ TAME posits agents operating at the *concept* level. Token-level routing limits 
 | **3a. Chunk-level routing** | Group tokens into 16–32 token spans (or attention-derived semantic chunks) and have experts bid on entire spans — enables specialisation on reasoning chains, code blocks, factual claims; reduces auction overhead by 16–32× | Not started |
 | **3b. Expert memory (intra-forward)** | Lightweight per-expert recurrent state (EMA of past hidden states within current generation) — turns experts from reflexes into simple agents with short-term context | Not started |
 
-**Why after Phase 2:** Chunk-level routing changes the reward signal granularity (one reward per chunk, not per token). Stable economy dynamics are needed before changing this shape.
+**Why after Phase 2:** Chunk-level routing changes the reward signal granularity (one reward per chunk, not per token), and memory amplifies whatever dynamics exist. The economy's dynamics under stakes are measured before its shape changes; lineage and population selection follow for the same reason.
 
 ---
 
@@ -1257,9 +1275,8 @@ While MoB provides the body and Steering provides the goal, the system currently
 | Task | Description | Status |
 |------|-------------|--------|
 | **5a. Recurrent Memory Transformer** | Memory tokens that persist across context window segments, acting as virtual gap junctions — the "bioelectric state" of the swarm survives beyond the context boundary, expanding the system's Cognitive Light Cone | Not started |
-| **5b. Allostasis / stress response** | Meta-controller monitoring system-level statistics (mean alignment, Gini, loss trend) and adapting control setpoints — tightens steering under sustained adversarial pressure, relaxes when stable; the computational analogue of the HPA axis | Not started |
 
-**Why last:** RMT and allostasis amplify whatever dynamics exist. If the economy is unstable (pre-Phase 2), persistent memory would propagate instability across segments. If steering is decoupled from routing (pre-Phase 1), persistent memory just remembers the wrong things.
+**Why last:** RMT amplifies whatever dynamics exist. If the economy is unstable (pre-Phase 2), persistent memory would propagate instability across segments. Allostasis, the former 5b, is now the viability core of [Phase 2](#phase-2--stakes) ([#42](https://gitlab.hephaestus/mipkovich/tame-swarm/-/issues/42)): the setpoints are adapted by the organism's own margins, not by a meta-controller added last. If steering is decoupled from routing (pre-Phase 1), persistent memory just remembers the wrong things.
 
 ---
 
