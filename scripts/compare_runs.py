@@ -35,6 +35,16 @@ else -- and refuses to print a delta whose arms disagree on anything more. A
 summary written before fingerprints were recorded is compared unchecked, and says
 so; one written before the field existed reads as a field-off arm.
 
+Two more things a fingerprint pair cannot settle on its own (#31). *Code*: the
+fingerprints carry the git SHA the arm ran at, and the comparison refuses two
+groups that cannot be shown to have run one code -- different SHAs, a dirty tree,
+or no SHA at all, which is every summary recorded before #31 -- unless
+``--allow-code-drift`` is passed, in which case the drift is printed beside the
+table. *The run-to-run floor*: a seed pairs the data between two arms and, under
+``--deterministic warn``, not the trajectory, so ``run_seeds.py`` runs one seed
+twice per group and the table quotes that pair's spread (``repl_std``) beside
+every delta.
+
     uv run python scripts/compare_runs.py \\
         --group_a runs/mob --group_b runs/softmax
 """
@@ -187,13 +197,52 @@ def _values(group: dict[str, Any], metric: str) -> list[float]:
     return [result[metric] for result in group["per_seed"].values() if metric in result]
 
 
+def pooled_replication_std(group_a: dict[str, Any], group_b: dict[str, Any], metric: str) -> float:
+    """The run-to-run floor on ``metric``, pooled over the groups that measured it.
+
+    Each group's ``replication_std`` is the sample std of one seed run twice (one
+    degree of freedom), so pooling is the root mean square of whichever groups
+    carry it; NaN when neither does, which the table prints as such rather than
+    as a floor of zero.
+    """
+    floors = [
+        group["replication_std"][metric]
+        for group in (group_a, group_b)
+        if metric in (group.get("replication_std") or {})
+    ]
+    if not floors:
+        return float("nan")
+    return math.sqrt(sum(floor**2 for floor in floors) / len(floors))
+
+
+def replication_note(group_a: dict[str, Any], group_b: dict[str, Any]) -> str:
+    """Which groups the ``repl_std`` column comes from, and what it means."""
+    measured = [
+        f"seed {group['replicate_seed']}"
+        for group in (group_a, group_b)
+        if group.get("replication_std")
+    ]
+    if not measured:
+        return (
+            "repl_std: the run-to-run floor, NOT measured for either group -- "
+            "run_seeds.py --replicate runs one seed twice and records it"
+        )
+    return (
+        f"repl_std: the run-to-run floor -- one seed run twice ({', '.join(measured)}), the "
+        f"sample std of the pair, pooled over the {len(measured)} group(s) that measured it. "
+        "A delta inside it is inside what re-running one seed already produces."
+    )
+
+
 def compare(group_a: dict[str, Any], group_b: dict[str, Any]) -> dict[str, dict[str, float]]:
     """Delta and pooled std for every metric both groups measured on >=2 seeds each.
 
     A metric measured on only one seed in either group has no within-group spread
     to pool, and a delta reported without a noise floor to compare it against is
     exactly the unquotable single-sample number #13 exists to stop shipping --
-    so it is skipped rather than reported with a missing denominator.
+    so it is skipped rather than reported with a missing denominator. The
+    run-to-run floor (#31) rides along as ``replication_std`` so the table can
+    quote it beside the delta.
     """
     metrics_a = {metric for metric, stats in group_a["stats"].items() if stats["n"] >= 2}
     metrics_b = {metric for metric, stats in group_b["stats"].items() if stats["n"] >= 2}
@@ -230,6 +279,7 @@ def compare(group_a: dict[str, Any], group_b: dict[str, Any]) -> dict[str, dict[
             "delta": delta,
             "pooled_std": pooled_std,
             "delta_over_std": delta_over_std,
+            "replication_std": pooled_replication_std(group_a, group_b, metric),
         }
     return comparison
 
@@ -338,14 +388,17 @@ def multiplicity_line(comparison: dict[str, dict[str, float]]) -> str:
 
 def format_table(comparison: dict[str, dict[str, float]], label_a: str, label_b: str) -> str:
     header = (
-        f"{'metric':<32}{label_a:>14}{label_b:>14}{'delta':>12}{'pooled_std':>12}{'delta/std':>11}"
+        f"{'metric':<32}{label_a:>14}{label_b:>14}{'delta':>12}{'pooled_std':>12}"
+        f"{'delta/std':>11}{'repl_std':>12}"
     )
     lines = [header, "-" * len(header)]
     for metric, values in comparison.items():
+        floor = values.get("replication_std", float("nan"))
+        floor_str = f"{'n/a':>12}" if math.isnan(floor) else f"{floor:>12.5f}"
         lines.append(
             f"{metric:<32}{values['mean_a']:>14.5f}{values['mean_b']:>14.5f}"
             f"{values['delta']:>+12.5f}{values['pooled_std']:>12.5f}"
-            f"{values['delta_over_std']:>11.2f}"
+            f"{values['delta_over_std']:>11.2f}{floor_str}"
         )
     lines.append("")
     lines.append(multiplicity_line(comparison))
@@ -470,6 +523,7 @@ def main() -> None:
         "well under 1 means the effect is not distinguishable from re-running "
         "the same configuration."
     )
+    print(replication_note(group_a, group_b))
 
     primary = declared_primary(group_a, group_b, args.primary)
     if primary is not None:

@@ -18,6 +18,14 @@ Every seed shares one config except the seed itself -- unlike ``compare_routers.
 there is nothing here to assert parity *between*: the point of this harness is the
 spread a fixed configuration produces on its own, which is exactly what a fixed
 seed across arms is supposed to remove.
+
+It does not remove all of it (#31). Under ``--deterministic warn`` the attention
+backward is non-deterministic, so one seed run twice is two trajectories; the
+between-seed spread above already contains that, but nothing said how much of it
+was run-to-run. ``--replicate`` (on by default) runs the first seed a second time
+and records the pair's spread as ``replication_std``, which ``compare_runs.py``
+quotes beside every delta. Under ``--deterministic strict`` the pair is bitwise
+identical and the floor reads zero.
 """
 
 import argparse
@@ -72,8 +80,15 @@ def headline_metrics(final: dict[str, float]) -> dict[str, float]:
     }
 
 
-def run_seed(seed: int, config: TrainingConfig) -> tuple[dict[str, float], dict[str, object]]:
-    """Train one replicate to completion; its final headline metrics and its arm fingerprint.
+def run_seed(
+    seed: int, config: TrainingConfig, replicate: bool = False
+) -> tuple[dict[str, float], dict[str, object]]:
+    """Train one seed to completion; its final headline metrics and its arm fingerprint.
+
+    A ``replicate`` is the same seed again in its own output directory, so it
+    rebuilds its held-out split and re-hashes its data order rather than reading
+    the first run's -- the fingerprint equality the caller asserts is then a
+    measurement and not a copy.
 
     The fingerprint travels with the summary so that ``compare_runs.py`` can refuse
     a comparison between two groups that differ in anything but the variable under
@@ -88,11 +103,12 @@ def run_seed(seed: int, config: TrainingConfig) -> tuple[dict[str, float], dict[
     "Cannot copy out of meta tensor". Reproduced empirically: seed 0 of a real
     Qwen3-1.7B sweep saved cleanly, seed 1 (same process, no cleanup) did not.
     """
+    run_name = f"seed{seed}-replicate" if replicate else f"seed{seed}"
     logger.info("=" * 80)
-    logger.info(f"Seed: {seed}")
+    logger.info(f"Seed: {seed}" + (" (replicate: the run-to-run floor)" if replicate else ""))
     logger.info("=" * 80)
 
-    trainer = TAMETrainer(replace(config, seed=seed, output_dir=f"{config.output_dir}/seed{seed}"))
+    trainer = TAMETrainer(replace(config, seed=seed, output_dir=f"{config.output_dir}/{run_name}"))
     trainer.setup()
     trainer.train()
 
@@ -134,12 +150,33 @@ def aggregate(per_seed: dict[int, dict[str, float]]) -> dict[str, dict[str, floa
     return stats
 
 
-def format_table(stats: dict[str, dict[str, float]]) -> str:
+def replication_std(first: dict[str, float], second: dict[str, float]) -> dict[str, float]:
+    """The run-to-run floor per metric: the sample std of one seed's two runs.
+
+    Two values have one degree of freedom, so the sample std is |a - b| / sqrt(2)
+    -- the same estimator ``aggregate`` uses across seeds, at n = 2, which is what
+    lets ``compare_runs.py`` pool it with the between-seed spread on one footing.
+    """
+    return {
+        metric: abs(first[metric] - second[metric]) / math.sqrt(2)
+        for metric in sorted(first)
+        if metric in second
+    }
+
+
+def format_table(
+    stats: dict[str, dict[str, float]], replication: dict[str, float] | None = None
+) -> str:
     header = f"{'metric':<32}{'mean':>12}{'std':>12}{'n':>4}"
+    if replication is not None:
+        header += f"{'repl_std':>12}"
     lines = [header, "-" * len(header)]
     for metric, values in stats.items():
         std_str = f"{values['std']:>12.5f}" if not math.isnan(values["std"]) else f"{'n=1':>12}"
-        lines.append(f"{metric:<32}{values['mean']:>12.5f}{std_str}{values['n']:>4.0f}")
+        line = f"{metric:<32}{values['mean']:>12.5f}{std_str}{values['n']:>4.0f}"
+        if replication is not None:
+            line += f"{replication[metric]:>12.5f}" if metric in replication else f"{'n/a':>12}"
+        lines.append(line)
     return "\n".join(lines)
 
 
@@ -223,6 +260,16 @@ def main() -> None:
             "loop, certified strength and layers (#28; default: the field is absent)"
         ),
     )
+    # #31: the run-to-run floor, measured rather than assumed absent.
+    parser.add_argument(
+        "--replicate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Run the first seed a second time and record the pair's spread as "
+            "replication_std, the run-to-run floor compare_runs.py quotes (default: on)"
+        ),
+    )
     # #35: the metric this sweep is to be read on, declared before it is read.
     # It travels in the summary so compare_runs.py puts the interval on the
     # contrast that was chosen in advance rather than the largest row found.
@@ -299,6 +346,19 @@ def main() -> None:
     fingerprints = {seed: fingerprint for seed, (_, fingerprint) in runs.items()}
     stats = aggregate(per_seed)
 
+    replicate_seed = seeds[0] if args.replicate else None
+    replicate_metrics: dict[str, float] | None = None
+    replication: dict[str, float] | None = None
+    if replicate_seed is not None:
+        replicate_metrics, replicate_fingerprint = run_seed(replicate_seed, config, replicate=True)
+        if replicate_fingerprint != fingerprints[replicate_seed]:
+            raise RuntimeError(
+                f"the replicate of seed {replicate_seed} is not the same arm as its first run; "
+                f"its spread is not a run-to-run floor: {fingerprints[replicate_seed]} vs "
+                f"{replicate_fingerprint}"
+            )
+        replication = replication_std(per_seed[replicate_seed], replicate_metrics)
+
     arm = arm_label(args.router, args.coupling_goal, args.steer_goal)
     if args.primary is not None and args.primary not in stats:
         logger.warning(
@@ -306,8 +366,14 @@ def main() -> None:
             f"sweep measured ({sorted(stats)}); it is recorded as declared, but no "
             "comparison will find it"
         )
-    print("\n" + format_table(stats))
+    print("\n" + format_table(stats, replication))
     print(f"\narm: {arm} | seeds: {seeds} | steps: {args.steps} | primary: {args.primary}")
+    print(
+        f"replicate: seed {replicate_seed} run twice under --deterministic {args.deterministic}; "
+        "repl_std is the pair's sample std, the run-to-run floor"
+        if replicate_seed is not None
+        else "replicate: none (--no-replicate); the run-to-run floor is not measured"
+    )
     print(f"artefacts: {workspace}")
 
     summary_path = workspace / "seed_summary.json"
@@ -325,6 +391,9 @@ def main() -> None:
                 "per_seed": per_seed,
                 "fingerprints": fingerprints,
                 "stats": stats,
+                "replicate_seed": replicate_seed,
+                "replicate": replicate_metrics,
+                "replication_std": replication,
             },
             indent=2,
         )

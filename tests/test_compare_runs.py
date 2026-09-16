@@ -27,6 +27,8 @@ from compare_runs import (  # noqa: E402
     format_table,
     multiplicity_line,
     paired_deltas,
+    pooled_replication_std,
+    replication_note,
 )
 
 from parity import CodeDriftError, ParityError  # noqa: E402
@@ -366,3 +368,41 @@ def test_allow_code_drift_compares_and_prints_the_drift_beside_the_table(caplog)
     assert "different code: ['aaaaaaaaa', 'bbbbbbbbb']" in line
     assert any("code drift allowed" in record.message for record in caplog.records)
 
+
+def _with_replicate(group: dict, seed: int, floors: dict[str, float]) -> dict:
+    return {**group, "replicate_seed": seed, "replication_std": floors}
+
+
+def test_the_table_quotes_the_run_to_run_floor_beside_every_delta():
+    """#31: the floor pooled over the groups that measured it, root mean square."""
+    group_a = _with_replicate(
+        _group("mob", {"eval/loss": [2.79, 2.80, 2.81]}), 0, {"eval/loss": 0.0012}
+    )
+    group_b = _with_replicate(
+        _group("mob", {"eval/loss": [2.78, 2.79, 2.80]}), 0, {"eval/loss": 0.0016}
+    )
+
+    comparison = compare(group_a, group_b)
+    expected = math.sqrt((0.0012**2 + 0.0016**2) / 2)
+
+    assert comparison["eval/loss"]["replication_std"] == pytest.approx(expected)
+    assert pooled_replication_std(group_a, group_b, "eval/loss") == pytest.approx(expected)
+    table = format_table(comparison, "mob", "mob+truthful")
+    assert "repl_std" in table.splitlines()[0]
+    assert f"{expected:.5f}" in table
+    assert "2 group(s)" in replication_note(group_a, group_b)
+
+
+def test_a_floor_from_one_group_is_quoted_alone_and_from_none_prints_n_a():
+    group_a = _with_replicate(
+        _group("mob", {"eval/loss": [2.79, 2.80, 2.81]}), 0, {"eval/loss": 0.0012}
+    )
+    group_b = _group("mob", {"eval/loss": [2.78, 2.79, 2.80]})
+
+    assert pooled_replication_std(group_a, group_b, "eval/loss") == pytest.approx(0.0012)
+    assert "1 group(s)" in replication_note(group_a, group_b)
+
+    comparison = compare(group_b, group_b)
+    assert math.isnan(comparison["eval/loss"]["replication_std"])
+    assert "n/a" in format_table(comparison, "a", "b").splitlines()[2]
+    assert "NOT measured" in replication_note(group_b, group_b)
