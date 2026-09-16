@@ -60,6 +60,15 @@ ROUTING_SHARE_UNIFORM = "uniform"
 ROUTING_SHARE_PROPORTIONAL = "proportional"
 SUPPORTED_ROUTING_SHARES = frozenset({ROUTING_SHARE_UNIFORM, ROUTING_SHARE_PROPORTIONAL})
 
+# Which loser the exploration slot goes to (#38). "staleness" weights each loser by
+# one plus the number of settled steps since it last held a token, so an expert
+# shut out for longer is re-sampled sooner -- the constitution's re-entry
+# property. "uniform" is the draw every arm before #38 ran under, kept as the
+# inert state the re-entry test fails on.
+EXPLORATION_DRAW_STALENESS = "staleness"
+EXPLORATION_DRAW_UNIFORM = "uniform"
+SUPPORTED_EXPLORATION_DRAWS = frozenset({EXPLORATION_DRAW_STALENESS, EXPLORATION_DRAW_UNIFORM})
+
 # Floor under a bid before it enters the log domain. A production bid cannot reach
 # it: the confidence logit is clamped at -20, so softplus bottoms out near 2.1e-9,
 # and MoBConfig rejects a non-positive min_wealth. It exists so that a bid of
@@ -138,11 +147,12 @@ class VCGAuctioneer(nn.Module):
     1.0 approaches the uniform split. The uniform share ignores it.
 
     ``exploration_rate`` is the fraction of tokens on which, in training, one
-    slot -- drawn uniformly over the *k* -- is handed to a uniformly random loser
-    instead of sold. A head is trained only on the value its expert realises on
-    the tokens it holds, so an expert that has fallen to a truthful report of zero
-    would otherwise never hold another token, never see another target, and never
-    come back however much its adapter later learns -- measured on the
+    slot -- drawn uniformly over the *k* -- is handed to a loser instead of sold;
+    ``exploration_draw`` says which loser. A head is trained only on the value its
+    expert realises on the tokens it holds, so an expert that has fallen to a
+    truthful report of zero would otherwise never hold another token, never see
+    another target, and never come back however much its adapter later learns --
+    measured on the
     planted-competence fixture as a market that collapsed to two of eight experts
     with the other six at the wealth floor. The slot is a gift from the tissue
     rather than a trade: the explorer pays nothing, and the token's rebate is
@@ -150,10 +160,15 @@ class VCGAuctioneer(nn.Module):
     ``_compute_rebates``).
 
     What this does to the incentive claim, exactly. Whether a token is explored,
-    and which slot, is drawn before any report is read; which loser receives it is
-    uniform over the losers. A loser therefore cannot raise its chance of the
-    gift by any report, and a winner can only reach the lottery by giving up its
-    win. Drawing the slot uniformly is what removes the deviation a fixed last
+    and which slot, is drawn before any report is read; which loser receives it
+    reads no report in this token's auction: under ``"uniform"`` every loser is
+    equally likely, under ``"staleness"`` (#38, the default) a loser's weight is
+    one plus the settled steps since it last held a token, a ledger the layer
+    keeps and only the allocation writes. A loser therefore cannot raise its
+    chance of *this* gift by any report, and a winner can only reach the lottery
+    by giving up its win; what a report can do is lose now to be staler later,
+    which the bound below covers.
+    Drawing the slot uniformly is what removes the deviation a fixed last
     slot would create -- a marginal winner overreporting into a slot that is never
     displaced, at an unchanged price. What remains is that a winner faces a
     ``rate / k`` chance of displacement it cannot bid away, and a loser an
@@ -163,6 +178,18 @@ class VCGAuctioneer(nn.Module):
     rate of zero. ``test_deviation_gain_is_bounded_by_the_exploration_rate``
     pins the bound. The bid stays the truthful value estimate; the noise that
     keeps every cell sampling its environment lives here, in the allocation.
+
+    The bound survives the staleness weighting, re-derived rather than assumed:
+    the lever a weighted draw adds is that an expert could lose on purpose to
+    let its staleness grow, but one explored token carries one gift, so on any
+    token no expert's chance of it exceeds ``rate`` whatever the weights, and a
+    deviation is still worth at most ``rate x value`` -- now against a forgone
+    win on every token spent farming it, where under the uniform draw the
+    stalest loser's chance was ``rate / (n - k)``. The weights read the ledger
+    and never a report of the token being allocated. A loser whose uniform is
+    exactly zero keys at ``-inf`` and ties with the winners, at probability
+    ``2^-24`` per draw; any other loser out-ranks it, so it is not a case.
+    ``tests/constitution/test_reentry.py`` pins the bound at a starved deviator.
     """
 
     def __init__(
@@ -173,8 +200,14 @@ class VCGAuctioneer(nn.Module):
         routing_share: str = ROUTING_SHARE_UNIFORM,
         temperature: float = 1.0,
         exploration_rate: float = 0.0,
+        exploration_draw: str = EXPLORATION_DRAW_STALENESS,
     ):
         super().__init__()
+        if exploration_draw not in SUPPORTED_EXPLORATION_DRAWS:
+            draws = ", ".join(sorted(SUPPORTED_EXPLORATION_DRAWS))
+            raise ValueError(
+                f"Unsupported exploration draw '{exploration_draw}'. Supported: {draws}"
+            )
         if routing_share not in SUPPORTED_ROUTING_SHARES:
             shares = ", ".join(sorted(SUPPORTED_ROUTING_SHARES))
             raise ValueError(f"Unsupported routing share '{routing_share}'. Supported: {shares}")
@@ -193,12 +226,16 @@ class VCGAuctioneer(nn.Module):
         self.routing_share = routing_share
         self.temperature = temperature
         self.exploration_rate = exploration_rate
+        self.exploration_draw = exploration_draw
 
     def forward(
         self,
         confidences: torch.Tensor,
         wealth: torch.Tensor,
+        staleness: torch.Tensor | None = None,
     ) -> "AuctionOutcome":
+        """``staleness`` is the layer's ``expert_steps_since_held`` ledger; ``None``
+        (a gate driven outside a layer, or before #38) draws uniformly."""
         wealth_snapshot = wealth.detach().clone()
         # The ledger is float32 whatever the model runs in; the bid takes the
         # report's dtype so the routing weights match the expert outputs they scale.
@@ -209,7 +246,9 @@ class VCGAuctioneer(nn.Module):
 
         explored: torch.Tensor | None = None
         if self.training and self.exploration_rate > 0.0:
-            selected_experts, payments, explored = self._explore(bids, selected_experts, payments)
+            selected_experts, payments, explored = self._explore(
+                bids, selected_experts, payments, staleness
+            )
             rebates = self._fund_exploration(rebates, explored, wealth_snapshot)
             top_bids = torch.gather(bids, -1, selected_experts)
 
@@ -218,17 +257,25 @@ class VCGAuctioneer(nn.Module):
         return AuctionOutcome(selected_experts, routing_weights, payments, rebates, explored)
 
     def _explore(
-        self, bids: torch.Tensor, selected_experts: torch.Tensor, payments: torch.Tensor
+        self,
+        bids: torch.Tensor,
+        selected_experts: torch.Tensor,
+        payments: torch.Tensor,
+        staleness: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Hand one slot to a random loser on an ``exploration_rate`` fraction of tokens.
+        """Hand one slot to a loser on an ``exploration_rate`` fraction of tokens.
 
         Three draws, in this order and before any report is consulted: which
         tokens, which of the *k* slots, and -- masked to the experts that did not
-        win -- which loser, as the argmax of independent uniforms. The displaced
-        winner is not charged for a slot it no longer holds, and the explorer is
-        not charged for one it did not bid for. The other winners' prices are the
-        auction's prices: their externality was computed on the bids, and the bids
-        have not changed.
+        win -- which loser. Under the uniform draw the loser is the argmax of
+        independent uniforms; under the staleness draw each loser's uniform is
+        raised to ``1 / (1 + staleness)`` first (Efraimidis-Spirakis, in the log
+        domain), which is a draw with probability proportional to the weight and
+        the uniform draw's own arithmetic when every staleness is zero. The
+        displaced winner is not charged for a slot it no longer holds, and the
+        explorer is not charged for one it did not bid for. The other winners'
+        prices are the auction's prices: their externality was computed on the
+        bids, and the bids have not changed.
 
         With ``top_k >= num_experts`` there is no loser to hand a slot to.
         """
@@ -243,9 +290,12 @@ class VCGAuctioneer(nn.Module):
         explored.scatter_(-1, slot.unsqueeze(-1), explore_token.unsqueeze(-1))
 
         is_winner = torch.zeros_like(bids, dtype=torch.bool).scatter_(-1, selected_experts, True)
-        draw = torch.rand(batch, seq_len, num_experts, device=bids.device).masked_fill(
-            is_winner, -1.0
-        )
+        uniforms = torch.rand(batch, seq_len, num_experts, device=bids.device)
+        if staleness is None or self.exploration_draw == EXPLORATION_DRAW_UNIFORM:
+            draw = uniforms.masked_fill(is_winner, -1.0)
+        else:
+            weights = 1.0 + staleness.detach().to(uniforms.dtype).clamp_min(0.0)
+            draw = (torch.log(uniforms) / weights).masked_fill(is_winner, -torch.inf)
         explorer = draw.argmax(dim=-1, keepdim=True).expand_as(selected_experts)
 
         selected_experts = torch.where(explored, explorer, selected_experts)

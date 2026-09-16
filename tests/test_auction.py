@@ -3,12 +3,12 @@ import torch
 
 from mob import VCGAuctioneer, routing_diagnostics
 
-PAYMENT_TOLERANCE = 1e-5
-
-
-def _make_auction(num_experts=4, top_k=2, differentiable=True, routing_share="uniform"):
-    auctioneer = VCGAuctioneer(num_experts, top_k, differentiable, routing_share=routing_share)
-    return auctioneer
+from .constitution.helpers import (
+    PAYMENT_TOLERANCE,
+    _bids,
+    _expert_zero_utility,
+    _make_auction,
+)
 
 
 def test_vcg_top_k_selection():
@@ -90,11 +90,6 @@ def test_vcg_differentiable_mode():
     loss.backward()
     assert confidences.grad is not None
     assert (confidences.grad.abs() > 0).any()
-
-
-def _bids(confidences: torch.Tensor, wealth: torch.Tensor) -> torch.Tensor:
-    """The auction's bid rule, restated here so tests never import it."""
-    return confidences * wealth.unsqueeze(0).unsqueeze(0)
 
 
 def _kth_highest(bid_row: torch.Tensor, index: int) -> float:
@@ -455,87 +450,6 @@ def test_payment_is_the_winners_critical_value():
     assert not outcome(price - 1e-3)[0], "report below the price must lose"
 
 
-# Wealth and rival reports chosen so expert 0's threshold lands mid-sweep. Rival
-# bids are 2*0.8=1.6, 3*0.5=1.5, 1*0.9=0.9 and 5*0.28=1.4; with two slots, expert 0
-# enters the allocation once 4*c_0 clears the second-highest rival bid of 1.5, so
-# its critical value is 0.375 and the sweep below straddles it in both directions.
-_UTILITY_WEALTH = torch.tensor([4.0, 2.0, 3.0, 1.0, 5.0])
-_UTILITY_FIELD = torch.tensor([0.0, 0.8, 0.5, 0.9, 0.28])
-_UTILITY_CRITICAL_VALUE = 0.375
-
-
-def _expert_zero_utility(auctioneer, report: float, true_value: float) -> float:
-    """Quasi-linear payoff for expert 0: what it banks, less what it is charged.
-
-    Influence is the winner's share renormalised by an equal split, so it is
-    identically 1.0 under the uniform rule and the expression reduces to the
-    textbook ``v * 1[win] - p``. It is written this way so the same utility is
-    defined for the proportional baseline, where a winner's slice does move with its own
-    report and the deviation test below must be able to see that.
-    """
-    confidences = _UTILITY_FIELD.clone()
-    confidences[0] = report
-    selected, weights, payments, _, _ = auctioneer(confidences.view(1, 1, -1), _UTILITY_WEALTH)
-
-    slots = (selected[0, 0] == 0).nonzero()
-    if slots.numel() == 0:
-        return 0.0
-
-    slot = slots[0, 0]
-    influence = weights[0, 0, slot].item() * auctioneer.top_k
-    return true_value * influence - payments[0, 0, slot].item()
-
-
-def test_truthful_reporting_maximises_expert_utility():
-    """The incentive statement itself, checked by exhaustive deviation.
-
-    Sweeping expert 0's *report* across the whole range while its true value is held
-    fixed, no misreport ever beats reporting truthfully. This is the property the
-    README is allowed to claim, and it needs both halves of the mechanism: an
-    undivided weighted price or an own-bid-dependent share each hand some deviation
-    a strictly better payoff.
-    """
-    auctioneer = _make_auction(num_experts=5, top_k=2)
-    auctioneer.eval()
-
-    winning_outcomes = set()
-    for true_value in torch.linspace(0.05, 0.95, 10).tolist():
-        truthful = _expert_zero_utility(auctioneer, true_value, true_value)
-        winning_outcomes.add(true_value > _UTILITY_CRITICAL_VALUE)
-
-        assert truthful >= -PAYMENT_TOLERANCE, "truthful reporting must never lose money"
-
-        for report in torch.linspace(0.0, 1.0, 41).tolist():
-            deviation = _expert_zero_utility(auctioneer, report, true_value)
-            assert deviation <= truthful + PAYMENT_TOLERANCE, (
-                f"misreporting {report:.3f} beat truthful {true_value:.3f}: "
-                f"{deviation:.6f} > {truthful:.6f}"
-            )
-
-    assert winning_outcomes == {True, False}, "sweep must straddle the critical value"
-
-
-def test_proportional_baseline_rewards_overreporting():
-    """Negative control for the deviation sweep above.
-
-    The same utility, the same fixture, the same truthful report -- but with the
-    own-bid-weighted gate restored there is a strictly profitable lie. Asserting the
-    baseline *fails* the property is what stops the test above from passing for
-    reasons unrelated to the mechanism.
-    """
-    auctioneer = _make_auction(num_experts=5, top_k=2, routing_share="proportional")
-    auctioneer.eval()
-
-    true_value = 0.5
-    truthful = _expert_zero_utility(auctioneer, true_value, true_value)
-    best_lie = max(
-        _expert_zero_utility(auctioneer, report, true_value)
-        for report in torch.linspace(0.0, 1.0, 41).tolist()
-    )
-
-    assert best_lie > truthful + PAYMENT_TOLERANCE
-
-
 def test_negative_wealth_trips_the_negativity_assert():
     """Why there is no wealth assert beside the epsilon clamp.
 
@@ -578,83 +492,6 @@ def test_zero_wealth_is_accepted_and_prices_at_zero():
 
     assert torch.isfinite(payments).all()
     assert (payments == 0).all()
-
-
-def test_rebate_is_independent_of_the_recipients_own_bid():
-    """The property the whole redistribution rests on.
-
-    Cavallo pays expert i out of a quantity computed from everyone *but* i, so no
-    report an expert can make moves the money it gets back. A rebate that did depend
-    on it — an even split of the collected pot, say — would shift that expert's
-    threshold away from its price, which is the Green–Laffont trade this rule exists
-    to avoid.
-    """
-    auctioneer = _make_auction(num_experts=6, top_k=2)
-    auctioneer.eval()
-
-    torch.manual_seed(31)
-    wealth = torch.rand(6) * 8.0 + 1.0
-    confidences = torch.rand(1, 1, 6)
-
-    baseline = auctioneer(confidences, wealth).rebates[0, 0, 0].item()
-
-    for own_bid in torch.linspace(0.0, 1.0, 21).tolist():
-        perturbed = confidences.clone()
-        perturbed[0, 0, 0] = own_bid
-        rebate = auctioneer(perturbed, wealth).rebates[0, 0, 0].item()
-        assert rebate == pytest.approx(baseline, abs=PAYMENT_TOLERANCE), (
-            f"reporting {own_bid:.2f} moved expert 0's own rebate"
-        )
-
-
-def test_rebate_never_exceeds_what_the_auction_collected():
-    """Budget feasibility, in the currency the wealth ledger actually uses.
-
-    Both sides are the per-expert quantities the wealth update consumes: payments
-    already divided by each winner's own wealth, rebates divided by the harmonic
-    mean of the k richest. Checking this in bid units instead — multiplying wealth
-    back in — tests an inequality that holds even when the ledger's does not, which
-    is exactly how a rebate that over-paid by 7.4x passed a feasibility test.
-    """
-    torch.manual_seed(37)
-    for num_experts, top_k in ((6, 2), (8, 3), (5, 1), (4, 2)):
-        auctioneer = _make_auction(num_experts=num_experts, top_k=top_k)
-        auctioneer.eval()
-
-        # Spanning the configured min_wealth..max_wealth band, not a narrow
-        # random range: a per-recipient divisor only over-rebates once the
-        # spread is wide, so a tight fixture cannot see it.
-        wealth = torch.linspace(15.0, 750.0, num_experts)
-        confidences = torch.rand(2, 6, num_experts)
-        outcome = auctioneer(confidences, wealth)
-
-        collected = outcome.payments.sum(dim=-1)
-        returned = outcome.rebates.sum(dim=-1)
-
-        assert (returned <= collected + PAYMENT_TOLERANCE).all(), (
-            f"n={num_experts} k={top_k}: rebate exceeds revenue in credits"
-        )
-        assert (returned > 0).any(), "fixture returns nothing; feasibility is vacuous"
-
-        # The classical Cavallo bound, which does not depend on the divisor: every
-        # reference is at most b_(k+1), so sum_i (k/n) * ref_i <= k * b_(k+1).
-        # Measured slack, credit vs bid-unit: 16.6/2.5, 24.7/2.4, 2.0/2.0, 72.4/61.6.
-        # So this bound is the tight one wherever k >= 2 and n > k + 2 -- a 3%
-        # reference inflation trips it while the credit assertion sleeps through.
-        # All four fixtures share one wealth spread, so the k/n relation is what
-        # separates them, not the spread. On n=5 k=1 the two coincide, because a lone winner
-        # collapses the harmonic mean onto its own wealth and the tight token is
-        # one the richest expert takes; on n=4 k=2 both are slack, because
-        # k + 2 == n leaves the reference at the bottom of the bid vector.
-        richest = torch.topk(wealth, top_k).values
-        payout_in_bid_units = (outcome.rebates * (top_k / (1.0 / richest).sum())).sum(dim=-1)
-        displaced = torch.sort(_bids(confidences, wealth), dim=-1, descending=True)[0][..., top_k]
-        # Relative, not absolute: these are bid-unit quantities of order 100, where
-        # a 1e-5 absolute tolerance is really no tolerance at all.
-        bound = top_k * displaced
-        assert (payout_in_bid_units <= bound * (1 + PAYMENT_TOLERANCE)).all(), (
-            f"n={num_experts} k={top_k}: exclusion rule returned too large a reference"
-        )
 
 
 def test_every_expert_is_rebated_not_only_winners():

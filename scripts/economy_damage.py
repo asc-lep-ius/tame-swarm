@@ -55,7 +55,12 @@ SEEDS = (0, 1, 2)
 # A market that has re-formed sits at the loss a collective born without the
 # damaged expert reaches, within this factor, and no longer routes to it.
 RE_FORMATION_FACTOR = 1.1
-DEAD_SHARE_CEILING = 0.01
+# Since #38 the exploration draw is weighted by staleness, and a dead expert --
+# a loser on every token -- is among the stalest, so it is re-sampled at up to
+# the gift's own share of the slots, exploration_rate / top_k = 0.01, on top of
+# whatever the auction still gives its stale report. Measured 0.0016-0.0137 on
+# the three seeds (0.001-0.006 under the uniform draw); the ceiling is the rate.
+DEAD_SHARE_CEILING = 0.02
 SURVIVOR_TRACKING_FLOOR = 0.5
 TRACKING_AFTER_RELEASE = 0.7
 # The best expert has regained its standing when it holds this much of the share
@@ -133,7 +138,9 @@ class ForcedSubset(torch.nn.Module):
         # Its own stream, so the forcing does not move the economy's draws.
         self.generator = torch.Generator().manual_seed(seed)
 
-    def forward(self, confidences: torch.Tensor, wealth: torch.Tensor) -> AuctionOutcome:
+    def forward(
+        self, confidences: torch.Tensor, wealth: torch.Tensor, staleness: torch.Tensor | None = None
+    ) -> AuctionOutcome:
         batch, seq_len, num_experts = confidences.shape
         draws = torch.stack(
             [

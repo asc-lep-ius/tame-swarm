@@ -355,6 +355,10 @@ class TrainingConfig:
     # loser rather than sells, so a head that has fallen to a truthful zero keeps
     # seeing targets. See MoBConfig.exploration_rate.
     exploration_rate: float = 0.02
+    # Which loser the explored slot goes to: "staleness" (#38, re-entry) or
+    # "uniform", the draw every arm before #38 ran under. See
+    # MoBConfig.exploration_draw.
+    exploration_draw: str = "staleness"
     # The confidence heads are single linear layers regressing onto values of
     # order 1e-2, and at the backbone's 2e-5 a head's logit moves by that much per
     # step: measured on Qwen3-1.7B over 120 steps, every report stayed within
@@ -751,6 +755,7 @@ class TAMETrainer:
             use_differentiable_routing=True,
             confidence_calibration_weight=self.config.calibration_loss_weight,
             exploration_rate=self.config.exploration_rate,
+            exploration_draw=self.config.exploration_draw,
             router=ARM_ROUTERS[self.config.router],
         )
 
@@ -2082,6 +2087,16 @@ def main():
             "loser, so every confidence head keeps seeing targets (#15)"
         ),
     )
+    parser.add_argument(
+        "--exploration_draw",
+        type=str,
+        default="staleness",
+        choices=["staleness", "uniform"],
+        help=(
+            "Which loser the explored slot goes to: weighted by steps since it last "
+            "held a token (#38, the default), or uniform as every arm before #38"
+        ),
+    )
 
     # Reproducibility (#13, #31)
     parser.add_argument(
@@ -2188,6 +2203,7 @@ def main():
         probe_tokens=args.probe_tokens,
         seed=args.seed,
         exploration_rate=args.exploration_rate,
+        exploration_draw=args.exploration_draw,
         confidence_head_learning_rate=args.confidence_head_learning_rate,
         deterministic=args.deterministic,
         shuffle_buffer_size=args.shuffle_buffer_size,

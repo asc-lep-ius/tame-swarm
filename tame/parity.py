@@ -231,6 +231,9 @@ class ArmFingerprint:
     strict_determinism: bool = False
     code_sha: str | None = None
     code_dirty: bool | None = None
+    # #38. A run recorded before the draw was a field ran under the uniform draw,
+    # so a legacy fingerprint reads as one; it is a confound like any other field.
+    exploration_draw: str = "uniform"
 
     @property
     def arm(self) -> str:
@@ -301,6 +304,7 @@ def fingerprint_arm(
         lora_dropout=config.lora_dropout,
         calibration_loss_weight=config.calibration_loss_weight,
         exploration_rate=config.exploration_rate,
+        exploration_draw=config.exploration_draw,
         confidence_head_learning_rate=config.confidence_head_learning_rate,
         wealth_update_frequency=config.wealth_update_frequency,
         coupling_goal=config.coupling_goal,

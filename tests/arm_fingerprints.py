@@ -26,6 +26,7 @@ BASE = ArmFingerprint(
     lora_dropout=0.05,
     calibration_loss_weight=0.15,
     exploration_rate=0.02,
+    exploration_draw="staleness",
     confidence_head_learning_rate=5e-3,
     wealth_update_frequency=1,
     coupling_goal=None,

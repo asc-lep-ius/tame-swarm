@@ -212,6 +212,7 @@ def test_fingerprint_arm_reads_the_training_config():
         lora_dropout=0.11,
         calibration_loss_weight=0.23,
         exploration_rate=0.07,
+        exploration_draw="uniform",
         confidence_head_learning_rate=0.011,
         wealth_update_frequency=19,
         coupling_beta=0.31,
@@ -253,6 +254,7 @@ def test_fingerprint_arm_reads_the_training_config():
     assert arm.lora_dropout == 0.11
     assert arm.calibration_loss_weight == 0.23
     assert arm.exploration_rate == 0.07
+    assert arm.exploration_draw == "uniform"
     assert arm.confidence_head_learning_rate == 0.011
     assert arm.wealth_update_frequency == 19
     assert arm.coupling_goal is None

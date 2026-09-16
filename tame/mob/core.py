@@ -94,6 +94,12 @@ LEDGER_BUFFERS = (
     "expert_usage_count",
     "expert_baseline_loss",
     "expert_performance_ema",
+    # Settled forwards since each expert last held a token (#38): what the
+    # staleness exploration draw reads. Kept here rather than on the gate so a
+    # forced-routing episode, which swaps the gate out, still ages the starved.
+    # Written by every forward that moves the ledgers, serving included, on the
+    # same gate as the usage counts.
+    "expert_steps_since_held",
 )
 
 
@@ -108,6 +114,7 @@ def ledger_initial_values(config: MoBConfig) -> dict[str, float]:
         "expert_usage_count": 0.0,
         "expert_baseline_loss": 1.0,
         "expert_performance_ema": 0.0,
+        "expert_steps_since_held": 0.0,
     }
 
 
@@ -170,6 +177,7 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
                 routing_share=config.routing_share,
                 temperature=config.routing_temperature,
                 exploration_rate=config.exploration_rate,
+                exploration_draw=config.exploration_draw,
             )
             if config.has_economy
             else SoftmaxRouter(config.num_experts, config.top_k)
@@ -304,6 +312,9 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
             output = self._forward_inference(
                 hidden_states, output, selected_experts, routing_weights, update_wealth
             )
+
+        if update_wealth and self.config.has_economy:
+            self._record_holdings(selected_experts)
 
         if output.dtype == torch.bfloat16 or output.dtype == torch.float16:
             output = torch.nan_to_num(output, nan=0.0, posinf=65000.0, neginf=-65000.0)
@@ -467,6 +478,19 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         self._warned.add(key)
         logger.warning(message)
 
+    def _record_holdings(self, selected_experts: torch.Tensor) -> None:
+        """Age every expert by one settled step and reset the ones that held a token.
+
+        A comparison against ``arange`` rather than a scatter or bincount: the
+        counts are not needed, only who held anything, and the comparison has a
+        deterministic kernel under ``--deterministic strict`` where the
+        alternatives do not.
+        """
+        experts = torch.arange(self.config.num_experts, device=selected_experts.device)
+        held = (selected_experts.reshape(-1, 1) == experts).any(dim=0)
+        self.expert_steps_since_held.add_(1.0)
+        self.expert_steps_since_held.masked_fill_(held, 0.0)
+
     def _route(self, confidence_logits: torch.Tensor, confidences: torch.Tensor) -> AuctionOutcome:
         """Turn reports into an allocation, by whichever gate this arm configures.
 
@@ -477,7 +501,9 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         forcing one signature onto both.
         """
         if self.config.has_economy:
-            return cast(VCGAuctioneer, self.gate)(confidences, self.expert_wealth)
+            return cast(VCGAuctioneer, self.gate)(
+                confidences, self.expert_wealth, staleness=self.expert_steps_since_held
+            )
         return cast(SoftmaxRouter, self.gate)(confidence_logits)
 
     def _economy_live(self) -> bool:

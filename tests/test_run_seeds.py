@@ -13,7 +13,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "tame"))
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 import run_seeds  # noqa: E402
-from run_seeds import aggregate, format_table, measure_replication, replication_std  # noqa: E402
+from run_seeds import (  # noqa: E402
+    aggregate,
+    build_parser,
+    format_table,
+    measure_replication,
+    replication_std,
+)
 
 from train import TrainingConfig  # noqa: E402
 
@@ -83,3 +89,12 @@ def test_the_floor_is_measured_when_the_replicate_is_the_same_arm(monkeypatch):
 
     assert (metrics, error) == ({"eval/loss": 2.81}, None)
     assert floor == replication_std({"eval/loss": 2.79}, {"eval/loss": 2.81})
+
+
+def test_the_sweep_accepts_the_uniform_draw_so_a_new_arm_can_meet_a_recorded_one():
+    """Every recorded group ran under the uniform draw and the draw is in the
+    fingerprint (#38), so without this flag no new sweep could be compared."""
+    args = build_parser().parse_args(["--exploration_draw", "uniform"])
+
+    assert args.exploration_draw == "uniform"
+    assert build_parser().parse_args([]).exploration_draw == "staleness"

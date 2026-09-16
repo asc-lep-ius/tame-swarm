@@ -49,6 +49,7 @@ from smoke_fixture import build_smoke_fixture  # noqa: E402
 
 from coupling import DEFAULT_COUPLING_BETA, DEFAULT_WARMUP_STEPS  # noqa: E402
 from determinism import DETERMINISM_DEFAULT, DETERMINISM_MODES  # noqa: E402
+from mob.auction import EXPLORATION_DRAW_STALENESS, SUPPORTED_EXPLORATION_DRAWS  # noqa: E402
 from parity import arm_label  # noqa: E402
 from train import TAMETrainer, TrainingConfig  # noqa: E402
 
@@ -209,9 +210,8 @@ def format_table(
     return "\n".join(lines)
 
 
-def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(message)s")
-
+def build_parser() -> argparse.ArgumentParser:
+    """The sweep's flags; a function so a test can parse them without training."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model_id", type=str, default=None, help="Default: a local smoke model")
     parser.add_argument("--dataset", type=str, default=None, help="Default: a local smoke corpus")
@@ -251,6 +251,17 @@ def main() -> None:
             "about five percent per step; warn: the mode every arm before #31 ran under, the "
             "attention backward left non-deterministic and logged; off: torch's defaults "
             f"(default: {DETERMINISM_DEFAULT})"
+        ),
+    )
+    parser.add_argument(
+        "--exploration_draw",
+        type=str,
+        choices=sorted(SUPPORTED_EXPLORATION_DRAWS),
+        default=EXPLORATION_DRAW_STALENESS,
+        help=(
+            "Which loser the explored slot goes to: weighted by steps since it last held a "
+            "token (#38, the default) or uniform, which every recorded arm ran under and "
+            "which a new arm compared against one must pass, the draw being in the fingerprint"
         ),
     )
     # The coupled arm of #6's ablation: the same auction, with the routing
@@ -312,7 +323,13 @@ def main() -> None:
             "(default: none declared, and compare_runs.py prints no primary block)"
         ),
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(message)s")
+
+    args = build_parser().parse_args()
 
     seeds = [int(part) for part in args.seeds.split(",")]
     if len(seeds) < 2:
@@ -359,6 +376,7 @@ def main() -> None:
         gradient_checkpointing=False,
         use_lora=args.use_lora,
         deterministic=args.deterministic,
+        exploration_draw=args.exploration_draw,
         coupling_goal=args.coupling_goal,
         coupling_beta=args.coupling_beta,
         coupling_warmup_steps=args.coupling_warmup_steps,
