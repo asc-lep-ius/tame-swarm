@@ -62,12 +62,16 @@ FIELD_FIELDS = frozenset({"steer_strength", "steer_layers"})
 # Reported for context, not asserted: see the module docstring on ``dense``.
 REPORTED_FIELDS = frozenset({"converted_layers"})
 
-# The code that produced the arm (#31): the git SHA and whether the tree was
-# dirty. Not asserted by ``assert_parity`` -- arms built in one process share a
-# SHA by construction, and between two recorded groups it is ``code_drift`` that
-# decides, because there a *missing* SHA (every summary recorded before #31) has
-# to count as drift, which a field-equality check would read as agreement.
-CODE_FIELDS = frozenset({"code_sha", "code_dirty"})
+# What code produced the arm (#31): the git SHA, whether the tree was dirty, and
+# whether the kernels were the strict set. Not asserted by ``assert_parity`` --
+# arms built in one process share all three by construction, and between two
+# recorded groups it is ``code_drift`` that decides, because there a *missing*
+# SHA (every summary recorded before #31) has to count as drift, which a
+# field-equality check would read as agreement. A strict arm against a warn one
+# is the same kind of difference -- a different attention-backward kernel, a
+# floor-sized effect -- and is declared with the SHAs rather than refused
+# outright, so the arms recorded before #31 stay comparable, labelled.
+DRIFT_FIELDS = frozenset({"code_sha", "code_dirty", "strict_determinism"})
 
 # ``TrainingConfig`` fields the fingerprint folds into a derived field instead of
 # copying: the dataset name and its config become one string, and the layer bounds
@@ -223,7 +227,7 @@ class ArmFingerprint:
     # #31. ``deterministic`` stays the bool every recorded summary carries, so a
     # legacy fingerprint loads; ``strict_determinism`` is the third state, and a
     # run recorded before it existed was, by construction, a ``warn`` run. The
-    # code identity defaults to "unknown", which ``code_drift`` treats as drift.
+    # code identity defaults to "unknown". All three are ``code_drift``'s.
     strict_determinism: bool = False
     code_sha: str | None = None
     code_dirty: bool | None = None
@@ -354,7 +358,7 @@ def assert_parity(arms: Sequence[ArmFingerprint]) -> None:
     reference = arms[0]
     disagreements: list[str] = []
     for field in fields(ArmFingerprint):
-        if field.name in VARYING_FIELDS | REPORTED_FIELDS | FIELD_FIELDS | CODE_FIELDS:
+        if field.name in VARYING_FIELDS | REPORTED_FIELDS | FIELD_FIELDS | DRIFT_FIELDS:
             continue
         expected = getattr(reference, field.name)
         for arm in arms[1:]:
@@ -382,12 +386,18 @@ def assert_parity(arms: Sequence[ArmFingerprint]) -> None:
 def code_drift(arms: Sequence[ArmFingerprint]) -> list[str]:
     """Why these arms cannot be shown to have run one code; empty when they can.
 
-    Three reasons, each its own line: a fingerprint with no SHA (every summary
+    Four reasons, each its own line: a fingerprint with no SHA (every summary
     recorded before #31, which is what "legacy counts as drift" means), a dirty
-    tree behind any SHA, and more than one SHA among the arms. The caller decides
+    tree behind any SHA, more than one SHA among the arms, and strict and warn
+    arms side by side (different attention-backward kernels). The caller decides
     whether drift is refused or merely said; this only names it.
     """
     reasons: list[str] = []
+    if len({arm.strict_determinism for arm in arms}) > 1:
+        reasons.append(
+            "  different determinism modes: strict and warn arms take different "
+            "attention-backward kernels (every arm before #31 is warn)"
+        )
     missing = [arm.arm for arm in arms if arm.code_sha is None]
     if missing:
         reasons.append(

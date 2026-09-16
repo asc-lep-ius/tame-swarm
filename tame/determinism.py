@@ -20,8 +20,10 @@ first optimizer step. ``strict`` calls it with ``warn_only=False``: the same
 backward takes torch's deterministic path, anything with no deterministic form
 at all raises a ``RuntimeError`` naming itself, and ``train/loss`` reproduces
 bitwise (``tests/test_determinism.py`` asserts this at the ablation
-configuration). ``off`` undoes every switch. Which mode an arm ran under is in
-its fingerprint, so two arms that took different kernels are not at parity.
+configuration) for about five percent per step. It is the default from #31 on:
+every arm recorded before ran under ``warn``, and the README says so. ``off``
+undoes every switch. Which mode an arm ran under is in its fingerprint, so a
+strict arm compared against a warn one is declared drift, not read as parity.
 """
 
 import logging
@@ -37,6 +39,7 @@ DETERMINISM_OFF = "off"
 DETERMINISM_WARN = "warn"
 DETERMINISM_STRICT = "strict"
 DETERMINISM_MODES = (DETERMINISM_OFF, DETERMINISM_WARN, DETERMINISM_STRICT)
+DETERMINISM_DEFAULT = DETERMINISM_STRICT
 
 # Only the once-per-process env var and backend switches are guarded, by the
 # mode they were last set for; RNG seeding itself repeats on every call, since a

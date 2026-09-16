@@ -102,8 +102,8 @@ from coupling import (
     SteeringCouplingConfig,
 )
 from determinism import (
+    DETERMINISM_DEFAULT,
     DETERMINISM_MODES,
-    DETERMINISM_WARN,
     configure_determinism,
     seed_worker,
     validate_determinism_mode,
@@ -442,15 +442,16 @@ class TrainingConfig:
     probe_tokens: int = 4096
 
     # Reproducibility (#13, #31). ``deterministic`` is one of DETERMINISM_MODES:
-    # ``warn`` forces deterministic kernels (torch.use_deterministic_algorithms,
-    # cuDNN, cuBLAS workspace) wherever one exists and logs the rest as a known
-    # variance source; ``strict`` refuses the rest and makes the attention
-    # backward deterministic too, at a throughput cost the README states;
-    # ``off`` is torch's defaults -- see determinism.py. ``shuffle_buffer_size``
-    # seeds a bounded shuffle of the streaming dataset; 0 keeps the current
+    # ``strict`` (the default) refuses any kernel without a deterministic form
+    # and makes the attention backward deterministic, at about five percent per
+    # step; ``warn`` -- every arm recorded before #31 -- forces deterministic
+    # kernels (torch.use_deterministic_algorithms, cuDNN, cuBLAS workspace)
+    # wherever one exists and logs the rest as a known variance source; ``off``
+    # is torch's defaults -- see determinism.py. ``shuffle_buffer_size`` seeds
+    # a bounded shuffle of the streaming dataset; 0 keeps the current
     # unshuffled, already order-deterministic stream.
     seed: int = 42
-    deterministic: str = DETERMINISM_WARN
+    deterministic: str = DETERMINISM_DEFAULT
     shuffle_buffer_size: int = 0
 
     def __post_init__(self) -> None:
@@ -2087,11 +2088,12 @@ def main():
         "--deterministic",
         type=str,
         choices=DETERMINISM_MODES,
-        default=DETERMINISM_WARN,
+        default=DETERMINISM_DEFAULT,
         help=(
-            "warn: deterministic kernels where one exists, the rest logged; strict: the "
-            "rest refused and the attention backward made deterministic, at a throughput "
-            "cost; off: torch's defaults (default: warn)"
+            "strict: every kernel deterministic or the run refuses, bitwise reproducible at "
+            "about five percent per step; warn: the mode every arm before #31 ran under, the "
+            "attention backward left non-deterministic and logged; off: torch's defaults "
+            f"(default: {DETERMINISM_DEFAULT})"
         ),
     )
     parser.add_argument(

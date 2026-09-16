@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from parity import (
-    CODE_FIELDS,
+    DRIFT_FIELDS,
     ArmFingerprint,
     ParityError,
     assert_parity,
@@ -66,7 +66,6 @@ def test_dense_arm_may_convert_nothing():
     [
         ("seed", 43),
         ("deterministic", False),
-        ("strict_determinism", True),
         ("max_steps", 401),
         ("adapter_rank", 16),
         ("requested_layers", (5, 6)),
@@ -220,6 +219,7 @@ def test_fingerprint_arm_reads_the_training_config():
         gradient_checkpointing=False,
         device="cpu",
         probe_tokens=8192,
+        deterministic="warn",
     )
 
     arm = fingerprint_arm(
@@ -272,6 +272,11 @@ def test_fingerprint_arm_reads_the_training_config():
     assert arm.code_dirty is None
 
 
+def test_new_arms_are_recorded_under_strict():
+    """The README says which mode new arms run under; this is that sentence, pinned."""
+    assert TrainingConfig().deterministic == "strict"
+
+
 @pytest.mark.parametrize(
     ("mode", "deterministic", "strict"),
     [("off", False, False), ("warn", True, False), ("strict", True, True)],
@@ -315,18 +320,33 @@ def test_code_identity_reads_this_repository():
     assert code_identity(repo=Path("/")) == (None, None)
 
 
-def test_the_code_fields_are_reported_and_not_asserted_between_arms():
-    """Two arms built in one process share a SHA by construction; between two
-    recorded groups it is ``code_drift`` that decides, because there a missing
-    SHA has to count as drift and a field-equality check would read two ``None``s
-    as agreement."""
-    assert {"code_sha", "code_dirty"} == CODE_FIELDS
+def test_the_drift_fields_are_reported_and_not_asserted_between_arms():
+    """Two arms built in one process share a SHA and a mode by construction;
+    between two recorded groups it is ``code_drift`` that decides, because there
+    a missing SHA has to count as drift and a field-equality check would read
+    two ``None``s as agreement."""
+    assert {"code_sha", "code_dirty", "strict_determinism"} == DRIFT_FIELDS
     assert_parity(
         [
-            replace(BASE, code_sha="aaaa", code_dirty=False),
+            replace(BASE, code_sha="aaaa", code_dirty=False, strict_determinism=True),
             replace(BASE, router="softmax", code_sha="bbbb", code_dirty=True),
         ]
     )
+
+
+def test_a_strict_arm_beside_a_warn_arm_is_drift_not_parity():
+    """#32's arms run strict; #28's ran warn. Comparable, labelled -- not refused."""
+    reasons = code_drift(
+        [
+            replace(BASE, code_sha="a" * 40, code_dirty=False, strict_determinism=True),
+            replace(BASE, router="softmax", code_sha="a" * 40, code_dirty=False),
+        ]
+    )
+
+    assert reasons == [
+        "  different determinism modes: strict and warn arms take different "
+        "attention-backward kernels (every arm before #31 is warn)"
+    ]
 
 
 def test_code_drift_names_missing_dirty_and_differing_shas():
@@ -350,11 +370,7 @@ def test_code_drift_names_missing_dirty_and_differing_shas():
 def test_a_fingerprint_recorded_before_the_sha_reads_as_unknown_code():
     """Every summary under ~/tame-runs predates #31: it must load, and it must not
     claim a SHA it does not have."""
-    recorded = {
-        key: value
-        for key, value in asdict(BASE).items()
-        if key not in CODE_FIELDS and key != "strict_determinism"
-    }
+    recorded = {key: value for key, value in asdict(BASE).items() if key not in DRIFT_FIELDS}
 
     loaded = ArmFingerprint(**recorded)
 

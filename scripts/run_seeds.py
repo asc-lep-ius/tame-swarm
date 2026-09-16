@@ -19,13 +19,14 @@ there is nothing here to assert parity *between*: the point of this harness is t
 spread a fixed configuration produces on its own, which is exactly what a fixed
 seed across arms is supposed to remove.
 
-It does not remove all of it (#31). Under ``--deterministic warn`` the attention
-backward is non-deterministic, so one seed run twice is two trajectories; the
-between-seed spread above already contains that, but nothing said how much of it
-was run-to-run. ``--replicate`` (on by default) runs the first seed a second time
-and records the pair's spread as ``replication_std``, which ``compare_runs.py``
-quotes beside every delta. Under ``--deterministic strict`` the pair is bitwise
-identical and the floor reads zero.
+It did not remove all of it (#31). Under ``--deterministic warn``, the mode every
+arm before #31 ran under, the attention backward is non-deterministic, so one
+seed run twice is two trajectories; the between-seed spread above already
+contains that, but nothing said how much of it was run-to-run. ``--replicate``
+(on by default) runs the first seed a second time and records the pair's spread
+as ``replication_std``, which ``compare_runs.py`` quotes beside every delta.
+Under ``--deterministic strict``, the default since #31, the pair is bitwise
+identical and the floor reads zero -- which is then the check that it still does.
 """
 
 import argparse
@@ -47,7 +48,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from smoke_fixture import build_smoke_fixture  # noqa: E402
 
 from coupling import DEFAULT_COUPLING_BETA, DEFAULT_WARMUP_STEPS  # noqa: E402
-from determinism import DETERMINISM_MODES, DETERMINISM_WARN  # noqa: E402
+from determinism import DETERMINISM_DEFAULT, DETERMINISM_MODES  # noqa: E402
 from parity import arm_label  # noqa: E402
 from train import TAMETrainer, TrainingConfig  # noqa: E402
 
@@ -210,17 +211,18 @@ def main() -> None:
     parser.add_argument(
         "--layers", type=str, default="1:3", help="MoB layer range as start:end (exclusive)"
     )
-    # #31: warn lets the attention backward through non-deterministic and the
-    # replicate below measures what that costs; strict reproduces bitwise.
+    # #31: strict reproduces bitwise; warn lets the attention backward through
+    # non-deterministic, and the replicate below measures what that costs.
     parser.add_argument(
         "--deterministic",
         type=str,
         choices=DETERMINISM_MODES,
-        default=DETERMINISM_WARN,
+        default=DETERMINISM_DEFAULT,
         help=(
-            "warn: deterministic kernels where one exists, the rest logged; strict: the "
-            "rest refused and the attention backward made deterministic; off: torch's "
-            "defaults (default: warn)"
+            "strict: every kernel deterministic or the run refuses, bitwise reproducible at "
+            "about five percent per step; warn: the mode every arm before #31 ran under, the "
+            "attention backward left non-deterministic and logged; off: torch's defaults "
+            f"(default: {DETERMINISM_DEFAULT})"
         ),
     )
     # The coupled arm of #6's ablation: the same auction, with the routing
