@@ -107,7 +107,29 @@ test:
   tags: [hephaestus]
   extends: .python-job
   script:
-    - uv run pytest tests/ -x --tb=short -m "not gpu"
+    # #51: this job was the critical path of every pipeline -- 894-1013s against
+    # a 904s pipeline wall clock, with nothing else finishing after it. Measured
+    # on the workstation, 856 tests: 154-161s serial, 419s under `-n auto` without
+    # the pin below, 34s with it; here the job reads 162s against that baseline.
+    #
+    # The speedup is only there because tests/conftest.py pins each worker to one
+    # torch thread. The tensors here are hidden_dim 32, so torch's intra-op pool
+    # buys nothing and claims the cores a second time, once per worker.
+    #
+    # `auto` is physical cores -- xdist asks psutil first and falls back to
+    # sched_getaffinity, so it is 8 on this runner rather than the 16 threads it
+    # advertises. Two caveats on that word. psutil is only a transitive
+    # dependency (accelerate, via the `train` extra), so dropping that extra
+    # silently doubles the worker count; and psutil's physical count ignores a
+    # cgroup quota or a cpuset, so `auto` is sized against the box and not
+    # against an allowance. Neither bites while this job owns the runner it is
+    # tagged for. PYTEST_XDIST_AUTO_NUM_WORKERS overrides it if one starts to.
+    #
+    # `-x` stays. Under xdist it ends the session on the first failure while
+    # workers already in flight finish theirs, so a run can report more than one
+    # failure -- more information rather than less, and it still does the thing
+    # `-x` is for, which is not spending the rest of the suite on a broken tree.
+    - uv run pytest tests/ -x --tb=short -m "not gpu" -n auto
 
 # On the workstation, not the hephaestus box: the locked torch is the CUDA 12.8
 # build, whose wheels ship kernels for sm_70 and up, and hephaestus carries a
