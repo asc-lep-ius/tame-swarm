@@ -13,6 +13,7 @@ mutation-verified in #14) and the ``TrainingConfig`` field scan in
 ``tests/test_training_config_usage.py``; neither is repeated here.
 """
 
+import os
 from dataclasses import fields
 
 import pytest
@@ -171,3 +172,19 @@ def test_the_projection_switch_is_live():
         assert torch.allclose(injected, raw, atol=1e-6)
         assert homeostat.get_capability_retention()[layer] == 1.0
     homeostat.detach_from_model()
+
+
+def test_the_xdist_thread_pin_is_active_in_this_worker():
+    """#51's speedup is the pin in conftest, and deleting it is silent.
+
+    ``-n auto`` on its own claims the cores twice -- xdist sizes its worker count
+    from the box and torch sizes its intra-op pool from the box inside each of
+    those workers -- which turned a 161 s suite into 419 s, and into a run that
+    had not finished after 21 minutes at load average 135 when it was reproduced
+    during review. Nothing fails when the pin goes: CI gets five to twelve times
+    slower and nobody is told, which is exactly this module's subject.
+    """
+    if not os.environ.get("PYTEST_XDIST_WORKER"):
+        pytest.skip("serial runs keep torch's default pool; the pin is for workers")
+
+    assert torch.get_num_threads() == 1
