@@ -48,13 +48,16 @@ gpu_jobs() {  # gpu_jobs <ci file>
     awk -v group="$RESOURCE_GROUP" '
         /^[^[:space:]#]/ {
             job = ""
-            # Only the trailing colon and any comment after it come off. A job
-            # called `test:3.12:` is a real shape — sophia names jobs that way —
-            # and truncating at the first colon would record it as `test`, which
-            # then matches no running job and reads as a free card.
-            if ($0 ~ /^[A-Za-z_][A-Za-z0-9_.-]*:/) {
-                job = $0
-                sub(/:[[:space:]]*(#.*)?$/, "", job)
+            # The name is what precedes the key colon, and nothing after it.
+            # Two shapes break the obvious readings. `test:3.12:` is a real job
+            # name — sophia names jobs that way — so truncating at the *first*
+            # colon records it as `test`; and `test-gpu: &gpu-job` carries a YAML
+            # anchor, so stripping only a *trailing* colon keeps the anchor in
+            # the name. Either way the name matches no running job and the card
+            # reads as free. Matching the key itself and taking what is left of
+            # its colon handles both, and a trailing comment falls outside it.
+            if (match($0, /^[A-Za-z_][A-Za-z0-9_.:-]*:/)) {
+                job = substr($0, 1, RLENGTH - 1)
             }
             next
         }

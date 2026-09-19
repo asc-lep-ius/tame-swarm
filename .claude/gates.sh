@@ -110,16 +110,17 @@ FORMAT_EXTENSIONS="py"
 GPU_CMD="scripts/gpu_gate.sh uv run pytest tests/ -x --tb=short -m gpu --durations=10"
 
 # What the six tests reach, one hop deep, which is the only honest answer to "is
-# this worth 295 seconds". The direct imports are the first thirteen entries; the
-# rest arrive through train.py, homeostat.py, steering_pipeline.py and
-# contrastive_data.py, and a change to one of those is just as capable of moving
-# a bitwise-determinism result as a change to the file that imports it.
+# this worth 295 seconds". Most of it is what the two test files import outright;
+# coupling.py and pid_controller.py arrive through mob/ and homeostat.py, and the
+# last seven through train.py, homeostat.py, steering_pipeline.py and
+# contrastive_data.py. A change one hop out is just as capable of moving a
+# bitwise-determinism result as a change to the file that imports it.
 #
 # Read by a person and by nothing else — no hook, skill or rule in ~/.claude
 # names this key, so a path here changing never runs anything on its own.
 #
 # One line, and not for the reason it is tempting to give: `decision_doc` folds
-# newlines before `read -ra` (gate-lib.sh:155) precisely so a wrapped value keeps
+# newlines before `read -ra` (gate-lib.sh:156) precisely so a wrapped value keeps
 # its entries, and `glob_specs` splits on IFS, which includes newline. Both would
 # take a wrapped list. One line is simply the shape every reader agrees on
 # without anyone having to check which of them folds.

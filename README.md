@@ -945,7 +945,7 @@ The CPU suite cannot be a gate at the length it currently runs. The Stop hook's
 timeout is 300 seconds, and a 143-second suite is already enough to push a
 headless `/ship` turn into the background and lose the process it was waiting
 for. CI's `test` job measured 894–1013 seconds in pipelines 462 and 466
-(2026-09-16). Here the same invocation — `-m "not gpu"`, 852 tests — takes 161
+(2026-09-16). Here the same invocation — `-m "not gpu"`, 852 passing of 855 selected — takes 161
 seconds, and the bare `uv run pytest` takes 137 for 851, the difference being the
 one `slow` test that `addopts` also deselect. Neither is the deciding number:
 `run_all_gates` runs lint and types first, so filling the slot would cost a Stop
