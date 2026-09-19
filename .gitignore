@@ -67,3 +67,8 @@ mlruns/
 # the next checkout a pass it never earned.
 .claude/state/
 .claude/settings.local.json
+# A /council roster is written per run and read by nobody else. Left untracked and
+# unignored it makes `git status --porcelain` dirty, which is what
+# `parity.code_identity()` reads: every fingerprint recorded from this checkout
+# would say the SHA identifies no code (#46).
+.claude/perspectives.md

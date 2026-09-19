@@ -18,7 +18,8 @@ This directory contains the full implementation of the TAME multi-scale competen
 | [`mob/core.py`](mob/core.py) | MoB layer, apply/save/load orchestration | `MixtureOfBidders`, `apply_mob_to_model()` |
 | [`mob/auction.py`](mob/auction.py) | VCG externality-based auction mechanism | `VCGAuctioneer` |
 | [`mob/experts.py`](mob/experts.py) | Expert, LightweightExpert (LoRA), and ConfidenceHead implementations | `Expert`, `LightweightExpert`, `ConfidenceHead` |
-| [`mob/wealth.py`](mob/wealth.py) | Wealth update paths (loss, quality, participation) | `update_wealth_from_loss()` |
+| [`mob/ledger.py`](mob/ledger.py) | One `WealthUpdater` — relax, pay a reward signal, charge, hold at a floor — and its three plugs | `WealthUpdater`, `Settlement`, `BandFloor`, `RealisedValueReward` |
+| [`mob/wealth.py`](mob/wealth.py) | The layer's side of the ledger: the value hook, the VCG charge, the settlement caches | `realised_values()`, `update_wealth_from_loss()` |
 | [`mob/utils.py`](mob/utils.py) | Gini coefficient, serialisation helpers | `compute_gini()` |
 | [`mob/mob_config.py`](mob/mob_config.py) | MoBConfig dataclass | `MoBConfig` |
 | [`steering.py`](steering.py) | **Cognitive Homeostasis** — steering vector extraction (prefix + completion-position), P-controller, orthogonal projection | `CognitiveHomeostat`, `SteeringVectorExtractor`, `AdaptiveHomeostat` |
@@ -71,17 +72,19 @@ Token hidden state h
 - **Differentiable routing** (training only, and only under `"proportional"`): straight-through estimator on the VCG selection. The forward pass uses hard top-k selection; the backward pass flows gradients through the log-domain softmax over all experts. Under the uniform share this path is deliberately absent — no language-modelling gradient reaches a confidence head, and each head is trained only by its own value objective.
 - **Realised gate sharpness is recorded, not assumed.** `MoBStats.routing` carries the top-1 routing weight (mean, median, fraction above 0.99) and `exp(entropy(routing_weights))` for every forward, as device tensors so no per-layer sync is forced; `get_mob_statistics()` aggregates them across layers. `top_k` says how many experts were paid for, the effective expert count says how many were used.
 
-**Wealth economy — three update paths:**
+**Wealth economy — one ledger, three reward signals:**
 
-| Path | When Used | Signal | Quality |
+The three update paths shared one structure — relax → compute reward → VCG payment net of rebate → clamp — and [#40](../README.md#ledger-stability) made that structure the code: `WealthUpdater` in [`mob/ledger.py`](mob/ledger.py), with the differences as plugs. Exactly one signal is reachable for a given `MoBConfig`, which is what the three paths were.
+
+| Reward signal | When used | Signal | Quality |
 |------|-----------|--------|----------|
-| `update_wealth_from_loss()` | Training (primary) | Per-token loss reduction vs expert baseline EMA | Best — direct supervision |
-| `_update_wealth_local_quality()` | Inference (primary) | Output norm consistency + magnitude appropriateness | Proxy — no loss available |
-| `_update_wealth_participation()` | Fallback | Selection frequency × confidence × routing weight | Weakest — no quality signal |
+| `RealisedValueReward` | Training (primary) | The winner's contribution against the loss gradient, plus [#33](../README.md#goal-in-value-33)'s goal term | Best — a counterfactual against the shared base |
+| `LocalQualityReward` | Inference (primary) | Output norm consistency + magnitude appropriateness | Proxy — no loss available |
+| `ParticipationReward` | Fallback | Selection frequency × confidence × routing weight | Weakest — no quality signal |
 
-All three paths share the same structure: decay → compute reward → VCG payment net of rebate → clamp. [Phase 2](../README.md#phase-2--economy-stabilisation) will unify them into a single `WealthUpdater` class.
+The other two plugs are the **floor** (`BandFloor` clamps into `[min_wealth, max_wealth]`; [#43](https://gitlab.hephaestus/mipkovich/tame-swarm/-/issues/43)'s budget will plug a dormancy rule in here) and the **mode** — whether the ledger relaxes toward zero (`decay`, every recorded arm) or toward a setpoint (`setpoint`, [#26](https://gitlab.hephaestus/mipkovich/tame-swarm/-/issues/26)'s ledger, derived and measured and not adopted). [#39](../README.md#stakes-dial-cell)'s shadow ledger is a mode too: under `decoupled` the ledger settles exactly as it always did and the gate reads a pinned wealth instead of it.
 
-**Current limitation:** The wealth dynamics still use hand-tuned constants (`LOSS_REWARD_MULTIPLIER`, `LOCAL_REWARD_MULTIPLIER`, …) without formal stability analysis, and the system can oscillate between undertrained and monopoly states depending on hyperparameters. `payment_scale` is no longer among them — the transfer coefficient is derived so that `reward − charge` is a single quasi-linear utility. A sharper limitation is recorded in [#15](../README.md#phase-05--mechanism-correction): winning is currently unprofitable on the synthetic objective, so abstaining pays. See the [tuning guide](../README.md#tuning-guide--diagnostics) for diagnostic interpretation.
+**Current limitation:** The wealth dynamics still use hand-tuned reward constants (`LOSS_REWARD_MULTIPLIER`, `LOCAL_REWARD_MULTIPLIER`, …). What is no longer missing is the stability analysis: [`#ledger-stability`](../README.md#ledger-stability) derives the ledger's fixed point, the condition under which the approach to it is monotone rather than oscillatory — the shipped ledger is 333 times inside it — and why both bounds of the wealth band bind. `payment_scale` is no longer among them — the transfer coefficient is derived so that `reward − charge` is a single quasi-linear utility. A sharper limitation is recorded in [#15](../README.md#phase-05--mechanism-correction): winning is currently unprofitable on the synthetic objective, so abstaining pays. See the [tuning guide](../README.md#tuning-guide--diagnostics) for diagnostic interpretation.
 
 ### Steering Controller
 

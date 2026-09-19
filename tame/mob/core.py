@@ -24,6 +24,7 @@ from .auction import (
 )
 from .experts import ConfidenceHead, Expert, LightweightExpert
 from .goal import GoalField, goal_terms
+from .ledger import WealthUpdater
 from .mob_config import MoBConfig
 from .routing_trace import DEFAULT_TRACE_TOKENS, RoutingTrace
 from .softmax_router import SoftmaxRouter
@@ -187,6 +188,12 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         for ledger, value in ledger_initial_values(config).items():
             self.register_buffer(ledger, torch.full((config.num_experts,), float(value)))
 
+        # How ``expert_wealth`` moves: the reward signal this configuration
+        # selects, the band it is held in, and whether the gate reads the ledger
+        # or the pinned wealth #39 puts over it. One object rather than three
+        # methods, so the organism's budget (#43) is an instance of it (#40).
+        self.wealth_updater = WealthUpdater.for_experts(config)
+
         self.last_stats: MoBStats | None = None
         # Serve-time only, off by default and never enabled by training. See
         # ``enable_routing_trace`` and ``mob.routing_trace``.
@@ -344,26 +351,26 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
                 "first pass this way and is not supported",
             )
 
-        # The loss path settles in update_wealth_from_loss. The other two paths
-        # are fallbacks for when no loss reaches the layer, and settle here.
-        if update_wealth and self._economy_live() and not self.config.use_loss_feedback:
-            if self.config.use_local_quality:
-                self._update_wealth_local_quality(
-                    selected_experts,
-                    routing_weights,
-                    confidences,
-                    outcome.payments,
-                    outcome.rebates,
-                    output,
-                )
-            elif self.training:
-                self._update_wealth_participation(
-                    selected_experts,
-                    routing_weights,
-                    confidences,
-                    outcome.payments,
-                    outcome.rebates,
-                )
+        # The loss path settles in update_wealth_from_loss, after the backward that
+        # gives a winner's value its meaning. The fallbacks for when no loss
+        # reaches the layer settle here, on the same ledger: the local-quality
+        # proxy at inference as well as in training, and participation -- which
+        # prices nothing about what the cell did -- only while training.
+        settles_in_forward = (
+            update_wealth
+            and self._economy_live()
+            and not self.config.use_loss_feedback
+            and (self.config.use_local_quality or self.training)
+        )
+        if settles_in_forward:
+            self._settle_in_forward(
+                selected_experts,
+                routing_weights,
+                confidences,
+                outcome.payments,
+                outcome.rebates,
+                output,
+            )
 
         if not recomputing:
             self.last_stats = MoBStats(

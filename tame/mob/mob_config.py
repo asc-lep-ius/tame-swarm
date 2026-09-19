@@ -8,8 +8,14 @@ from .auction import (
     SUPPORTED_EXPLORATION_DRAWS,
     SUPPORTED_ROUTING_SHARES,
 )
+from .ledger import (
+    LEDGER_DECAY,
+    PERSISTENCE_SHUFFLED,
+    PERSISTENCE_VALUE,
+    SUPPORTED_LEDGER_MODES,
+    SUPPORTED_PERSISTENCE_COUPLINGS,
+)
 from .softmax_router import ROUTER_AUCTION, SUPPORTED_ROUTERS
-from .wealth import PERSISTENCE_SHUFFLED, PERSISTENCE_VALUE, SUPPORTED_PERSISTENCE_COUPLINGS
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +46,7 @@ AUCTION_ONLY_FIELDS = (
     "exploration_rate",
     "exploration_draw",
     "persistence_coupling",
+    "ledger_mode",
     # Reached only below the has_economy early return in update_wealth_from_loss, so
     # under the softmax gate the cached loss stays None and the trainer adds zero.
     "confidence_calibration_weight",
@@ -251,8 +258,20 @@ class MoBConfig:
     # reads at initial_wealth and draws re-entry uniformly, and the ledger
     # settles on as a shadow -- what is logged under decoupled is the wealth a
     # cell would have had. "shuffled" keeps the economy live and permutes the
-    # heads' regression targets across experts each step. See mob/wealth.py.
+    # heads' regression targets across experts each step. See mob/ledger.py.
     persistence_coupling: str = PERSISTENCE_VALUE
+    # What the ledger relaxes toward between settlements (#40). "decay" is every
+    # arm there has been: wealth is multiplied by wealth_decay each step, so a
+    # cell that earns nothing sinks toward zero and min_wealth is what stops it.
+    # "setpoint" is #26's ledger as a mode of the same arithmetic -- the ledger
+    # relaxes toward initial_wealth at that same rate -- which lowers the wealth
+    # below which a cell can no longer climb back rather than raising the floor it
+    # rests on. The two differ only in where the relaxation points, so one
+    # fixed-point analysis covers both: README #ledger-stability derives the
+    # equilibrium, the condition for reaching it without oscillating, and the ruin
+    # threshold each mode implies. Derived and measured there, not adopted -- the
+    # default is the economy every recorded arm ran under.
+    ledger_mode: str = LEDGER_DECAY
     # Which gate turns reports into an allocation. "auction" is MoB. "softmax" is
     # the #12 control arm: the same confidence heads, softmaxed, with the whole
     # economy switched off -- no wealth read, no payment, no rebate, no value
@@ -318,6 +337,10 @@ class MoBConfig:
         if self.router not in SUPPORTED_ROUTERS:
             routers = ", ".join(sorted(SUPPORTED_ROUTERS))
             raise ValueError(f"Unsupported router '{self.router}'. Supported: {routers}")
+
+        if self.ledger_mode not in SUPPORTED_LEDGER_MODES:
+            modes = ", ".join(sorted(SUPPORTED_LEDGER_MODES))
+            raise ValueError(f"Unsupported ledger mode '{self.ledger_mode}'. Supported: {modes}")
 
         if self.persistence_coupling not in SUPPORTED_PERSISTENCE_COUPLINGS:
             couplings = ", ".join(sorted(SUPPORTED_PERSISTENCE_COUPLINGS))

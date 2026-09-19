@@ -50,7 +50,7 @@ from smoke_fixture import build_smoke_fixture  # noqa: E402
 from coupling import DEFAULT_COUPLING_BETA, DEFAULT_WARMUP_STEPS  # noqa: E402
 from determinism import DETERMINISM_DEFAULT, DETERMINISM_MODES  # noqa: E402
 from mob.auction import EXPLORATION_DRAW_STALENESS, SUPPORTED_EXPLORATION_DRAWS  # noqa: E402
-from mob.wealth import PERSISTENCE_VALUE, SUPPORTED_PERSISTENCE_COUPLINGS  # noqa: E402
+from mob.ledger import PERSISTENCE_VALUE, SUPPORTED_PERSISTENCE_COUPLINGS  # noqa: E402
 from parity import arm_label  # noqa: E402
 from train import TAMETrainer, TrainingConfig  # noqa: E402
 
