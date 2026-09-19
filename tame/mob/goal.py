@@ -69,6 +69,20 @@ class ConstantGoalField:
         return self.vector
 
 
+def error_relieved(reading: torch.Tensor, push: torch.Tensor, setpoint: float) -> torch.Tensor:
+    """The atom of every stress signal: error without the cell, minus error with it.
+
+    ``reading`` is what the tissue holds *with* this cell's ``push`` already in
+    it, so removing the cell removes its own term and leaves the other winners in
+    place. Named and separate because it is the shape the reward-signal slot in
+    ``mob/ledger.py`` probes a plugged signal against (#40): a signal built on
+    this is a stress by construction, and one that is not has to say why.
+    """
+    error_with = (setpoint - reading).abs()
+    error_without = (setpoint - (reading - push)).abs()
+    return error_without - error_with
+
+
 def goal_error_reduction(
     contributions: torch.Tensor,
     routing_weights: torch.Tensor,
@@ -97,9 +111,7 @@ def goal_error_reduction(
     )
     pushes = routing_weights.float() * coordinates
     reading = pushes.sum(dim=-1, keepdim=True)
-    error_with = (setpoint - reading).abs()
-    error_without = (setpoint - (reading - pushes)).abs()
-    return error_without - error_with
+    return error_relieved(reading, pushes, setpoint)
 
 
 def goal_terms(

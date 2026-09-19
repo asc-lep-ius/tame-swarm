@@ -16,7 +16,7 @@ from synthetic_economy import (  # noqa: E402
 
 from mob import MixtureOfBidders, MoBConfig  # noqa: E402
 from mob.utils import get_mob_statistics, get_total_router_z_loss  # noqa: E402
-from mob.wealth import (  # noqa: E402
+from mob.ledger import (  # noqa: E402
     LOCAL_REWARD_MULTIPLIER,
     LOSS_REWARD_MULTIPLIER,
     PARTICIPATION_REWARD_MULTIPLIER,

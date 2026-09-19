@@ -140,7 +140,7 @@ from mob import (
     update_all_mob_from_loss,
 )
 from mob.experts import CONFIDENCE_INITIAL_LOGIT, ConfidenceHead
-from mob.wealth import SUPPORTED_PERSISTENCE_COUPLINGS
+from mob.ledger import SUPPORTED_PERSISTENCE_COUPLINGS
 from parity import ArmFingerprint, code_identity, data_order_fingerprint, fingerprint_arm
 from specialisation import SpecialisationReport, probe_specialisation
 from steering import ADAPTIVE_STEERING, SteeringConfig
