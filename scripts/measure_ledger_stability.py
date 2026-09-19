@@ -92,6 +92,12 @@ class CellReading:
     settles_at: float
     ruined_below: float
     clamped: bool
+    # How far the recorded inflow, run back through the map, lands from the
+    # ledger it should reproduce. Not a property of the economy: a check that the
+    # settlement was recorded whole, so that R and kappa below are readings of it
+    # rather than of part of it. Meaningless for a clamped cell, whose ledger was
+    # held by a bound the recursion knows nothing about.
+    reconstruction_error: float
 
     @property
     def relative_error(self) -> float:
@@ -135,6 +141,7 @@ def measure(
 
     layer._vcg_charges = recording_charge  # type: ignore[method-assign]
 
+    start = layer.expert_wealth.clone()
     wins = torch.zeros(config.num_experts)
     losses: list[float] = []
     # Whether a bound held the cell at any point in the tail, rather than whether
@@ -155,6 +162,12 @@ def measure(
 
     share = wins / wins.sum()
     rho = 1.0 - config.wealth_decay
+    reconstructed = _replay(
+        torch.stack(recorded.paid) - torch.stack(charges),
+        start=start,
+        decay=config.wealth_decay,
+        setpoint=config.initial_wealth if mode == LEDGER_SETPOINT else 0.0,
+    )
     setpoint = config.initial_wealth if mode == LEDGER_SETPOINT else 0.0
     reward = torch.stack(recorded.paid)[-tail:].mean(dim=0)
     charged = torch.stack(charges)[-tail:]
@@ -171,6 +184,7 @@ def measure(
                 reward=float(reward[index]),
                 price_coefficient=float(price_coefficient[index]),
                 clamped=bool(clamped[index]),
+                reconstruction_error=abs(float(reconstructed[index]) - wealth) / wealth,
                 **_roots(rho, setpoint, float(reward[index]), float(price_coefficient[index])),
             )
         )
@@ -184,6 +198,21 @@ def measure(
         wealth_vs_competence=pearson(layer.expert_wealth, economy.competence),
         tail_loss=sum(losses) / len(losses),
     )
+
+
+def _replay(
+    inflow: torch.Tensor, start: torch.Tensor, decay: float, setpoint: float
+) -> torch.Tensor:
+    """The ledger the recorded inflow implies: ``decay^T w_0 + sum_j decay^j n_(T-1-j)``.
+
+    The map with no clamp in it, summed in float64 so what it reports is the
+    recording's completeness rather than the replay's own rounding.
+    """
+    steps = inflow.size(0)
+    weights = torch.tensor([decay**j for j in range(steps)], dtype=torch.float64)
+    relaxed = start.double() * decay**steps
+    toward = setpoint * (1.0 - decay) * float(weights.sum())
+    return relaxed + toward + (inflow.double() * weights.flip(0).unsqueeze(-1)).sum(dim=0)
 
 
 def _roots(
@@ -216,14 +245,14 @@ def _report(reading: LedgerReading) -> None:
     )
     print(
         f"{'c':>5} {'wealth':>9} {'share':>7} {'R':>8} {'kappa':>9} "
-        f"{'settles at':>11} {'ruined below':>13} {'rel':>7}"
+        f"{'settles at':>11} {'ruined below':>13} {'rel':>7} {'replay':>9}"
     )
     for cell in reading.cells:
         marker = " (clamped)" if cell.clamped else ""
         print(
             f"{cell.competence:>5.2f} {cell.wealth:>9.2f} {cell.share:>7.4f} {cell.reward:>8.4f} "
             f"{cell.price_coefficient:>9.2f} {cell.settles_at:>11.2f} {cell.ruined_below:>13.2f} "
-            f"{cell.relative_error:>7.3f}{marker}"
+            f"{cell.relative_error:>7.3f} {cell.reconstruction_error:>9.1e}{marker}"
         )
 
 

@@ -454,6 +454,7 @@ def test_two_arms_that_relax_toward_different_things_are_not_at_parity():
 # the check non-empty; the two monopolists rest on the ceiling with their
 # equilibrium above it.
 RECORDED_CLOSED_FORM_ERROR = 0.02
+RECORDED_RECONSTRUCTION_ERROR = 1e-4
 RECORDED_UNCLAMPED_CELLS = 6
 
 
@@ -477,6 +478,11 @@ def test_the_closed_form_predicts_the_setpoint_arms_settled_ledger():
     for cell in reading.cells:
         if cell.clamped:
             assert cell.settles_at > BASE_CONFIG.max_wealth, cell
+        else:
+            # The reward and the charge are the whole settlement: run back
+            # through the map they rebuild the ledger. A reading that had missed
+            # a term would still solve a quadratic, and it would be the wrong one.
+            assert cell.reconstruction_error < RECORDED_RECONSTRUCTION_ERROR, cell
 
     # The other half of the row: the ledger moved and the allocation did not.
     assert reading.market_holders == 2
