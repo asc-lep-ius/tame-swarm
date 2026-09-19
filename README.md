@@ -935,29 +935,29 @@ CI runs the 855 non-GPU tests under `pytest-xdist` (#51): `-n auto` is physical 
 <a name="the-local-gate-50"></a>
 
 `.claude/gates.sh` is what checks the tree before a push rather than after it
-(#50). Two slots are filled; the third is empty on purpose.
+(#50). All three slots are filled, and 98 seconds is what a tree change costs.
 
 | Gate | Command | Cost on the RTX 5070 Ti box |
 |---|---|---|
 | lint | `uv run ruff check . && uv run ruff format --check .` | < 1 s (116 files, cache deleted first) |
 | types | `uv run pyright tame scripts` | 62 s |
-| tests | *empty* | — |
+| tests | `uv run pytest tests/ -x --tb=short -m 'not gpu' -n auto` | 34 s |
 
-The tests slot is empty, and since #51 that is a decision rather than a
-constraint. The Stop hook's timeout is 300 seconds, and a 143-second suite is
-already enough to push a headless `/ship` turn into the background and lose the
-process it was waiting for. Serially this suite was over that line — 161 seconds
-here, 894–1013 in CI — and under `-n auto` with pinned worker threads it is 33,
-which would make the whole gate about 95 seconds. What that buys has to be
-weighed against putting 855 tests and twelve worker processes in front of every
-tree change including the docstring ones, so `.claude/gates.sh` records the
-measurement and the argument and leaves the slot empty for someone to decide.
+The tests slot was empty when #50 installed the file, and #51 is what filled it.
+The Stop hook's timeout is 300 seconds, and a 143-second suite is already enough
+to push a headless `/ship` turn into the background and lose the process it was
+waiting for. Serially this suite is over that line — 161 seconds here, 894–1013
+in CI — and under `-n auto` with pinned worker threads it is 33. The command
+mirrors CI's `test` job exactly, because a gate that runs a different invocation
+from the pipeline can pass here and fail there. The argument for emptying it
+again is in `gates.sh` beside the slot: 98 seconds is nearly three times the
+ceiling sophia's gate holds itself to, and it is paid on docstring edits too.
 
-Meanwhile the suite is gated one step later — CI runs it on every push — while
-`pyright` covers both `tame` and `scripts` statically, in the turn that wrote the
-code. `.pre-commit-config.yaml` runs ruff and pyright too, but once per commit,
-only in a clone where someone ran `pre-commit install`, and only over `tame`; the
-gate is wider and a turn earlier.
+The suite is still gated a second time, by CI on every push, and `pyright` covers
+both `tame` and `scripts` statically in the turn that wrote the code.
+`.pre-commit-config.yaml` runs ruff and pyright too, but once per commit, only in
+a clone where someone ran `pre-commit install`, and only over `tame`; the gate is
+wider and a turn earlier.
 
 The GPU suite is opt-in for the same reason and one more. `GPU_CMD` runs it
 behind `scripts/gpu_gate.sh`, which asks the forge whether `resource_group: gpu`

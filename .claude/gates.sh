@@ -3,10 +3,12 @@
 #
 # Installed by #50. Before it there was no `.claude/` path in this repo at all:
 # every turn ran with nothing checking the tree, and the pipeline was the only
-# gate the project had. Two of the three slots below are filled with commands
-# confirmed by running them on prometheus; the third is empty, and the whole
-# point of the note above it is that the reason lives in this file rather than
-# in somebody's memory.
+# gate the project had. All three slots below are filled, each with a command
+# confirmed by running it on prometheus — the test slot only since #51, which is
+# why the note above it is longer than the command. That note is the argument
+# rather than the conclusion, and it is kept in this file because the next person
+# to weigh emptying the slot needs the measurements, not somebody's memory of
+# them.
 #
 # `.pre-commit-config.yaml` runs ruff and pyright too, and it is not what this
 # replaces: pre-commit fires once per commit, only in a clone where somebody ran
@@ -30,13 +32,16 @@ LINT_CMD="uv run ruff check . && uv run ruff format --check ."
 # what the issues' verification block asks for and is what CI's reviewer reads.
 TYPE_CMD="uv run pyright tame scripts"
 
-# 75, against the 62s measured above. The default is 60, which this gate is over
-# on every single run, and a row that is advisory every time is a row that stops
-# being read. The margin is there to show drift from what the gate costs now,
-# not to leave room for it to grow.
-GATE_BUDGET_S="75"
+# 110, against the 98s the three gates measure together on prometheus (62s of it
+# pyright, 34s the parallel suite). The default is 60, which this gate is over on
+# every single run, and a row that is advisory every time is a row that stops
+# being read. The margin is there to show drift from what the gates cost now, not
+# to leave room for them to grow.
+GATE_BUDGET_S="110"
 
-# Empty, and this is the measurement #50 exists to write down.
+# Filled since #51, and empty before it. What follows is the measurement #50
+# exists to write down and the one #51 overturned, in that order, because the
+# case for emptying it again is the first one.
 #
 # The Stop hook's timeout is 300s (.claude/settings.json). sophia's gates.sh
 # records that a **143s** suite reliably pushed headless `/ship` turns into the
@@ -58,21 +63,20 @@ GATE_BUDGET_S="75"
 # same box — 12 workers, 3m49s of CPU against the serial run's 30m34s, because
 # the tensors are hidden_dim 32 and torch's intra-op pool was claiming the cores
 # a second time. A fifth of the figure that broke two ships, and the whole gate
-# would come to about 95s against a 300s timeout.
+# comes to 98s against a 300s timeout.
 #
-# It is still empty, and that is now a decision rather than a constraint. Filling
-# it puts 855 tests and twelve worker processes in front of every tree change in
-# this repo, including the ones that only touch a docstring, and neither #50 nor
-# #51 asked for that. Whoever fills it should: set
-#   TEST_CMD="uv run pytest tests/ --tb=short -m 'not gpu' -n auto"
-# raise GATE_BUDGET_S past 95, and re-measure, because the 33s above is one box
-# on one day.
+# So it is filled, and the cost is the thing to keep an eye on rather than the
+# saving: 855 tests and twelve worker processes now run in front of every tree
+# change in this repo, including the ones that only touch a docstring. The whole
+# gate measures 98s against the 300s timeout. sophia holds its own gate to a ~35s
+# ceiling deliberately and this is nearly three times that, so if a turn here
+# starts feeling like it is waiting on something, this is what it is waiting on —
+# empty the slot rather than reaching for --no-verify.
 #
-# The suite is not ungated meanwhile, it is gated one step later: CI's `test` job
-# runs it on every push, and /ship's last step triages that pipeline. `pyright
-# tame scripts` above still covers both trees statically, in-turn, which is the
-# half of the answer a Stop hook could always afford.
-TEST_CMD=""
+# The command mirrors CI's `test` job exactly, `-x` and all. A gate that runs a
+# different invocation from the pipeline can pass here and fail there, which is
+# the one thing a pre-push gate must not do.
+TEST_CMD="uv run pytest tests/ -x --tb=short -m 'not gpu' -n auto"
 
 # One command, one file — post-edit-lint.sh applies these to the file just
 # written, never to the tree.
