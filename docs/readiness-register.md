@@ -88,11 +88,20 @@ it argues.
 The rule is checked, not stated. `CORE_ACTIONS` in `tame/readiness.py` is the
 tissue's whole action space — each action with everything it reads and the one
 thing it moves — and `tests/test_readiness_register.py` enumerates it from that
-module and asserts four things of every action: the operator is not among its
-inputs; every input it does read is a declared channel, because an undeclared
-channel is an unchecked one; it writes none of the sealed channels (the budget,
-what evaluation returns, what the margins read); and it is gated by a flag some
-autonomy in the register carries.
+module and asserts of every action: the operator is not among its inputs; every
+input it does read is a declared channel; it writes one of the declared actuators
+and none of the sealed channels (the budget, what evaluation returns, what the
+margins read); and it is gated by a flag some autonomy in the register carries.
+Both sides are allowlists, because an undeclared channel is an unchecked one —
+a denylist of writes would have held for the three spellings it named and not
+for the rule they stand for.
 
 An action may still *cost* budget — asking is a budgeted action — because the
 ledger charges it. What no action does is set it.
+
+**What #42 owes this register.** The action space is a declaration, and today
+nothing can contradict it: there is no tissue yet whose actuator calls could go
+around it. The obligation that makes it a constraint rather than a document the
+tests agree with is #42's — every actuator call it builds dispatches through
+`CORE_ACTIONS`, so an action that is not in the register is an action the tissue
+cannot take.

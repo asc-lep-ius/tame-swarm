@@ -95,6 +95,7 @@ from synthetic_economy import (  # noqa: E402
 from mob import PERSISTENCE_DECOUPLED, PERSISTENCE_SHUFFLED, PERSISTENCE_VALUE  # noqa: E402
 from mob.experts import CONFIDENCE_INITIAL_LOGIT  # noqa: E402
 from parity import ArmFingerprint, arm_label, code_identity  # noqa: E402
+from readiness import READINESS_OFF, ReadinessConfig  # noqa: E402
 
 ARMS = (PERSISTENCE_VALUE, PERSISTENCE_DECOUPLED, PERSISTENCE_SHUFFLED)
 SEEDS = (0, 1, 2)
@@ -134,9 +135,19 @@ class TokenRecords:
 
 
 def fixture_fingerprint(
-    fixture: str, seed: int, arm: str, doses: tuple[float, ...], steps: int
+    fixture: str,
+    seed: int,
+    arm: str,
+    doses: tuple[float, ...],
+    steps: int,
+    readiness: ReadinessConfig = READINESS_OFF,
 ) -> ArmFingerprint:
-    """A fingerprint for a fixture run: what the arms share, the dial, the doses, the code."""
+    """A fingerprint for a fixture run: what the arms share, the dial, the doses, the code.
+
+    ``readiness`` is #46's register, taken here as ``parity.fingerprint_arm`` takes
+    it, so a fixture run that granted an autonomy cannot record itself as one that
+    did not. Every flag is off until the issue that earns one turns it on.
+    """
     code_sha, code_dirty = code_identity()
     return ArmFingerprint(
         router="mob",
@@ -179,6 +190,11 @@ def fixture_fingerprint(
         code_dirty=code_dirty,
         persistence_coupling=arm,
         goal_doses=doses,
+        autonomy_plasticity=readiness.autonomy_plasticity,
+        autonomy_exploration=readiness.autonomy_exploration,
+        autonomy_setpoints=readiness.autonomy_setpoints,
+        autonomy_evaluation=readiness.autonomy_evaluation,
+        autonomy_dormancy=readiness.autonomy_dormancy,
     )
 
 

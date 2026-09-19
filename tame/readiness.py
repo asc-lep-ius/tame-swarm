@@ -69,10 +69,29 @@ ACTUATOR_SETPOINT = "steering_setpoint"
 ACTUATOR_EVALUATION_QUEUE = "evaluation_queue"
 ACTUATOR_DORMANCY = "dormancy_state"
 
+# What an action may move, listed rather than left open. The inputs are
+# allowlisted and the writes were not, which made the rule only as wide as the
+# spellings below: an action declaring ``writes="budget_reading"`` -- the name of
+# a channel declared in this very module -- passed the check that exists to say
+# no action can change the budget. Both sides are allowlists now, and a new
+# actuator is declared here before an action can reach it.
+ACTUATORS = frozenset(
+    {
+        ACTUATOR_PLASTICITY,
+        ACTUATOR_EXPLORATION,
+        ACTUATOR_SETPOINT,
+        ACTUATOR_EVALUATION_QUEUE,
+        ACTUATOR_DORMANCY,
+    }
+)
+
 # Reading the budget is allowed; setting it is not, and neither is setting what
 # evaluation says about the organism or what its margins read. ``OPERATOR`` is
 # sealed on both sides: an action that could write to a human would be the
-# resource channel through persuasion that the rule exists to close.
+# resource channel through persuasion that the rule exists to close. Kept beside
+# ``ACTUATORS`` because the message a sealed write earns is the specific one --
+# "this is computed by code the tissue cannot reach" -- and an undeclared write
+# only earns the generic one.
 SEALED_CHANNELS = frozenset({"budget", "evaluation_outcome", CHANNEL_VIABILITY_MARGIN, OPERATOR})
 
 # --- The register --------------------------------------------------------------------
@@ -267,11 +286,13 @@ CORE_ACTIONS: tuple[CoreAction, ...] = (
 def human_channel_violations(actions: tuple[CoreAction, ...] = CORE_ACTIONS) -> list[str]:
     """Why these actions break the human-channel rule; empty when they do not.
 
-    Four ways, each its own line: an action that reads the operator, an action
-    that reads a channel nobody declared -- undeclared is unchecked, the rule
-    `parity.NOT_A_CONFOUND` follows -- an action that writes a sealed channel, and
-    an action gated by a flag no granted autonomy carries, which is an action
-    outside the register rather than inside it.
+    Five ways, each its own line: an action that reads the operator, an action
+    that reads a channel nobody declared, an action that writes a sealed channel,
+    an action that writes anything else nobody declared an actuator, and an action
+    gated by a flag no granted autonomy carries, which is an action outside the
+    register rather than inside it. Undeclared is unchecked on both sides -- the
+    rule ``parity.NOT_A_CONFOUND`` follows -- and the rule is "no action can
+    change its budget", not "no action can write these three strings".
     """
     reasons: list[str] = []
     flags = set(granted_flags())
@@ -290,6 +311,10 @@ def human_channel_violations(actions: tuple[CoreAction, ...] = CORE_ACTIONS) -> 
             reasons.append(
                 f"  {action.name!r} writes {action.writes!r}, which is computed by code the "
                 "tissue cannot reach"
+            )
+        elif action.writes not in ACTUATORS:
+            reasons.append(
+                f"  {action.name!r} writes {action.writes!r}, which is not a declared actuator"
             )
         if action.gated_by not in flags:
             reasons.append(

@@ -69,6 +69,11 @@ def test_the_whole_action_space_satisfies_the_rule():
         pytest.param({"inputs": (OPERATOR,)}, "reads the operator", id="operator-as-input"),
         pytest.param({"inputs": ("mood",)}, "undeclared channels", id="undeclared-channel"),
         pytest.param({"writes": "budget"}, "writes 'budget'", id="writes-the-budget"),
+        pytest.param(
+            {"writes": "budget_reading"},
+            "not a declared actuator",
+            id="writes-an-undeclared-channel",
+        ),
         pytest.param({"gated_by": "autonomy_spawn"}, "not a granted", id="ungated-action"),
     ],
 )
@@ -117,8 +122,15 @@ def test_the_evidence_is_a_citation_and_the_citation_resolves(autonomy):
     """
     assert autonomy.evidence, f"{autonomy.name} is scheduled with no evidence required"
 
+    preregistration = (REPOSITORY / "docs" / "preregistration.md").read_text(encoding="utf-8")
+
     for citation in autonomy.evidence:
         if citation in PREREGISTERED_SIGNATURES:
+            row = citation.rsplit(" ", 1)[1]
+            assert re.search(rf"^\| {row} \|", preregistration, re.M), (
+                f"{autonomy.name} cites {citation!r}, which is not a row of the "
+                "preregistration's section 1 table"
+            )
             continue
         assert citation.startswith("tests/constitution/"), (
             f"{autonomy.name} cites {citation!r}, which is neither a preregistration "
@@ -132,14 +144,15 @@ def test_a_phase_three_autonomy_carries_no_flag_to_flip(autonomy):
     """Listed, not granted: a flag that exists is a flag somebody can turn on."""
     assert autonomy.flag is None
 
+
+def test_the_config_the_fingerprint_and_the_register_name_one_set():
+    """No flag exists for an autonomy the register does not grant -- Phase 3's included."""
     declared = {spec.name for spec in fields(ReadinessConfig)}
     fingerprinted = {
         spec.name for spec in fields(ArmFingerprint) if spec.name.startswith("autonomy_")
     }
-    assert declared == fingerprinted == set(granted_flags()), (
-        "a flag exists for an autonomy the register does not grant; the config, the fingerprint "
-        "and the granted rows must name the same set"
-    )
+
+    assert declared == fingerprinted == set(granted_flags())
 
 
 def test_the_document_names_what_the_module_declares():
