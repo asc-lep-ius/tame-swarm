@@ -637,7 +637,7 @@ def assert_same_manifest(arms: Sequence[ArmFingerprint], allow_drift: bool = Fal
     """Refuse margins read on different rotations; else say which one they were read on.
 
     The line this returns is what a README row and a printed table carry beside
-    every number, in the form the parity summary below already prints ``eval split=``
+    every number, in the form the parity summary above already prints ``eval split=``
     and the trainer's eval line prints ``split <fingerprint>``: a margin quoted
     without the date and fingerprint of the stream it was read on is a number nobody
     can check, because the stream it came from no longer exists.

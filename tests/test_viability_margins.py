@@ -217,6 +217,34 @@ def test_a_base_sharing_storage_through_a_distinct_parameter_is_refused():
         base.assert_separate_from(model)
 
 
+def test_a_base_holding_an_offset_view_of_the_model_is_refused():
+    """``data_ptr()`` is the storage *plus the offset*, so a slice reports a new one.
+
+    Every byte under the slice is the organism's, and the margin on it is the
+    organism against itself; a pointer comparison reads it as a separate base.
+    """
+    model = build_tiny_causal_lm()
+    base = FrozenBase.freeze(deepcopy(model))
+    base.module.lm_head.weight = nn.Parameter(model.lm_head.weight.data[2:], requires_grad=False)
+
+    assert base.module.lm_head.weight.data_ptr() != model.lm_head.weight.data_ptr()
+    with pytest.raises(ViabilityError, match="shares parameter storage"):
+        base.assert_separate_from(model)
+
+
+def test_two_unrelated_models_carrying_empty_parameters_are_not_aliases():
+    """The pairing, and a false positive is not a free one: it refuses a legitimate base.
+
+    ``data_ptr()`` is ``0`` for every zero-element tensor, so keying on it alone
+    makes any two models that each carry one look like views of each other.
+    """
+    base_module, model = build_tiny_causal_lm(), build_tiny_causal_lm()
+    base_module.register_parameter("empty", nn.Parameter(torch.empty(0)))
+    model.register_parameter("empty", nn.Parameter(torch.empty(0)))
+
+    FrozenBase.freeze(base_module).assert_separate_from(model)
+
+
 def test_a_base_made_trainable_again_is_caught_after_the_pass():
     """``requires_grad`` is a property anything holding the module can set back."""
     base = FrozenBase.freeze(build_tiny_causal_lm())
@@ -281,6 +309,23 @@ def test_a_ledger_that_signals_by_return_value_rather_than_by_raising_is_caught(
 
     with pytest.raises(ViabilityError, match="took the budget to"):
         charge_evaluation(CALLER_CORE, OverdrawnLedger(), num_items=20)
+
+
+def test_a_ledger_written_as_a_command_is_refused_rather_than_crashing():
+    """The likeliest wrong implementation of the contract the check above enforces.
+
+    ``debit`` reads as an imperative, so writing it with no ``return`` is the
+    natural mistake -- and a ledger that reports nothing cannot report a budget it
+    has just overdrawn. Caught as a `ViabilityError` naming the contract, not as a
+    ``TypeError`` from comparing ``None`` with a number.
+    """
+
+    class CommandLedger(RecordingLedger):
+        def debit(self, amount: float, reason: str) -> float:
+            return None  # type: ignore[return-value] # the mistake under test
+
+    with pytest.raises(ViabilityError, match="returned nothing"):
+        charge_evaluation(CALLER_CORE, CommandLedger(), num_items=20)
 
 
 def test_a_core_with_no_ledger_is_refused():
@@ -402,7 +447,7 @@ def test_too_few_canaries_to_read_the_tolerance_is_refused(fake_tokenizer, organ
         today=TODAY,
     )
 
-    with pytest.raises(ViabilityError, match="moves the accuracy by 0.143, against a tolerance"):
+    with pytest.raises(ViabilityError, match="quietest signal the detector can give"):
         measure_viability(model, base, thin, batch_size=8, device=CPU, caller=CALLER_TRAINER)
 
 

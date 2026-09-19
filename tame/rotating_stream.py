@@ -200,7 +200,7 @@ def load_manifest(path: str | Path, name: str | None = None) -> DatedManifest:
 class RotationRecord:
     """What an arm records about the rotation its margins were read on.
 
-    Six strings rather than an object reference, because this is what survives into
+    Flat fields rather than an object reference, because this is what survives into
     a summary on disk and is read back a month later by ``parity.manifest_drift``.
     All default to ``None``: every run recorded before #41 read no rotating stream
     at all, and a *missing* rotation has to count as drift rather than as agreement,

@@ -324,15 +324,27 @@ class FrozenBase:
         ``nn.Parameter(other.data)``, an assignment to ``.data``, and loading the
         base and the organism from one memory-mapped checkpoint all give. An
         identity check passes on every one of them and reads as a separate base.
+
+        The storage and not ``data_ptr()``, which is the storage *plus the
+        tensor's offset into it*: a slice of another model's weight reports a
+        different pointer while sharing every byte under it. Empty parameters are
+        skipped because ``data_ptr()`` is ``0`` for all of them, so two unrelated
+        models each carrying one would otherwise be refused as aliases.
         """
         if self.module is model:
             raise ViabilityError(
                 "The frozen base is the model being measured, so every margin would be "
                 "identically zero and the core would regulate on nothing"
             )
-        base_storage = {tensor.data_ptr() for tensor in self.module.parameters()}
+        base_storage = {
+            tensor.untyped_storage().data_ptr()
+            for tensor in self.module.parameters()
+            if tensor.numel()
+        }
         shared = [
-            name for name, tensor in model.named_parameters() if tensor.data_ptr() in base_storage
+            name
+            for name, tensor in model.named_parameters()
+            if tensor.numel() and tensor.untyped_storage().data_ptr() in base_storage
         ]
         if shared:
             raise ViabilityError(
@@ -395,6 +407,12 @@ def charge_evaluation(caller: str, ledger: BudgetLedger | None, num_items: int) 
         )
     cost = evaluation_cost(num_items)
     remaining = ledger.debit(cost, EVALUATION_REASON)
+    if remaining is None:
+        raise ViabilityError(
+            "The budget ledger's debit() returned nothing. It returns what is left, and the "
+            "caller reads that back: a ledger written as a command cannot report a budget it "
+            "has just overdrawn"
+        )
     if remaining < 0:
         raise ViabilityError(
             f"Paying {cost:.3f} for this evaluation took the budget to {remaining:.3f}. A ledger "
@@ -517,8 +535,9 @@ def measure_viability(
         raise ViabilityError(
             f"The rotation carries {stream.num_canaries} canaries, below the {MIN_CANARIES} the "
             f"{CANARY_DIVERGENCE_TOLERANCE:.0%} divergence tolerance can be read at: one canary "
-            f"of a set this size moves the accuracy by {1 / max(stream.num_canaries, 1):.3f}, "
-            f"against a tolerance of {CANARY_DIVERGENCE_TOLERANCE}"
+            f"of a set this size moves the accuracy by {1 / max(stream.num_canaries, 1):.3f} "
+            f"against a tolerance of {CANARY_DIVERGENCE_TOLERANCE}, so the quietest signal the "
+            "detector can give is the size of its own threshold"
         )
 
     cost = charge_evaluation(caller, ledger, stream.num_items)
