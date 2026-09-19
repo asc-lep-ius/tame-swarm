@@ -1,0 +1,207 @@
+# Per-project quality gate commands. Anything left empty is skipped.
+# Sourced by .claude/hooks/gate-lib.sh and read by /ship.
+#
+# Installed by #50. Before it there was no `.claude/` path in this repo at all:
+# every turn ran with nothing checking the tree, and the pipeline was the only
+# gate the project had. Two of the three slots below are filled with commands
+# confirmed by running them on prometheus; the third is empty, and the whole
+# point of the note above it is that the reason lives in this file rather than
+# in somebody's memory.
+#
+# `.pre-commit-config.yaml` runs ruff and pyright too, and it is not what this
+# replaces: pre-commit fires once per commit, only in a clone where somebody ran
+# `pre-commit install`, and by then the turn that introduced the error is over.
+
+# uv lives in ~/.local/bin, which is on the PATH of a login shell but not of the
+# non-login shell a hook inherits. Setting it here rather than relying on the
+# caller's environment is deliberate: a gate that cannot find its own tools
+# fails every turn and reads as "your code is broken".
+export PATH="$HOME/.local/bin:$PATH"
+
+# Measured on prometheus, 2026-09-19, twice, the same figure both times:
+#   lint <1s · types 62s · total 62s
+# The gate is pyright and nothing else — ruff walks all 116 files in about 60 ms
+# with its cache deleted first, so there is no warm/cold distinction to record.
+LINT_CMD="uv run ruff check . && uv run ruff format --check ."
+
+# `tame scripts`, not a bare `pyright`: pyrightconfig.json includes only `tame`,
+# and scripts/ is where the measurement code lives — the sweeps and probes whose
+# numbers end up in the README. Naming both directories on the command line is
+# what the issues' verification block asks for and is what CI's reviewer reads.
+TYPE_CMD="uv run pyright tame scripts"
+
+# 75, against the 62s measured above. The default is 60, which this gate is over
+# on every single run, and a row that is advisory every time is a row that stops
+# being read. The margin is there to show drift from what the gate costs now,
+# not to leave room for it to grow.
+GATE_BUDGET_S="75"
+
+# Empty, and this is the measurement #50 exists to write down.
+#
+# The Stop hook's timeout is 300s (.claude/settings.json). sophia's gates.sh
+# records that a **143s** suite reliably pushed headless `/ship` turns into the
+# background and killed two consecutive attempts to ship an issue: the command
+# outlives the turn, the turn ends waiting for a notification from a process
+# that is gone. This repo's CPU suite is 860 tests and CI's `test` job measured
+# **894–1013s** in pipelines 462 and 466 (2026-09-16) — seven times the figure
+# that already broke it, and three times the timeout.
+#
+# The second measurement is the one that decides it, because a Stop hook runs
+# here and not on the runner: the same suite takes **161s** on prometheus
+# (2026-09-19, 852 passed + 3 xfailed, 2m40s wall against 30m34s of CPU — torch
+# is already spending eleven cores on it). That is still over the 143s, on the
+# fastest box this project has, with every core it owns — so #51 shortening the
+# CI job under pytest-xdist does not on its own make this fillable. Whatever
+# xdist buys on the runner, it is buying back the parallelism torch already
+# takes here, and here the answer is 161s.
+#
+# The suite is not ungated, it is gated one step later: CI's `test` job runs
+# `pytest tests/ -x --tb=short -m "not gpu"` on every push, and /ship's last step
+# triages that pipeline. `pyright tame scripts` above still covers both trees
+# statically, in-turn, which is the half of the answer a Stop hook can afford.
+#
+# If this is ever filled, raise the Stop hook's timeout in settings.json to match
+# — and expect headless `/ship` turns to start failing.
+TEST_CMD=""
+
+# One command, one file — post-edit-lint.sh applies these to the file just
+# written, never to the tree.
+FORMAT_CMD="uv run ruff format"
+LINT_FILE_CMD="uv run ruff check --fix"
+FORMAT_EXTENSIONS="py"
+
+# --- the opt-in suites --------------------------------------------------------
+# Neither of these is a gate. `run_all_gates` reads LINT_CMD, TYPE_CMD and
+# TEST_CMD and nothing else, so nothing below ever runs on Stop.
+
+# The GPU suite: 6 tests, the bitwise-determinism pair at the ablation
+# configuration and the four real-model tissue tests, all of which load
+# Qwen3-1.7B from the local HuggingFace cache. Measured 267s on the RTX 5070 Ti
+# (README), 296s here on 2026-09-19 through the guard below, and a 295s median
+# across the last 26 `test-gpu` jobs on the forge.
+#
+# Under 300s and so nominally inside the Stop hook's timeout, and still not
+# TEST_CMD: 295s is double the 143s that already broke two headless ships, and
+# it would put a five-minute model load in front of every tree change including
+# the ones that only touch a docstring. The shape MUTATION_CMD already has.
+#
+# It runs behind scripts/gpu_gate.sh, and that is the part worth reading. The
+# three CI jobs that touch the card share `resource_group: gpu`, which serialises
+# them against each other and knows nothing about a local process — and the
+# runner tagged `workstation` *is* this workstation. A local run that starts
+# while CI holds the group will not corrupt the numerics; it will OOM the job or
+# push it past the 300s budget its log asserts against, and a blown budget reads
+# as a performance regression in the code. The guard asks the forge who holds the
+# group and refuses rather than queueing, because a queue and a refusal reach a
+# terminal as the same wait. TAME_GPU_GATE_FORCE=1 is the way past it.
+GPU_CMD="scripts/gpu_gate.sh uv run pytest tests/ -x --tb=short -m gpu --durations=10"
+
+# What the six tests actually import, which is the only honest answer to "is this
+# worth 295 seconds". Read by a person and by /ship's definition of done; nothing
+# in the harness runs anything because a path here changed.
+#
+# One line, wide as it is: `glob_specs` splits on IFS and would take a wrapped
+# value, but `decision_doc` next door reads its list with `read -ra`, which stops
+# at the first newline. A path list that works in one helper and silently drops
+# half its entries in the other is not a distinction to leave lying in a file
+# people hand-edit.
+GPU_PATHS="tame/mob/** tame/steering.py tame/steering_pipeline.py tame/homeostat.py tame/pid_controller.py tame/coupling.py tame/determinism.py tame/train.py tame/behavioural_validation.py tame/contrastive_data.py tame/contrastive_templates.py tame/config.py scripts/smoke_fixture.py tests/test_determinism.py tests/test_real_model.py"
+
+# Empty: nothing here runs mutmut yet. The `mutants/` line in .gitignore is
+# aspiration rather than configuration. mob/auction.py and mob/wealth.py are the
+# branchy, deterministic candidates when somebody picks them up.
+MUTATION_CMD=""
+MUTATION_PATHS=""
+
+# --- the run contract ---------------------------------------------------------
+# Every slot empty, and deliberately rather than by omission.
+#
+# /ship step 2c starts the product and walks a flow on it to prove a change
+# works. There is a FastAPI surface here (tame/routes.py, tame/metrics_routes.py)
+# and a Gradio chat UI, but bringing either up means loading Qwen3-1.7B onto the
+# card — minutes, the GPU the CI jobs above are queueing for, and no sign-in to
+# walk past. What that proof would cover is covered instead by tests/test_api.py
+# and the metrics-surface tests, in the CPU suite, against the app factory.
+#
+# SURFACE_PATHS is empty for a second reason worth stating, because it is a
+# tripwire: foreman.sh makes a surface named with no RUN_CMD a **required**
+# finding, on the grounds that /ship skips the proof of use when RUN_CMD is
+# empty, so naming a surface here without a way to run it would stop step 0 on
+# every ship rather than buy anything.
+RUN_CMD=""
+STOP_CMD=""
+READY_URL=""
+SESSION_CMD=""
+SURFACE_PATHS=""
+
+# Empty, and not the same word as tame/parity.py — which is about arm
+# fingerprints and refuses a comparison whose arms differ in anything but the
+# gate. This key is about a test double drifting from the server it stands in
+# for, and there is no double here: tests/test_api.py drives the real app
+# factory through FastAPI's TestClient. Nothing to pin, rather than something
+# unpinned.
+PARITY_CMD=""
+PARITY_PATHS=""
+
+# The documents whose *meaning* is not an implementation branch's to change.
+# The default list is `*SPEC*.md docs/decisions/** DECISIONS.md` and would match
+# nothing in this repo, which would leave decision-doc-context.sh installed and
+# inert. docs/preregistration.md is the one that matters: a preregistration
+# edited to agree with the result it was registered against is the exact failure
+# it exists to prevent, and it is a file an implementation branch has every
+# ordinary reason to touch.
+DECISION_DOCS="docs/preregistration.md docs/phase-2-stakes-plan.md"
+
+# --- the pipeline this project pushes into ------------------------------------
+# Nothing here runs a pipeline or changes what CI does; these only say whether
+# something may stand still watching one, and where that standing still happens.
+
+# tip-only. The CPU suite is this project's largest check and CI is the only
+# place it runs, so the tip's pipeline is genuinely what stands between the work
+# and main — but at the median below, waiting on every phase of a stacked
+# milestone costs hours of the session window for an answer the tip repeats.
+CI_WAIT="tip-only"
+
+# 2700, against a default of 1800. The median is the number below; the slowest
+# successful MR pipeline in the same sample was 2146s, and 1800 would have
+# recorded that one as a timeout. A timeout never resolves to green, so erring
+# short turns a pipeline that passed into a run that reports it never saw one.
+CI_WAIT_TIMEOUT="2700"
+
+# The observed median MR pipeline, and what a proposal to tier this project's CI
+# has to argue against. Nothing reads it to decide anything.
+CI_MR_SECONDS="753  # median of 48 successful MR pipelines, 2026-09-19"
+
+# Empty, which is `yes`, and #50 did not flip it. Installing this file was the
+# precondition for flipping it — before today there was no local gate at all and
+# `yes` was the only honest answer — but it is not sufficient, for two reasons
+# that are worth writing down here rather than rediscovering.
+#
+# The first is the split, which is what a skip would be taking a chance on. Lint
+# and types run on every tree change, in-turn, over both `tame` and `scripts`.
+# The 860-test CPU suite and the 6-test GPU suite run nowhere but CI. Anything
+# tiered here would be tiered against static checks and never against the tests.
+#
+# The second is a trap, and it is why this is empty rather than `no` today.
+# `ci_policy_outcome` reads `no` on a **draft** MR as `draft-skipped` — "the
+# pipeline was skipped by policy" — and .gitlab-ci.yml here has no draft rule at
+# all: `workflow:` runs a full merge_request_event pipeline on a draft, and !31
+# is a draft with four of them. So `no` would not be inert while CI_TIER_PATHS is
+# empty, as it looks; it would write "no check ran" into the ledger on every
+# draft ship, for pipelines that ran and could have been red. That is the false
+# all-clear these keys exist to prevent, arriving through the key itself.
+#
+# To flip it: land mipkovich/claude-config#36, and either give .gitlab-ci.yml the
+# draft rule the value assumes or fix the assumption. Both are out of scope here,
+# where changing .gitlab-ci.yml is a non-goal.
+CI_IS_ONLY_GATE=""
+
+# Empty is `full-ci`, which is the label this project would use.
+CI_TIP_LABEL=""
+
+# Empty: .gitlab-ci.yml defers nothing today, so this project reads
+# `ci-policy=full` and behaves exactly as it did before these keys existed.
+# Tiering the GPU jobs to the stack tip is out of scope for #50, which installed
+# this file, and is blocked on mipkovich/claude-config#36 landing the
+# `ci-policy=` line.
+CI_TIER_PATHS=""
