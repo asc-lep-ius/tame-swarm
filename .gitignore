@@ -59,3 +59,11 @@ mutants/
 
 # ── MLflow local tracking store (#7) ───────────────────────────────────────
 mlruns/
+
+# ── Claude Code (#50) ───────────────────────────────────────────────────────
+# The gate itself is tracked; only what a session writes is not. `.claude/state/`
+# is per-session marker files keyed to a working-tree fingerprint, and
+# settings.local.json is one machine's overrides — committing either would hand
+# the next checkout a pass it never earned.
+.claude/state/
+.claude/settings.local.json
