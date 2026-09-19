@@ -428,3 +428,67 @@ def test_a_goal_field_recruits_the_type_it_pays_for():
 def test_the_fixture_refuses_a_goal_on_a_type_it_did_not_plant():
     with pytest.raises(ValueError, match="expert_type"):
         _differentiated(0, None).add_goal_field(9, setpoint=0.5, dose=0.1)
+
+
+# --- The recorded fixture result (scripts/measure_stakes_dial.py, code 4fd65a5) ----------
+
+# Seed 0 of the recorded run, 600 steps, tail 100, reference dose 0.25, setpoint
+# 0.5, ratios 1/2/4: the rows README#stakes-dial-cell quotes. Single-threaded
+# under xdist the run reproduces them to four decimals; the tolerance is for a
+# BLAS whose reduction order differs from this box's.
+RECORDED_TV_AT_RATIO_4 = {"value": 0.276, "decoupled": 0.320}
+RECORDED_TAIL_LOSS_AT_RATIO_1 = {"value": 0.2102, "decoupled": 0.1801, "shuffled": 0.3848}
+RECORDED_ON_TYPE_AT_RATIO_1 = {"value": 0.602, "decoupled": 0.717}
+RECORDED_ABSTENTION_FLOOR_MINUS_MIDDLE = {"value": 0.3205, "decoupled": 0.1426}
+RECORDED_TOLERANCE = 0.01
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("arm", ["value", "decoupled"])
+def test_the_recorded_allocation_shift_reproduces(arm):
+    """Seed 0 of the recorded run: the shift at ratio 4, and the decoupled arm's larger.
+
+    The pairing the fixture result rests on. Split per arm so xdist spreads the
+    600-step runs; the cross-arm ordering is asserted on the recorded rows, which
+    each item reproduces to the tolerance above.
+    """
+    from allocation_shift import total_variation
+    from measure_stakes_dial import run_differentiated
+
+    at_one, _ = run_differentiated(arm, 1.0, 0)
+    at_four, _ = run_differentiated(arm, 4.0, 0)
+
+    shift = total_variation(at_one, at_four)
+    assert shift == pytest.approx(RECORDED_TV_AT_RATIO_4[arm], abs=RECORDED_TOLERANCE), shift
+    assert RECORDED_TV_AT_RATIO_4["decoupled"] > RECORDED_TV_AT_RATIO_4["value"]
+    loss, on_type = at_one["eval/loss"], at_one["routing/on_type_share"]
+    assert loss == pytest.approx(RECORDED_TAIL_LOSS_AT_RATIO_1[arm], abs=RECORDED_TOLERANCE), loss
+    assert on_type == pytest.approx(RECORDED_ON_TYPE_AT_RATIO_1[arm], abs=RECORDED_TOLERANCE)
+
+
+@pytest.mark.slow
+def test_the_shuffled_arm_has_the_highest_recorded_loss():
+    """A head regressed onto noise about itself cannot allocate: the control loses most."""
+    from measure_stakes_dial import run_differentiated
+
+    at_one, _ = run_differentiated("shuffled", 1.0, 0)
+
+    loss = at_one["eval/loss"]
+    assert loss == pytest.approx(RECORDED_TAIL_LOSS_AT_RATIO_1["shuffled"], abs=RECORDED_TOLERANCE)
+    recorded = RECORDED_TAIL_LOSS_AT_RATIO_1
+    assert recorded["decoupled"] < recorded["value"] < recorded["shuffled"]
+
+
+@pytest.mark.slow
+@pytest.mark.parametrize("arm", ["value", "decoupled"])
+def test_the_recorded_abstention_reading_reproduces(arm):
+    """Signature 3's abstention row at seed 0, and #15's band in the value arm."""
+    from measure_stakes_dial import run_quality
+
+    reading = run_quality(arm, 0, 600)
+
+    assert reading.abstention_floor_minus_middle == pytest.approx(
+        RECORDED_ABSTENTION_FLOOR_MINUS_MIDDLE[arm], abs=RECORDED_TOLERANCE
+    )
+    if arm == "value":
+        assert reading.wealth_vs_competence > 0.5, "#15's band, the value arm unchanged"
