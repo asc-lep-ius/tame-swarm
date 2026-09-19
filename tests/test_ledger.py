@@ -441,3 +441,44 @@ def test_two_arms_that_relax_toward_different_things_are_not_at_parity():
         assert_parity([BASE, replace(decoupled, ledger_mode=LEDGER_SETPOINT)])
 
     assert BASE.ledger_mode == LEDGER_DECAY, "a fingerprint recorded before the mode is a decay one"
+
+
+# --- The recorded ledger-stability row (README #ledger-stability) -------------------------
+
+# The quality fixture at the shipped constants, 2667 steps -- eight memory
+# horizons -- read over a 333-step tail, under the setpoint ledger at seed 0. The
+# row rests on the closed form predicting a *live* economy's settled ledger, so
+# what is pinned is the prediction's error and not the wealth: a fixture whose
+# inflow moved would move both together, and only the error says the algebra is
+# right. Six of eight cells are unclamped under this mode, which is what makes
+# the check non-empty; the two monopolists rest on the ceiling with their
+# equilibrium above it.
+RECORDED_CLOSED_FORM_ERROR = 0.02
+RECORDED_UNCLAMPED_CELLS = 6
+
+
+@pytest.mark.slow
+def test_the_closed_form_predicts_the_setpoint_arms_settled_ledger():
+    """README #ledger-stability's measured claim, at seed 0.
+
+    Solved from the run's own reward and price coefficient, not from constants
+    chosen to fit: a cell that is not held by a bound settles where
+    ``rho w^2 - (rho S + R) w + kappa = 0`` says it does.
+    """
+    from measure_ledger_stability import measure
+
+    reading = measure(LEDGER_SETPOINT, seed=0)
+
+    unclamped = [cell for cell in reading.cells if not cell.clamped]
+    assert len(unclamped) == RECORDED_UNCLAMPED_CELLS, [cell.wealth for cell in reading.cells]
+    for cell in unclamped:
+        assert cell.relative_error < RECORDED_CLOSED_FORM_ERROR, cell
+
+    for cell in reading.cells:
+        if cell.clamped:
+            assert cell.settles_at > BASE_CONFIG.max_wealth, cell
+
+    # The other half of the row: the ledger moved and the allocation did not.
+    assert reading.market_holders == 2
+    assert reading.least_share < 0.01
+    assert reading.wealth_vs_competence > 0.5
