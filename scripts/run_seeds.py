@@ -50,6 +50,7 @@ from smoke_fixture import build_smoke_fixture  # noqa: E402
 from coupling import DEFAULT_COUPLING_BETA, DEFAULT_WARMUP_STEPS  # noqa: E402
 from determinism import DETERMINISM_DEFAULT, DETERMINISM_MODES  # noqa: E402
 from mob.auction import EXPLORATION_DRAW_STALENESS, SUPPORTED_EXPLORATION_DRAWS  # noqa: E402
+from mob.wealth import PERSISTENCE_VALUE, SUPPORTED_PERSISTENCE_COUPLINGS  # noqa: E402
 from parity import arm_label  # noqa: E402
 from train import TAMETrainer, TrainingConfig  # noqa: E402
 
@@ -264,6 +265,18 @@ def build_parser() -> argparse.ArgumentParser:
             "which a new arm compared against one must pass, the draw being in the fingerprint"
         ),
     )
+    # #39's stakes dial: the one field the three stakes arms differ in.
+    parser.add_argument(
+        "--persistence_coupling",
+        type=str,
+        choices=sorted(SUPPORTED_PERSISTENCE_COUPLINGS),
+        default=PERSISTENCE_VALUE,
+        help=(
+            "Whether a cell's continuation depends on its realised value: value (the "
+            "economy as recorded), decoupled (pinned wealth, uniform re-entry, a shadow "
+            "ledger) or shuffled (regression targets permuted across experts each step)"
+        ),
+    )
     # The coupled arm of #6's ablation: the same auction, with the routing
     # coupling seeded from a certified direction (#14). Everything else is shared
     # with the uncoupled arm, which is what makes the two summaries comparable.
@@ -377,6 +390,7 @@ def main() -> None:
         use_lora=args.use_lora,
         deterministic=args.deterministic,
         exploration_draw=args.exploration_draw,
+        persistence_coupling=args.persistence_coupling,
         coupling_goal=args.coupling_goal,
         coupling_beta=args.coupling_beta,
         coupling_warmup_steps=args.coupling_warmup_steps,
@@ -403,7 +417,7 @@ def main() -> None:
             replicate_seed, config, per_seed[replicate_seed], fingerprints[replicate_seed]
         )
 
-    arm = arm_label(args.router, args.coupling_goal, args.steer_goal)
+    arm = arm_label(args.router, args.coupling_goal, args.steer_goal, args.persistence_coupling)
     if args.primary is not None and args.primary not in stats:
         logger.warning(
             f"the declared primary metric {args.primary!r} is not among the metrics this "
@@ -431,6 +445,7 @@ def main() -> None:
                 "router": args.router,
                 "coupling_goal": args.coupling_goal,
                 "steer_goal": args.steer_goal,
+                "persistence_coupling": args.persistence_coupling,
                 "trace_goal": config.trace_goal or config.coupling_goal or config.steer_goal,
                 "seeds": seeds,
                 "steps": args.steps,

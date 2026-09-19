@@ -52,7 +52,9 @@ DATA_ORDER_PROBE_BATCHES = 8
 # asserted among the coupled arms only (``COUPLING_FIELDS``): an uncoupled arm
 # carries them inert, as the softmax arm carries the auction-only fields, and
 # #32 reads each dose against the one uncoupled reference.
-VARYING_FIELDS = frozenset({"router", "coupling_goal", "steer_goal"})
+# ``persistence_coupling`` is #39's stakes dial: whether a cell's continuation
+# depends on its realised value, the one thing the three stakes arms differ in.
+VARYING_FIELDS = frozenset({"router", "coupling_goal", "steer_goal", "persistence_coupling"})
 
 # The coupling's own parameters, asserted only between arms that have a
 # coupling. An uncoupled arm has no dose; a default it carries inert must not
@@ -122,14 +124,21 @@ NOT_A_CONFOUND = {
 }
 
 
-def arm_label(router: str, coupling_goal: str | None = None, steer_goal: str | None = None) -> str:
+def arm_label(
+    router: str,
+    coupling_goal: str | None = None,
+    steer_goal: str | None = None,
+    persistence_coupling: str = "value",
+) -> str:
     """What an arm is called in tables and summaries.
 
     The gate, plus the goal it is coupled to (``mob+truthful``), plus the field it
-    was trained in (``mob@truthful``, ``mob+truthful@truthful``).
+    was trained in (``mob@truthful``, ``mob+truthful@truthful``), plus the stakes
+    dial when it is not the live economy (``mob~decoupled``, ``mob@truthful~shuffled``).
     """
     label = router if coupling_goal is None else f"{router}+{coupling_goal}"
-    return label if steer_goal is None else f"{label}@{steer_goal}"
+    label = label if steer_goal is None else f"{label}@{steer_goal}"
+    return label if persistence_coupling == "value" else f"{label}~{persistence_coupling}"
 
 
 class ParityError(AssertionError):
@@ -241,10 +250,19 @@ class ArmFingerprint:
     # #38. A run recorded before the draw was a field ran under the uniform draw,
     # so a legacy fingerprint reads as one; it is a confound like any other field.
     exploration_draw: str = "uniform"
+    # #39. Every run recorded before the dial existed was the live economy under a
+    # new name, so a legacy fingerprint reads as ``value``. The dial varies; the
+    # doses of the goal fields the arms were paid under (#33) are asserted equal,
+    # as the coupling's dose is: two arms at different doses are a sweep, not the
+    # contrast. Empty when no goal field was attached.
+    persistence_coupling: str = "value"
+    goal_doses: tuple[float, ...] = ()
 
     @property
     def arm(self) -> str:
-        return arm_label(self.router, self.coupling_goal, self.steer_goal)
+        return arm_label(
+            self.router, self.coupling_goal, self.steer_goal, self.persistence_coupling
+        )
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -312,6 +330,7 @@ def fingerprint_arm(
         calibration_loss_weight=config.calibration_loss_weight,
         exploration_rate=config.exploration_rate,
         exploration_draw=config.exploration_draw,
+        persistence_coupling=config.persistence_coupling,
         confidence_head_learning_rate=config.confidence_head_learning_rate,
         wealth_update_frequency=config.wealth_update_frequency,
         coupling_goal=config.coupling_goal,

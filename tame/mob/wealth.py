@@ -16,6 +16,26 @@ LOCAL_REWARD_MULTIPLIER = 5.0
 PARTICIPATION_REWARD_MULTIPLIER = 10.0
 WEALTH_EPSILON = 1e-6
 
+# The stakes dial (#39): whether a cell's continuation depends on its realised
+# value. "value" is the economy as it has always run -- the gate reads the ledger,
+# so what a cell reports changes whether it keeps holding tokens. "decoupled" is
+# the control: the gate reads ``initial_wealth`` for every expert, so relative
+# wealth is equal and the allocation is the report ranking alone; the exploration
+# draw is uniform, so re-entry owes nothing to the ledger either; and the ledger
+# itself still settles every step -- payments, rebates, rewards, the clamp -- as a
+# **shadow ledger**, the wealth a cell would have had, logged and never read by
+# the gate. The head's value regression is untouched: the cell perceives value and
+# is not paid in continuation, which is the whole experiment. "shuffled" keeps the
+# economy live and permutes the regression's targets across experts each step,
+# so the cell is paid in continuation for a value signal that is noise about
+# itself -- the control for a signature that is really the head's regression.
+PERSISTENCE_VALUE = "value"
+PERSISTENCE_DECOUPLED = "decoupled"
+PERSISTENCE_SHUFFLED = "shuffled"
+SUPPORTED_PERSISTENCE_COUPLINGS = frozenset(
+    {PERSISTENCE_VALUE, PERSISTENCE_DECOUPLED, PERSISTENCE_SHUFFLED}
+)
+
 
 class ValueSummary(NamedTuple):
     """What the last loss-feedback update paid for, averaged over the slots it priced.
@@ -84,10 +104,54 @@ class WealthUpdateMixin:
     _cached_rebates: torch.Tensor | None
     _cached_explored: torch.Tensor | None
     _cached_values: torch.Tensor | None
+    _cached_goal_terms: torch.Tensor | None
     _loss_feedback_pending: bool
     _cached_calibration_loss: torch.Tensor | None
     last_value_summary: ValueSummary | None
     last_realised_values: torch.Tensor | None
+    last_goal_terms: torch.Tensor | None
+
+    def allocation_wealth(self) -> torch.Tensor:
+        """The wealth the gate reads: the ledger, or under ``decoupled`` a pinned one.
+
+        Pinned at ``initial_wealth`` rather than at any other constant so that the
+        decoupled arm's first auction is the live arm's: at step 0 every ledger
+        holds ``initial_wealth`` anyway, and prices are ratios of wealths, so the
+        shadow ledger's first settlement is identically the live one's -- the
+        invariant ``test_the_shadow_ledger_is_the_live_ledger_at_step_zero`` pins.
+        """
+        if self.config.persistence_coupling == PERSISTENCE_DECOUPLED:
+            return torch.full_like(self.expert_wealth, self.config.initial_wealth)
+        return self.expert_wealth
+
+    def allocation_staleness(self) -> torch.Tensor | None:
+        """The staleness the exploration draw reads; ``None`` draws uniformly (#38).
+
+        Under ``decoupled`` re-entry is uniform: a cell that has been shut out is
+        re-sampled no faster than one that has not, so nothing the ledger records
+        reaches the allocation by this channel either. The ledger still ages, for
+        the shadow.
+        """
+        if self.config.persistence_coupling == PERSISTENCE_DECOUPLED:
+            return None
+        return self.expert_steps_since_held
+
+    def _value_target_sources(self) -> torch.Tensor:
+        """Which expert's realised values each head regresses onto.
+
+        Its own, except under ``shuffled``: a cyclic shift by a fresh draw in
+        ``[1, num_experts)`` each step, which is a derangement in one draw -- no
+        head ever sees its own value, and each sees every other expert's equally
+        often over steps. The draw is from the global stream, as the exploration
+        draw is, so the shuffled arm's trajectory diverges from the live arm's from
+        the first settlement and never by a hidden constant.
+        """
+        num_experts = self.config.num_experts
+        experts = torch.arange(num_experts, device=self.expert_wealth.device)
+        if self.config.persistence_coupling != PERSISTENCE_SHUFFLED:
+            return experts
+        shift = int(torch.randint(1, num_experts, (1,)).item())
+        return (experts + shift) % num_experts
 
     def _transfer_coefficient(self, reward_multiplier: float) -> float:
         """The single scale that makes ``reward - charge`` a quasi-linear utility.
@@ -232,9 +296,13 @@ class WealthUpdateMixin:
             return
         live_confidences = live_confidences[:, :seq_len, :]
 
+        sources = self._value_target_sources()
         expert_terms = []
         for expert_idx in range(self.config.num_experts):
-            held_slots = selected_experts == expert_idx
+            # Under the shuffled arm the head is trained on another expert's
+            # tokens and targets (#39); otherwise ``source`` is the head's own.
+            source = int(sources[expert_idx])
+            held_slots = selected_experts == source
             held = held_slots.any(dim=-1) & valid_mask
             if not held.any():
                 continue
@@ -259,6 +327,7 @@ class WealthUpdateMixin:
         self._live_confidences = None
         self._cached_calibration_loss = None
         self._cached_values = None
+        self._cached_goal_terms = None
 
     def update_wealth_from_loss(
         self,
@@ -336,6 +405,13 @@ class WealthUpdateMixin:
             routing_weights = routing_weights[:, :seq_len, :]
             confidences = confidences[:, :seq_len, :]
             values = values[:, :seq_len, :].float() * loss_gradient_scale
+            # The goal term (#33, ``mob.goal``) is already in per-token loss units
+            # -- the dose prices a unit of goal error in them -- so it joins the
+            # value after the gradient has been restated in those units, not before.
+            goal_terms = self._cached_goal_terms
+            if goal_terms is not None:
+                goal_terms = goal_terms[:, :seq_len, :]
+                values = values + goal_terms
             if payments is not None:
                 payments = payments[:, :seq_len, :]
             if rebates is not None:
@@ -387,11 +463,13 @@ class WealthUpdateMixin:
             self.expert_wealth.clamp_(min=self.config.min_wealth, max=self.config.max_wealth)
 
             self.last_realised_values = values
+            self.last_goal_terms = goal_terms
             self.last_value_summary = self._summarise_values(
                 values, confidences, selected_experts, payments, explored, valid_mask
             )
             self._loss_feedback_pending = False
             self._cached_values = None
+            self._cached_goal_terms = None
 
         self._compute_and_cache_calibration_loss(values, selected_experts, valid_mask)
 

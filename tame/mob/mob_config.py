@@ -9,6 +9,7 @@ from .auction import (
     SUPPORTED_ROUTING_SHARES,
 )
 from .softmax_router import ROUTER_AUCTION, SUPPORTED_ROUTERS
+from .wealth import PERSISTENCE_SHUFFLED, PERSISTENCE_VALUE, SUPPORTED_PERSISTENCE_COUPLINGS
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +39,7 @@ AUCTION_ONLY_FIELDS = (
     "use_differentiable_routing",
     "exploration_rate",
     "exploration_draw",
+    "persistence_coupling",
     # Reached only below the has_economy early return in update_wealth_from_loss, so
     # under the softmax gate the cached loss stays None and the trainer adds zero.
     "confidence_calibration_weight",
@@ -244,6 +246,13 @@ class MoBConfig:
     # expert is re-sampled faster than a merely unlucky one -- the constitution's
     # re-entry property. "uniform" is what every arm before #38 ran under.
     exploration_draw: str = EXPLORATION_DRAW_STALENESS
+    # The stakes dial (#39): does a cell's continuation depend on its realised
+    # value? "value" is today's economy. "decoupled" pins the wealth the gate
+    # reads at initial_wealth and draws re-entry uniformly, and the ledger
+    # settles on as a shadow -- what is logged under decoupled is the wealth a
+    # cell would have had. "shuffled" keeps the economy live and permutes the
+    # heads' regression targets across experts each step. See mob/wealth.py.
+    persistence_coupling: str = PERSISTENCE_VALUE
     # Which gate turns reports into an allocation. "auction" is MoB. "softmax" is
     # the #12 control arm: the same confidence heads, softmaxed, with the whole
     # economy switched off -- no wealth read, no payment, no rebate, no value
@@ -309,6 +318,17 @@ class MoBConfig:
         if self.router not in SUPPORTED_ROUTERS:
             routers = ", ".join(sorted(SUPPORTED_ROUTERS))
             raise ValueError(f"Unsupported router '{self.router}'. Supported: {routers}")
+
+        if self.persistence_coupling not in SUPPORTED_PERSISTENCE_COUPLINGS:
+            couplings = ", ".join(sorted(SUPPORTED_PERSISTENCE_COUPLINGS))
+            raise ValueError(
+                f"Unsupported persistence coupling '{self.persistence_coupling}'. "
+                f"Supported: {couplings}"
+            )
+        # A permutation across experts with no other expert to draw from is the
+        # identity, and the shuffled arm would silently be the value arm.
+        if self.persistence_coupling == PERSISTENCE_SHUFFLED and self.num_experts < 2:
+            raise ValueError("the shuffled arm needs at least two experts to permute across")
 
         self._warn_about_ignored_auction_settings()
 

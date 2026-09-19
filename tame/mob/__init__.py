@@ -25,6 +25,7 @@ from .auction import (
 )
 from .core import MixtureOfBidders, MoBStats, apply_mob_to_model, ledger_initial_values
 from .experts import ConfidenceHead, Expert, LightweightExpert
+from .goal import ConstantGoalField, GoalField, goal_error_reduction, goal_terms
 from .mob_config import MoBConfig
 from .routing_trace import (
     DEFAULT_TRACE_TOKENS,
@@ -57,6 +58,12 @@ from .utils import (
     save_mob_state,
     update_all_mob_from_loss,
 )
+from .wealth import (
+    PERSISTENCE_DECOUPLED,
+    PERSISTENCE_SHUFFLED,
+    PERSISTENCE_VALUE,
+    SUPPORTED_PERSISTENCE_COUPLINGS,
+)
 
 __all__ = [
     "MoBConfig",
@@ -84,6 +91,14 @@ __all__ = [
     "detach_coupling",
     "MoBStats",
     "MixtureOfBidders",
+    "GoalField",
+    "ConstantGoalField",
+    "goal_error_reduction",
+    "goal_terms",
+    "PERSISTENCE_VALUE",
+    "PERSISTENCE_DECOUPLED",
+    "PERSISTENCE_SHUFFLED",
+    "SUPPORTED_PERSISTENCE_COUPLINGS",
     "apply_mob_to_model",
     "ledger_initial_values",
     "get_mob_layers",

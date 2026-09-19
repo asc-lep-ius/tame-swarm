@@ -23,6 +23,7 @@ from .auction import (
     routing_diagnostics,
 )
 from .experts import ConfidenceHead, Expert, LightweightExpert
+from .goal import GoalField, goal_terms
 from .mob_config import MoBConfig
 from .routing_trace import DEFAULT_TRACE_TOKENS, RoutingTrace
 from .softmax_router import SoftmaxRouter
@@ -208,6 +209,12 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         # value every winner realised on every token. Read by the wealth update,
         # which therefore has to run after the backward.
         self._cached_values: torch.Tensor | None = None
+        # The goal fields attached to this layer (#33, ``mob.goal``), and what they
+        # priced on the last forward: added to every winner's value at settlement.
+        # Empty by default, so the value definition is what it always was.
+        self.goal_fields: list[GoalField] = []
+        self._cached_goal_terms: torch.Tensor | None = None
+        self.last_goal_terms: torch.Tensor | None = None
         self._loss_feedback_pending: bool = False
         self._cached_calibration_loss: torch.Tensor | None = None
         self._cached_router_z_loss: torch.Tensor | None = None
@@ -243,6 +250,7 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
             self._cached_calibration_loss = None
             self._live_confidences = None
             self._cached_values = None
+            self._cached_goal_terms = None
 
         # The routing path observes the representation; it does not reshape it. Every
         # head reads the same hidden states, so without this detach each expert's
@@ -322,6 +330,10 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         if collect_contributions:
             assert contributions is not None and live_confidences is not None
             self._cache_loss_feedback(outcome, confidences, live_confidences)
+            with torch.no_grad():
+                self._cached_goal_terms = goal_terms(
+                    contributions, routing_weights.detach(), self.goal_fields, routing_hidden_states
+                )
             self._register_value_hook(output, contributions)
         elif expects_feedback:
             self._warn_once(
@@ -502,7 +514,7 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         """
         if self.config.has_economy:
             return cast(VCGAuctioneer, self.gate)(
-                confidences, self.expert_wealth, staleness=self.expert_steps_since_held
+                confidences, self.allocation_wealth(), staleness=self.allocation_staleness()
             )
         return cast(SoftmaxRouter, self.gate)(confidence_logits)
 
@@ -544,6 +556,16 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
             delattr(self, "coupling")
         self._last_coupling_metrics = None
         self.last_stats = None
+
+    def attach_goal_field(self, field: GoalField) -> None:
+        """Add a goal field to what every winner is paid for, from the next settlement."""
+        if field.dose < 0.0:
+            raise ValueError(f"a goal field's dose must be non-negative, got {field.dose}")
+        self.goal_fields.append(field)
+
+    def detach_goal_fields(self) -> None:
+        self.goal_fields = []
+        self._cached_goal_terms = None
 
     def get_router_z_loss(self) -> torch.Tensor:
         if self._cached_router_z_loss is None:
