@@ -42,7 +42,7 @@ GATE_BUDGET_S="75"
 # records that a **143s** suite reliably pushed headless `/ship` turns into the
 # background and killed two consecutive attempts to ship an issue: the command
 # outlives the turn, the turn ends waiting for a notification from a process
-# that is gone. This repo's CPU suite is 860 tests and CI's `test` job measured
+# that is gone. This repo's CPU suite is 855 tests and CI's `test` job measured
 # **894–1013s** in pipelines 462 and 466 (2026-09-16) — seven times the figure
 # that already broke it, and three times the timeout.
 #
@@ -50,18 +50,28 @@ GATE_BUDGET_S="75"
 # here and not on the runner: the same suite takes **161s** on prometheus
 # (2026-09-19, 852 passed + 3 xfailed, 2m40s wall against 30m34s of CPU — torch
 # is already spending eleven cores on it). That is still over the 143s, on the
-# fastest box this project has, with every core it owns — so #51 shortening the
-# CI job under pytest-xdist does not on its own make this fillable. Whatever
-# xdist buys on the runner, it is buying back the parallelism torch already
-# takes here, and here the answer is 161s.
+# fastest box this project has, with every core it owns.
 #
-# The suite is not ungated, it is gated one step later: CI's `test` job runs
-# `pytest tests/ -x --tb=short -m "not gpu"` on every push, and /ship's last step
-# triages that pipeline. `pyright tame scripts` above still covers both trees
-# statically, in-turn, which is the half of the answer a Stop hook can afford.
+# **#51 changed that, and the number is recorded here rather than left to
+# contradict the paragraph above it.** Under `-n auto` with each worker pinned to
+# one torch thread (tests/conftest.py), the same 855 tests take **33s** on the
+# same box — 12 workers, 3m49s of CPU against the serial run's 30m34s, because
+# the tensors are hidden_dim 32 and torch's intra-op pool was claiming the cores
+# a second time. A fifth of the figure that broke two ships, and the whole gate
+# would come to about 95s against a 300s timeout.
 #
-# If this is ever filled, raise the Stop hook's timeout in settings.json to match
-# — and expect headless `/ship` turns to start failing.
+# It is still empty, and that is now a decision rather than a constraint. Filling
+# it puts 855 tests and twelve worker processes in front of every tree change in
+# this repo, including the ones that only touch a docstring, and neither #50 nor
+# #51 asked for that. Whoever fills it should: set
+#   TEST_CMD="uv run pytest tests/ --tb=short -m 'not gpu' -n auto"
+# raise GATE_BUDGET_S past 95, and re-measure, because the 33s above is one box
+# on one day.
+#
+# The suite is not ungated meanwhile, it is gated one step later: CI's `test` job
+# runs it on every push, and /ship's last step triages that pipeline. `pyright
+# tame scripts` above still covers both trees statically, in-turn, which is the
+# half of the answer a Stop hook could always afford.
 TEST_CMD=""
 
 # One command, one file — post-edit-lint.sh applies these to the file just
@@ -105,7 +115,7 @@ GPU_CMD="scripts/gpu_gate.sh uv run pytest tests/ -x --tb=short -m gpu --duratio
 # at the first newline. A path list that works in one helper and silently drops
 # half its entries in the other is not a distinction to leave lying in a file
 # people hand-edit.
-GPU_PATHS="tame/mob/** tame/steering.py tame/steering_pipeline.py tame/homeostat.py tame/pid_controller.py tame/coupling.py tame/determinism.py tame/train.py tame/behavioural_validation.py tame/contrastive_data.py tame/contrastive_templates.py tame/config.py scripts/smoke_fixture.py tests/test_determinism.py tests/test_real_model.py"
+GPU_PATHS="tame/mob/** tame/steering.py tame/steering_pipeline.py tame/homeostat.py tame/pid_controller.py tame/coupling.py tame/determinism.py tame/train.py tame/behavioural_validation.py tame/contrastive_data.py tame/contrastive_templates.py tame/config.py scripts/smoke_fixture.py tests/conftest.py tests/test_determinism.py tests/test_real_model.py"
 
 # Empty: nothing here runs mutmut yet. The `mutants/` line in .gitignore is
 # aspiration rather than configuration. mob/auction.py and mob/wealth.py are the
@@ -179,7 +189,7 @@ CI_MR_SECONDS="753  # median of 48 successful MR pipelines, 2026-09-19"
 #
 # The first is the split, which is what a skip would be taking a chance on. Lint
 # and types run on every tree change, in-turn, over both `tame` and `scripts`.
-# The 860-test CPU suite and the 6-test GPU suite run nowhere but CI. Anything
+# The 855-test CPU suite and the 6-test GPU suite run nowhere but CI. Anything
 # tiered here would be tiered against static checks and never against the tests.
 #
 # The second is a trap, and it is why this is empty rather than `no` today.
