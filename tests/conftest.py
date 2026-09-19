@@ -1,3 +1,4 @@
+import os
 import sys
 from pathlib import Path
 
@@ -8,6 +9,16 @@ from hypothesis import settings
 sys.path.insert(0, str(Path(__file__).parent.parent / "tame"))
 
 from mob import MixtureOfBidders, MoBConfig
+
+# Under xdist every worker is its own process and torch sizes its intra-op pool
+# from the whole box in each of them, so the parallelism is claimed twice. On the
+# 24-thread workstation that turned a 161 s suite into 419 s and burned five
+# times the CPU doing it (#51). One thread per worker hands the parallelism to
+# xdist, which is the thing counting cores once. A serial run is untouched, and
+# so is ``-m gpu``: the GPU suite is never invoked under xdist, and must not be
+# -- it shares ``resource_group: gpu`` and asserts against a measured budget.
+if os.environ.get("PYTEST_XDIST_WORKER"):
+    torch.set_num_threads(1)
 
 # Property-based tests build a MoB layer and run torch per example, which is far
 # slower than hypothesis's default 200 ms deadline expects and varies with the

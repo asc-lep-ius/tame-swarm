@@ -107,7 +107,20 @@ test:
   tags: [hephaestus]
   extends: .python-job
   script:
-    - uv run pytest tests/ -x --tb=short -m "not gpu"
+    # #51: this job was the critical path of every pipeline -- 894-1013s against
+    # a 904s pipeline wall clock, with nothing else finishing after it. `auto` is
+    # physical cores, which xdist reads through psutil rather than off the host's
+    # thread count. The speedup is only there because tests/conftest.py pins each
+    # worker to one torch thread: the tensors here are hidden_dim 32, so torch's
+    # intra-op pool buys nothing and claims the cores twice. Measured on the
+    # workstation, 855 tests: 161s serial, 419s under `-n auto` without the pin,
+    # 33s with it.
+    #
+    # `-x` stays. Under xdist it ends the session on the first failure while
+    # workers already in flight finish theirs, so a run can report more than one
+    # failure -- more information rather than less, and it still does the thing
+    # `-x` is for, which is not spending the rest of the suite on a broken tree.
+    - uv run pytest tests/ -x --tb=short -m "not gpu" -n auto
 
 # On the workstation, not the hephaestus box: the locked torch is the CUDA 12.8
 # build, whose wheels ship kernels for sm_70 and up, and hephaestus carries a
