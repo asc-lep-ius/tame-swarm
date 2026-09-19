@@ -47,29 +47,43 @@ GATE_BUDGET_S="110"
 # records that a **143s** suite reliably pushed headless `/ship` turns into the
 # background and killed two consecutive attempts to ship an issue: the command
 # outlives the turn, the turn ends waiting for a notification from a process
-# that is gone. This repo's CPU suite is 855 tests and CI's `test` job measured
-# **894–1013s** in pipelines 462 and 466 (2026-09-16) — seven times the figure
-# that already broke it, and three times the timeout.
+# that is gone. This repo's CPU suite is 855 tests of the 861 collected — the
+# other six are `-m gpu` — and CI's `test` job measured **894–1013s** in
+# pipelines 462 and 466 (2026-09-16): seven times the figure that already broke
+# it, and three times the timeout.
 #
-# The second measurement is the one that decides it, because a Stop hook runs
-# here and not on the runner: the same suite takes **161s** on prometheus
-# (2026-09-19, 852 passed + 3 xfailed, 2m40s wall against 30m34s of CPU — torch
-# is already spending eleven cores on it). That is still over the 143s, on the
-# fastest box this project has, with every core it owns.
+# The local figure is the one that decides it, because a Stop hook runs here and
+# not on the runner. **Which invocation, exactly**, because the two differ and a
+# reader who measures one and reads the other will think the file is wrong:
 #
-# **#51 changed that, and the number is recorded here rather than left to
-# contradict the paragraph above it.** Under `-n auto` with each worker pinned to
-# one torch thread (tests/conftest.py), the same 855 tests take **33s** on the
-# same box — 12 workers, 3m49s of CPU against the serial run's 30m34s, because
-# the tensors are hidden_dim 32 and torch's intra-op pool was claiming the cores
-# a second time. A fifth of the figure that broke two ships, and the whole gate
-# comes to 98s against a 300s timeout.
+#   uv run pytest tests/ -m "not gpu"   852 passed + 3 xfailed   161s   ← CI's
+#   uv run pytest                       851 passed + 3 xfailed   137s
+#
+# Both on prometheus, 2026-09-19. The gap is the single `slow` test that
+# pyproject's `addopts` also deselect (tests/test_mixture.py:464). The first is
+# the one to compare against CI, and 2m40s of wall against 30m34s of CPU says
+# torch is already spending eleven cores on it.
+#
+# Neither is what a Stop invocation costs, and that is the number that decides
+# the slot either way: `run_all_gates` runs lint and types first, so a *serial*
+# suite here would make one Stop hook 62s + 161s ≈ **223s** against a 300s
+# timeout — seventy seconds of headroom for a suite whose own run-to-run spread
+# is tens of seconds, and half again past the 143s that already lost two ships.
+# On those numbers #50 left the slot empty, and that reasoning is kept because
+# it is the case for emptying it again.
+#
+# **#51 changed the input to it.** Under `-n auto` with each worker pinned to one
+# torch thread (tests/conftest.py), the same 855 tests take **33s** on the same
+# box — 12 workers, 3m49s of CPU against the serial run's 30m34s, because the
+# tensors are hidden_dim 32 and torch's intra-op pool was claiming the cores a
+# second time. A fifth of the figure that broke two ships, and the whole gate
+# measures **98s** against the 300s timeout.
 #
 # So it is filled, and the cost is the thing to keep an eye on rather than the
 # saving: 855 tests and twelve worker processes now run in front of every tree
-# change in this repo, including the ones that only touch a docstring. The whole
-# gate measures 98s against the 300s timeout. sophia holds its own gate to a ~35s
-# ceiling deliberately and this is nearly three times that, so if a turn here
+# change in this repo, including the ones that only touch a docstring. sophia
+# holds its own gate to a ~35s ceiling deliberately and this is nearly three
+# times that, so if a turn here
 # starts feeling like it is waiting on something, this is what it is waiting on —
 # empty the slot rather than reaching for --no-verify.
 #
@@ -110,16 +124,25 @@ FORMAT_EXTENSIONS="py"
 # terminal as the same wait. TAME_GPU_GATE_FORCE=1 is the way past it.
 GPU_CMD="scripts/gpu_gate.sh uv run pytest tests/ -x --tb=short -m gpu --durations=10"
 
-# What the six tests actually import, which is the only honest answer to "is this
-# worth 295 seconds". Read by a person and by /ship's definition of done; nothing
-# in the harness runs anything because a path here changed.
+# What the six tests reach, one hop deep, which is the only honest answer to "is
+# this worth 295 seconds". Most of it is what the two test files import outright;
+# coupling.py and pid_controller.py arrive through mob/ and homeostat.py, and the
+# last seven through train.py, homeostat.py, steering_pipeline.py and
+# contrastive_data.py. A change one hop out is just as capable of moving a
+# bitwise-determinism result as a change to the file that imports it.
 #
-# One line, wide as it is: `glob_specs` splits on IFS and would take a wrapped
-# value, but `decision_doc` next door reads its list with `read -ra`, which stops
-# at the first newline. A path list that works in one helper and silently drops
-# half its entries in the other is not a distinction to leave lying in a file
-# people hand-edit.
-GPU_PATHS="tame/mob/** tame/steering.py tame/steering_pipeline.py tame/homeostat.py tame/pid_controller.py tame/coupling.py tame/determinism.py tame/train.py tame/behavioural_validation.py tame/contrastive_data.py tame/contrastive_templates.py tame/config.py scripts/smoke_fixture.py tests/conftest.py tests/test_determinism.py tests/test_real_model.py"
+# tests/conftest.py is in the list since #51: it now decides how many torch
+# threads a worker gets, which every test in the file sees, GPU ones included.
+#
+# Read by a person and by nothing else — no hook, skill or rule in ~/.claude
+# names this key, so a path here changing never runs anything on its own.
+#
+# One line, and not for the reason it is tempting to give: `decision_doc` folds
+# newlines before `read -ra` (gate-lib.sh:156) precisely so a wrapped value keeps
+# its entries, and `glob_specs` splits on IFS, which includes newline. Both would
+# take a wrapped list. One line is simply the shape every reader agrees on
+# without anyone having to check which of them folds.
+GPU_PATHS="tame/mob/** tame/steering.py tame/steering_pipeline.py tame/homeostat.py tame/pid_controller.py tame/coupling.py tame/determinism.py tame/train.py tame/behavioural_validation.py tame/contrastive_data.py tame/contrastive_templates.py tame/config.py scripts/smoke_fixture.py tame/evaluation.py tame/homeostat_calibration.py tame/metrics.py tame/parity.py tame/specialisation.py tame/tracking.py tame/contrastive_sources.py tests/conftest.py tests/test_determinism.py tests/test_real_model.py"
 
 # Empty: nothing here runs mutmut yet. The `mutants/` line in .gitignore is
 # aspiration rather than configuration. mob/auction.py and mob/wealth.py are the

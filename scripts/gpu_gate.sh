@@ -23,6 +23,12 @@
 #
 # exit 0  the group is free — and, with a command, whatever that command exited
 # exit 1  the group is held, or nothing could establish that it is not
+#
+# It asks once, before starting. A CI job that begins after that still collides,
+# and nothing here holds the group against the runner either — the guard closes
+# the common case, which is starting a five-minute suite on top of a job already
+# running, and not the race. Naming what it does not cover is cheaper than
+# discovering it from a job log.
 set -uo pipefail
 
 CI_FILE=".gitlab-ci.yml"
@@ -42,10 +48,26 @@ gpu_jobs() {  # gpu_jobs <ci file>
     awk -v group="$RESOURCE_GROUP" '
         /^[^[:space:]#]/ {
             job = ""
-            if ($0 ~ /^[A-Za-z_][A-Za-z0-9_.-]*:/) { job = $0; sub(/:.*/, "", job) }
+            # The name is what precedes the key colon, and nothing after it.
+            # Two shapes break the obvious readings. `test:3.12:` is a real job
+            # name — sophia names jobs that way — so truncating at the *first*
+            # colon records it as `test`; and `test-gpu: &gpu-job` carries a YAML
+            # anchor, so stripping only a *trailing* colon keeps the anchor in
+            # the name. Either way the name matches no running job and the card
+            # reads as free. Matching the key itself and taking what is left of
+            # its colon handles both, and a trailing comment falls outside it.
+            if (match($0, /^[A-Za-z_][A-Za-z0-9_.:-]*:/)) {
+                job = substr($0, 1, RLENGTH - 1)
+            }
             next
         }
-        job != "" && $1 == "resource_group:" && $2 == group { print job }
+        # Quotes stripped before comparing: `resource_group: "gpu"` is valid YAML
+        # and would otherwise drop that job out of the guarded list silently.
+        job != "" && $1 == "resource_group:" {
+            value = $2
+            gsub(/^["'"'"']|["'"'"']$/, "", value)
+            if (value == group) print job
+        }
     ' "$1"
 }
 
@@ -53,10 +75,15 @@ gpu_jobs() {  # gpu_jobs <ci file>
 # prefers one called literally `gitlab` over `origin`, which is how a query
 # meant for the self-hosted instance silently reaches gitlab.com — and a
 # gitlab.com answer of "nothing is running" would be true and useless.
+# `error` rather than `empty` on a body that is not the jobs array: jq exits 5,
+# pipefail carries it out, and the caller refuses. `empty` would map an HTTP 200
+# carrying `{"message":"401 Unauthorized"}` onto "nothing is running", which is
+# the one way this script could say the card is free without having been told so.
 busy_jobs() {  # busy_jobs <origin url>; prints "<name>\t<status>\t<pipeline>"
     timeout "$QUERY_TIMEOUT" glab api -R "$1" \
         "projects/:id/jobs?${BUSY_SCOPES}&per_page=${JOBS_PER_PAGE}" 2>/dev/null \
-        | jq -r 'if type == "array" then .[] | "\(.name)\t\(.status)\t\(.pipeline.id)" else empty end'
+        | jq -r 'if type == "array" then .[] | "\(.name)\t\(.status)\t\(.pipeline.id)"
+                 else error("unexpected response from the jobs API") end'
 }
 
 # Which of the guarded jobs are in that list, one per line. Reads busy_jobs'
@@ -90,7 +117,7 @@ group_is_free() {
     # An empty array and a failed query both print nothing, so the exit status is
     # what tells them apart and it is kept rather than re-derived from the text.
     if ! busy=$(busy_jobs "$origin_url"); then
-        say "could not reach $origin_url within ${QUERY_TIMEOUT}s to ask what is running"
+        say "no usable answer from $origin_url about what is running — timed out after ${QUERY_TIMEOUT}s, or the reply was not the jobs array (jq says which, above)"
         return 1
     fi
     held=$(held_by_ci "${guarded[@]}" <<<"$busy")

@@ -946,12 +946,18 @@ CI runs the 855 non-GPU tests under `pytest-xdist` (#51): `-n auto` is physical 
 The tests slot was empty when #50 installed the file, and #51 is what filled it.
 The Stop hook's timeout is 300 seconds, and a 143-second suite is already enough
 to push a headless `/ship` turn into the background and lose the process it was
-waiting for. Serially this suite is over that line — 161 seconds here, 894–1013
-in CI — and under `-n auto` with pinned worker threads it is 33. The command
-mirrors CI's `test` job exactly, because a gate that runs a different invocation
-from the pipeline can pass here and fail there. The argument for emptying it
-again is in `gates.sh` beside the slot: 98 seconds is nearly three times the
-ceiling sophia's gate holds itself to, and it is paid on docstring edits too.
+waiting for. Serially this suite is over that line: CI's `test` job measured
+894–1013 seconds in pipelines 462 and 466 (2026-09-16), and here the same
+invocation — `-m "not gpu"`, 852 passing of 855 selected — takes 161 seconds,
+while the bare `uv run pytest` takes 137 for 851, the difference being the one
+`slow` test that `addopts` also deselect. What settles it is neither figure but
+the whole hook: `run_all_gates` runs lint and types first, so a serial suite here
+would cost a Stop invocation about 223 seconds. Under `-n auto` with pinned
+worker threads the suite is 33 and the hook is 98. The command mirrors CI's
+`test` job exactly, because a gate that runs a different invocation from the
+pipeline can pass here and fail there. The argument for emptying it again is in
+`gates.sh` beside the slot: 98 seconds is nearly three times the ceiling sophia's
+gate holds itself to, and it is paid on docstring edits too.
 
 The suite is still gated a second time, by CI on every push, and `pyright` covers
 both `tame` and `scripts` statically in the turn that wrote the code.
