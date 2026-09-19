@@ -124,6 +124,24 @@ def test_the_decoupled_gate_reads_a_pinned_wealth_and_draws_uniformly():
     assert not torch.equal(mob.expert_wealth, wealth), "the shadow ledger was overwritten"
 
 
+def _quality_run(config: MoBConfig, steps: int = 30) -> tuple[list[torch.Tensor], torch.Tensor]:
+    """Built and run in one call: the exploration draw reads the global stream, so two
+    economies stepped side by side would share it and part for that reason alone."""
+    economy = SyntheticEconomy(shuffled(DEFAULT_COMPETENCE, 0), seed=0, config=config)
+    return [economy.step().selected_experts for _ in range(steps)], economy.mob.expert_wealth
+
+
+def test_the_value_arm_is_the_recorded_fixture_bit_for_bit():
+    """``value`` is today's economy under a new name: nothing recorded is invalidated."""
+    recorded_winners, recorded_wealth = _quality_run(BASE_CONFIG)
+    named_winners, named_wealth = _quality_run(
+        replace(BASE_CONFIG, persistence_coupling=PERSISTENCE_VALUE)
+    )
+    for recorded, named in zip(recorded_winners, named_winners, strict=True):
+        assert torch.equal(recorded, named)
+    assert torch.equal(recorded_wealth, named_wealth)
+
+
 # --- The shadow ledger -------------------------------------------------------------------
 
 
