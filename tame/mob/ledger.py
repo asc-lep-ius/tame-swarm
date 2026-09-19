@@ -20,7 +20,7 @@ Why modes rather than more constants: with the relaxation written as one rate,
 the ledger's fixed point and the condition for reaching it monotonically are
 closed forms, so the constants a second ledger needs are *derived* rather than
 tuned. README ``#ledger-stability`` carries the derivation and what it fixes;
-:meth:`WealthUpdater.equilibrium` and :attr:`WealthUpdater.converges_monotonically`
+:meth:`WealthUpdater.equilibrium` and :meth:`WealthUpdater.cannot_oscillate`
 are the two formulas themselves.
 
 ``tame/mob/wealth.py`` is the MoB layer's side of this: the value hook, the VCG
@@ -244,6 +244,17 @@ def refuse_a_direction_score(reward: object) -> None:
     Signals that declare neither are left alone -- the three the expert economy
     runs on price holdings rather than a tissue error, and have no setpoint to be
     probed at. Raises ``ValueError``, at construction, where it is cheap to read.
+
+    **What this does not reach**, so that #43 and #44 read it as a guard and not
+    as a guarantee. It is opt-*in* by shape: a signal that spells its members
+    anything other than ``setpoint`` and ``reduction``, or one behind a
+    delegating wrapper that does not forward them, is never probed. And it
+    validates ``reduction`` while :meth:`WealthUpdater.settle` pays through
+    ``__call__``, with nothing binding the two -- ``__call__`` takes a
+    :class:`Settlement` rather than a reading and a push, so the three states
+    cannot be posed to it. What is checked is that the signal's *stated* atom is
+    a stress; that the signal pays what its atom prices is still the plugger's to
+    get right.
     """
     if not hasattr(reward, "setpoint") or not callable(getattr(reward, "reduction", None)):
         return
@@ -487,30 +498,54 @@ class WealthUpdater:
         """
         return 1.0 - self.decay
 
-    @property
-    def converges_monotonically(self) -> bool:
-        """Whether this ledger can oscillate on its way to equilibrium.
+    def cannot_oscillate(self, price_coefficient: float = 0.0, wealth: float = 1.0) -> bool:
+        """Whether the approach to equilibrium is monotone rather than alternating.
 
-        The map's slope is ``1 - rho + kappa / w^2`` with ``kappa >= 0`` the price
-        coefficient (a winner pays ``b_(k+1) / w``, so a richer cell is charged
-        less and the charge's own slope is positive). Alternating convergence
-        needs that slope negative, so it needs ``rho > 1 + kappa / w^2``: a ledger
-        that closes more than the whole gap to its setpoint in one step. At
-        ``rho <= 1`` no price coefficient can make it oscillate, which is the
-        bound this reports and the one #43's relaxation rate has to respect.
+        The map's slope is ``f'(w) = decay + kappa / w^2``, and alternating
+        approach is exactly ``f'(w) < 0``. So the condition has two halves and the
+        second is easy to state wrongly:
+
+        - A *winner* pays ``b_(k+1) / w``, so its ``kappa`` is non-negative and
+          ``rho <= 1`` alone settles it: no price a winner pays can make its
+          ledger oscillate. That is the bound #43's relaxation rate has to
+          respect, and at ``wealth_decay`` 0.997 the expert ledger is 333 times
+          inside it.
+        - A *shut-out* cell's ``kappa`` is **negative** -- the Cavallo rebate
+          exceeds the payments it never makes -- and a negative one lowers the
+          slope rather than raising it, so ``rho <= 1`` no longer settles it on
+          its own. Oscillation then needs ``kappa < -decay * w^2``, which is about
+          -224 at the floor against the -0.28 to -0.36 measured across three seeds
+          (README ``#ledger-stability``): the shipped conclusion survives by a
+          factor of roughly 660, and it survives on a measurement rather than on
+          the sign of ``kappa``.
+
+        Named for what it tests and nothing more. A ledger with ``decay > 1``
+        diverges monotonically, and this still answers ``True``, because it did
+        not oscillate on the way out.
         """
-        return self.rate <= 1.0
+        return self.decay + price_coefficient / wealth**2 >= 0.0
 
     def equilibrium(self, net_inflow: float) -> float:
         """The ledger's fixed point at a net inflow that does not depend on the ledger.
 
         ``w* = S + n / rho``. Exact under #39's ``decoupled`` arm, where every
         price is computed from the pinned wealth and the inflow therefore carries
-        no ``w`` at all, so the shadow ledger is a linear filter with a closed-form
-        steady state -- which is what
-        ``test_the_pinned_arms_steady_state_is_the_closed_form`` checks. Under a
-        live economy the inflow does depend on the ledger and this is its leading
-        term; README ``#ledger-stability`` carries the quadratic that replaces it.
+        no ``w`` at all, so the shadow ledger is a linear filter with a
+        closed-form steady state. Under a live economy the inflow does depend on
+        the ledger and this is its leading term; README ``#ledger-stability``
+        carries the quadratic that replaces it.
+
+        Held in two halves rather than one, deliberately.
+        ``test_the_pinned_arms_inflow_does_not_read_its_own_ledger`` pins the
+        independence that makes the formula *apply* to the pinned arm, and
+        ``test_a_ledger_at_a_constant_inflow_settles_where_the_closed_form_says``
+        runs the formula itself out to its fixed point. They are not composed into
+        one check on the fixture because the pinned arm's inflow is independent of
+        its ledger but not *stationary* over the ledger's own 333-step memory --
+        the confidence heads are still calibrating at every budget the fixture
+        affords -- so a steady-state comparison there pins that drift and not this
+        formula. ``scripts/measure_ledger_stability.py --coupling decoupled``
+        reports how far, and README ``#ledger-stability`` records the range.
         """
         return self.setpoint + net_inflow / self.rate
 

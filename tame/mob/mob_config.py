@@ -258,7 +258,7 @@ class MoBConfig:
     # reads at initial_wealth and draws re-entry uniformly, and the ledger
     # settles on as a shadow -- what is logged under decoupled is the wealth a
     # cell would have had. "shuffled" keeps the economy live and permutes the
-    # heads' regression targets across experts each step. See mob/wealth.py.
+    # heads' regression targets across experts each step. See mob/ledger.py.
     persistence_coupling: str = PERSISTENCE_VALUE
     # What the ledger relaxes toward between settlements (#40). "decay" is every
     # arm there has been: wealth is multiplied by wealth_decay each step, so a

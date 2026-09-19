@@ -249,8 +249,17 @@ def test_an_over_relaxed_ledger_oscillates_and_the_shipped_one_cannot():
     shipped = _ledger_at(LEDGER_DECAY, 0.997, inflow=0.6)
     over_relaxed = _ledger_at(LEDGER_SETPOINT, -0.5, setpoint=10.0)
 
-    assert shipped.converges_monotonically
-    assert not over_relaxed.converges_monotonically
+    assert shipped.cannot_oscillate()
+    assert not over_relaxed.cannot_oscillate()
+
+    # The winner's case is not the only case. A shut-out cell's price coefficient
+    # is negative -- the rebate exceeds the payments it never makes -- and a
+    # negative one lowers the slope rather than raising it, so rho <= 1 does not
+    # settle the question on its own. The -0.34 measured at the floor is far
+    # inside the bound; a coefficient past -decay*w^2 is not, and the default
+    # argument would have said so either way.
+    assert shipped.cannot_oscillate(price_coefficient=-0.34, wealth=15.0)
+    assert not shipped.cannot_oscillate(price_coefficient=-300.0, wealth=15.0)
 
     wealth = _ledger_wealth(0.0)
     errors = []

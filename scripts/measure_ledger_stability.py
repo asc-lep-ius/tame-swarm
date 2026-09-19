@@ -43,7 +43,9 @@ from synthetic_economy import (  # noqa: E402
 from mob.ledger import (  # noqa: E402
     LEDGER_DECAY,
     LEDGER_SETPOINT,
+    PERSISTENCE_VALUE,
     SUPPORTED_LEDGER_MODES,
+    SUPPORTED_PERSISTENCE_COUPLINGS,
     RewardSignal,
     Settlement,
 )
@@ -91,6 +93,13 @@ class CellReading:
     price_coefficient: float
     settles_at: float
     ruined_below: float
+    # The bare closed form ``S + n / rho`` at the flat mean of the tail's inflow,
+    # beside the quadratic solved from R and kappa. It is the right prediction
+    # only where the inflow is stationary over the ledger's own memory, and the
+    # gap between the two is what says whether it is -- see the ``decoupled`` row
+    # in README #ledger-stability, where the inflow carries no wealth at all and
+    # this is nonetheless the looser of the two.
+    from_flat_inflow: float
     clamped: bool
     # How far the recorded inflow, run back through the map, lands from the
     # ledger it should reproduce. Not a property of the economy: a check that the
@@ -104,12 +113,18 @@ class CellReading:
         """How far the predicted equilibrium is from the wealth the cell rests at."""
         return abs(self.settles_at - self.wealth) / self.wealth
 
+    @property
+    def flat_inflow_error(self) -> float:
+        """How far the bare ``S + n / rho`` is from it -- the inflow's own drift."""
+        return abs(self.from_flat_inflow - self.wealth) / self.wealth
+
 
 @dataclass(frozen=True)
 class LedgerReading:
     """One arm of the fixture: every cell, and what the allocation did."""
 
     mode: str
+    coupling: str
     seed: int
     cells: tuple[CellReading, ...]
     market_holders: int
@@ -119,13 +134,24 @@ class LedgerReading:
 
 
 def measure(
-    mode: str, seed: int, steps: int = DEFAULT_STEPS, tail: int = DEFAULT_TAIL
+    mode: str,
+    seed: int,
+    steps: int = DEFAULT_STEPS,
+    tail: int = DEFAULT_TAIL,
+    coupling: str = PERSISTENCE_VALUE,
 ) -> LedgerReading:
-    """Run the quality fixture under ``mode`` and solve each cell's quadratic."""
+    """Run the quality fixture under ``mode`` and solve each cell's quadratic.
+
+    ``coupling`` is #39's stakes dial. Under ``decoupled`` every price is computed
+    from the pinned wealth, so the inflow carries no wealth at all and the bare
+    ``S + n / rho`` is the exact fixed point of the map -- which makes that arm
+    the one place the *stationarity* of the inflow is the only thing left between
+    the formula and the ledger.
+    """
     if tail > steps:
         raise ValueError(f"tail must fit inside the run, got {tail} of {steps} steps")
 
-    config = replace(BASE_CONFIG, ledger_mode=mode)
+    config = replace(BASE_CONFIG, ledger_mode=mode, persistence_coupling=coupling)
     economy = SyntheticEconomy(shuffled(DEFAULT_COMPETENCE, seed), seed=seed, config=config)
     layer = economy.mob
     recorded = _Recorded(layer.wealth_updater.reward)
@@ -172,6 +198,7 @@ def measure(
     reward = torch.stack(recorded.paid)[-tail:].mean(dim=0)
     charged = torch.stack(charges)[-tail:]
     price_coefficient = (charged * torch.stack(recorded.against)[-tail:]).mean(dim=0)
+    flat_inflow = (torch.stack(recorded.paid) - torch.stack(charges))[-tail:].mean(dim=0)
 
     cells = []
     for index in range(config.num_experts):
@@ -185,12 +212,14 @@ def measure(
                 price_coefficient=float(price_coefficient[index]),
                 clamped=bool(clamped[index]),
                 reconstruction_error=abs(float(reconstructed[index]) - wealth) / wealth,
+                from_flat_inflow=layer.wealth_updater.equilibrium(float(flat_inflow[index])),
                 **_roots(rho, setpoint, float(reward[index]), float(price_coefficient[index])),
             )
         )
 
     return LedgerReading(
         mode=mode,
+        coupling=coupling,
         seed=seed,
         cells=tuple(cells),
         market_holders=int((share > MARKET_SHARE).sum()),
@@ -237,7 +266,7 @@ def _roots(
 
 def _report(reading: LedgerReading) -> None:
     print(
-        f"\n--- {reading.mode}, seed {reading.seed}: "
+        f"\n--- {reading.mode} ledger, {reading.coupling} arm, seed {reading.seed}: "
         f"win>{MARKET_SHARE:.0%} {reading.market_holders} of {len(reading.cells)}, "
         f"least share {reading.least_share:.4f}, "
         f"r(wealth, competence) {reading.wealth_vs_competence:.3f}, "
@@ -245,14 +274,15 @@ def _report(reading: LedgerReading) -> None:
     )
     print(
         f"{'c':>5} {'wealth':>9} {'share':>7} {'R':>8} {'kappa':>9} "
-        f"{'settles at':>11} {'ruined below':>13} {'rel':>7} {'replay':>9}"
+        f"{'settles at':>11} {'ruined below':>13} {'rel':>7} {'n/rho':>9} {'rel':>7} {'replay':>9}"
     )
     for cell in reading.cells:
         marker = " (clamped)" if cell.clamped else ""
         print(
             f"{cell.competence:>5.2f} {cell.wealth:>9.2f} {cell.share:>7.4f} {cell.reward:>8.4f} "
             f"{cell.price_coefficient:>9.2f} {cell.settles_at:>11.2f} {cell.ruined_below:>13.2f} "
-            f"{cell.relative_error:>7.3f} {cell.reconstruction_error:>9.1e}{marker}"
+            f"{cell.relative_error:>7.3f} {cell.from_flat_inflow:>9.2f} "
+            f"{cell.flat_inflow_error:>7.3f} {cell.reconstruction_error:>9.1e}{marker}"
         )
 
 
@@ -262,12 +292,18 @@ def main() -> None:
     parser.add_argument("--seeds", default="0,1,2", help="comma-separated fixture seeds")
     parser.add_argument("--steps", type=int, default=DEFAULT_STEPS)
     parser.add_argument("--tail", type=int, default=DEFAULT_TAIL)
+    parser.add_argument(
+        "--coupling",
+        default=PERSISTENCE_VALUE,
+        choices=sorted(SUPPORTED_PERSISTENCE_COUPLINGS),
+        help="#39's stakes dial; decoupled is where the bare closed form is exact",
+    )
     args = parser.parse_args()
 
     modes = [LEDGER_DECAY, LEDGER_SETPOINT] if args.mode == "both" else [args.mode]
     for mode in modes:
         for seed in (int(seed) for seed in args.seeds.split(",")):
-            _report(measure(mode, seed, steps=args.steps, tail=args.tail))
+            _report(measure(mode, seed, steps=args.steps, tail=args.tail, coupling=args.coupling))
 
 
 if __name__ == "__main__":

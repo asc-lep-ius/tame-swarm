@@ -464,6 +464,119 @@ def test_vcg_charge_weights_by_token_share():
     assert charges[3].item() == 0.0
 
 
+def test_padding_reaches_neither_the_charge_nor_the_rebate():
+    """What sits under the mask is not a trade, so it must not be priced as one.
+
+    ``_vcg_charges`` says so in its docstring and ``settle`` is the single call
+    site that carries ``valid_mask`` to it, so if that argument were dropped the
+    only thing that would notice is this test: every recorded fixture settles
+    without a token mask, so its ledger moves by exactly zero either way.
+
+    The fixture plants a large payment on the padded half. Under the mask it is
+    charged for nothing; ignored, it would be charged as a win -- and padding
+    would be a pure drain on whichever expert the mask was hiding.
+    """
+    mob = MixtureOfBidders(QUASI_LINEAR_CONFIG)
+    selected = _uniform_selection(1, 4)
+    token_mask = torch.tensor([[1.0, 1.0, 0.0, 0.0]])
+    valid = mob._valid_token_mask(token_mask, batch_size=1, seq_len=4)
+
+    def charge_with(padded_payment: float) -> torch.Tensor:
+        payments = torch.full((1, 4, 2), 2.0)
+        payments[0, 2:, :] = padded_payment
+        return mob._vcg_charges(
+            payments,
+            selected,
+            num_tokens=4,
+            reward_multiplier=LOSS_REWARD_MULTIPLIER,
+            valid_mask=valid,
+        )
+
+    quiet = charge_with(2.0)
+    loud = charge_with(500.0)
+    assert torch.equal(quiet, loud), "a payment under the mask reached the charge"
+
+    # Two halves of the same rule, and the mask has to be doing the work: the
+    # same payments with no mask price the padding, so the fixture can tell.
+    unmasked = mob._vcg_charges(
+        torch.cat([torch.full((1, 2, 2), 2.0), torch.full((1, 2, 2), 500.0)], dim=1),
+        selected,
+        num_tokens=4,
+        reward_multiplier=LOSS_REWARD_MULTIPLIER,
+    )
+    assert not torch.allclose(unmasked, loud), "the fixture cannot tell masked from not"
+
+    # The rebate is dropped from the same positions, or the netting would return
+    # money on tokens nobody was charged for.
+    rebates = torch.zeros(1, 4, QUASI_LINEAR_CONFIG.num_experts)
+    rebates[0, 2:, :] = 9.0
+    rebated = mob._vcg_charges(
+        torch.full((1, 4, 2), 2.0),
+        selected,
+        num_tokens=4,
+        reward_multiplier=LOSS_REWARD_MULTIPLIER,
+        rebates=rebates,
+        valid_mask=valid,
+    )
+    assert torch.equal(rebated, quiet), "a rebate under the mask reached the transfer"
+
+
+def _ledger_after_padded_payment(padded_payment: float) -> torch.Tensor:
+    """Settle one step whose padded half carries ``padded_payment``, and return the ledger.
+
+    Decay off and the realised values planted, so what moves the ledger is the
+    transfer alone; the caches are written directly for the reason
+    ``_wealth_change`` writes them, so every win is worth exactly one.
+    """
+    torch.manual_seed(13)
+    config = replace(QUASI_LINEAR_CONFIG, wealth_decay=1.0)
+    mob = MixtureOfBidders(config)
+    mob.train()
+    mob(torch.randn(1, 4, 32))
+
+    payments = torch.full((1, 4, 2), 2.0)
+    payments[0, 2:, :] = padded_payment
+    mob._cached_values = torch.full((1, 4, 2), 1.0)
+    mob._cached_selected_experts = _uniform_selection(1, 4)
+    mob._cached_routing_weights = torch.full((1, 4, 2), 0.5)
+    mob._cached_payments = payments
+    mob._cached_rebates = torch.zeros(1, 4, config.num_experts)
+
+    mob.update_wealth_from_loss(torch.ones(1, 4), token_mask=torch.tensor([[1.0, 1.0, 0.0, 0.0]]))
+    return mob.expert_wealth.clone()
+
+
+def test_the_settlement_carries_the_mask_to_the_charge():
+    """The wiring, not the formula: one updater, one call site, one argument.
+
+    The test above holds ``_vcg_charges`` itself. This holds that ``settle``
+    hands it the mask -- the single point of failure the merge into one updater
+    created. Every recorded fixture settles with no token mask at all, so
+    dropping this argument moves no pinned number by so much as a last bit.
+    """
+    assert torch.equal(_ledger_after_padded_payment(2.0), _ledger_after_padded_payment(500.0)), (
+        "a payment on a padded token reached the ledger, so settle dropped the mask"
+    )
+
+    # The fixture has to be able to tell: with the padding admitted, it does move.
+    torch.manual_seed(13)
+    unmasked = MixtureOfBidders(replace(QUASI_LINEAR_CONFIG, wealth_decay=1.0))
+    unmasked.train()
+    unmasked(torch.randn(1, 4, 32))
+    payments = torch.full((1, 4, 2), 2.0)
+    payments[0, 2:, :] = 500.0
+    unmasked._cached_values = torch.full((1, 4, 2), 1.0)
+    unmasked._cached_selected_experts = _uniform_selection(1, 4)
+    unmasked._cached_routing_weights = torch.full((1, 4, 2), 0.5)
+    unmasked._cached_payments = payments
+    unmasked._cached_rebates = torch.zeros(1, 4, QUASI_LINEAR_CONFIG.num_experts)
+    unmasked.update_wealth_from_loss(torch.ones(1, 4))
+
+    assert not torch.allclose(unmasked.expert_wealth, _ledger_after_padded_payment(500.0)), (
+        "the fixture cannot tell a masked settlement from an unmasked one"
+    )
+
+
 def test_vcg_charge_accumulates_across_slots():
     """One expert winning in two different slots pays for both."""
     mob = MixtureOfBidders(QUASI_LINEAR_CONFIG)
