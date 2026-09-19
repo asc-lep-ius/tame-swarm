@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 from synthetic_economy import (  # noqa: E402
     BASE_CONFIG,
     DEFAULT_COMPETENCE,
+    DifferentiatedEconomy,
     SyntheticEconomy,
     shuffled,
 )
@@ -311,3 +312,101 @@ def test_the_dial_is_the_variable_under_test_and_the_dose_is_a_confound():
 
     with pytest.raises(ParityError, match="goal_doses"):
         assert_parity([BASE, replace(decoupled, goal_doses=(0.5,))])
+
+
+# --- The goal fields on the differentiated fixture ---------------------------------------
+
+
+def _differentiated(
+    seed: int, doses: tuple[float, float] | None, **kwargs
+) -> DifferentiatedEconomy:
+    """The fixture at ``seed`` with a goal field on types 0 and 1 at ``doses``, or none."""
+    economy = DifferentiatedEconomy(shuffled(DEFAULT_COMPETENCE, seed), seed=seed, **kwargs)
+    if doses is not None:
+        for expert_type, dose in enumerate(doses):
+            economy.add_goal_field(expert_type, setpoint=0.5, dose=dose)
+    return economy
+
+
+def test_the_goal_term_on_the_fixture_is_the_closed_form():
+    """The layer's coordinate arithmetic against the planted competences, slot by slot.
+
+    An expert of the field's type moves the reading by its competence per unit
+    share and any other expert by exactly zero, so the term is a closed form in
+    the winners' types and competences; the layer computes it from adapters and
+    directions and must land on the same number. The gradient part of the value
+    keeps its first-order relation to the exact counterfactual beside it -- on
+    the on-type slots, where that relation is stated: an off-type winner's exact
+    loss is a pure quadratic in its own contribution, so the first-order estimate
+    is exactly twice it, on this fixture with or without a field.
+    """
+    economy = _differentiated(1, (0.25, 0.5))
+    with torch.no_grad():
+        economy.competence.mul_(0.2)  # the regime the first-order check is stated in
+        for expert in economy.mob.experts:
+            expert.down_adapter_B.weight.mul_(0.2)  # type: ignore[union-attr]
+
+    record = economy.step(with_exact_values=True)
+
+    terms = economy.mob.last_goal_terms
+    assert terms is not None and record.exact_values is not None
+    closed_form = economy.closed_form_goal_terms(record.selected_experts)
+    assert bool((closed_form != 0).any()), "no winner of a goal type; the check is empty"
+    assert torch.allclose(terms, closed_form, rtol=1e-4, atol=1e-6)
+
+    gradient_part = record.realised_values - terms
+    exact_part = record.exact_values - closed_form
+    assert torch.equal(gradient_part.sign(), exact_part.sign())
+    assert economy.last_types is not None
+    on_type = economy.expert_types[record.selected_experts] == economy.last_types.unsqueeze(-1)
+    relative_error = ((gradient_part - exact_part).abs() / exact_part.abs())[on_type]
+    assert relative_error.numel() > 0 and relative_error.median().item() < 0.1
+
+
+def _winners_and_ledger(seed: int, doses: tuple[float, float] | None, steps: int = 20):
+    economy = _differentiated(seed, doses)
+    return [economy.step().selected_experts for _ in range(steps)], economy.mob.expert_wealth
+
+
+def test_a_goal_at_dose_zero_is_the_recorded_fixture_bit_for_bit():
+    """``lambda = 0`` reproduces today's fixture and a dose does not: the inert pairing."""
+    bare_winners, bare_wealth = _winners_and_ledger(0, None)
+    zero_winners, zero_wealth = _winners_and_ledger(0, (0.0, 0.0))
+    dosed_winners, dosed_wealth = _winners_and_ledger(0, (0.5, 0.5))
+
+    for zero, bare in zip(zero_winners, bare_winners, strict=True):
+        assert torch.equal(zero, bare)
+    assert torch.equal(zero_wealth, bare_wealth)
+    assert not torch.equal(dosed_wealth, bare_wealth), "a dosed field left the ledger untouched"
+    assert any(
+        not torch.equal(dosed, bare)
+        for dosed, bare in zip(dosed_winners, bare_winners, strict=True)
+    ), "a dosed field left every allocation untouched"
+
+
+def _type_share(economy: DifferentiatedEconomy, expert_type: int, steps: int) -> float:
+    wins = torch.zeros(economy.config.num_experts)
+    for _ in range(steps):
+        wins += torch.bincount(
+            economy.step().selected_experts.flatten(), minlength=economy.config.num_experts
+        ).float()
+    share = wins / wins.sum()
+    return float(share[economy.expert_types == expert_type].sum())
+
+
+def test_a_goal_field_recruits_the_type_it_pays_for():
+    """No silent no-op on the field: paid for holding type 0's correction, the tissue holds it.
+
+    Chance for a type's share of the slots is 0.25; the loss alone already
+    concentrates slots on competent cells, so the comparison is against the
+    field-off share at the same seed rather than against chance.
+    """
+    field_off = _type_share(_differentiated(2, None), 0, steps=150)
+    field_on = _type_share(_differentiated(2, (1.0, 0.0)), 0, steps=150)
+
+    assert field_on > field_off + 0.1, (field_off, field_on)
+
+
+def test_the_fixture_refuses_a_goal_on_a_type_it_did_not_plant():
+    with pytest.raises(ValueError, match="expert_type"):
+        _differentiated(0, None).add_goal_field(9, setpoint=0.5, dose=0.1)

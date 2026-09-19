@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import math
 import sys
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
@@ -198,6 +199,7 @@ class SyntheticEconomy:
             self.mob.confidence_heads.parameters(), lr=head_learning_rate
         )
         self.generator = torch.Generator().manual_seed(seed)
+        self.last_sign: torch.Tensor | None = None
 
     def _plant(self, competence: torch.Tensor) -> None:
         config = self.config
@@ -235,7 +237,12 @@ class SyntheticEconomy:
 
     def _sign(self) -> torch.Tensor:
         positive = torch.rand(self.batch_size, self.seq_len, generator=self.generator)
-        return torch.where(positive < self.positive_fraction, 1.0, -1.0).unsqueeze(-1)
+        sign = torch.where(positive < self.positive_fraction, 1.0, -1.0)
+        # Kept for the readers that class tokens by whether the correction paid
+        # (signature 2, ``scripts/measure_stakes_dial.py``); the heads cannot read
+        # it off the input, which is what makes it a class the report cannot follow.
+        self.last_sign = sign
+        return sign.unsqueeze(-1)
 
     def exact_values(
         self, x: torch.Tensor, output: torch.Tensor, target: torch.Tensor, selected: torch.Tensor
@@ -244,6 +251,8 @@ class SyntheticEconomy:
 
         For each winner slot: the per-token loss with that expert's contribution
         replaced by the base, minus the per-token loss as realised, per unit share.
+        The differentiated fixture adds the goal fields' term from its closed
+        form, so the identity holds with a field attached as it does without.
         """
         k = self.config.top_k
         with torch.no_grad():
@@ -264,7 +273,11 @@ class SyntheticEconomy:
                     without = output[mask] - (held - reference) / k
                     counterfactual = ((without - target[mask]) ** 2).sum(-1)
                     exact[:, :, slot][mask] = (counterfactual - per_token[mask]) * k
-        return exact
+        return exact + self._exact_goal_terms(selected)
+
+    def _exact_goal_terms(self, selected: torch.Tensor) -> torch.Tensor:
+        """Zero on the quality fixture, which has no goal field to plant."""
+        return torch.zeros(selected.shape, dtype=torch.float32)
 
     def step(self, with_exact_values: bool = False) -> StepRecord:
         x, target = self._draw()
@@ -457,6 +470,44 @@ class DifferentiatedEconomy(SyntheticEconomy):
         self.last_types = types
         return x, target
 
+    def add_goal_field(self, expert_type: int, setpoint: float, dose: float) -> TypeGoalField:
+        """Attach a goal field on one type's correction (#33, #39); see ``TypeGoalField``."""
+        if not 0 <= expert_type < self.num_types:
+            raise ValueError(f"expert_type must lie in [0, {self.num_types}), got {expert_type}")
+        field = TypeGoalField(self, expert_type, setpoint, dose)
+        self.mob.attach_goal_field(field)
+        return field
+
+    def goal_fields(self) -> Sequence[TypeGoalField]:
+        return [field for field in self.mob.goal_fields if isinstance(field, TypeGoalField)]
+
+    def closed_form_goal_terms(self, selected: torch.Tensor) -> torch.Tensor:
+        """What the goal fields pay every winner slot, per unit share, from the planted numbers.
+
+        The layer reads the coordinate of each contribution along the field's
+        direction; on this fixture that coordinate is the winner's competence when
+        it is of the field's type and zero otherwise, so the tissue's reading on a
+        token is ``(1/k) sum_{i in W, t(i) = t} c_i`` -- the on-goal-type
+        competence delivered -- and the counterfactual is the same expression
+        without the slot. This is the identity the layer's arithmetic is checked
+        against (``test_the_goal_term_on_the_fixture_is_the_closed_form``).
+        """
+        k = self.config.top_k
+        total = torch.zeros(selected.shape, dtype=torch.float32)
+        winner_types = self.expert_types[selected]
+        competence = self.competence[selected] / k
+        for field in self.goal_fields():
+            pushes = competence * (winner_types == field.expert_type)
+            reading = pushes.sum(dim=-1, keepdim=True)
+            reduction = (field.setpoint - (reading - pushes)).abs() - (
+                field.setpoint - reading
+            ).abs()
+            total = total + field.dose * reduction * k
+        return total
+
+    def _exact_goal_terms(self, selected: torch.Tensor) -> torch.Tensor:
+        return self.closed_form_goal_terms(selected)
+
     def on_type_share(self, selected: torch.Tensor) -> float:
         """The fraction of slots held by an expert of the token's own type.
 
@@ -491,3 +542,39 @@ class DifferentiatedEconomy(SyntheticEconomy):
                 held = (self.expert_types[selected] == expert_type) & ~same
                 off_type = off_type + (competence * held).sum(-1) ** 2
             return gap * ((1.0 - on_type) ** 2 + off_type)
+
+
+@dataclass(frozen=True)
+class TypeGoalField:
+    """A goal field on the differentiated fixture: hold ``setpoint`` of one type's correction.
+
+    The goal the tissue is asked to hold is a projection level, as the
+    homeostat's is (``tame/homeostat.py``): on every token, whatever type it
+    calls for, the tissue's contribution should sit at ``setpoint`` of the
+    correction that ``expert_type`` carries. The direction the layer reads the
+    coordinate along is that correction on this token, ``M_t A h``, so an expert
+    of the type moves the reading by its competence per unit share and every
+    other expert moves it by exactly zero. That is what makes the setpoint a
+    *conflicting* one, which signature 1 is about: on a token of another type
+    the loss wants nothing along this direction and the goal wants ``setpoint``;
+    on a token of the goal's own type the loss wants the whole correction and
+    the goal wants to stop at ``setpoint``. ``dose`` prices one unit of goal
+    error -- one full correction -- in per-token loss units; the fixture has no
+    injection whose held-out cost could fix it (``docs/preregistration.md`` 7),
+    so it is a parameter, carried in the fingerprint as ``goal_doses``.
+
+    Two fields on two types at a *relative* dose are #39's stakes-dial fixture:
+    as the ratio moves, the allocation moves toward the experts whose type the
+    dearer goal pays for, and the question is whether it moves further when a
+    cell's continuation depends on being paid than when it does not.
+    """
+
+    economy: DifferentiatedEconomy
+    expert_type: int
+    setpoint: float
+    dose: float
+
+    def direction(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        with torch.no_grad():
+            _, base_hidden = self.economy._base(hidden_states)
+            return base_hidden @ self.economy._corrections[self.expert_type].T
