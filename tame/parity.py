@@ -34,6 +34,7 @@ from typing import Any
 import torch
 
 from determinism import DETERMINISM_OFF, DETERMINISM_STRICT
+from evaluation import ROTATION_ABSENT, RotationRecord
 from readiness import READINESS_OFF, ReadinessConfig
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,23 @@ REPORTED_FIELDS = frozenset({"converted_layers"})
 # floor-sized effect -- and is declared with the SHAs rather than refused
 # outright, so the arms recorded before #31 stay comparable, labelled.
 DRIFT_FIELDS = frozenset({"code_sha", "code_dirty", "strict_determinism"})
+
+# Which rotation of the held-out stream a margin was read on (#41), and which
+# canary set was hidden in it. Not asserted by ``assert_parity`` for exactly the
+# reason the code identity is not: between two recorded groups a *missing*
+# rotation -- every summary written before #41 -- has to count as drift, and a
+# field-equality check reads two ``None``s as agreement. ``manifest_drift``
+# decides instead, and ``assert_same_manifest`` is the refusal.
+ROTATION_FIELDS = frozenset(
+    {
+        "rotating_stream",
+        "rotating_stream_date",
+        "rotating_refresh_days",
+        "canary_set",
+        "canary_set_date",
+        "canary_refresh_days",
+    }
+)
 
 # ``TrainingConfig`` fields the fingerprint folds into a derived field instead of
 # copying: the dataset name and its config become one string, and the layer bounds
@@ -148,6 +166,10 @@ class ParityError(AssertionError):
 
 class CodeDriftError(ParityError):
     """Raised when two recorded groups cannot be shown to have run the same code."""
+
+
+class ManifestDriftError(ParityError):
+    """Raised when two margins cannot be shown to have been read on one rotation."""
 
 
 def code_identity(repo: Path | None = None) -> tuple[str | None, bool | None]:
@@ -277,6 +299,20 @@ class ArmFingerprint:
     autonomy_setpoints: bool = False
     autonomy_evaluation: bool = False
     autonomy_dormancy: bool = False
+    # #41's rotating held-out stream and the canaries hidden in it, each with the
+    # date it was last refreshed and the cadence it promises. The fingerprint and
+    # the date are what a README row quotes beside every margin, which is why both
+    # are here rather than the fingerprint alone: a reader checking whether two
+    # numbers are comparable reads a date, and a reader checking whether a stream
+    # is still rotating reads a cadence. All default to ``None`` -- no run before
+    # #41 read a rotating stream at all -- and ``manifest_drift`` is what decides
+    # between arms, because a missing rotation must count as drift.
+    rotating_stream: str | None = None
+    rotating_stream_date: str | None = None
+    rotating_refresh_days: int | None = None
+    canary_set: str | None = None
+    canary_set_date: str | None = None
+    canary_refresh_days: int | None = None
 
     @property
     def arm(self) -> str:
@@ -312,6 +348,7 @@ def fingerprint_arm(
     steer_layers: Sequence[int] = (),
     code: tuple[str | None, bool | None] = (None, None),
     readiness: ReadinessConfig = READINESS_OFF,
+    rotation: RotationRecord = ROTATION_ABSENT,
 ) -> ArmFingerprint:
     """Build a fingerprint from a ``TrainingConfig`` and the two measured hashes.
 
@@ -324,7 +361,10 @@ def fingerprint_arm(
     does not depend on the state of the tree the test runs in. ``readiness`` is
     #46's register of granted autonomies, all off until the issue that earns one
     turns it on; it is separate from ``TrainingConfig`` because the tissue that
-    reads it (#42) outlives any one training run.
+    reads it (#42) outlives any one training run. ``rotation`` is #41's stream and
+    canary set as the run actually read them, separate for the same reason: the
+    rotation a margin was read on is a property of the day it ran, not of the
+    config it ran under, and the trainer -- which reads no margins -- records none.
     """
     code_sha, code_dirty = code
     return ArmFingerprint(
@@ -378,6 +418,12 @@ def fingerprint_arm(
         autonomy_setpoints=readiness.autonomy_setpoints,
         autonomy_evaluation=readiness.autonomy_evaluation,
         autonomy_dormancy=readiness.autonomy_dormancy,
+        rotating_stream=rotation.stream_fingerprint,
+        rotating_stream_date=rotation.stream_refreshed,
+        rotating_refresh_days=rotation.stream_refresh_days,
+        canary_set=rotation.canary_fingerprint,
+        canary_set_date=rotation.canary_refreshed,
+        canary_refresh_days=rotation.canary_refresh_days,
     )
 
 
@@ -432,7 +478,12 @@ def assert_parity(arms: Sequence[ArmFingerprint]) -> None:
     disagreements: list[str] = []
     for field in fields(ArmFingerprint):
         if field.name in (
-            VARYING_FIELDS | REPORTED_FIELDS | FIELD_FIELDS | COUPLING_FIELDS | DRIFT_FIELDS
+            VARYING_FIELDS
+            | REPORTED_FIELDS
+            | FIELD_FIELDS
+            | COUPLING_FIELDS
+            | DRIFT_FIELDS
+            | ROTATION_FIELDS
         ):
             continue
         expected = getattr(reference, field.name)
@@ -491,3 +542,98 @@ def code_drift(arms: Sequence[ArmFingerprint]) -> list[str]:
     if len(shas) > 1:
         reasons.append(f"  different code: {shas}")
     return reasons
+
+
+def _rotation_drift(
+    arms: Sequence[ArmFingerprint],
+    what: str,
+    fingerprint_field: str,
+    date_field: str,
+    cadence_field: str,
+) -> list[str]:
+    """Why these arms cannot be shown to have read one rotation of ``what``.
+
+    The date and the cadence are reported separately from the fingerprint even
+    though the fingerprint already folds both in. That is not redundancy: a reader
+    told only "different fingerprints" cannot tell a manifest that rotated on
+    schedule from one whose schedule was widened, and those are two different
+    problems -- the first makes two numbers incomparable, the second means the
+    stream stopped being held out.
+    """
+    reasons: list[str] = []
+    missing = [arm.arm for arm in arms if getattr(arm, fingerprint_field) is None]
+    if missing:
+        reasons.append(
+            f"  no {what} recorded for {sorted(set(missing))} (a summary from before #41)"
+        )
+
+    prints = sorted(
+        {getattr(arm, fingerprint_field) for arm in arms if getattr(arm, fingerprint_field)}
+    )
+    if len(prints) > 1:
+        dates = sorted({getattr(arm, date_field) for arm in arms if getattr(arm, date_field)})
+        reasons.append(f"  different {what}: {prints}, refreshed {dates}")
+
+    cadences = sorted(
+        {getattr(arm, cadence_field) for arm in arms if getattr(arm, cadence_field) is not None}
+    )
+    if len(cadences) > 1:
+        reasons.append(
+            f'  different {what} cadence: {cadences} days, so "newer than the last update" '
+            "means two different things across these arms"
+        )
+    return reasons
+
+
+def manifest_drift(arms: Sequence[ArmFingerprint]) -> list[str]:
+    """Why these margins cannot be shown to have been read on one rotation (#41).
+
+    The stream and the canary set are checked separately and both matter. Two arms
+    read on the same stream and different canaries are as incomparable as two read
+    the other way round: the canary accuracy is half of what farming is read from,
+    and a canary set that turned over between the arms makes that half a comparison
+    of two different items.
+
+    Named rather than refused, exactly as ``code_drift`` is -- the caller decides
+    whether a drifted margin is refused or merely labelled, and
+    ``assert_same_manifest`` is the refusal built on top.
+    """
+    return _rotation_drift(
+        arms, "rotating stream", "rotating_stream", "rotating_stream_date", "rotating_refresh_days"
+    ) + _rotation_drift(arms, "canary set", "canary_set", "canary_set_date", "canary_refresh_days")
+
+
+def assert_same_manifest(arms: Sequence[ArmFingerprint], allow_drift: bool = False) -> str:
+    """Refuse margins read on different rotations; else say which one they were read on.
+
+    The line this returns is what a README row and a printed table carry beside
+    every number, in the form ``evaluate()`` already logs ``eval_split=``: a
+    margin quoted without the date and fingerprint of the stream it was read on is
+    a number nobody can check, because the stream it came from no longer exists.
+
+    ``allow_drift`` is ``--allow-manifest-drift`` where a script offers it -- the
+    drift is logged and returned as the label printed under the table, so the
+    comparison is made and never made silently. No script offers it yet: the first
+    caller is the viability core (#42), which is the first thing that reads a
+    margin, and wiring the flag into ``compare_runs.py`` today would refuse every
+    recorded comparison there is, since none of them carries a rotation at all.
+    """
+    reasons = manifest_drift(arms)
+    if not reasons:
+        reference = arms[0]
+        return (
+            f"stream: {reference.rotating_stream} refreshed {reference.rotating_stream_date} "
+            f"every {reference.rotating_refresh_days}d, canaries: {reference.canary_set} "
+            f"refreshed {reference.canary_set_date} every {reference.canary_refresh_days}d"
+        )
+
+    detail = "\n".join(reasons)
+    if not allow_drift:
+        raise ManifestDriftError(
+            "these margins were not read on one rotation of the held-out stream, so every "
+            "difference between them could be the stream and not the organism:\n" + detail + "\n"
+            "pass --allow-manifest-drift to compare anyway, with the drift printed beside "
+            "the numbers"
+        )
+    logger.warning("manifest drift allowed by --allow-manifest-drift:\n%s", detail)
+    return "stream: DRIFT, allowed by --allow-manifest-drift:\n" + detail
