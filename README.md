@@ -928,36 +928,43 @@ docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
 
 About 861 tests across 50 modules covering auction properties (hand-built and hypothesis-drawn), the value definition and exploration slot, wealth dynamics, gradient checkpointing, steering, the tissue on the measured plant, recovery from designed and undesigned damage, the metrics surface and its builders' 10 ms budget, the routing trace, the outcome probe, API endpoints, config, and experts; three strict expected failures record claims the economy does not yet meet ([#6](#integration-tests-6), re-attributed by [#16](#wealth-bounds-16) and split there into the two claims of different strength they had been asserting under one name). `-m slow` adds the 5000-step gate-stationarity run; `-m gpu` the bitwise-determinism check and the real-model integration tests, which load Qwen3-1.7B from the local HuggingFace cache (267 seconds on the RTX 5070 Ti, against a 300-second budget: 120 at [#6](#integration-tests-6), 160 when [#23](#calibration-corpus-23) moved the fixture onto the served calibration corpus, 300 when [#31](#run-to-run-31) put the determinism pair at the ablation configuration — 131 of the 267 — beside the real-model suite); without the cache they skip on a developer's machine and fail under CI.
 
-CI runs the 855 non-GPU tests under `pytest-xdist` (#51): `-n auto` is physical cores, and `tests/conftest.py` gives each worker a single torch thread. Both halves are needed and the second is the one that is easy to miss — the tensors here are `hidden_dim` 32, so torch's intra-op pool buys nothing and claims the cores a second time. On the workstation, 855 tests: **161 s** serial, **419 s** under `-n auto` without the pin, **33 s** with it. The GPU suite stays serial — it shares `resource_group: gpu` and asserts against a measured budget — and is unaffected, because the pin is keyed on `PYTEST_XDIST_WORKER` and `-m gpu` is never run under xdist.
+CI runs the 856 non-GPU tests under `pytest-xdist` (#51): `-n auto` is physical cores, and `tests/conftest.py` gives each worker a single torch thread. Both halves are needed and the second is the one that is easy to miss — the tensors here are `hidden_dim` 32, so torch's intra-op pool buys nothing and claims the cores a second time. On the workstation, 856 tests: **154–161 s** serial, **419 s** under `-n auto` without the pin, **34 s** with it (12 workers; the runner gets 8, and reads 162 s). The GPU suite stays serial — it shares `resource_group: gpu` and asserts against a measured budget — and is unaffected, because the pin is keyed on `PYTEST_XDIST_WORKER` and `-m gpu` is never run under xdist.
 
 ### The Local Gate
 
 <a name="the-local-gate-50"></a>
 
 `.claude/gates.sh` is what checks the tree before a push rather than after it
-(#50). All three slots are filled, and 98 seconds is what a tree change costs.
+(#50). All three slots are filled, and 93–96 seconds is what a tree change costs
+on this box.
 
 | Gate | Command | Cost on the RTX 5070 Ti box |
 |---|---|---|
 | lint | `uv run ruff check . && uv run ruff format --check .` | < 1 s (116 files, cache deleted first) |
 | types | `uv run pyright tame scripts` | 62 s |
-| tests | `uv run pytest tests/ -x --tb=short -m 'not gpu' -n auto` | 34 s |
+| tests | `uv run pytest tests/ -x --tb=short -m 'not gpu' -n auto` | 34 s (12 workers) |
 
 The tests slot was empty when #50 installed the file, and #51 is what filled it.
 The Stop hook's timeout is 300 seconds, and a 143-second suite is already enough
 to push a headless `/ship` turn into the background and lose the process it was
 waiting for. Serially this suite is over that line: CI's `test` job measured
 894–1013 seconds in pipelines 462 and 466 (2026-09-16), and here the same
-invocation — `-m "not gpu"`, 852 passing of 855 selected — takes 161 seconds,
-while the bare `uv run pytest` takes 137 for 851, the difference being the one
+invocation — `-m "not gpu"`, 852 passing of 856 selected — takes 154–161 seconds,
+while the bare `uv run pytest` takes 130–137 for 851, the difference being the one
 `slow` test that `addopts` also deselect. What settles it is neither figure but
 the whole hook: `run_all_gates` runs lint and types first, so a serial suite here
-would cost a Stop invocation about 223 seconds. Under `-n auto` with pinned
-worker threads the suite is 33 and the hook is 98. The command mirrors CI's
+would cost a Stop invocation about 220 seconds. Under `-n auto` with pinned
+worker threads the suite is 34 and the hook is 93–96. The command mirrors CI's
 `test` job exactly, because a gate that runs a different invocation from the
-pipeline can pass here and fail there. The argument for emptying it again is in
-`gates.sh` beside the slot: 98 seconds is nearly three times the ceiling sophia's
-gate holds itself to, and it is paid on docstring edits too.
+pipeline can pass here and fail there.
+
+That 93–96 seconds does not travel. The same command is 162–225 seconds as CI's
+`test` job on the hephaestus box, where `pyright` is slower too, which would put
+a Stop hook there near the 300-second timeout this slot was empty to stay clear
+of — so a session on that box should empty `TEST_CMD` and drop `GATE_BUDGET_S`
+back to 75. Even here the argument for emptying it is in `gates.sh` beside the
+slot: 96 seconds is nearly three times the ceiling sophia's gate holds itself to,
+and it is paid on docstring edits too.
 
 The suite is still gated a second time, by CI on every push, and `pyright` covers
 both `tame` and `scripts` statically in the turn that wrote the code.

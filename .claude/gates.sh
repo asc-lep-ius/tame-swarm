@@ -32,11 +32,14 @@ LINT_CMD="uv run ruff check . && uv run ruff format --check ."
 # what the issues' verification block asks for and is what CI's reviewer reads.
 TYPE_CMD="uv run pyright tame scripts"
 
-# 110, against the 98s the three gates measure together on prometheus (62s of it
-# pyright, 34s the parallel suite). The default is 60, which this gate is over on
-# every single run, and a row that is advisory every time is a row that stops
-# being read. The margin is there to show drift from what the gates cost now, not
-# to leave room for them to grow.
+# 110, against the 93–96s the three gates measure together on prometheus (62s of
+# it pyright, 34s the parallel suite, lint under a second). The default is 60, which
+# this gate is over on every single run, and a row that is advisory every time is
+# a row that stops being read. The margin is there to show drift from what the
+# gates cost now, not to leave room for them to grow.
+#
+# Measured on prometheus, and that is a caveat rather than a detail: see the note
+# above TEST_CMD. On a slower box this budget is wrong by as much as the box is.
 GATE_BUDGET_S="110"
 
 # Filled since #51, and empty before it. What follows is the measurement #50
@@ -47,7 +50,7 @@ GATE_BUDGET_S="110"
 # records that a **143s** suite reliably pushed headless `/ship` turns into the
 # background and killed two consecutive attempts to ship an issue: the command
 # outlives the turn, the turn ends waiting for a notification from a process
-# that is gone. This repo's CPU suite is 855 tests of the 861 collected — the
+# that is gone. This repo's CPU suite is 856 tests of the 862 collected — the
 # other six are `-m gpu` — and CI's `test` job measured **894–1013s** in
 # pipelines 462 and 466 (2026-09-16): seven times the figure that already broke
 # it, and three times the timeout.
@@ -56,36 +59,47 @@ GATE_BUDGET_S="110"
 # not on the runner. **Which invocation, exactly**, because the two differ and a
 # reader who measures one and reads the other will think the file is wrong:
 #
-#   uv run pytest tests/ -m "not gpu"   852 passed + 3 xfailed   161s   ← CI's
-#   uv run pytest                       851 passed + 3 xfailed   137s
+#   uv run pytest tests/ -m "not gpu"   852 passed + 3 xfailed   154–161s  ← CI's
+#   uv run pytest                       851 passed + 3 xfailed   130–137s
 #
-# Both on prometheus, 2026-09-19. The gap is the single `slow` test that
-# pyproject's `addopts` also deselect (tests/test_mixture.py:464). The first is
-# the one to compare against CI, and 2m40s of wall against 30m34s of CPU says
-# torch is already spending eleven cores on it.
+# Ranges across four runs on prometheus, 2026-09-19, because the spread is real
+# and a single figure invites the next reader to think the file is wrong. The gap
+# between the rows is the single `slow` test that pyproject's `addopts` also
+# deselect (tests/test_mixture.py:464); both rows also skip one test, the xdist
+# thread-pin guard, which only runs under workers. The first row is the one to
+# compare against CI, and 2m34s of wall against ~30m of CPU says torch is already
+# spending eleven cores on it.
 #
 # Neither is what a Stop invocation costs, and that is the number that decides
 # the slot either way: `run_all_gates` runs lint and types first, so a *serial*
-# suite here would make one Stop hook 62s + 161s ≈ **223s** against a 300s
-# timeout — seventy seconds of headroom for a suite whose own run-to-run spread
-# is tens of seconds, and half again past the 143s that already lost two ships.
+# suite here would make one Stop hook 62s + ~160s ≈ **220s** against a 300s
+# timeout — eighty seconds of headroom for a suite whose own run-to-run spread is
+# tens of seconds, and half again past the 143s that already lost two ships.
 # On those numbers #50 left the slot empty, and that reasoning is kept because
 # it is the case for emptying it again.
 #
 # **#51 changed the input to it.** Under `-n auto` with each worker pinned to one
-# torch thread (tests/conftest.py), the same 855 tests take **33s** on the same
+# torch thread (tests/conftest.py), the same 856 tests take **34s** on the same
 # box — 12 workers, 3m49s of CPU against the serial run's 30m34s, because the
 # tensors are hidden_dim 32 and torch's intra-op pool was claiming the cores a
 # second time. A fifth of the figure that broke two ships, and the whole gate
-# measures **98s** against the 300s timeout.
+# measures **93–96s** against the 300s timeout.
+#
+# **Those 93–96s are prometheus, and the headroom does not travel.** The same
+# command
+# is 162s and 225s as CI's `test` job on the hephaestus box (pipelines 482 and
+# 484), where pyright is slower too — a Stop hook there lands somewhere around
+# 250–300s, which is the failure this slot was empty to avoid. A session on that
+# box should empty TEST_CMD and put GATE_BUDGET_S back to 75; the numbers here
+# are the fastest machine the project has and nothing else.
 #
 # So it is filled, and the cost is the thing to keep an eye on rather than the
-# saving: 855 tests and twelve worker processes now run in front of every tree
+# saving: 856 tests and twelve worker processes now run in front of every tree
 # change in this repo, including the ones that only touch a docstring. sophia
 # holds its own gate to a ~35s ceiling deliberately and this is nearly three
-# times that, so if a turn here
-# starts feeling like it is waiting on something, this is what it is waiting on —
-# empty the slot rather than reaching for --no-verify.
+# times that, so if a turn here starts feeling like it is waiting on something,
+# this is what it is waiting on — empty the slot and drop the budget back to 75,
+# rather than reaching for --no-verify.
 #
 # The command mirrors CI's `test` job exactly, `-x` and all. A gate that runs a
 # different invocation from the pipeline can pass here and fail there, which is
@@ -216,7 +230,7 @@ CI_MR_SECONDS="753  # median of 48 successful MR pipelines, 2026-09-19"
 #
 # The first is the split, which is what a skip would be taking a chance on. Lint
 # and types run on every tree change, in-turn, over both `tame` and `scripts`.
-# The 855-test CPU suite and the 6-test GPU suite run nowhere but CI. Anything
+# The 856-test CPU suite and the 6-test GPU suite run nowhere but CI. Anything
 # tiered here would be tiered against static checks and never against the tests.
 #
 # The second is a trap, and it is why this is empty rather than `no` today.

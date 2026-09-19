@@ -12,11 +12,20 @@ from mob import MixtureOfBidders, MoBConfig
 
 # Under xdist every worker is its own process and torch sizes its intra-op pool
 # from the whole box in each of them, so the parallelism is claimed twice. On the
-# 24-thread workstation that turned a 161 s suite into 419 s and burned five
+# 24-thread workstation that turned a ~160 s suite into 419 s and burned five
 # times the CPU doing it (#51). One thread per worker hands the parallelism to
 # xdist, which is the thing counting cores once. A serial run is untouched, and
 # so is ``-m gpu``: the GPU suite is never invoked under xdist, and must not be
 # -- it shares ``resource_group: gpu`` and asserts against a measured budget.
+#
+# Here rather than as ``OMP_NUM_THREADS=1`` on the CI job, so that a developer's
+# own ``uv run pytest -n auto`` gets the same treatment as CI. The cost of that
+# choice: this reaches torch's pool and not OpenBLAS's or MKL's, so a future
+# numpy-heavy CPU test would reintroduce the double count and want the env var
+# after all. torch is the only pool that matters today.
+#
+# ``tests/test_no_silent_noops.py`` asserts this actually took, because deleting
+# it fails nothing and only makes CI five to twelve times slower.
 if os.environ.get("PYTEST_XDIST_WORKER"):
     torch.set_num_threads(1)
 
