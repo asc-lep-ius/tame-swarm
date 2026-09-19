@@ -34,6 +34,7 @@ from typing import Any
 import torch
 
 from determinism import DETERMINISM_OFF, DETERMINISM_STRICT
+from readiness import READINESS_OFF, ReadinessConfig
 
 logger = logging.getLogger(__name__)
 
@@ -257,6 +258,16 @@ class ArmFingerprint:
     # contrast. Empty when no goal field was attached.
     persistence_coupling: str = "value"
     goal_doses: tuple[float, ...] = ()
+    # #46's readiness register: one field per autonomy the tissue may be granted,
+    # named exactly as the flag in ``readiness.ReadinessConfig``. Off in every run
+    # there has been, so a legacy fingerprint reads as a run that granted none.
+    # Deliberately *not* a varying field: an arm that acts on its own plasticity
+    # is not at parity with one that does not, whatever else the two share.
+    autonomy_plasticity: bool = False
+    autonomy_exploration: bool = False
+    autonomy_setpoints: bool = False
+    autonomy_evaluation: bool = False
+    autonomy_dormancy: bool = False
 
     @property
     def arm(self) -> str:
@@ -291,6 +302,7 @@ def fingerprint_arm(
     steer_strength: float | None = None,
     steer_layers: Sequence[int] = (),
     code: tuple[str | None, bool | None] = (None, None),
+    readiness: ReadinessConfig = READINESS_OFF,
 ) -> ArmFingerprint:
     """Build a fingerprint from a ``TrainingConfig`` and the two measured hashes.
 
@@ -300,7 +312,10 @@ def fingerprint_arm(
     at, read off the attached hooks rather than the certification record, so the
     fingerprint records the injection and not the intent. ``code`` is
     ``code_identity()`` as read by the trainer, so a fingerprint built in a test
-    does not depend on the state of the tree the test runs in.
+    does not depend on the state of the tree the test runs in. ``readiness`` is
+    #46's register of granted autonomies, all off until the issue that earns one
+    turns it on; it is separate from ``TrainingConfig`` because the tissue that
+    reads it (#42) outlives any one training run.
     """
     code_sha, code_dirty = code
     return ArmFingerprint(
@@ -348,6 +363,11 @@ def fingerprint_arm(
         strict_determinism=config.deterministic == DETERMINISM_STRICT,
         code_sha=code_sha,
         code_dirty=code_dirty,
+        autonomy_plasticity=readiness.autonomy_plasticity,
+        autonomy_exploration=readiness.autonomy_exploration,
+        autonomy_setpoints=readiness.autonomy_setpoints,
+        autonomy_evaluation=readiness.autonomy_evaluation,
+        autonomy_dormancy=readiness.autonomy_dormancy,
     )
 
 

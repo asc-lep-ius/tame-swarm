@@ -14,7 +14,7 @@ mutation-verified in #14) and the ``TrainingConfig`` field scan in
 """
 
 import os
-from dataclasses import fields
+from dataclasses import fields, replace
 
 import pytest
 import torch
@@ -22,9 +22,12 @@ import torch
 from homeostat import CognitiveHomeostat
 from mob import MixtureOfBidders, MoBConfig, SteeringCouplingConfig
 from mob.auction import ROUTING_SHARE_PROPORTIONAL, VCGAuctioneer
+from parity import ArmFingerprint, ParityError, assert_parity
 from pid_controller import PIDConfig
+from readiness import AUTONOMIES, ReadinessConfig, granted_flags
 from steering import SteeringConfig, SteeringVector
 
+from .arm_fingerprints import BASE
 from .auction_mutations import pre_nine_payments
 from .config_reads import read_names
 from .conftest import TINY_HIDDEN_DIM, build_tiny_causal_lm
@@ -172,6 +175,64 @@ def test_the_projection_switch_is_live():
         assert torch.allclose(injected, raw, atol=1e-6)
         assert homeostat.get_capability_retention()[layer] == 1.0
     homeostat.detach_from_model()
+
+
+# --- The readiness register's gates are off, and a run says which it granted ------------
+
+# ``ReadinessConfig`` (``tame/readiness.py``) is the one config #46 puts the gate
+# flags in, and the call site that will read it is the viability tissue of #42 --
+# ``tame/viability.py`` in the Phase 2 plan, the lift-out of ``homeostat.py``
+# generalised from a projection onto a direction to a viability margin. That
+# module does not exist yet, so the config-read scanner above cannot cover these
+# fields and ``ReadinessConfig`` is deliberately not in ``CONFIGS``: adding it
+# today would assert a read nothing can yet make. When #42 lands and reads them,
+# it goes in ``CONFIGS`` and this section keeps the other half of the guarantee.
+#
+# The no-op this section names is the autonomy's own: a gate that is on by
+# default grants silently, and a gate the fingerprint does not carry makes a run
+# that granted it indistinguishable from one that did not -- the difference
+# between "the register schedules this" and "the register happened".
+
+
+@pytest.mark.parametrize("flag", granted_flags())
+def test_the_gate_flag_is_off_by_default(flag):
+    assert getattr(ReadinessConfig(), flag) is False, (
+        f"{flag} is on in the default ReadinessConfig. Every autonomy in "
+        "docs/readiness-register.md is off until the issue that earns it turns it on."
+    )
+
+
+@pytest.mark.parametrize("flag", granted_flags())
+def test_the_gate_flag_is_fingerprinted_and_asserted_at_parity(flag):
+    """In ``ArmFingerprint`` under the same name, defaulted off, and a confound when it differs."""
+    spec = {field.name: field for field in fields(ArmFingerprint)}
+    assert flag in spec, f"{flag} gates an autonomy and is not in ArmFingerprint"
+    assert spec[flag].default is False
+
+    with pytest.raises(ParityError, match=flag):
+        assert_parity([BASE, replace(BASE, router="softmax", **{flag: True})])
+
+
+def test_the_default_config_grants_nothing():
+    """The pairing: ``granted()`` is what a run would report, and today it is empty."""
+    assert ReadinessConfig().granted() == ()
+    assert ReadinessConfig(autonomy_dormancy=True).granted() == ("autonomy_dormancy",)
+
+
+def test_every_flag_in_the_register_is_checked_here():
+    """A row added to ``AUTONOMIES`` with a flag must arrive with its two checks.
+
+    The parametrisations above read ``granted_flags()``, so this only has to fail
+    when the register and the config part company -- a flag scheduled in the
+    register and never declared in the config gates nothing at all.
+    """
+    declared = {spec.name for spec in fields(ReadinessConfig)}
+    scheduled = {autonomy.flag for autonomy in AUTONOMIES if autonomy.flag is not None}
+
+    assert scheduled == declared, (
+        "docs/readiness-register.md's flags and ReadinessConfig's fields must be the same set; "
+        f"register-only {sorted(scheduled - declared)}, config-only {sorted(declared - scheduled)}"
+    )
 
 
 def test_the_xdist_thread_pin_is_active_in_this_worker():
