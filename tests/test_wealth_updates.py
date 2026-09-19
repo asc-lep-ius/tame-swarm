@@ -1,17 +1,27 @@
+import sys
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from mob import MixtureOfBidders, MoBConfig
-from mob.utils import get_mob_statistics, get_total_router_z_loss
-from mob.wealth import (
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+
+from synthetic_economy import (  # noqa: E402
+    DEFAULT_COMPETENCE,
+    SyntheticEconomy,
+    shuffled,
+)
+
+from mob import MixtureOfBidders, MoBConfig  # noqa: E402
+from mob.utils import get_mob_statistics, get_total_router_z_loss  # noqa: E402
+from mob.wealth import (  # noqa: E402
     LOCAL_REWARD_MULTIPLIER,
     LOSS_REWARD_MULTIPLIER,
     PARTICIPATION_REWARD_MULTIPLIER,
 )
-from train import TAMETrainer, TrainingConfig
+from train import TAMETrainer, TrainingConfig  # noqa: E402
 
 STABILITY_CONFIG = MoBConfig(
     num_experts=2,
@@ -944,3 +954,50 @@ def test_report_is_not_capped_below_the_value_it_must_predict():
     mob(torch.randn(1, 8, 32))
 
     assert mob.last_stats.confidences.max().item() > 1.0
+
+
+# --- The recorded fixture, pinned point by point (#40) -----------------------------------
+
+# ``scripts/synthetic_economy.py`` at seeds 0/1/2, 400 steps read over a tail of
+# 100: the run ``test_expert_value.py::test_winning_is_profitable_for_a_competent
+# _expert`` asserts a *sign* on and the README quotes as a band --
+# ``r(wealth, competence)`` 0.76-0.85 and a surplus per win of +0.070 to +0.077.
+# A band that wide is the right claim to make about an economy and the wrong one
+# to refactor against: #40 merges the three wealth paths into one updater, and
+# every arithmetic change worth catching lands well inside 0.76-0.85. So the
+# point values the band was taken from are recorded here, measured on 159e611 --
+# the commit before the merge -- and the merge has to reproduce them.
+#
+# The tolerance is not slack to spend. The fixture is chaotic: a reduction order
+# that flips one winner moves these numbers in the second decimal, so anything a
+# real change does is orders above this bound, and what the bound is actually for
+# is the last digit or two of an unchanged trajectory. Measured at 1, 2 and 8
+# torch threads the three seeds agree to 1.2e-7; the values below are the
+# one-thread reading, which is what the suite runs under (``tests/conftest.py``).
+RECORDED_QUALITY_FIXTURE = {
+    0: (0.847883939743042, 0.07101525582373142),
+    1: (0.829250156879425, 0.07173023656010628),
+    2: (0.7854968309402466, 0.0667997519299388),
+}
+RECORDED_PARITY_TOLERANCE = 1e-6
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_the_value_path_reproduces_the_recorded_fixture_numbers(seed):
+    """The parity criterion for #40: one updater, the same economy, to seven figures.
+
+    Wealth tracking and surplus per win together cover both halves of the
+    settlement -- the correlation reads the ledger the transfer left behind, the
+    surplus reads what a win was worth before the ledger was touched -- so a
+    reward that lost its share weighting and a charge that lost its coefficient
+    are both visible here.
+    """
+    summary = SyntheticEconomy(shuffled(DEFAULT_COMPETENCE, seed), seed=seed).run(400, window=100)
+
+    tracking, surplus = RECORDED_QUALITY_FIXTURE[seed]
+    assert summary.wealth_vs_competence == pytest.approx(tracking, abs=RECORDED_PARITY_TOLERANCE), (
+        summary.wealth_vs_competence
+    )
+    assert summary.final_surplus == pytest.approx(surplus, abs=RECORDED_PARITY_TOLERANCE), (
+        summary.final_surplus
+    )
