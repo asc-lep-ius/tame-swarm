@@ -258,6 +258,15 @@ class ArmFingerprint:
     # contrast. Empty when no goal field was attached.
     persistence_coupling: str = "value"
     goal_doses: tuple[float, ...] = ()
+    # #40. What the ledger relaxes toward. Every run recorded before the mode
+    # existed relaxed toward zero, so a legacy fingerprint reads as ``decay``.
+    # Deliberately *not* a varying field: #26's setpoint ledger is derived and
+    # measured, not adopted, and two arms whose ledgers have different fixed
+    # points and different ruin thresholds are not comparable on anything the
+    # economy does. It is here because ``MoBConfig`` is invisible to this
+    # fingerprint -- the field is carried on ``TrainingConfig`` for that reason,
+    # and #25's two arms ran different code and fingerprinted equal.
+    ledger_mode: str = "decay"
     # #46's readiness register: one field per autonomy the tissue may be granted,
     # named exactly as the flag in ``readiness.ReadinessConfig``. Off in every run
     # there has been, so a legacy fingerprint reads as a run that granted none.
@@ -346,6 +355,7 @@ def fingerprint_arm(
         exploration_rate=config.exploration_rate,
         exploration_draw=config.exploration_draw,
         persistence_coupling=config.persistence_coupling,
+        ledger_mode=config.ledger_mode,
         confidence_head_learning_rate=config.confidence_head_learning_rate,
         wealth_update_frequency=config.wealth_update_frequency,
         coupling_goal=config.coupling_goal,

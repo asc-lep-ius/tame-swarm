@@ -235,6 +235,7 @@ def test_fingerprint_arm_reads_the_training_config():
         exploration_rate=0.07,
         exploration_draw="uniform",
         persistence_coupling="decoupled",
+        ledger_mode="setpoint",
         confidence_head_learning_rate=0.011,
         wealth_update_frequency=19,
         coupling_beta=0.31,
@@ -278,6 +279,7 @@ def test_fingerprint_arm_reads_the_training_config():
     assert arm.exploration_rate == 0.07
     assert arm.exploration_draw == "uniform"
     assert arm.persistence_coupling == "decoupled"
+    assert arm.ledger_mode == "setpoint"
     assert arm.goal_doses == ()
     assert arm.confidence_head_learning_rate == 0.011
     assert arm.wealth_update_frequency == 19
