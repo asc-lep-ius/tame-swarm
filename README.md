@@ -944,11 +944,13 @@ About 861 tests across 50 modules covering auction properties (hand-built and hy
 The CPU suite cannot be a gate at the length it currently runs. The Stop hook's
 timeout is 300 seconds, and a 143-second suite is already enough to push a
 headless `/ship` turn into the background and lose the process it was waiting
-for; CI's `test` job measured 894–1013 seconds in pipelines 462 and 466
-(2026-09-16), and the same suite takes 161 seconds here — over the line on the
-fastest box the project has, with all 24 of its threads and torch already using
-eleven cores' worth of them. It is gated one step later instead — CI runs it on
-every push —
+for. CI's `test` job measured 894–1013 seconds in pipelines 462 and 466
+(2026-09-16). Here the same invocation — `-m "not gpu"`, 852 tests — takes 161
+seconds, and the bare `uv run pytest` takes 137 for 851, the difference being the
+one `slow` test that `addopts` also deselect. Neither is the deciding number:
+`run_all_gates` runs lint and types first, so filling the slot would cost a Stop
+invocation about 223 seconds against a 300-second timeout, on the fastest box the
+project has. It is gated one step later instead — CI runs it on every push —
 while `pyright` covers both `tame` and `scripts` statically, in the turn that
 wrote the code. `.pre-commit-config.yaml` runs ruff and pyright too, but once
 per commit, only in a clone where someone ran `pre-commit install`, and only
