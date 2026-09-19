@@ -928,6 +928,48 @@ docker compose -f docker-compose.test.yml up --build --abort-on-container-exit
 
 About 861 tests across 50 modules covering auction properties (hand-built and hypothesis-drawn), the value definition and exploration slot, wealth dynamics, gradient checkpointing, steering, the tissue on the measured plant, recovery from designed and undesigned damage, the metrics surface and its builders' 10 ms budget, the routing trace, the outcome probe, API endpoints, config, and experts; three strict expected failures record claims the economy does not yet meet ([#6](#integration-tests-6), re-attributed by [#16](#wealth-bounds-16) and split there into the two claims of different strength they had been asserting under one name). `-m slow` adds the 5000-step gate-stationarity run; `-m gpu` the bitwise-determinism check and the real-model integration tests, which load Qwen3-1.7B from the local HuggingFace cache (267 seconds on the RTX 5070 Ti, against a 300-second budget: 120 at [#6](#integration-tests-6), 160 when [#23](#calibration-corpus-23) moved the fixture onto the served calibration corpus, 300 when [#31](#run-to-run-31) put the determinism pair at the ablation configuration — 131 of the 267 — beside the real-model suite); without the cache they skip on a developer's machine and fail under CI.
 
+### The Local Gate
+
+<a name="the-local-gate-50"></a>
+
+`.claude/gates.sh` is what checks the tree before a push rather than after it
+(#50). Two slots are filled; the third is empty on purpose.
+
+| Gate | Command | Cost on the RTX 5070 Ti box |
+|---|---|---|
+| lint | `uv run ruff check . && uv run ruff format --check .` | < 1 s (116 files, cache deleted first) |
+| types | `uv run pyright tame scripts` | 62 s |
+| tests | *empty* | — |
+
+The CPU suite cannot be a gate at the length it currently runs. The Stop hook's
+timeout is 300 seconds, and a 143-second suite is already enough to push a
+headless `/ship` turn into the background and lose the process it was waiting
+for; CI's `test` job measured 894–1013 seconds in pipelines 462 and 466
+(2026-09-16), and the same suite takes 161 seconds here — over the line on the
+fastest box the project has, with all 24 of its threads and torch already using
+eleven cores' worth of them. It is gated one step later instead — CI runs it on
+every push —
+while `pyright` covers both `tame` and `scripts` statically, in the turn that
+wrote the code. `.pre-commit-config.yaml` runs ruff and pyright too, but once
+per commit, only in a clone where someone ran `pre-commit install`, and only
+over `tame`; the gate is wider and a turn earlier.
+
+The GPU suite is opt-in for the same reason and one more. `GPU_CMD` runs it
+behind `scripts/gpu_gate.sh`, which asks the forge whether `resource_group: gpu`
+is held before it touches the card. `test-gpu`, `train-smoke` and
+`perf-regression` share that group, which serialises them against each other and
+knows nothing about a process started by hand — and the runner tagged
+`workstation` *is* this workstation. A local run underneath a CI job does not
+corrupt the numerics; it OOMs the job or pushes it past the 300-second budget
+its log asserts against, and a blown budget reads as a performance regression in
+the code.
+
+```bash
+scripts/gpu_gate.sh                     # report only — is the card free?
+.claude/hooks/run-gates.sh              # lint + types, as the Stop hook runs them
+.claude/hooks/foreman.sh --measuring    # is the harness installed, is the checkout current?
+```
+
 ### Key Concepts for Contributors
 
 | Concept | File(s) | What to Know |
