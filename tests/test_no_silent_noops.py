@@ -14,23 +14,35 @@ mutation-verified in #14) and the ``TrainingConfig`` field scan in
 """
 
 import os
+from copy import deepcopy
 from dataclasses import fields, replace
 
 import pytest
 import torch
 
 from homeostat import CognitiveHomeostat
-from mob import MixtureOfBidders, MoBConfig, SteeringCouplingConfig
+from mob import MixtureOfBidders, MoBConfig, SteeringCouplingConfig, apply_mob_to_model
 from mob.auction import ROUTING_SHARE_PROPORTIONAL, VCGAuctioneer
 from parity import ArmFingerprint, ParityError, assert_parity
 from pid_controller import PIDConfig
 from readiness import AUTONOMIES, ReadinessConfig, granted_flags
+from rotating_stream import build_rotating_stream
 from steering import SteeringConfig, SteeringVector
+from viability_margins import (
+    CALLER_TRAINER,
+    FrozenBase,
+    MetricSet,
+    ViabilityError,
+    ViabilityMargins,
+    measure_viability,
+    score_predictions,
+)
 
 from .arm_fingerprints import BASE
 from .auction_mutations import pre_nine_payments
 from .config_reads import read_names
 from .conftest import TINY_HIDDEN_DIM, build_tiny_causal_lm
+from .rotating_fixtures import CUTOFF, MAX_SEQ_LENGTH, TODAY, canary_manifest, stream_manifest
 
 # --- Every config field is read by something -----------------------------------------
 
@@ -249,3 +261,101 @@ def test_the_xdist_thread_pin_is_active_in_this_worker():
         pytest.skip("serial runs keep torch's default pool; the pin is for workers")
 
     assert torch.get_num_threads() == 1
+
+
+# --- The frozen base is read-only, and is never the model it is measured against ------------
+
+# ``viability_margins.FrozenBase`` (#41) is the copy of the base every viability
+# margin is a margin *against*. The no-op it can fail into is the quietest in this
+# module: a base that is the served model, or that shares its parameters, makes
+# every margin identically zero -- which is also what a healthy organism at parity
+# with its base looks like. A core (#42) regulating on that regulates on nothing,
+# and nothing fails. The second half is the freeze itself: a base left trainable
+# is a second model being trained on the held-out stream, one gradient at a time.
+
+
+def _rotation(fake_tokenizer):
+    return build_rotating_stream(
+        stream_manifest(),
+        canary_manifest(),
+        fake_tokenizer,
+        MAX_SEQ_LENGTH,
+        cutoff=CUTOFF,
+        today=TODAY,
+    )
+
+
+def _organism_and_base(config: MoBConfig):
+    torch.manual_seed(0)
+    pristine = build_tiny_causal_lm()
+    base = FrozenBase.freeze(deepcopy(pristine))
+    return apply_mob_to_model(pristine, config, layers_to_modify=[1, 2]), base
+
+
+def test_the_frozen_base_takes_no_gradient_from_a_margin_pass(tiny_mob_config, fake_tokenizer):
+    model, base = _organism_and_base(tiny_mob_config)
+
+    measure_viability(
+        model,
+        base,
+        _rotation(fake_tokenizer),
+        batch_size=8,
+        device=torch.device("cpu"),
+        caller=CALLER_TRAINER,
+    )
+
+    for name, tensor in base.module.named_parameters():
+        assert not tensor.requires_grad, name
+        assert tensor.grad is None, name
+
+
+def test_a_base_that_was_not_frozen_does_take_one(fake_tokenizer):
+    """The pairing: the same items through the same forward leave a gradient.
+
+    Without it, the assertion above passes on a model whose parameters no gradient
+    could reach for reasons of its own -- which is a test of the fixture.
+    """
+    unfrozen = build_tiny_causal_lm()
+    stream = _rotation(fake_tokenizer)
+
+    outputs = unfrozen(input_ids=stream.input_ids, attention_mask=stream.attention_mask)
+    outputs.logits.sum().backward()
+
+    assert any(tensor.grad is not None for tensor in unfrozen.parameters())
+
+
+def test_the_organism_is_refused_as_its_own_frozen_base(tiny_mob_config, fake_tokenizer):
+    """Both ways it could be handed over: converted, and as the very object measured."""
+    model, base = _organism_and_base(tiny_mob_config)
+
+    with pytest.raises(ViabilityError, match="MoB layers"):
+        FrozenBase.freeze(model)
+
+    base.module = model
+    with pytest.raises(ViabilityError, match="every margin would be identically zero"):
+        measure_viability(
+            model,
+            base,
+            _rotation(fake_tokenizer),
+            batch_size=8,
+            device=torch.device("cpu"),
+            caller=CALLER_TRAINER,
+        )
+
+
+def test_a_base_that_is_the_model_reads_as_a_perfectly_healthy_organism(
+    tiny_mob_config, fake_tokenizer
+):
+    """The inert state the refusal above exists to prevent, shown rather than described."""
+    model, _ = _organism_and_base(tiny_mob_config)
+    predictions = score_predictions(model, _rotation(fake_tokenizer), 8, torch.device("cpu"))
+    metrics = MetricSet.of(predictions.stream)
+
+    margins = ViabilityMargins.between(metrics, metrics)
+
+    assert (margins.accuracy, margins.calibration, margins.brier, margins.selective) == (
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+    )

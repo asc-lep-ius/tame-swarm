@@ -27,6 +27,15 @@ point of #12: three arms whose held-out sets differ by so much as tokenisation
 are three numbers that cannot be subtracted. The split is tokenised once, frozen
 to disk, and fingerprinted; the parity check refuses to compare arms whose
 fingerprints differ.
+
+**The second held-out artefact (#41) is not here.** The split above is fixed so
+that arms can be subtracted; a *viability margin* needs the opposite property, and
+the rotating stream that provides it lives in ``rotating_stream`` -- documents
+newer than the checkpoint's cutoff, on a schedule nothing in the system can move,
+with canaries hidden in them. ``viability_margins`` is what reads a margin off it.
+Three modules rather than one because they fail differently: a fixed split that
+drifts is a broken comparison, a rotating stream that stops rotating is a farmable
+one, and a margin computed against the wrong base is neither.
 """
 
 import hashlib
