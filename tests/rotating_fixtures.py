@@ -26,6 +26,11 @@ MAX_SEQ_LENGTH = 48
 
 ANSWERS = (" alpha", " beta", " gamma", " delta")
 
+# Eight, not four: ``viability_margins.MIN_CANARIES`` refuses a set small enough
+# that one canary moves the accuracy by more than the divergence tolerance, and a
+# fixture below that floor could not exercise the detector it is there to test.
+CANARY_COUNT = 8
+
 
 def dated_items(prefix: str, count: int, published: date) -> tuple[DatedItem, ...]:
     return tuple(
@@ -54,7 +59,7 @@ def stream_manifest(
 
 
 def canary_manifest(
-    count: int = 4,
+    count: int = CANARY_COUNT,
     refreshed: date = REFRESHED,
     refresh_days: int = 90,
     published: date = CANARY_PLANTED,

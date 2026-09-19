@@ -27,6 +27,7 @@ from evaluation import (
 
 from .conftest import FakeTokenizer
 from .rotating_fixtures import (
+    CANARY_COUNT,
     CANARY_PLANTED,
     CUTOFF,
     MAX_SEQ_LENGTH,
@@ -152,8 +153,8 @@ def test_every_canary_is_marked_and_no_stream_item_is(fake_tokenizer):
     marked = {item_id for item_id, flag in pairs if flag}
 
     assert marked == {item.item_id for item in canary_manifest().items}
-    assert built.num_canaries == 4
-    assert built.num_items == 16
+    assert built.num_canaries == CANARY_COUNT
+    assert built.num_items == 12 + CANARY_COUNT
 
 
 # --- The fingerprint names the rotation ------------------------------------------------------
@@ -304,5 +305,5 @@ def test_the_canaries_need_not_be_newer_than_the_cutoff(fake_tokenizer):
     built = _build(fake_tokenizer)
 
     assert CANARY_PLANTED < CUTOFF
-    assert built.num_canaries == 4
-    assert torch.equal(built.is_canary.sum(), torch.tensor(4))
+    assert built.num_canaries == CANARY_COUNT
+    assert torch.equal(built.is_canary.sum(), torch.tensor(CANARY_COUNT))
