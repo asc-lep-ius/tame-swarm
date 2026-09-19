@@ -140,6 +140,7 @@ from mob import (
     update_all_mob_from_loss,
 )
 from mob.experts import CONFIDENCE_INITIAL_LOGIT, ConfidenceHead
+from mob.ledger import SUPPORTED_LEDGER_MODES, SUPPORTED_PERSISTENCE_COUPLINGS
 from parity import ArmFingerprint, code_identity, data_order_fingerprint, fingerprint_arm
 from specialisation import SpecialisationReport, probe_specialisation
 from steering import ADAPTIVE_STEERING, SteeringConfig
@@ -359,6 +360,17 @@ class TrainingConfig:
     # "uniform", the draw every arm before #38 ran under. See
     # MoBConfig.exploration_draw.
     exploration_draw: str = "staleness"
+    # The stakes dial (#39): "value" is the economy as recorded, "decoupled" pins
+    # the wealth the gate reads and settles a shadow ledger, "shuffled" permutes
+    # the heads' regression targets. Fingerprinted; see MoBConfig.persistence_coupling.
+    persistence_coupling: str = "value"
+    # What the ledger relaxes toward (#40): "decay" is every arm there has been,
+    # "setpoint" is #26's ledger as a mode of the same arithmetic. Fingerprinted
+    # rather than left to MoBConfig, which ArmFingerprint cannot see: two arms
+    # whose ledgers relax toward different things are not at parity, and #25's
+    # failure was exactly a field that steered a run and no fingerprint carried.
+    # See MoBConfig.ledger_mode and README #ledger-stability.
+    ledger_mode: str = "decay"
     # The confidence heads are single linear layers regressing onto values of
     # order 1e-2, and at the backbone's 2e-5 a head's logit moves by that much per
     # step: measured on Qwen3-1.7B over 120 steps, every report stayed within
@@ -756,6 +768,8 @@ class TAMETrainer:
             confidence_calibration_weight=self.config.calibration_loss_weight,
             exploration_rate=self.config.exploration_rate,
             exploration_draw=self.config.exploration_draw,
+            persistence_coupling=self.config.persistence_coupling,
+            ledger_mode=self.config.ledger_mode,
             router=ARM_ROUTERS[self.config.router],
         )
 
@@ -2097,6 +2111,28 @@ def main():
             "held a token (#38, the default), or uniform as every arm before #38"
         ),
     )
+    parser.add_argument(
+        "--ledger_mode",
+        type=str,
+        default="decay",
+        choices=sorted(SUPPORTED_LEDGER_MODES),
+        help=(
+            "What the expert ledger relaxes toward between settlements (#40): decay "
+            "(toward zero, every arm there has been) or setpoint (toward "
+            "initial_wealth, #26's ledger)"
+        ),
+    )
+    parser.add_argument(
+        "--persistence_coupling",
+        type=str,
+        default="value",
+        choices=sorted(SUPPORTED_PERSISTENCE_COUPLINGS),
+        help=(
+            "The stakes dial (#39): value (the economy as recorded), decoupled (the gate "
+            "reads a pinned wealth and re-entry is uniform; the ledger settles as a "
+            "shadow) or shuffled (the heads regress onto another expert's values)"
+        ),
+    )
 
     # Reproducibility (#13, #31)
     parser.add_argument(
@@ -2204,6 +2240,8 @@ def main():
         seed=args.seed,
         exploration_rate=args.exploration_rate,
         exploration_draw=args.exploration_draw,
+        persistence_coupling=args.persistence_coupling,
+        ledger_mode=args.ledger_mode,
         confidence_head_learning_rate=args.confidence_head_learning_rate,
         deterministic=args.deterministic,
         shuffle_buffer_size=args.shuffle_buffer_size,

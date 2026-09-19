@@ -1,6 +1,7 @@
 """Parity between arms, asserted programmatically rather than assumed."""
 
 from dataclasses import asdict, fields, replace
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -8,18 +9,23 @@ import torch
 
 from parity import (
     DRIFT_FIELDS,
+    ROTATION_FIELDS,
     ArmFingerprint,
+    ManifestDriftError,
     ParityError,
     assert_parity,
+    assert_same_manifest,
     code_drift,
     code_identity,
     data_order_fingerprint,
     fingerprint_arm,
+    manifest_drift,
     unchecked_config_fields,
 )
 from train import TrainingConfig
 
 from .arm_fingerprints import BASE
+from .rotating_fixtures import canary_manifest, stream_manifest
 
 
 def _batches(seed: int, count: int = 8):
@@ -234,6 +240,8 @@ def test_fingerprint_arm_reads_the_training_config():
         calibration_loss_weight=0.23,
         exploration_rate=0.07,
         exploration_draw="uniform",
+        persistence_coupling="decoupled",
+        ledger_mode="setpoint",
         confidence_head_learning_rate=0.011,
         wealth_update_frequency=19,
         coupling_beta=0.31,
@@ -276,6 +284,9 @@ def test_fingerprint_arm_reads_the_training_config():
     assert arm.calibration_loss_weight == 0.23
     assert arm.exploration_rate == 0.07
     assert arm.exploration_draw == "uniform"
+    assert arm.persistence_coupling == "decoupled"
+    assert arm.ledger_mode == "setpoint"
+    assert arm.goal_doses == ()
     assert arm.confidence_head_learning_rate == 0.011
     assert arm.wealth_update_frequency == 19
     assert arm.coupling_goal is None
@@ -473,3 +484,158 @@ def test_lora_settings_break_parity():
 def test_a_different_objective_breaks_parity():
     with pytest.raises(ParityError, match="calibration_loss_weight"):
         assert_parity([BASE, replace(BASE, router="softmax", calibration_loss_weight=0.9)])
+
+
+# --- The rotation a margin was read on (#41) ------------------------------------------------
+
+ROTATED = replace(
+    BASE,
+    rotating_stream="stream0001",
+    rotating_stream_date="2026-09-01",
+    rotating_refresh_days=30,
+    rotating_stream_overdue_days=0,
+    rotating_stream_cutoff="2026-01-01",
+    canary_set="canary001",
+    canary_set_date="2026-09-01",
+    canary_refresh_days=90,
+)
+
+
+def test_the_rotation_fields_are_recorded_and_not_asserted_between_arms():
+    """Two arms measured in one process read one rotation by construction.
+
+    Between two recorded groups it is ``manifest_drift`` that decides, because
+    there a missing rotation -- every summary written before #41 -- has to count
+    as drift, and a field-equality check would read two ``None``s as agreement.
+    """
+    assert {
+        "rotating_stream",
+        "rotating_stream_date",
+        "rotating_refresh_days",
+        "rotating_stream_overdue_days",
+        "rotating_stream_cutoff",
+        "canary_set",
+        "canary_set_date",
+        "canary_refresh_days",
+    } == ROTATION_FIELDS
+
+    assert_parity([ROTATED, replace(ROTATED, router="softmax", rotating_stream="stream0002")])
+
+
+def test_fingerprint_arm_records_the_rotation_it_was_handed():
+    from rotating_stream import RotationRecord
+
+    stream, canaries = stream_manifest(), canary_manifest()
+    print_ = fingerprint_arm(
+        TrainingConfig(),
+        eval_split_fingerprint="abc",
+        data_order="def",
+        converted_layers=3,
+        rotation=RotationRecord.of(stream, canaries, cutoff=date(2026, 1, 1), days_overdue=4),
+    )
+
+    assert print_.rotating_stream == stream.fingerprint
+    assert print_.rotating_stream_date == "2026-09-01"
+    assert print_.rotating_refresh_days == 30
+    assert print_.rotating_stream_overdue_days == 4
+    assert print_.rotating_stream_cutoff == "2026-01-01"
+    assert print_.canary_set == canaries.fingerprint
+    assert print_.canary_refresh_days == 90
+
+
+def test_a_trainer_that_reads_no_margin_records_no_rotation():
+    """The trainer's recorded measurement is the fixed split, not the rotating one."""
+    print_ = fingerprint_arm(
+        TrainingConfig(), eval_split_fingerprint="abc", data_order="def", converted_layers=3
+    )
+
+    assert print_.rotating_stream is None
+    assert print_.canary_set is None
+    assert manifest_drift([print_]) == [
+        "  no rotating stream recorded for ['mob'] (a summary from before #41)",
+        "  no canary set recorded for ['mob'] (a summary from before #41)",
+    ]
+
+
+def test_two_rotations_of_the_stream_are_drift():
+    reasons = manifest_drift([ROTATED, replace(ROTATED, rotating_stream="stream0002")])
+
+    assert reasons == [
+        "  different rotating stream: ['stream0001', 'stream0002'], refreshed ['2026-09-01']"
+    ]
+
+
+def test_a_widened_cadence_is_drift_of_its_own():
+    """A rotation that agrees and a schedule that does not are two different problems."""
+    reasons = manifest_drift([ROTATED, replace(ROTATED, rotating_refresh_days=365)])
+
+    assert reasons == [
+        '  different rotating stream cadence: [30, 365] days, so "newer than the last update" '
+        "means two different things across these arms"
+    ]
+
+
+def test_canaries_that_turned_over_between_the_arms_are_drift():
+    """Half of what farming is read from; a rotated canary set makes it two halves."""
+    reasons = manifest_drift([ROTATED, replace(ROTATED, canary_set="canary002")])
+
+    assert reasons == [
+        "  different canary set: ['canary001', 'canary002'], refreshed ['2026-09-01']"
+    ]
+
+
+def test_one_rotation_is_labelled_with_its_date_and_fingerprint():
+    label = assert_same_manifest([ROTATED, replace(ROTATED, router="softmax")])
+
+    assert label == (
+        "stream: stream0001 refreshed 2026-09-01 every 30d, "
+        "canaries: canary001 refreshed 2026-09-01 every 90d"
+    )
+
+
+def test_drifted_margins_are_refused_by_default():
+    with pytest.raises(ManifestDriftError, match="not read on one rotation"):
+        assert_same_manifest([ROTATED, replace(ROTATED, rotating_stream="stream0002")])
+
+
+def test_drift_may_be_allowed_and_is_then_printed_beside_the_numbers(caplog):
+    """The pairing: allowed is labelled, never silent."""
+    with caplog.at_level("WARNING"):
+        label = assert_same_manifest(
+            [ROTATED, replace(ROTATED, rotating_stream="stream0002")], allow_drift=True
+        )
+
+    assert label.startswith("stream: DRIFT, allowed by --allow-manifest-drift")
+    assert "different rotating stream" in caplog.text
+
+
+def test_a_fingerprint_recorded_before_the_rotation_existed_still_loads():
+    """Every summary under ~/tame-runs predates #41 and must read as a run with none."""
+    recorded = {key: value for key, value in asdict(BASE).items() if key not in ROTATION_FIELDS}
+
+    loaded = ArmFingerprint(**recorded)
+
+    assert loaded == BASE
+    assert loaded.rotating_stream is None and loaded.canary_set is None
+
+
+def test_a_stream_read_after_it_stopped_rotating_is_drift():
+    """A stale rotation hashes as it did while fresh, so the fingerprint cannot say."""
+    stale = replace(ROTATED, rotating_stream_overdue_days=40)
+
+    assert manifest_drift([stale, stale]) == [
+        "  stream read up to 40 days past its refresh for ['mob']: it had stopped rotating, "
+        "so it is a held-out corpus only in the sense that it was one"
+    ]
+    assert manifest_drift([ROTATED, ROTATED]) == []
+
+
+def test_arms_filtered_against_different_cutoffs_are_drift():
+    reasons = manifest_drift([ROTATED, replace(ROTATED, rotating_stream_cutoff="2025-06-01")])
+
+    assert any("different checkpoint cutoffs" in reason for reason in reasons)
+
+
+def test_naming_a_rotation_for_no_arms_is_a_parity_error_not_an_index_error():
+    with pytest.raises(ParityError, match="no rotation to name"):
+        assert_same_manifest([])

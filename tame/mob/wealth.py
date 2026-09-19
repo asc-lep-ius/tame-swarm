@@ -1,3 +1,13 @@
+"""The MoB layer's side of the ledger: what a winner realised, and what it is charged.
+
+:mod:`mob.ledger` owns the settlement -- one :class:`~mob.ledger.WealthUpdater`
+relaxing a ledger, paying a reward signal and holding the result at a floor. This
+module is what a MoB layer brings to it: the value every winner realised on every
+token (:func:`realised_values`, captured by a hook the loss backward fires), the
+VCG charge in the reward's own units, the caches a settlement is assembled from,
+and the two diagnostics the ledger does not read.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -6,15 +16,17 @@ from typing import TYPE_CHECKING, NamedTuple
 import torch
 import torch.nn.functional as F
 
+from .ledger import (
+    PERSISTENCE_DECOUPLED,
+    PERSISTENCE_SHUFFLED,
+    Settlement,
+    WealthUpdater,
+)
+
 if TYPE_CHECKING:
     from .mob_config import MoBConfig
 
 logger = logging.getLogger(__name__)
-
-LOSS_REWARD_MULTIPLIER = 50.0
-LOCAL_REWARD_MULTIPLIER = 5.0
-PARTICIPATION_REWARD_MULTIPLIER = 10.0
-WEALTH_EPSILON = 1e-6
 
 
 class ValueSummary(NamedTuple):
@@ -71,6 +83,7 @@ def realised_values(contributions: torch.Tensor, output_gradient: torch.Tensor) 
 class WealthUpdateMixin:
     # Declared for type checking — provided by MixtureOfBidders.__init__()
     config: MoBConfig
+    wealth_updater: WealthUpdater
     expert_wealth: torch.Tensor
     expert_usage_count: torch.Tensor
     expert_baseline_loss: torch.Tensor
@@ -84,10 +97,52 @@ class WealthUpdateMixin:
     _cached_rebates: torch.Tensor | None
     _cached_explored: torch.Tensor | None
     _cached_values: torch.Tensor | None
+    _cached_goal_terms: torch.Tensor | None
     _loss_feedback_pending: bool
     _cached_calibration_loss: torch.Tensor | None
     last_value_summary: ValueSummary | None
     last_realised_values: torch.Tensor | None
+    last_goal_terms: torch.Tensor | None
+
+    def allocation_wealth(self) -> torch.Tensor:
+        """The wealth the gate reads: the ledger, or under ``decoupled`` a pinned one.
+
+        Which of the two is the ledger's own mode (:attr:`WealthUpdater.pinned_at`)
+        rather than a branch here, so that a ledger settling as a shadow is the
+        same class as one the gate reads and not a fourth wealth path.
+        """
+        return self.wealth_updater.allocation_wealth(self.expert_wealth)
+
+    def allocation_staleness(self) -> torch.Tensor | None:
+        """The staleness the exploration draw reads; ``None`` draws uniformly (#38).
+
+        Under ``decoupled`` re-entry is uniform: a cell that has been shut out is
+        re-sampled no faster than one that has not, so nothing the ledger records
+        reaches the allocation by this channel either. The ledger still ages, for
+        the shadow. Read off the dial rather than off the ledger because the draw
+        belongs to the gate: what #40 folded into the ledger is the pinned wealth,
+        which the ledger is what the gate reads *instead of*.
+        """
+        if self.config.persistence_coupling == PERSISTENCE_DECOUPLED:
+            return None
+        return self.expert_steps_since_held
+
+    def _value_target_sources(self) -> torch.Tensor:
+        """Which expert's realised values each head regresses onto.
+
+        Its own, except under ``shuffled``: a cyclic shift by a fresh draw in
+        ``[1, num_experts)`` each step, which is a derangement in one draw -- no
+        head ever sees its own value, and each sees every other expert's equally
+        often over steps. The draw is from the global stream, as the exploration
+        draw is, so the shuffled arm's trajectory diverges from the live arm's from
+        the first settlement and never by a hidden constant.
+        """
+        num_experts = self.config.num_experts
+        experts = torch.arange(num_experts, device=self.expert_wealth.device)
+        if self.config.persistence_coupling != PERSISTENCE_SHUFFLED:
+            return experts
+        shift = int(torch.randint(1, num_experts, (1,)).item())
+        return (experts + shift) % num_experts
 
     def _transfer_coefficient(self, reward_multiplier: float) -> float:
         """The single scale that makes ``reward - charge`` a quasi-linear utility.
@@ -103,11 +158,11 @@ class WealthUpdateMixin:
         ``report > price`` -- so overreporting pays, and the mechanism's
         strategyproofness says nothing about the economy that realises the payoff.
 
-        ``reward_multiplier`` is passed per call because the three wealth paths use
-        different ones; a single constant would only be quasi-linear for whichever
-        path it was derived from. ``payment_scale`` survives as a dimensionless
-        deviation from the balanced point, so 1.0 is the value the theory picks and
-        anything else is a deliberate over- or under-pricing.
+        ``reward_multiplier`` is passed per call because the three reward signals
+        use different ones; a single constant would only be quasi-linear for
+        whichever path it was derived from. ``payment_scale`` survives as a
+        dimensionless deviation from the balanced point, so 1.0 is the value the
+        theory picks and anything else is a deliberate over- or under-pricing.
         """
         return (
             self.config.payment_scale
@@ -232,9 +287,13 @@ class WealthUpdateMixin:
             return
         live_confidences = live_confidences[:, :seq_len, :]
 
+        sources = self._value_target_sources()
         expert_terms = []
         for expert_idx in range(self.config.num_experts):
-            held_slots = selected_experts == expert_idx
+            # Under the shuffled arm the head is trained on another expert's
+            # tokens and targets (#39); otherwise ``source`` is the head's own.
+            source = int(sources[expert_idx])
+            held_slots = selected_experts == source
             held = held_slots.any(dim=-1) & valid_mask
             if not held.any():
                 continue
@@ -259,6 +318,7 @@ class WealthUpdateMixin:
         self._live_confidences = None
         self._cached_calibration_loss = None
         self._cached_values = None
+        self._cached_goal_terms = None
 
     def update_wealth_from_loss(
         self,
@@ -336,6 +396,13 @@ class WealthUpdateMixin:
             routing_weights = routing_weights[:, :seq_len, :]
             confidences = confidences[:, :seq_len, :]
             values = values[:, :seq_len, :].float() * loss_gradient_scale
+            # The goal term (#33, ``mob.goal``) is already in per-token loss units
+            # -- the dose prices a unit of goal error in them -- so it joins the
+            # value after the gradient has been restated in those units, not before.
+            goal_terms = self._cached_goal_terms
+            if goal_terms is not None:
+                goal_terms = goal_terms[:, :seq_len, :]
+                values = values + goal_terms
             if payments is not None:
                 payments = payments[:, :seq_len, :]
             if rebates is not None:
@@ -344,56 +411,66 @@ class WealthUpdateMixin:
                 explored = explored[:, :seq_len, :]
 
             valid_mask = self._valid_token_mask(token_mask, batch_size, seq_len)
-            num_tokens = batch_size * seq_len
 
-            self.expert_wealth *= self.config.wealth_decay
-
-            expert_rewards = torch.zeros_like(self.expert_wealth)
-            for expert_idx in range(self.config.num_experts):
-                held_slots = selected_experts == expert_idx
-                held = held_slots.any(dim=-1) & valid_mask
-                if not held.any():
-                    continue
-
-                expert_value = (values * held_slots).sum(dim=-1)
-                expert_share = (routing_weights.float() * held_slots).sum(dim=-1)
-                credited = (expert_value * expert_share)[held].sum() / num_tokens
-                expert_rewards[expert_idx] += (
-                    credited * self.config.reward_scale * LOSS_REWARD_MULTIPLIER
-                )
-
-                decay = self.config.loss_ema_decay
-                self.expert_performance_ema[expert_idx] = (
-                    decay * self.expert_performance_ema[expert_idx]
-                    + (1 - decay) * expert_value[held].mean()
-                )
-                self.expert_baseline_loss[expert_idx] = (
-                    decay * self.expert_baseline_loss[expert_idx]
-                    + (1 - decay) * per_token_loss[held].float().mean()
-                )
-
-            # The rebate is netted inside _vcg_charges, so wealth moves by a single
-            # transfer rather than a charge and a credit applied separately.
-            expert_rewards -= self._vcg_charges(
-                payments,
-                selected_experts,
-                num_tokens,
-                LOSS_REWARD_MULTIPLIER,
-                rebates,
-                valid_mask,
+            self.wealth_updater.settle(
+                self.expert_wealth,
+                Settlement(
+                    selected_experts=selected_experts,
+                    routing_weights=routing_weights,
+                    confidences=confidences,
+                    num_tokens=batch_size * seq_len,
+                    payments=payments,
+                    rebates=rebates,
+                    valid_mask=valid_mask,
+                    values=values,
+                    usage_count=self.expert_usage_count,
+                ),
+                self._vcg_charges,
             )
-
-            self.expert_wealth += expert_rewards
-            self.expert_wealth.clamp_(min=self.config.min_wealth, max=self.config.max_wealth)
+            self._update_expert_baselines(values, per_token_loss, selected_experts, valid_mask)
 
             self.last_realised_values = values
+            self.last_goal_terms = goal_terms
             self.last_value_summary = self._summarise_values(
                 values, confidences, selected_experts, payments, explored, valid_mask
             )
             self._loss_feedback_pending = False
             self._cached_values = None
+            self._cached_goal_terms = None
 
         self._compute_and_cache_calibration_loss(values, selected_experts, valid_mask)
+
+    def _update_expert_baselines(
+        self,
+        values: torch.Tensor,
+        per_token_loss: torch.Tensor,
+        selected_experts: torch.Tensor,
+        valid_mask: torch.Tensor,
+    ) -> None:
+        """Two EMAs over the tokens each expert held, neither of which the ledger reads.
+
+        ``expert_performance_ema`` tracks the value an expert realises and
+        ``expert_baseline_loss`` the organism's loss on the tokens it held. Both
+        are diagnostics that survive in the checkpoint format, kept out of the
+        reward signal for that reason: what a cell is paid for should be readable
+        without reading what is merely recorded about it.
+        """
+        decay = self.config.loss_ema_decay
+        for expert_idx in range(self.config.num_experts):
+            held_slots = selected_experts == expert_idx
+            held = held_slots.any(dim=-1) & valid_mask
+            if not held.any():
+                continue
+
+            expert_value = (values * held_slots).sum(dim=-1)
+            self.expert_performance_ema[expert_idx] = (
+                decay * self.expert_performance_ema[expert_idx]
+                + (1 - decay) * expert_value[held].mean()
+            )
+            self.expert_baseline_loss[expert_idx] = (
+                decay * self.expert_baseline_loss[expert_idx]
+                + (1 - decay) * per_token_loss[held].float().mean()
+            )
 
     def _valid_token_mask(
         self, token_mask: torch.Tensor | None, batch_size: int, seq_len: int
@@ -447,7 +524,7 @@ class WealthUpdateMixin:
             mean_surplus=(realised - price).mean(),
         )
 
-    def _update_wealth_local_quality(
+    def _settle_in_forward(
         self,
         selected_experts: torch.Tensor,
         routing_weights: torch.Tensor,
@@ -455,106 +532,28 @@ class WealthUpdateMixin:
         payments: torch.Tensor | None,
         rebates: torch.Tensor | None,
         output: torch.Tensor,
-    ):
-        with torch.no_grad():
-            batch_size, seq_len, hidden_dim = output.shape
-            num_tokens = batch_size * seq_len
+    ) -> None:
+        """The settlement for a layer no loss reaches: the same ledger, a different signal.
 
-            is_inference = not self.config.use_loss_feedback
-
-            decay_rate = (
-                self.config.inference_wealth_decay if is_inference else self.config.wealth_decay
-            )
-            self.expert_wealth *= decay_rate
-
-            expert_rewards = torch.zeros_like(self.expert_wealth)
-            output_norms = output.norm(dim=-1)
-            global_mean_norm = output_norms.mean()
-
-            for k in range(self.config.top_k):
-                for expert_idx in range(self.config.num_experts):
-                    mask = selected_experts[:, :, k] == expert_idx
-                    if not mask.any():
-                        continue
-
-                    expert_output_norms = output_norms[mask]
-
-                    if expert_output_norms.numel() >= 2:
-                        norm_std = expert_output_norms.std(correction=0)
-                    else:
-                        norm_std = torch.tensor(0.0, device=expert_output_norms.device)
-                    consistency_reward = 1.0 / (1.0 + norm_std)
-
-                    norm_mean = expert_output_norms.mean()
-                    magnitude_diff = (norm_mean - global_mean_norm).abs()
-                    magnitude_reward = 1.0 / (1.0 + magnitude_diff)
-
-                    quality = (consistency_reward + magnitude_reward) / 2.0
-
-                    mean_confidence = confidences[:, :, expert_idx][mask].mean()
-                    mean_weight = routing_weights[:, :, k][mask].mean()
-                    selection_fraction = mask.sum().float() / num_tokens
-
-                    reward = quality * mean_confidence * mean_weight * selection_fraction
-                    expert_rewards[expert_idx] += (
-                        reward * self.config.reward_scale * LOCAL_REWARD_MULTIPLIER
-                    )
-
-            expert_rewards -= self._vcg_charges(
-                payments, selected_experts, num_tokens, LOCAL_REWARD_MULTIPLIER, rebates
-            )
-
-            if is_inference and self.config.inference_exploration_bonus > 0:
-                mean_usage = self.expert_usage_count.mean()
-                if mean_usage > 0:
-                    usage_ratio = self.expert_usage_count / (mean_usage + WEALTH_EPSILON)
-                    exploration_bonus = (1.0 - usage_ratio).clamp(
-                        min=0
-                    ) * self.config.inference_exploration_bonus
-                    exploration_bonus = exploration_bonus * self.expert_wealth.mean()
-                    expert_rewards += exploration_bonus
-
-            self.expert_wealth += expert_rewards
-            self.expert_wealth.clamp_(min=self.config.min_wealth, max=self.config.max_wealth)
-
-    def _update_wealth_participation(
-        self,
-        selected_experts: torch.Tensor,
-        routing_weights: torch.Tensor,
-        confidences: torch.Tensor,
-        payments: torch.Tensor | None = None,
-        rebates: torch.Tensor | None = None,
-    ):
+        ``update_wealth_from_loss`` cannot run here -- a winner's value is its
+        contribution against the loss gradient, and inside the forward there is no
+        gradient yet -- so the layer settles on whichever proxy its configuration
+        selected. Which one that is belongs to ``WealthUpdater.for_experts``; this
+        only assembles the step.
+        """
         with torch.no_grad():
             batch_size, seq_len, _ = confidences.shape
-            num_tokens = batch_size * seq_len
-
-            self.expert_wealth *= self.config.wealth_decay
-
-            expert_rewards = torch.zeros_like(self.expert_wealth)
-
-            for k in range(self.config.top_k):
-                for expert_idx in range(self.config.num_experts):
-                    mask = selected_experts[:, :, k] == expert_idx
-                    if mask.any():
-                        selection_count = mask.sum().float()
-                        selection_fraction = selection_count / num_tokens
-                        mean_confidence = confidences[:, :, expert_idx][mask].mean()
-                        mean_weight = routing_weights[:, :, k][mask].mean()
-
-                        base_reward = selection_fraction * mean_confidence * mean_weight
-                        expert_rewards[expert_idx] += (
-                            base_reward * self.config.reward_scale * PARTICIPATION_REWARD_MULTIPLIER
-                        )
-
-            expert_rewards -= self._vcg_charges(
-                payments,
-                selected_experts,
-                num_tokens,
-                PARTICIPATION_REWARD_MULTIPLIER,
-                rebates,
+            self.wealth_updater.settle(
+                self.expert_wealth,
+                Settlement(
+                    selected_experts=selected_experts,
+                    routing_weights=routing_weights,
+                    confidences=confidences,
+                    num_tokens=batch_size * seq_len,
+                    payments=payments,
+                    rebates=rebates,
+                    output=output,
+                    usage_count=self.expert_usage_count,
+                ),
+                self._vcg_charges,
             )
-
-            self.expert_wealth += expert_rewards
-
-            self.expert_wealth.clamp_(min=self.config.min_wealth, max=self.config.max_wealth)

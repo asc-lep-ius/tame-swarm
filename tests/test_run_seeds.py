@@ -21,6 +21,7 @@ from run_seeds import (  # noqa: E402
     replication_std,
 )
 
+from parity import arm_label  # noqa: E402
 from train import TrainingConfig  # noqa: E402
 
 
@@ -98,3 +99,13 @@ def test_the_sweep_accepts_the_uniform_draw_so_a_new_arm_can_meet_a_recorded_one
 
     assert args.exploration_draw == "uniform"
     assert build_parser().parse_args([]).exploration_draw == "staleness"
+
+
+def test_the_sweep_takes_the_stakes_dial_and_names_the_arm_by_it():
+    """#39's three arms are one flag apart, and the label says which one a summary is."""
+    args = build_parser().parse_args(["--persistence_coupling", "decoupled"])
+
+    assert args.persistence_coupling == "decoupled"
+    assert build_parser().parse_args([]).persistence_coupling == "value"
+    assert arm_label("mob", None, "truthful", "decoupled") == "mob@truthful~decoupled"
+    assert arm_label("mob", None, None, "value") == "mob"

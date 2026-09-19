@@ -111,5 +111,5 @@ results were read is a new run, not this one.
 
 | Run | Deviation | Written on |
 |---|---|---|
-| #39 | — | — |
+| #39 | **Fixture-only in this MR; the GPU arms are deferred.** The operator's scope decision of 2026-09-19: the three arms are run on the differentiated fixture (two goal fields, 3 seeds, signature 1) and the quality fixture (signatures 2 and 3), on CPU, and the primary is read there with the resampled-mean range at 3 seeds. The differentiated body at #25's budget is a later run, launched from the code SHA the README's `#stakes-dial-cell` stub records, and is written up as its own row here before it is read. Two things the fixture cannot do as section 1 states them: it has no injection to price a unit of goal error against, so the dose is a script parameter carried in the fingerprint (`goal_doses`) rather than the injection's held-out cost; and its re-running floor is identically zero, the fixture being bitwise deterministic on CPU, so the excess over the floor is the shift itself. | 2026-09-19, before the first fixture run |
 | #44 | — | — |
