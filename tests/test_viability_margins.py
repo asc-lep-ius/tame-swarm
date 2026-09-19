@@ -12,8 +12,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-from evaluation import build_rotating_stream
 from mob import apply_mob_to_model
+from rotating_stream import build_rotating_stream
 from viability_margins import (
     CALLER_CORE,
     CALLER_TRAINER,
@@ -123,6 +123,31 @@ def test_the_margins_are_signed_so_positive_is_the_organism_ahead():
     assert margins.selective == pytest.approx(0.10)
 
 
+def test_an_integer_mask_is_refused_at_construction():
+    """``~`` on an int tensor is a bitwise NOT, and only one metric of four corrupts.
+
+    With a 0/1 ``int64`` mask the risk--coverage area comes back negative -- a
+    number a reader takes for a value, not an error -- while accuracy, ECE and
+    Brier coerce and go on agreeing. Refusing at construction is what stops the
+    corruption reaching one column of the four.
+    """
+    with pytest.raises(ViabilityError, match="not torch.bool"):
+        Predictions(
+            confidence=torch.tensor([0.9, 0.1]),
+            correct=torch.tensor([1, 0]),
+            is_canary=torch.tensor([False, False]),
+        )
+
+
+def test_masks_that_disagree_on_length_are_refused():
+    with pytest.raises(ViabilityError, match="disagree on length"):
+        Predictions(
+            confidence=torch.tensor([0.9, 0.1]),
+            correct=torch.tensor([True, False]),
+            is_canary=torch.tensor([False]),
+        )
+
+
 def test_predictions_split_into_the_half_that_rotates_and_the_half_that_does_not():
     predictions = _predictions([0.9, 0.8, 0.7], [True, False, True], canary=[False, True, False])
 
@@ -170,6 +195,24 @@ def test_a_base_that_shares_a_parameter_with_the_model_is_refused():
     base = FrozenBase.freeze(deepcopy(model))
     base.module.lm_head.weight = model.lm_head.weight
 
+    with pytest.raises(ViabilityError, match="shares parameter storage"):
+        base.assert_separate_from(model)
+
+
+def test_a_base_sharing_storage_through_a_distinct_parameter_is_refused():
+    """The aliasing that actually happens, which an identity check reads as separate.
+
+    ``nn.Parameter(other.data)`` -- and equally a ``.data`` assignment, or loading
+    the base and the organism from one memory-mapped checkpoint -- gives two
+    distinct ``Parameter`` objects over one buffer. Keyed on ``id()`` this passes
+    and the margin on that tensor is wrong while looking entirely plausible.
+    """
+    model = build_tiny_causal_lm()
+    base = FrozenBase.freeze(deepcopy(model))
+    base.module.lm_head.weight = nn.Parameter(model.lm_head.weight.data, requires_grad=False)
+
+    assert base.module.lm_head.weight is not model.lm_head.weight
+    assert base.module.lm_head.weight.data_ptr() == model.lm_head.weight.data_ptr()
     with pytest.raises(ViabilityError, match="shares parameter storage"):
         base.assert_separate_from(model)
 
@@ -222,6 +265,22 @@ def test_a_trainer_handed_a_ledger_is_refused():
     """Otherwise the number the experiment reads is a number the experiment caused."""
     with pytest.raises(ViabilityError, match="recorded measurement does not cost"):
         charge_evaluation(CALLER_TRAINER, RecordingLedger(), num_items=20)
+
+
+def test_a_ledger_that_signals_by_return_value_rather_than_by_raising_is_caught():
+    """The refusal is part of the interface, so a ledger obeying it wrongly is not obeyed.
+
+    ``debit`` returning "what is left" reads perfectly naturally as "possibly
+    negative", and #43 is free to write it that way. If the balance were discarded,
+    an organism out of budget would go on evaluating for nothing.
+    """
+
+    class OverdrawnLedger(RecordingLedger):
+        def debit(self, amount: float, reason: str) -> float:
+            return -5.0
+
+    with pytest.raises(ViabilityError, match="took the budget to"):
+        charge_evaluation(CALLER_CORE, OverdrawnLedger(), num_items=20)
 
 
 def test_a_core_with_no_ledger_is_refused():
@@ -343,7 +402,7 @@ def test_too_few_canaries_to_read_the_tolerance_is_refused(fake_tokenizer, organ
         today=TODAY,
     )
 
-    with pytest.raises(ViabilityError, match="below the 8"):
+    with pytest.raises(ViabilityError, match="moves the accuracy by 0.143, against a tolerance"):
         measure_viability(model, base, thin, batch_size=8, device=CPU, caller=CALLER_TRAINER)
 
 

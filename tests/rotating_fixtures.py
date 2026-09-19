@@ -8,7 +8,7 @@ construction and its date is when it was planted, not evidence of anything held 
 
 from datetime import date
 
-from evaluation import CANARY_MANIFEST, STREAM_MANIFEST, DatedItem, DatedManifest
+from rotating_stream import CANARY_MANIFEST, STREAM_MANIFEST, DatedItem, DatedManifest
 
 # The checkpoint's data cutoff, the day both manifests were last rotated, and the
 # day the test reads them on -- nine days into a thirty-day cadence, so the stream

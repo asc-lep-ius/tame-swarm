@@ -20,13 +20,13 @@ from dataclasses import fields, replace
 import pytest
 import torch
 
-from evaluation import build_rotating_stream
 from homeostat import CognitiveHomeostat
 from mob import MixtureOfBidders, MoBConfig, SteeringCouplingConfig, apply_mob_to_model
 from mob.auction import ROUTING_SHARE_PROPORTIONAL, VCGAuctioneer
 from parity import ArmFingerprint, ParityError, assert_parity
 from pid_controller import PIDConfig
 from readiness import AUTONOMIES, ReadinessConfig, granted_flags
+from rotating_stream import build_rotating_stream
 from steering import SteeringConfig, SteeringVector
 from viability_margins import (
     CALLER_TRAINER,

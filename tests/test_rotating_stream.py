@@ -13,7 +13,7 @@ from datetime import date
 import pytest
 import torch
 
-from evaluation import (
+from rotating_stream import (
     DEFAULT_REFRESH_DAYS,
     MANIFEST_VERSION,
     DatedItem,
@@ -95,13 +95,32 @@ def test_a_stream_past_its_refresh_date_is_refused():
         _build(FakeTokenizer(), stream=late)
 
 
-def test_a_stale_stream_is_readable_only_deliberately(fake_tokenizer):
-    """The pairing: the refusal is a refusal, not a warning dressed as one."""
+def test_a_stale_stream_is_readable_only_deliberately(fake_tokenizer, caplog):
+    """The pairing: the refusal is a refusal, not a warning dressed as one.
+
+    And the override says so twice -- once to whoever is watching the run, once on
+    the record every margin is quoted beside. An override that only logged would
+    be an override that vanished by the time the number was read.
+    """
     late = stream_manifest(refreshed=date(2026, 6, 1), refresh_days=30)
 
-    built = _build(fake_tokenizer, stream=late, allow_stale=True)
+    with caplog.at_level("WARNING"):
+        built = _build(fake_tokenizer, stream=late, allow_stale=True)
 
     assert built.rotation.stream_refreshed == "2026-06-01"
+    assert built.rotation.stream_days_overdue == 71
+    assert "STALE+71d" in built.rotation.label
+    assert "71 days past its refresh" in caplog.text
+
+
+def test_a_fresh_stream_is_labelled_without_a_staleness_note(fake_tokenizer, caplog):
+    with caplog.at_level("WARNING"):
+        built = _build(fake_tokenizer)
+
+    assert built.rotation.stream_days_overdue == 0
+    assert "STALE" not in built.rotation.label
+    assert built.rotation.stream_cutoff == CUTOFF.isoformat()
+    assert caplog.text == ""
 
 
 def test_overdue_counts_from_the_cadence_the_manifest_declares():
@@ -218,6 +237,41 @@ def test_a_tokenizer_that_does_not_extend_the_prompt_is_refused():
 
     with pytest.raises(ValueError, match="does not encode its prompt as a prefix"):
         _build(ReversingTokenizer())
+
+
+def test_a_left_padding_tokenizer_is_refused(fake_tokenizer):
+    """The prefix check alone passes vacuously here: pad compared against pad.
+
+    Under left padding the first ``length`` positions of both encodings are
+    padding, so ``torch.equal`` agrees, the target becomes the pad token and the
+    answer position points into the padding. Every item then scores "predict pad
+    from pad" -- the accuracy wrong by an invisible constant that the prefix
+    assertion exists to refuse, reached through the door it does not cover.
+    """
+
+    class LeftPaddingTokenizer(FakeTokenizer):
+        def __call__(self, texts, **kwargs):
+            encoded = super().__call__(texts, **kwargs)
+            ids, mask = encoded["input_ids"], encoded["attention_mask"]
+            width = ids.shape[1]
+            for row in range(ids.shape[0]):
+                used = int(mask[row].sum())
+                pad = torch.zeros(width - used, dtype=torch.long)
+                ids[row] = torch.cat([pad, ids[row, :used]])
+                mask[row] = torch.cat([pad, mask[row, :used]])
+            return {"input_ids": ids, "attention_mask": mask}
+
+    with pytest.raises(ValueError, match="pads on the left"):
+        _build(LeftPaddingTokenizer())
+
+
+def test_an_answer_that_tokenises_to_nothing_is_refused(fake_tokenizer):
+    """A blank answer is a row that cannot be answered, not a row that is wrong."""
+    stream = stream_manifest()
+    blank = replace(stream, items=(replace(stream.items[0], answer=""),) + stream.items[1:])
+
+    with pytest.raises(ValueError, match="adds no token to its prompt"):
+        _build(fake_tokenizer, stream=blank)
 
 
 def test_an_item_with_no_prompt_is_refused(fake_tokenizer):

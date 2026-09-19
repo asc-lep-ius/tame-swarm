@@ -34,8 +34,8 @@ from typing import Any
 import torch
 
 from determinism import DETERMINISM_OFF, DETERMINISM_STRICT
-from evaluation import ROTATION_ABSENT, RotationRecord
 from readiness import READINESS_OFF, ReadinessConfig
+from rotating_stream import ROTATION_ABSENT, RotationRecord
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +95,8 @@ ROTATION_FIELDS = frozenset(
         "rotating_stream",
         "rotating_stream_date",
         "rotating_refresh_days",
+        "rotating_stream_overdue_days",
+        "rotating_stream_cutoff",
         "canary_set",
         "canary_set_date",
         "canary_refresh_days",
@@ -310,6 +312,13 @@ class ArmFingerprint:
     rotating_stream: str | None = None
     rotating_stream_date: str | None = None
     rotating_refresh_days: int | None = None
+    # How late the stream was when this arm read it, and the cutoff it was
+    # filtered against. The overdue count is the one part of a rotation the
+    # fingerprint cannot imply: a manifest read forty days past its refresh
+    # hashes exactly as it did while it was fresh, so without this field a stale
+    # margin and a current one are the same row.
+    rotating_stream_overdue_days: int | None = None
+    rotating_stream_cutoff: str | None = None
     canary_set: str | None = None
     canary_set_date: str | None = None
     canary_refresh_days: int | None = None
@@ -421,6 +430,8 @@ def fingerprint_arm(
         rotating_stream=rotation.stream_fingerprint,
         rotating_stream_date=rotation.stream_refreshed,
         rotating_refresh_days=rotation.stream_refresh_days,
+        rotating_stream_overdue_days=rotation.stream_days_overdue,
+        rotating_stream_cutoff=rotation.stream_cutoff,
         canary_set=rotation.canary_fingerprint,
         canary_set_date=rotation.canary_refreshed,
         canary_refresh_days=rotation.canary_refresh_days,
@@ -598,18 +609,38 @@ def manifest_drift(arms: Sequence[ArmFingerprint]) -> list[str]:
     whether a drifted margin is refused or merely labelled, and
     ``assert_same_manifest`` is the refusal built on top.
     """
-    return _rotation_drift(
+    reasons = _rotation_drift(
         arms, "rotating stream", "rotating_stream", "rotating_stream_date", "rotating_refresh_days"
-    ) + _rotation_drift(arms, "canary set", "canary_set", "canary_set_date", "canary_refresh_days")
+    )
+    # Per-arm rather than between-arm, the way a dirty tree is in ``code_drift``:
+    # a stream read after it stopped rotating is a stream the arm had time to
+    # train on, and two arms agreeing on a stale rotation agree on the wrong one.
+    stale = sorted({arm.arm for arm in arms if (arm.rotating_stream_overdue_days or 0) > 0})
+    if stale:
+        overdue = max(arm.rotating_stream_overdue_days or 0 for arm in arms)
+        reasons.append(
+            f"  stream read up to {overdue} days past its refresh for {stale}: it had stopped "
+            "rotating, so it is a held-out corpus only in the sense that it was one"
+        )
+    cutoffs = sorted({arm.rotating_stream_cutoff for arm in arms if arm.rotating_stream_cutoff})
+    if len(cutoffs) > 1:
+        reasons.append(
+            f"  different checkpoint cutoffs {cutoffs}: the arms filtered the manifest against "
+            "different dates, so 'newer than the last update' names two different sets"
+        )
+    return reasons + _rotation_drift(
+        arms, "canary set", "canary_set", "canary_set_date", "canary_refresh_days"
+    )
 
 
 def assert_same_manifest(arms: Sequence[ArmFingerprint], allow_drift: bool = False) -> str:
     """Refuse margins read on different rotations; else say which one they were read on.
 
     The line this returns is what a README row and a printed table carry beside
-    every number, in the form ``evaluate()`` already logs ``eval_split=``: a
-    margin quoted without the date and fingerprint of the stream it was read on is
-    a number nobody can check, because the stream it came from no longer exists.
+    every number, in the form the parity summary below already prints ``eval split=``
+    and the trainer's eval line prints ``split <fingerprint>``: a margin quoted
+    without the date and fingerprint of the stream it was read on is a number nobody
+    can check, because the stream it came from no longer exists.
 
     ``allow_drift`` is ``--allow-manifest-drift`` where a script offers it -- the
     drift is logged and returned as the label printed under the table, so the
@@ -618,6 +649,9 @@ def assert_same_manifest(arms: Sequence[ArmFingerprint], allow_drift: bool = Fal
     margin, and wiring the flag into ``compare_runs.py`` today would refuse every
     recorded comparison there is, since none of them carries a rotation at all.
     """
+    if not arms:
+        raise ParityError("No arms were given, so there is no rotation to name")
+
     reasons = manifest_drift(arms)
     if not reasons:
         reference = arms[0]

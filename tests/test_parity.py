@@ -1,6 +1,7 @@
 """Parity between arms, asserted programmatically rather than assumed."""
 
 from dataclasses import asdict, fields, replace
+from datetime import date
 from pathlib import Path
 
 import pytest
@@ -492,6 +493,8 @@ ROTATED = replace(
     rotating_stream="stream0001",
     rotating_stream_date="2026-09-01",
     rotating_refresh_days=30,
+    rotating_stream_overdue_days=0,
+    rotating_stream_cutoff="2026-01-01",
     canary_set="canary001",
     canary_set_date="2026-09-01",
     canary_refresh_days=90,
@@ -509,6 +512,8 @@ def test_the_rotation_fields_are_recorded_and_not_asserted_between_arms():
         "rotating_stream",
         "rotating_stream_date",
         "rotating_refresh_days",
+        "rotating_stream_overdue_days",
+        "rotating_stream_cutoff",
         "canary_set",
         "canary_set_date",
         "canary_refresh_days",
@@ -518,7 +523,7 @@ def test_the_rotation_fields_are_recorded_and_not_asserted_between_arms():
 
 
 def test_fingerprint_arm_records_the_rotation_it_was_handed():
-    from evaluation import RotationRecord
+    from rotating_stream import RotationRecord
 
     stream, canaries = stream_manifest(), canary_manifest()
     print_ = fingerprint_arm(
@@ -526,12 +531,14 @@ def test_fingerprint_arm_records_the_rotation_it_was_handed():
         eval_split_fingerprint="abc",
         data_order="def",
         converted_layers=3,
-        rotation=RotationRecord.of(stream, canaries),
+        rotation=RotationRecord.of(stream, canaries, cutoff=date(2026, 1, 1), days_overdue=4),
     )
 
     assert print_.rotating_stream == stream.fingerprint
     assert print_.rotating_stream_date == "2026-09-01"
     assert print_.rotating_refresh_days == 30
+    assert print_.rotating_stream_overdue_days == 4
+    assert print_.rotating_stream_cutoff == "2026-01-01"
     assert print_.canary_set == canaries.fingerprint
     assert print_.canary_refresh_days == 90
 
@@ -610,3 +617,25 @@ def test_a_fingerprint_recorded_before_the_rotation_existed_still_loads():
 
     assert loaded == BASE
     assert loaded.rotating_stream is None and loaded.canary_set is None
+
+
+def test_a_stream_read_after_it_stopped_rotating_is_drift():
+    """A stale rotation hashes as it did while fresh, so the fingerprint cannot say."""
+    stale = replace(ROTATED, rotating_stream_overdue_days=40)
+
+    assert manifest_drift([stale, stale]) == [
+        "  stream read up to 40 days past its refresh for ['mob']: it had stopped rotating, "
+        "so it is a held-out corpus only in the sense that it was one"
+    ]
+    assert manifest_drift([ROTATED, ROTATED]) == []
+
+
+def test_arms_filtered_against_different_cutoffs_are_drift():
+    reasons = manifest_drift([ROTATED, replace(ROTATED, rotating_stream_cutoff="2025-06-01")])
+
+    assert any("different checkpoint cutoffs" in reason for reason in reasons)
+
+
+def test_naming_a_rotation_for_no_arms_is_a_parity_error_not_an_index_error():
+    with pytest.raises(ParityError, match="no rotation to name"):
+        assert_same_manifest([])

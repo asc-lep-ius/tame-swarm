@@ -51,8 +51,8 @@ from typing import Protocol
 import torch
 import torch.nn as nn
 
-from evaluation import RotatingStream, RotationRecord
 from mob import frozen_economy, get_mob_layers
+from rotating_stream import RotatingStream, RotationRecord
 
 logger = logging.getLogger(__name__)
 
@@ -81,9 +81,14 @@ EVALUATION_REASON = "viability-evaluation"
 EVALUATION_COST_PER_ITEM = 0.01
 
 # How far canary accuracy may stand above stream accuracy before it is farming
-# rather than noise, and the smallest canary set that tolerance can be read on. One
-# canary is 1/n of the canary accuracy, so a set smaller than 1/tolerance cannot
-# move by less than the tolerance and the detector could not fail to fire.
+# rather than noise, and the smallest canary set that tolerance can be read at.
+# One canary is 1/n of the canary accuracy, so at n <= 6 a single canary clears the
+# tolerance on its own and the detector could not fail to fire; 1/7 = 0.143 is
+# where that stops, and the floor is set one above it rather than on it. A
+# threshold a detector's quietest possible signal reaches 95% of is a threshold
+# that fires on the granularity of its own instrument. Eight is a floor and not a
+# sufficiency claim: the canary set a margin is really regulated on wants an order
+# of magnitude more, and #42 sizes it when it assembles one.
 CANARY_DIVERGENCE_TOLERANCE = 0.15
 MIN_CANARIES = 8
 
@@ -115,6 +120,29 @@ class Predictions:
     confidence: torch.Tensor
     correct: torch.Tensor
     is_canary: torch.Tensor
+
+    def __post_init__(self) -> None:
+        """Bool masks and matching lengths, checked here because #42 builds these.
+
+        ``risk_coverage_auc`` negates ``correct``, and ``~`` on an integer tensor is
+        a bitwise NOT rather than a logical one: a 0/1 ``int64`` mask silently gives
+        -1 and -2, and the metric comes back negative -- a number a reader would
+        read as a value rather than as an error. The other three metrics coerce and
+        would go on agreeing, so the corruption would show up in one column of four.
+        """
+        for name in ("correct", "is_canary"):
+            mask = getattr(self, name)
+            if mask.dtype is not torch.bool:
+                raise ViabilityError(
+                    f"Predictions.{name} is {mask.dtype}, not torch.bool; a 0/1 integer mask "
+                    "negates bitwise and makes the risk--coverage area come back negative"
+                )
+        lengths = {int(field.shape[0]) for field in (self.confidence, self.correct, self.is_canary)}
+        if len(lengths) != 1:
+            raise ViabilityError(
+                f"Predictions fields disagree on length ({sorted(lengths)}); a shorter canary "
+                "mask would silently shift which items are read as canaries"
+            )
 
     def __len__(self) -> int:
         return int(self.confidence.shape[0])
@@ -290,14 +318,22 @@ class FrozenBase:
         nothing -- and a base that merely *shares* a parameter makes the margin
         wrong on that parameter only, which is the same failure wearing a number
         that looks plausible.
+
+        Storage and not ``id()``: the aliasing that actually happens here produces
+        two distinct ``Parameter`` objects over one buffer, which is what
+        ``nn.Parameter(other.data)``, an assignment to ``.data``, and loading the
+        base and the organism from one memory-mapped checkpoint all give. An
+        identity check passes on every one of them and reads as a separate base.
         """
         if self.module is model:
             raise ViabilityError(
                 "The frozen base is the model being measured, so every margin would be "
                 "identically zero and the core would regulate on nothing"
             )
-        base_tensors = {id(tensor) for tensor in self.module.parameters()}
-        shared = [name for name, tensor in model.named_parameters() if id(tensor) in base_tensors]
+        base_storage = {tensor.data_ptr() for tensor in self.module.parameters()}
+        shared = [
+            name for name, tensor in model.named_parameters() if tensor.data_ptr() in base_storage
+        ]
         if shared:
             raise ViabilityError(
                 f"The frozen base shares parameter storage with the model being measured "
@@ -317,7 +353,16 @@ class BudgetLedger(Protocol):
     """
 
     def debit(self, amount: float, reason: str) -> float:
-        """Take ``amount`` off the budget and return what is left."""
+        """Take ``amount`` off the budget and return what is left.
+
+        **Raises when the budget cannot cover ``amount``.** The refusal is part of
+        the interface rather than an implementation detail: a ledger that signalled
+        "cannot afford" by returning a negative balance would be obeyed rather than
+        heard, because a caller that got a number back would treat the debit as
+        having happened -- and an organism out of budget would go on evaluating for
+        free. ``charge_evaluation`` reads the balance back as well, so a ledger
+        that signals the wrong way is caught instead of believed.
+        """
         ...
 
 
@@ -349,7 +394,13 @@ def charge_evaluation(caller: str, ledger: BudgetLedger | None, num_items: int) 
             "budgeted action; an evaluation that costs nothing is an unbounded one"
         )
     cost = evaluation_cost(num_items)
-    ledger.debit(cost, EVALUATION_REASON)
+    remaining = ledger.debit(cost, EVALUATION_REASON)
+    if remaining < 0:
+        raise ViabilityError(
+            f"Paying {cost:.3f} for this evaluation took the budget to {remaining:.3f}. A ledger "
+            "refuses what it cannot afford by raising; one that signals by return value would "
+            "otherwise let an organism out of budget evaluate for nothing"
+        )
     return cost
 
 
@@ -466,7 +517,8 @@ def measure_viability(
         raise ViabilityError(
             f"The rotation carries {stream.num_canaries} canaries, below the {MIN_CANARIES} the "
             f"{CANARY_DIVERGENCE_TOLERANCE:.0%} divergence tolerance can be read at: one canary "
-            "would move the accuracy by more than the tolerance itself"
+            f"of a set this size moves the accuracy by {1 / max(stream.num_canaries, 1):.3f}, "
+            f"against a tolerance of {CANARY_DIVERGENCE_TOLERANCE}"
         )
 
     cost = charge_evaluation(caller, ledger, stream.num_items)
