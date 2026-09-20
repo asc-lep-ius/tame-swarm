@@ -5,6 +5,7 @@ what a unit test can pin is that the floor is the same estimator ``aggregate``
 uses across seeds, at n = 2, so ``compare_runs.py`` can pool the two.
 """
 
+import json
 import math
 import sys
 from pathlib import Path
@@ -17,6 +18,7 @@ from run_seeds import (  # noqa: E402
     aggregate,
     build_parser,
     format_table,
+    goal_term_metrics,
     measure_replication,
     replication_std,
 )
@@ -110,6 +112,39 @@ def test_the_sweep_takes_the_stakes_dial_and_names_the_arm_by_it():
     assert build_parser().parse_args([]).persistence_coupling == "value"
     assert arm_label("mob", None, "truthful", "decoupled") == "mob@truthful~decoupled"
     assert arm_label("mob", None, None, "value") == "mob"
+
+
+def test_the_goal_term_reading_is_lifted_out_of_the_run_s_own_metrics_file(tmp_path):
+    """The share the preregistration reads before the primary has to reach the summary.
+
+    It is a training-step measurement, so it is in ``metrics.jsonl`` and never in
+    ``eval_history``, which is where every other headline metric comes from. Last
+    line wins, because the summary describes the run as it ended.
+    """
+    lines = [
+        {"step": 0, "train/loss": 3.1, "auction/mean_goal_term": 0.001, "auction/goal_share": 0.01},
+        {"step": 10, "eval/loss": 2.9},
+        {
+            "step": 20,
+            "train/loss": 2.8,
+            "auction/mean_goal_term": 0.004,
+            "auction/goal_share": 0.07,
+        },
+    ]
+    (tmp_path / "metrics.jsonl").write_text("\n".join(json.dumps(line) for line in lines) + "\n")
+
+    assert goal_term_metrics(tmp_path) == {
+        "auction/mean_goal_term": 0.004,
+        "auction/goal_share": 0.07,
+    }
+
+
+def test_an_arm_with_no_auction_contributes_no_goal_term_row(tmp_path):
+    """Empty, not zero: the dense arm has no economy, which is not a term of size nothing."""
+    (tmp_path / "metrics.jsonl").write_text(json.dumps({"step": 0, "train/loss": 3.1}) + "\n")
+
+    assert goal_term_metrics(tmp_path) == {}
+    assert goal_term_metrics(tmp_path / "nowhere") == {}
 
 
 def test_the_sweep_takes_a_dose_per_goal_and_reaches_the_fingerprint_with_it():

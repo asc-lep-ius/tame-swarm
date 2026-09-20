@@ -73,6 +73,13 @@ HEADLINE_METRICS = (
 # (``routing/goal_correlation_e<i>``, ``routing/win_share_e<i>``); how many there
 # are depends on ``--num_experts``, so they are matched by prefix.
 HEADLINE_PREFIXES = ("routing/",)
+# The goal term's own size and its share of what a cell was paid (#54). They are
+# training-step measurements and never reach ``eval_history``, which is where
+# every other metric here comes from -- so without this they exist only in each
+# run's ``metrics.jsonl`` and no comparison can table them. The preregistration
+# reads the share *before* it reads the primary (section 7, clause e2), and a
+# condition on a number nobody surfaces is a condition nobody applies.
+GOAL_TERM_KEYS = ("auction/mean_goal_term", "auction/goal_share")
 
 
 def headline_metrics(final: dict[str, float]) -> dict[str, float]:
@@ -84,10 +91,34 @@ def headline_metrics(final: dict[str, float]) -> dict[str, float]:
     }
 
 
+def goal_term_metrics(run_dir: Path) -> dict[str, float]:
+    """The last goal-term reading this run logged; empty when it logged none.
+
+    Read off the run's own ``metrics.jsonl`` the way ``dose_slope.py`` reads the
+    coupling's cap, because the trainer writes these on a training step and the
+    summary is otherwise built from the last held-out evaluation. Empty rather
+    than zero when the keys are absent -- the dense arm has no auction and never
+    writes them, and a zero there would read as "measured, and the term was
+    nothing" rather than "no economy to measure".
+    """
+    metrics = run_dir / "metrics.jsonl"
+    if not metrics.exists():
+        return {}
+    last: dict[str, float] = {}
+    for line in metrics.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            last.update(json.loads(line))
+    return {key: last[key] for key in GOAL_TERM_KEYS if key in last}
+
+
 def run_seed(
     seed: int, config: TrainingConfig, replicate: bool = False
 ) -> tuple[dict[str, float], dict[str, object]]:
     """Train one seed to completion; its final headline metrics and its arm fingerprint.
+
+    "Headline" includes the goal term's size and share (#54), which unlike every
+    other metric here are read off the run's ``metrics.jsonl`` rather than its
+    held-out evaluation -- see :func:`goal_term_metrics`.
 
     A ``replicate`` is the same seed again in its own output directory, so it
     rebuilds its held-out split and re-hashes its data order rather than reading
@@ -112,12 +143,13 @@ def run_seed(
     logger.info(f"Seed: {seed}" + (" (replicate: the run-to-run floor)" if replicate else ""))
     logger.info("=" * 80)
 
-    trainer = TAMETrainer(replace(config, seed=seed, output_dir=f"{config.output_dir}/{run_name}"))
+    run_dir = Path(config.output_dir) / run_name
+    trainer = TAMETrainer(replace(config, seed=seed, output_dir=str(run_dir)))
     trainer.setup()
     trainer.train()
 
     final = trainer.eval_history[-1] if trainer.eval_history else {}
-    result = headline_metrics(final)
+    result = {**headline_metrics(final), **goal_term_metrics(run_dir)}
     assert trainer.fingerprint is not None
     fingerprint = trainer.fingerprint.as_dict()
 
