@@ -119,17 +119,34 @@ def parse_goal_doses(specs: Sequence[str]) -> tuple[tuple[str, ...], tuple[float
     return tuple(goals), tuple(doses)
 
 
-def paying_layers(calibration: AlignmentCalibration, converted: Sequence[int]) -> tuple[int, ...]:
-    """Where a goal can be paid: a cell the calibration measured that is also a MoB layer.
+def paying_layers(
+    calibration: AlignmentCalibration,
+    converted: Sequence[int],
+    certified: Sequence[int],
+) -> tuple[int, ...]:
+    """Where a goal can be paid: certified for it, converted, and measured by the calibration.
 
-    The certification decides the first half -- a layer the behavioural gate never
-    passed is not a place this direction means anything (``certified_coupling_layers``)
-    -- and the conversion range the second. A goal with no layer in both is refused
-    by the caller rather than attached to nothing, the way ``_seed_coupling`` refuses
-    to seed nothing: a run that pays no cell for a goal it was launched to price is
-    a null by absence of mechanism.
+    All three, and the certification is a separate argument rather than something
+    read off the calibration, because **the calibration measures more cells than
+    the gate passed**. ``extract_steering_vectors`` deliberately extracts a vector
+    at ``readout_layer`` as well as at the actuators, so ``calibration.layers`` --
+    the sensors -- contains a cell the behavioural gate never passed: 22 for
+    ``truthful``. Intersecting the calibration with the converted range alone
+    therefore pays a cell whose direction means nothing there, which at
+    ``--layers 6:22`` is invisible only because 22 falls outside the range.
+    ``certified_coupling_layers`` is the gate, and the caller hands it in so that
+    this cannot silently be the calibration's own idea of which cells count.
+
+    A goal with no layer in all three is refused by the caller rather than
+    attached to nothing, the way ``_seed_coupling`` refuses to seed nothing: a run
+    that pays no cell for a goal it was launched to price is a null by absence of
+    mechanism.
     """
-    return tuple(sorted(set(calibration.layers) & set(calibration.directions) & set(converted)))
+    return tuple(
+        sorted(
+            set(calibration.layers) & set(calibration.directions) & set(converted) & set(certified)
+        )
+    )
 
 
 def _layer_device(mob: MixtureOfBidders) -> torch.device:
@@ -141,6 +158,7 @@ def attach_goal_fields(
     goals: Sequence[str],
     doses: Sequence[float],
     calibrations: Mapping[str, AlignmentCalibration],
+    certified: Mapping[str, Sequence[int]],
 ) -> tuple[AttachedGoalField, ...]:
     """Pay every converted layer for every goal certified there, at that layer's setpoint.
 
@@ -153,6 +171,9 @@ def attach_goal_fields(
     The direction is the one the calibration measured along, taken from the
     calibration rather than re-derived, so the reading and the setpoint are
     expressed in the same units by construction and not by two call sites agreeing.
+
+    ``certified`` is each goal's certified layers, ``certified_coupling_layers``'s
+    answer, passed in for the reason :func:`paying_layers` gives.
     """
     converted = mob_layers_by_index(model)
     for mob in converted.values():
@@ -161,11 +182,12 @@ def attach_goal_fields(
     records: list[AttachedGoalField] = []
     for goal, dose in zip(goals, doses, strict=True):
         calibration = calibrations[goal]
-        layers = paying_layers(calibration, list(converted))
+        layers = paying_layers(calibration, list(converted), certified[goal])
         if not layers:
             raise ValueError(
-                f"goal {goal!r} is calibrated at cells {sorted(calibration.layers)}, none of "
-                f"which is a converted layer ({sorted(converted)}): no cell could be paid for it"
+                f"goal {goal!r} is certified at {sorted(certified[goal])} and calibrated at "
+                f"{sorted(calibration.layers)}, and no cell is in both and converted "
+                f"({sorted(converted)}): no cell could be paid for it"
             )
         for layer in layers:
             mob = converted[layer]

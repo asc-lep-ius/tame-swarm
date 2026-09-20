@@ -13,6 +13,7 @@ that class.
 import pytest
 import torch
 
+from contrastive_data import certification_for
 from goal_field import (
     GOAL_ERROR_UNIT_COST,
     attach_goal_fields,
@@ -75,12 +76,36 @@ def test_a_cell_the_effort_does_not_move_is_asked_to_hold_where_it_already_rests
 # --- Where a goal is paid ----------------------------------------------------------------
 
 
-def test_a_goal_is_paid_only_where_it_is_both_calibrated_and_converted():
+def test_a_goal_is_paid_only_where_it_is_calibrated_converted_and_certified():
     calibration = body_calibration(layers=(1, 2, 3))
+    certified = (1, 2, 3)
 
-    assert paying_layers(calibration, [1, 2]) == (1, 2)
-    assert paying_layers(calibration, [2, 3, 9]) == (2, 3)
-    assert paying_layers(calibration, [0, 9]) == ()
+    assert paying_layers(calibration, [1, 2], certified) == (1, 2)
+    assert paying_layers(calibration, [2, 3, 9], certified) == (2, 3)
+    assert paying_layers(calibration, [0, 9], certified) == ()
+    assert paying_layers(calibration, [1, 2, 3], (2,)) == (2,)
+
+
+def test_the_readout_cell_is_calibrated_and_never_paid():
+    """The gap the certification gate closes, in the shape a real calibration has.
+
+    ``extract_steering_vectors`` extracts a vector at ``readout_layer`` too, so
+    ``calibration.layers`` holds a sensor the behavioural gate never passed --
+    22 for ``truthful``. Intersecting the calibration with the converted range
+    alone pays it; at ``--layers 6:22`` that is invisible only because 22 sits
+    outside the range, and at 6:23 a cell would be paid for a direction that
+    means nothing there.
+    """
+    calibration = body_calibration(layers=(1,), readout=2)
+    assert calibration.sensors == (1, 2) and calibration.actuators == (1,)
+
+    assert paying_layers(calibration, [1, 2], certified=(1,)) == (1,)
+    assert paying_layers(calibration, [1, 2], certified=calibration.sensors) == (1, 2)
+
+    model = paid_body(("truthful",), (GOAL_ERROR_UNIT_COST,), {"truthful": calibration})
+    layers = mob_layers_by_index(model)
+    assert [field.dose for field in layers[1].goal_fields] == [GOAL_ERROR_UNIT_COST]
+    assert layers[2].goal_fields == []
 
 
 def test_attaching_puts_one_field_per_paying_layer_at_that_layer_s_own_setpoint():
@@ -90,7 +115,11 @@ def test_attaching_puts_one_field_per_paying_layer_at_that_layer_s_own_setpoint(
     records = {
         record.layer: record
         for record in attach_goal_fields(
-            model, ("truthful",), (GOAL_ERROR_UNIT_COST,), {"truthful": calibration}
+            model,
+            ("truthful",),
+            (GOAL_ERROR_UNIT_COST,),
+            {"truthful": calibration},
+            {"truthful": calibration.actuators},
         )
     }
     assert sorted(records) == list(BODY_LAYERS)
@@ -119,7 +148,9 @@ def test_attaching_twice_replaces_rather_than_doubles_the_dose():
     calibration = body_calibration()
     model = paid_body(("truthful",), (0.017,), {"truthful": calibration})
 
-    attach_goal_fields(model, ("truthful",), (0.017,), {"truthful": calibration})
+    attach_goal_fields(
+        model, ("truthful",), (0.017,), {"truthful": calibration}, {"truthful": BODY_LAYERS}
+    )
 
     for mob in mob_layers_by_index(model).values():
         assert [field.dose for field in mob.goal_fields] == [0.017]
@@ -141,10 +172,15 @@ def test_the_preregistered_pair_pays_at_the_layers_the_preregistration_names():
     without anyone rereading the document.
     """
     converted = list(range(6, 22))
-    paid = {
-        goal: paying_layers(body_calibration(layers=certified_coupling_layers(goal)), converted)
-        for goal in ("truthful", "safe")
-    }
+    paid = {}
+    for goal in ("truthful", "safe"):
+        certified = certified_coupling_layers(goal)
+        # The calibration the trainer builds for this goal: a cell per certified
+        # layer plus the readout cell the extraction adds, which for `truthful`
+        # is 22 and is not certified.
+        readout = certification_for(goal).readout_layer  # type: ignore[union-attr]
+        calibration = body_calibration(layers=certified, readout=readout)
+        paid[goal] = paying_layers(calibration, converted, certified)
 
     assert paid["truthful"] == (13, 16, 17, 18, 19, 20, 21)
     assert paid["safe"] == (14, 18)
@@ -166,7 +202,7 @@ def test_a_direction_calibrated_on_the_cpu_reaches_the_device_its_layer_is_on():
 
     model = paid_body(
         ("truthful",), (GOAL_ERROR_UNIT_COST,), {"truthful": calibration}, device="cuda"
-    )
+    )  # certified defaults to the calibration's actuators; see paid_body
 
     for mob in mob_layers_by_index(model).values():
         assert mob.goal_fields[0].vector.device.type == "cuda"
@@ -213,10 +249,22 @@ def test_the_preregistered_pair_is_accepted_over_the_converted_range():
         (dict(goal_fields=("truthful",), goal_doses=()), "same length"),
         (dict(goal_fields=("truthful", "truthful"), goal_doses=(0.1, 0.1)), "names a goal twice"),
         (dict(goal_fields=("truthful",), goal_doses=(-0.1,)), "must be >= 0"),
-        (dict(goal_fields=("truthful",), goal_doses=(0.1,), router="dense"), "dense arm has none"),
+        (dict(goal_fields=("truthful",), goal_doses=(0.1,), router="dense"), "gate has none"),
+        (
+            dict(goal_fields=("truthful",), goal_doses=(0.1,), router="softmax"),
+            "gate has none",
+        ),
     ],
 )
 def test_a_goal_field_that_could_not_pay_a_cell_is_refused_at_construction(kwargs, message):
+    """The softmax row is not symmetry for its own sake.
+
+    ``MoBConfig.has_economy`` is ``router == ROUTER_AUCTION``, so under the
+    softmax gate ``collect_contributions`` is False and the goal term is never
+    computed -- while the fields attach, ``goal_fields.json`` is written and the
+    doses reach the fingerprint. That is the dense arm's failure with a different
+    name on it, and it reads in every column like the answer under test.
+    """
     with pytest.raises(ValueError, match=message):
         TrainingConfig(**{**CONVERTED_RANGE, **kwargs})
 

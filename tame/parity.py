@@ -84,6 +84,19 @@ FIELD_FIELDS = frozenset({"steer_strength", "steer_layers"})
 # Reported for context, not asserted: see the module docstring on ``dense``.
 REPORTED_FIELDS = frozenset({"converted_layers"})
 
+# Every field that holds a sequence, coerced back to a tuple on construction.
+# A fingerprint makes two round trips nothing else in this module makes: out to
+# ``seed_summary.json`` through ``as_dict`` and ``json.dumps``, and back in
+# through ``ArmFingerprint(**recorded)``. JSON has no tuple, so every one of
+# these returns as a *list*, and a list is neither hashable -- which
+# ``assert_parity`` needs, to tell one arm handed over twice from two arms --
+# nor equal to the tuple an in-memory arm carries, which is the quieter half:
+# a recorded arm compared against a freshly built one would have read
+# ``requested_layers`` as a disagreement and refused a comparison that was fine.
+# ``SEQUENCE_FIELDS`` is pinned against the dataclass by
+# ``tests/test_parity.py`` so a tuple field added later cannot miss the coercion.
+SEQUENCE_FIELDS = ("requested_layers", "steer_layers", "goal_doses", "goal_fields")
+
 # What code produced the arm (#31): the git SHA, whether the tree was dirty, and
 # whether the kernels were the strict set. Not asserted by ``assert_parity`` --
 # arms built in one process share all three by construction, and between two
@@ -337,6 +350,18 @@ class ArmFingerprint:
     canary_set: str | None = None
     canary_set_date: str | None = None
     canary_refresh_days: int | None = None
+
+    def __post_init__(self) -> None:
+        """Every sequence field is a tuple, whatever the caller or the JSON handed over.
+
+        See :data:`SEQUENCE_FIELDS`. Frozen, so the write goes through
+        ``object.__setattr__``; it runs once, at construction, and leaves a
+        fingerprint that is hashable and compares equal to its in-memory twin.
+        """
+        for name in SEQUENCE_FIELDS:
+            value = getattr(self, name)
+            if not isinstance(value, tuple):
+                object.__setattr__(self, name, tuple(value))
 
     @property
     def arm(self) -> str:

@@ -21,7 +21,13 @@ import pytest
 import torch
 
 from homeostat import CognitiveHomeostat
-from mob import MixtureOfBidders, MoBConfig, SteeringCouplingConfig, apply_mob_to_model
+from mob import (
+    MixtureOfBidders,
+    MoBConfig,
+    SteeringCouplingConfig,
+    apply_mob_to_model,
+    get_mob_statistics,
+)
 from mob.auction import ROUTING_SHARE_PROPORTIONAL, VCGAuctioneer
 from parity import ArmFingerprint, ParityError, assert_parity
 from pid_controller import PIDConfig
@@ -42,7 +48,13 @@ from .arm_fingerprints import BASE
 from .auction_mutations import pre_nine_payments
 from .config_reads import read_names
 from .conftest import TINY_HIDDEN_DIM, build_tiny_causal_lm
-from .goal_field_fixtures import BODY_LAYERS, body_calibration, paid_body, settle_body
+from .goal_field_fixtures import (
+    BODY_LAYERS,
+    body_calibration,
+    paid_body,
+    settle_body,
+    value_summaries,
+)
 from .rotating_fixtures import CUTOFF, MAX_SEQ_LENGTH, TODAY, canary_manifest, stream_manifest
 
 # --- Every config field is read by something -----------------------------------------
@@ -401,3 +413,51 @@ def test_a_field_at_dose_zero_leaves_realised_value_bitwise_what_it_was_on_the_b
 
     for before, after in zip(unpaid, at_zero, strict=True):
         assert torch.equal(before, after)
+
+
+# A term that is attached, fingerprinted and too small to decide anything is the
+# quietest no-op in this file, because it does not look like one: every other
+# column reads exactly as the extrinsic-teleology position predicts a real null
+# would. `last_goal_terms` was assigned and read by nothing, so the size of the
+# thing 18 GPU-hours are spent measuring was not recorded anywhere.
+
+
+def test_the_goal_term_s_own_size_is_recorded_beside_the_value_it_is_folded_into():
+    """Present, proportional to the dose, and zero when nothing is paid for.
+
+    Proportionality rather than a threshold: the term is ``dose x reduction`` by
+    construction, so four times the dose is four times the term *exactly*, and a
+    number that stops tracking the dose is a number that stopped being the term.
+    A floor would only say what this fixture happens to read.
+    """
+    calibration = body_calibration()
+    summaries = {}
+    for name, model in (
+        ("unpaid", paid_body()),
+        ("low", paid_body(("truthful",), (GOAL_DOSE,), {"truthful": calibration})),
+        ("high", paid_body(("truthful",), (4 * GOAL_DOSE,), {"truthful": calibration})),
+    ):
+        settle_body(model)
+        summaries[name] = value_summaries(model)
+
+    for unpaid, low, high in zip(*summaries.values(), strict=True):
+        assert float(unpaid.mean_goal_term) == 0.0 and float(unpaid.goal_share) == 0.0
+        assert float(low.mean_goal_term) > 0.0 and float(low.goal_share) > 0.0
+        assert float(high.mean_goal_term) == pytest.approx(4 * float(low.mean_goal_term), rel=1e-5)
+
+
+def test_the_size_reaches_the_statistics_the_trainer_logs():
+    """The half that makes it readable during the run rather than after it.
+
+    ``get_mob_statistics`` is what ``_log_training_step`` turns into
+    ``auction/`` rows in ``metrics.jsonl``, under the same guard as
+    ``mean_win_surplus``. Without these two keys the operator reads a null off a
+    run with no way to ask whether the mechanism was ever load-bearing.
+    """
+    model = paid_body(("truthful",), (GOAL_DOSE,), {"truthful": body_calibration()})
+    settle_body(model)
+
+    stats = get_mob_statistics(model)
+
+    assert "mean_goal_term" in stats and "goal_share" in stats
+    assert float(stats["goal_share"]) > 0.0

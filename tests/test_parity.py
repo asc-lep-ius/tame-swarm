@@ -1,5 +1,6 @@
 """Parity between arms, asserted programmatically rather than assumed."""
 
+import json
 from dataclasses import asdict, fields, replace
 from datetime import date
 from pathlib import Path
@@ -10,6 +11,7 @@ import torch
 from parity import (
     DRIFT_FIELDS,
     ROTATION_FIELDS,
+    SEQUENCE_FIELDS,
     ArmFingerprint,
     ManifestDriftError,
     ParityError,
@@ -475,6 +477,66 @@ def test_two_arms_that_differ_only_in_the_goal_dose_fingerprint_differently():
     assert (low.goal_doses, high.goal_doses) == ((0.017, 0.017), (0.068, 0.017))
     assert low != high
     assert arm_at().goal_doses == () and arm_at().goal_fields == ()
+
+
+def test_a_fingerprint_survives_the_round_trip_every_recorded_group_makes():
+    """The shape every read path uses, and the one no in-memory test exercises.
+
+    ``run_seeds.py`` writes fingerprints with ``as_dict`` and ``json.dumps`` and
+    ``compare_runs.assert_groups_at_parity`` reads them back with
+    ``ArmFingerprint(**recorded)``. JSON has no tuple, so without the coercion in
+    ``__post_init__`` every sequence field returns a list: unhashable, which is
+    what ``assert_parity`` needs to tell one arm from two, and unequal to the
+    tuple an in-memory arm carries, which would refuse a comparison that is fine.
+    Both halves are asserted here because the first one crashed every read on
+    this branch while the whole suite stayed green.
+    """
+    paid = replace(BASE, goal_fields=("truthful", "safe"), goal_doses=(0.017, 0.017))
+    recorded = json.loads(json.dumps(paid.as_dict()))
+
+    assert isinstance(recorded["goal_doses"], list)
+    loaded = ArmFingerprint(**recorded)
+
+    assert loaded == paid
+    assert loaded.goal_doses == (0.017, 0.017)
+    assert loaded.requested_layers == paid.requested_layers
+    assert {loaded, paid} == {paid}
+
+
+def test_two_recorded_dose_groups_of_one_arm_compare_at_parity():
+    """#54's own criterion, on the artefact the GPU run actually produces.
+
+    ``allocation_shift.py --group_a r1/value --group_b r4/value`` is how
+    signature 1's primary is read, and it asserts parity between two groups that
+    differ only in the dose. Read off disk, not built in memory.
+    """
+    low = replace(BASE, goal_fields=("truthful", "safe"), goal_doses=(0.017, 0.017))
+    high = replace(low, goal_doses=(0.068, 0.017))
+    through_json = [ArmFingerprint(**json.loads(json.dumps(a.as_dict()))) for a in (low, high)]
+
+    assert_parity(through_json)
+
+    with pytest.raises(ParityError, match="distinct"):
+        assert_parity([through_json[0], through_json[0]])
+
+
+def test_every_sequence_field_is_coerced_back_to_a_tuple():
+    """A tuple field added later must join ``SEQUENCE_FIELDS`` or it breaks the read path.
+
+    The failure it would cause is silent in every test that builds a fingerprint
+    in memory, and fatal in every script that reads one off disk, which is the
+    pairing that let it ship once already.
+    """
+    declared = {
+        field.name
+        for field in fields(ArmFingerprint)
+        if isinstance(getattr(BASE, field.name), tuple)
+    }
+
+    assert declared == set(SEQUENCE_FIELDS), (
+        f"ArmFingerprint holds tuple fields {sorted(declared - set(SEQUENCE_FIELDS))} that "
+        "parity.SEQUENCE_FIELDS does not coerce; a JSON round trip turns them into lists"
+    )
 
 
 def test_dataset_config_is_omitted_when_the_dataset_has_none():

@@ -578,8 +578,18 @@ class TrainingConfig:
             )
         if not self.goal_fields:
             return
-        if self.router == ARM_DENSE:
-            raise ValueError("goal fields need a MoB layer to pay; the dense arm has none")
+        if self.router != ARM_MOB:
+            # Not just the dense arm. ``MoBConfig.has_economy`` is
+            # ``router == ROUTER_AUCTION``, so under the softmax gate
+            # ``_economy_live()`` is False, ``collect_contributions`` is False and
+            # the goal term is never computed -- while the fields still attach,
+            # ``goal_fields.json`` is still written and the doses still reach the
+            # fingerprint. That is the dense arm's failure wearing another name.
+            raise ValueError(
+                f"goal fields are paid out of the auction economy, and the {self.router!r} "
+                "gate has none: the fields would attach, the doses would be fingerprinted "
+                "and no cell would ever be paid"
+            )
         if len(set(self.goal_fields)) != len(self.goal_fields):
             raise ValueError(
                 f"goal_fields names a goal twice ({self.goal_fields}), which attaches two "
@@ -915,11 +925,14 @@ class TAMETrainer:
         that does not and the two stay at parity on their data order.
 
         ``calibrate_alignment`` directly rather than ``CognitiveHomeostat.calibrate``,
-        which would install the result on the homeostat. That object may also be
-        ``self._field``: a calibrated homeostat gates its hooks on the actuator list
-        and starts filtering and recording a reading on every forward, which is
-        exactly what ``_attach_field`` relies on the constant loop *not* doing under
-        gradient checkpointing. The calibration is a measurement here, not a tissue.
+        which would install the result on the homeostat and rebuild its tissue
+        around it. That object may also be ``self._field``, and a calibrated
+        homeostat gates its hooks on the actuator list -- so the field's behaviour
+        would start depending on a measurement ``_attach_field`` deliberately does
+        without. Under the constant loop nothing would begin filtering or
+        recording, because ``sense`` returns ``base_strength`` before it reads
+        anything; the reason above is the one that carries the argument, and this
+        is why the measurement is kept off the tissue rather than merely beside it.
 
         A failure is raised, not warned past as the server warns past it. The server
         has a legacy setpoint to fall back on; an arm launched to price a goal has
@@ -960,6 +973,13 @@ class TAMETrainer:
             self.config.goal_fields,
             self.config.goal_doses,
             self._goal_calibrations,
+            # The gate, handed in rather than inferred: the calibration measures
+            # the readout cell too, and that cell is not one the behavioural gate
+            # passed. See goal_field.paying_layers.
+            {
+                goal: certified_coupling_layers(goal, self.config.model_id)
+                for goal in self.config.goal_fields
+            },
         )
         path = Path(self.config.output_dir) / GOAL_FIELDS_FILENAME
         path.write_text(
@@ -1914,6 +1934,12 @@ class TAMETrainer:
                 measurements["auction/mean_realised_value"] = _scalar(stats["mean_realised_value"])
                 measurements["auction/mean_report"] = _scalar(stats["mean_report"])
                 measurements["auction/mean_win_surplus"] = _scalar(stats["mean_win_surplus"])
+                # #54. The goal term's own size, and its share of what a cell was
+                # paid. Without them a primary that reads "no" cannot be told
+                # from a goal term too small to have moved anything, and those
+                # two are the same number in every other column.
+                measurements["auction/mean_goal_term"] = _scalar(stats["mean_goal_term"])
+                measurements["auction/goal_share"] = _scalar(stats["goal_share"])
             measurements.update(self._coupling_measurements())
 
             # Format performance EMA with sign
