@@ -49,6 +49,7 @@ from smoke_fixture import build_smoke_fixture  # noqa: E402
 
 from coupling import DEFAULT_COUPLING_BETA, DEFAULT_WARMUP_STEPS  # noqa: E402
 from determinism import DETERMINISM_DEFAULT, DETERMINISM_MODES  # noqa: E402
+from goal_field import GOAL_ERROR_UNIT_COST, parse_goal_doses  # noqa: E402
 from mob.auction import EXPLORATION_DRAW_STALENESS, SUPPORTED_EXPLORATION_DRAWS  # noqa: E402
 from mob.ledger import PERSISTENCE_VALUE, SUPPORTED_PERSISTENCE_COUPLINGS  # noqa: E402
 from parity import arm_label  # noqa: E402
@@ -314,6 +315,22 @@ def build_parser() -> argparse.ArgumentParser:
             "loop, certified strength and layers (#28; default: the field is absent)"
         ),
     )
+    # #54's dose axis: what a cell is paid for holding the tissue's goal, and how
+    # much. Nothing is injected -- that is --steer_goal -- and the two are
+    # independent, so a pay-only arm names no steer goal at all.
+    parser.add_argument(
+        "--goal_dose",
+        action="append",
+        default=None,
+        metavar="GOAL=DOSE",
+        help=(
+            "Pay every certified, converted layer for holding this goal, at this price per "
+            "unit of goal error; repeat or comma-separate for several goals (#54). One unit "
+            f"is {GOAL_ERROR_UNIT_COST} nats, what #28 measured the injection costing held-out "
+            "loss. The goals and doses are in the fingerprint and the dose is the declared "
+            "varying field, so two dose groups compare at parity (default: no goal is paid for)"
+        ),
+    )
     # #31: the run-to-run floor, measured rather than assumed absent.
     parser.add_argument(
         "--replicate",
@@ -365,6 +382,7 @@ def main() -> None:
         model_id, dataset = args.model_id, args.dataset
 
     start, end = (int(part) for part in args.layers.split(":"))
+    goal_fields, goal_doses = parse_goal_doses(args.goal_dose or ())
     config = TrainingConfig(
         model_id=model_id,
         output_dir=str(workspace / "runs"),
@@ -396,6 +414,8 @@ def main() -> None:
         coupling_warmup_steps=args.coupling_warmup_steps,
         trace_goal=args.trace_goal,
         steer_goal=args.steer_goal,
+        goal_fields=goal_fields,
+        goal_doses=goal_doses,
     )
 
     # One shared MLflow store across seeds, same reasoning as compare_routers.py:
@@ -445,6 +465,8 @@ def main() -> None:
                 "router": args.router,
                 "coupling_goal": args.coupling_goal,
                 "steer_goal": args.steer_goal,
+                "goal_fields": list(goal_fields),
+                "goal_doses": list(goal_doses),
                 "persistence_coupling": args.persistence_coupling,
                 "trace_goal": config.trace_goal or config.coupling_goal or config.steer_goal,
                 "seeds": seeds,

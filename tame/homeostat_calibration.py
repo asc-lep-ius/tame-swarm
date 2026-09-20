@@ -95,6 +95,21 @@ class AlignmentCalibration:
     def setpoint_z(self, layer: int) -> float:
         return self.layers[layer].gain_z * self.reference_strength
 
+    def setpoint_projection(self, layer: int) -> float:
+        """The same target in raw projection units: the inverse of :meth:`z` (#54).
+
+        ``setpoint_z`` is in the cell's own sigma, which is the unit the homeostat
+        filters and integrates in. Anything that reads this direction off the
+        residual stream without going through that filter -- the goal term of #33,
+        which prices what the experts add at a converted layer -- needs the level
+        itself. Equal to ``resting_mean + lift * reference_strength``: where the
+        cell's projection sits with every actuator injecting at the reference
+        strength, which is a target the tissue already held before any reward
+        existed to pay for it.
+        """
+        calibration = self.layers[layer]
+        return calibration.resting_mean + self.setpoint_z(layer) * calibration.sigma
+
     def weight(self, layer: int) -> float:
         """The cell's share of the consensus: its controllability under :attr:`weighting`.
 

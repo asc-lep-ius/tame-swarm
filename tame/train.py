@@ -17,6 +17,7 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import math
 import os
@@ -116,8 +117,13 @@ from evaluation import (
     evaluate,
     is_held_out_position,
 )
+from goal_field import AttachedGoalField, attach_goal_fields
 from homeostat import CognitiveHomeostat
-from homeostat_calibration import transformer_layers
+from homeostat_calibration import (
+    AlignmentCalibration,
+    calibrate_alignment,
+    transformer_layers,
+)
 from metrics import MetricSink
 from mob import (
     MOB_MODULES_FILENAME,
@@ -146,6 +152,7 @@ from specialisation import SpecialisationReport, probe_specialisation
 from steering import ADAPTIVE_STEERING, SteeringConfig
 from steering_pipeline import (
     SteeringExtraction,
+    calibration_texts,
     certified_coupling_layers,
     extract_steering_vectors,
     seed_coupling,
@@ -171,6 +178,10 @@ ARM_ROUTERS = {ARM_MOB: ROUTER_AUCTION, ARM_SOFTMAX: ROUTER_SOFTMAX}
 HELD_OUT_SPLIT_FILENAME = "held_out_split.pt"
 METRICS_FILENAME = "metrics.jsonl"
 MOB_STATE_FILENAME = "mob_state.pt"
+# The calibration behind every goal field this arm paid under (#54), beside the
+# checkpoints rather than in the log: the setpoints are measured at training
+# start on this run's own model and corpus, and nothing else records them.
+GOAL_FIELDS_FILENAME = "goal_fields.json"
 LORA_ADAPTER_FILENAME = "adapter_model.safetensors"
 FULL_WEIGHTS_FILENAME = "model.safetensors"
 
@@ -409,6 +420,16 @@ class TrainingConfig:
     # changes what is trained, so it is in the fingerprint with its strength and
     # layers; an arm that differs on it is a different arm, not a confound.
     steer_goal: str | None = None
+    # The goals a cell is *paid* for holding (#54, #33's term), and the price of one
+    # unit of goal error in each. Two parallel tuples rather than a mapping because
+    # the fingerprint carries them as tuples and their order is what a dose sweep
+    # varies. Unlike ``steer_goal`` nothing is injected: each goal is calibrated at
+    # training start and a ``ConstantGoalField`` is attached at every certified layer
+    # the conversion covers, so the cells are paid for carrying the layer's delta
+    # toward a setpoint the tissue already held. Empty leaves realised value bitwise
+    # what it was, which is every arm recorded before this one.
+    goal_fields: tuple[str, ...] = ()
+    goal_doses: tuple[float, ...] = ()
 
     # LoRA (optional)
     use_lora: bool = False
@@ -525,6 +546,7 @@ class TrainingConfig:
             # The same gate as the coupling: the field is injected only where, and
             # on the model, the behavioural gate certified the direction.
             certified_coupling_layers(self.steer_goal, self.model_id)
+        self._validate_goal_fields()
 
         if self.checkpoint_keep_last < 0:
             raise ValueError(f"checkpoint_keep_last must be >= 0, got {self.checkpoint_keep_last}")
@@ -538,6 +560,42 @@ class TrainingConfig:
             raise ValueError(f"shuffle_buffer_size must be >= 0, got {self.shuffle_buffer_size}")
 
         validate_determinism_mode(self.deterministic)
+
+    def _validate_goal_fields(self) -> None:
+        """Refuse a goal field that could not pay a cell, here rather than after the load.
+
+        Every failure below leaves a run that trains to completion and reports a
+        goal term of exactly zero, which is indistinguishable from the answer the
+        arm was launched to test. The certification gate is the coupling's
+        (``certified_coupling_layers``): a direction the behavioural gate never
+        passed on this model means nothing at these layers, and the goal term would
+        price a projection onto noise.
+        """
+        if len(self.goal_fields) != len(self.goal_doses):
+            raise ValueError(
+                f"goal_fields {self.goal_fields} and goal_doses {self.goal_doses} must be "
+                "the same length: each goal is paid at its own dose"
+            )
+        if not self.goal_fields:
+            return
+        if self.router == ARM_DENSE:
+            raise ValueError("goal fields need a MoB layer to pay; the dense arm has none")
+        if len(set(self.goal_fields)) != len(self.goal_fields):
+            raise ValueError(
+                f"goal_fields names a goal twice ({self.goal_fields}), which attaches two "
+                "fields to one layer and doubles its dose without saying so"
+            )
+        requested = range(self.mob_layers_start, self.mob_layers_end)
+        for goal, dose in zip(self.goal_fields, self.goal_doses, strict=True):
+            if dose < 0:
+                raise ValueError(f"the dose of goal {goal!r} must be >= 0, got {dose}")
+            certified = certified_coupling_layers(goal, self.model_id)
+            if not any(layer in requested for layer in certified):
+                raise ValueError(
+                    f"goal {goal!r} is certified at layers {list(certified)}, none inside the "
+                    f"converted range {requested.start}-{requested.stop - 1}: no cell could be "
+                    "paid for it"
+                )
 
 
 class TAMETrainer:
@@ -601,6 +659,11 @@ class TAMETrainer:
         # The goal field (#28): the certified homeostat whose hooks inject during
         # training, or None when the field is absent. See _attach_field.
         self._field: CognitiveHomeostat | None = None
+        # Per goal in ``config.goal_fields``: the calibration its setpoints come
+        # from, measured at setup on the pristine model, and the fields it attached
+        # (#54). Empty when no goal is paid for.
+        self._goal_calibrations: dict[str, AlignmentCalibration] = {}
+        self.goal_field_records: tuple[AttachedGoalField, ...] = ()
         self.metrics = MetricSink(
             Path(config.output_dir) / METRICS_FILENAME,
             run_tags={"router": config.router, "seed": config.seed},
@@ -678,6 +741,13 @@ class TAMETrainer:
                 self._trace_directions = self._directions_in_range(*direction_of(measured))
             if self.config.steer_goal is not None:
                 self._field = direction_of(self.config.steer_goal)[0]
+            # Before conversion, for the reason the extraction above is: this runs
+            # forwards over a generated corpus, and after conversion those forwards
+            # are the inference economy settling on the local-quality proxy -- an
+            # arm that pays a goal would start training from a wealth distribution
+            # an arm that does not never saw.
+            for goal in self.config.goal_fields:
+                self._goal_calibrations[goal] = self._calibrate_goal(goal, direction_of(goal)[0])
             self._apply_mob()
             if seed is not None:
                 self._seed_coupling(*seed)
@@ -708,6 +778,11 @@ class TAMETrainer:
         # evaluation, specialisation probe -- runs in the field.
         if self._field is not None:
             self._attach_field()
+
+        # After the field, and on the same placed model: the direction each field
+        # prices against has to land on the device its layer ended up on.
+        if self.config.goal_fields:
+            self._attach_goal_fields()
 
         # Setup optimizer
         self._setup_optimizer()
@@ -828,6 +903,69 @@ class TAMETrainer:
             sorted(directions),
         )
         return directions
+
+    def _calibrate_goal(self, goal: str, homeostat: CognitiveHomeostat) -> AlignmentCalibration:
+        """Measure where this goal's cells rest, and where they sit when steered (#54).
+
+        The corpus is the served one (``steering_pipeline.calibration_texts``): the
+        goal's own prompts, chat-wrapped, each followed by the model's greedy
+        continuation, because #4 measured general prose sitting about two sigma off
+        the regime the setpoint has to describe. Greedy and under ``no_grad``
+        throughout, so an arm that pays a goal consumes no more randomness than one
+        that does not and the two stay at parity on their data order.
+
+        ``calibrate_alignment`` directly rather than ``CognitiveHomeostat.calibrate``,
+        which would install the result on the homeostat. That object may also be
+        ``self._field``: a calibrated homeostat gates its hooks on the actuator list
+        and starts filtering and recording a reading on every forward, which is
+        exactly what ``_attach_field`` relies on the constant loop *not* doing under
+        gradient checkpointing. The calibration is a measurement here, not a tissue.
+
+        A failure is raised, not warned past as the server warns past it. The server
+        has a legacy setpoint to fall back on; an arm launched to price a goal has
+        nothing, and a run that quietly paid no cell for it answers a question
+        nobody asked.
+        """
+        assert self.model is not None
+        texts = calibration_texts(self.model, self.tokenizer, goal)
+        directions = {
+            layer: homeostat.projected_direction(layer)[0] for layer in homeostat.steering_vectors
+        }
+        calibration = calibrate_alignment(
+            self.model,
+            self.tokenizer,
+            homeostat.steering_vectors,
+            homeostat.config,
+            texts=texts,
+            directions=directions,
+        )
+        logger.info(
+            "Goal %r calibrated over %d passages: cells %s, setpoints %s in raw projection "
+            "units (#54)",
+            goal,
+            calibration.num_passages,
+            list(calibration.sensors),
+            {
+                layer: round(calibration.setpoint_projection(layer), 3)
+                for layer in calibration.sensors
+            },
+        )
+        return calibration
+
+    def _attach_goal_fields(self) -> None:
+        """Pay every converted layer for every goal certified there, and record the price."""
+        assert self.model is not None
+        self.goal_field_records = attach_goal_fields(
+            self.model,
+            self.config.goal_fields,
+            self.config.goal_doses,
+            self._goal_calibrations,
+        )
+        path = Path(self.config.output_dir) / GOAL_FIELDS_FILENAME
+        path.write_text(
+            json.dumps([record.as_dict() for record in self.goal_field_records], indent=2)
+        )
+        logger.info("Goal fields recorded at %s", path)
 
     def _seed_coupling(
         self,

@@ -42,6 +42,7 @@ from .arm_fingerprints import BASE
 from .auction_mutations import pre_nine_payments
 from .config_reads import read_names
 from .conftest import TINY_HIDDEN_DIM, build_tiny_causal_lm
+from .goal_field_fixtures import BODY_LAYERS, body_calibration, paid_body, settle_body
 from .rotating_fixtures import CUTOFF, MAX_SEQ_LENGTH, TODAY, canary_manifest, stream_manifest
 
 # --- Every config field is read by something -----------------------------------------
@@ -359,3 +360,44 @@ def test_a_base_that_is_the_model_reads_as_a_perfectly_healthy_organism(
         0.0,
         0.0,
     )
+
+
+# --- The goal dose reaches the body, and a zero dose leaves it exactly alone ----------------
+
+# ``TrainingConfig.goal_doses`` (#54) is read by ``goal_field.attach_goal_fields``
+# and nowhere else, and the inert state it can fail into is the one every arm of
+# #39's GPU run would be read through. A field built at a layer the conversion
+# does not cover, a direction left on the wrong device, a term the settlement
+# drops: each leaves realised value exactly what it was, and "realised value did
+# not move" is also what the extrinsic-teleology position predicts the answer
+# looks like. Nothing else in the run could tell those two apart.
+#
+# The pairing is the other half of #33's own guarantee. A field at dose zero must
+# leave realised value *bitwise* what it was, which is what lets the dose-zero
+# arm be the control it is; ``tests/test_stakes_dial.py`` pins that on the
+# synthetic fixture, and it is pinned here on a decoder stack with converted
+# layers, which is where the arms run.
+
+GOAL_DOSE = 0.017
+
+
+def test_a_paid_goal_field_changes_what_a_cell_realises_on_the_body():
+    calibration = body_calibration()
+
+    unpaid = settle_body(paid_body())
+    paid = settle_body(paid_body(("truthful",), (GOAL_DOSE,), {"truthful": calibration}))
+
+    assert len(paid) == len(unpaid) == len(BODY_LAYERS)
+    for before, after in zip(unpaid, paid, strict=True):
+        assert not torch.equal(before, after)
+
+
+def test_a_field_at_dose_zero_leaves_realised_value_bitwise_what_it_was_on_the_body():
+    """The inert state the test above needs, and the control the run needs: the same state."""
+    calibration = body_calibration()
+
+    unpaid = settle_body(paid_body())
+    at_zero = settle_body(paid_body(("truthful",), (0.0,), {"truthful": calibration}))
+
+    for before, after in zip(unpaid, at_zero, strict=True):
+        assert torch.equal(before, after)

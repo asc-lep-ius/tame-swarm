@@ -5,6 +5,7 @@ what PEFT does to a model after MoB has been applied, the other of what gradient
 checkpointing does to a forward pass that carries economic side effects.
 """
 
+import json
 import math
 import sys
 from pathlib import Path
@@ -912,3 +913,97 @@ def test_the_shared_base_check_reads_the_layer_it_was_taken_from(smoke_fixture, 
         get_mob_layers(trainer.model)[0].base_down_proj.weight.mul_(2.0)
     with pytest.raises(RuntimeError, match="layer 1: shared base down_proj"):
         trainer._assert_setup_invariants()
+
+
+# --- The goal field the cells are paid for (#54) -------------------------------------
+
+SMOKE_DOSE = 0.017
+# Four is ``MIN_CALIBRATION_PASSAGES``; six so the slow sigma is a spread rather
+# than a constant. The corpus is faked for the reason the pairs above are: the
+# real one is the goal's own prompts answered by the model, and the smoke
+# tokenizer knows none of those words. What is *not* faked is the calibration
+# itself, which is the arithmetic the setpoints come out of.
+SMOKE_CALIBRATION_TEXTS = [f"alpha beta gamma {i} delta epsilon zeta" for i in range(6)]
+
+
+def _pay_a_smoke_goal(monkeypatch, model_id: str, layers: tuple[int, ...] = (1, 2)) -> str:
+    import train as train_module
+
+    _certify_smoke_goal(monkeypatch, model_id, layers=layers)
+    monkeypatch.setattr(
+        train_module, "calibration_texts", lambda *a, **k: list(SMOKE_CALIBRATION_TEXTS)
+    )
+    return "smoke"
+
+
+def test_setup_calibrates_each_goal_and_pays_every_converted_layer_it_is_certified_at(
+    smoke_fixture, tmp_path, monkeypatch
+):
+    """#54 end to end through the trainer: calibrate, attach, record, fingerprint.
+
+    MoB at layers 1-2 and the certification at 2-3, as the coupling's test has
+    it, so "every converted layer it is certified at" is one layer and not all of
+    them. The setpoints are asserted to be *that calibration's* rather than any
+    particular number: a trainer that attached a field at a default setpoint, or
+    at another cell's, would read identically in the log.
+    """
+    model_id, _ = smoke_fixture
+    goal = _pay_a_smoke_goal(monkeypatch, model_id, layers=(2, 3))
+    trainer = TAMETrainer(
+        _config(smoke_fixture, tmp_path / "paid", goal_fields=(goal,), goal_doses=(SMOKE_DOSE,))
+    )
+
+    trainer.setup()
+
+    calibration = trainer._goal_calibrations[goal]
+    layers = mob_layers_by_index(trainer.model)
+    assert sorted(layers) == [1, 2]
+    assert layers[1].goal_fields == []
+    assert len(layers[2].goal_fields) == 1
+    field = layers[2].goal_fields[0]
+    assert field.dose == SMOKE_DOSE
+    assert field.setpoint == pytest.approx(calibration.setpoint_projection(2))
+    assert torch.equal(field.vector, calibration.directions[2])
+
+    recorded = json.loads((tmp_path / "paid" / "goal_fields.json").read_text())
+    assert [(row["goal"], row["layer"]) for row in recorded] == [(goal, 2)]
+    assert recorded[0]["num_passages"] == len(SMOKE_CALIBRATION_TEXTS)
+    assert trainer.fingerprint is not None
+    assert trainer.fingerprint.goal_fields == (goal,)
+    assert trainer.fingerprint.goal_doses == (SMOKE_DOSE,)
+
+
+def test_a_goal_paid_for_is_not_a_goal_injected(smoke_fixture, tmp_path, monkeypatch):
+    """The fork this issue settled, pinned: pay-only attaches no hook to the stream.
+
+    ``--steer_goal`` is what injects (#28) and it is a separate flag. An arm that
+    silently injected what it pays for would move the held-out loss by the
+    injection's own cost, which is the guardrail the run is read against.
+    """
+    model_id, _ = smoke_fixture
+    goal = _pay_a_smoke_goal(monkeypatch, model_id)
+    trainer = TAMETrainer(
+        _config(smoke_fixture, tmp_path / "payonly", goal_fields=(goal,), goal_doses=(SMOKE_DOSE,))
+    )
+
+    trainer.setup()
+
+    assert trainer._field is None
+    assert trainer.fingerprint is not None
+    assert trainer.fingerprint.steer_goal is None
+    assert trainer.fingerprint.steer_layers == ()
+    assert any(mob.goal_fields for mob in mob_layers_by_index(trainer.model).values())
+
+
+def test_an_arm_that_pays_for_nothing_attaches_no_field_and_records_none(smoke_fixture, tmp_path):
+    """The pairing, and every arm recorded before #54: no field, and no file claiming one."""
+    trainer = TAMETrainer(_config(smoke_fixture, tmp_path / "unpaid"))
+
+    trainer.setup()
+
+    assert trainer.goal_field_records == ()
+    assert not (tmp_path / "unpaid" / "goal_fields.json").exists()
+    for mob in mob_layers_by_index(trainer.model).values():
+        assert mob.goal_fields == []
+    assert trainer.fingerprint is not None
+    assert (trainer.fingerprint.goal_fields, trainer.fingerprint.goal_doses) == ((), ())

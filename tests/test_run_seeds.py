@@ -21,6 +21,7 @@ from run_seeds import (  # noqa: E402
     replication_std,
 )
 
+from goal_field import parse_goal_doses  # noqa: E402
 from parity import arm_label  # noqa: E402
 from train import TrainingConfig  # noqa: E402
 
@@ -109,3 +110,23 @@ def test_the_sweep_takes_the_stakes_dial_and_names_the_arm_by_it():
     assert build_parser().parse_args([]).persistence_coupling == "value"
     assert arm_label("mob", None, "truthful", "decoupled") == "mob@truthful~decoupled"
     assert arm_label("mob", None, None, "value") == "mob"
+
+
+def test_the_sweep_takes_a_dose_per_goal_and_reaches_the_fingerprint_with_it():
+    """#54's dose axis, from the flag to the tuples the fingerprint carries.
+
+    The arm label is deliberately *not* asked to change: the two dose groups of
+    signature 1's primary are one arm read at two doses, and putting the dose in
+    the label would rename every table row the fixture already recorded.
+    """
+    args = build_parser().parse_args(["--goal_dose", "truthful=0.068,safe=0.017"])
+    goals, doses = parse_goal_doses(args.goal_dose)
+
+    assert (goals, doses) == (("truthful", "safe"), (0.068, 0.017))
+    config = TrainingConfig(
+        mob_layers_start=6, mob_layers_end=22, goal_fields=goals, goal_doses=doses
+    )
+    assert (config.goal_fields, config.goal_doses) == (goals, doses)
+
+    assert build_parser().parse_args([]).goal_dose is None
+    assert parse_goal_doses(build_parser().parse_args([]).goal_dose or ()) == ((), ())

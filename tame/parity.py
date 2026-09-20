@@ -56,7 +56,18 @@ DATA_ORDER_PROBE_BATCHES = 8
 # #32 reads each dose against the one uncoupled reference.
 # ``persistence_coupling`` is #39's stakes dial: whether a cell's continuation
 # depends on its realised value, the one thing the three stakes arms differ in.
-VARYING_FIELDS = frozenset({"router", "coupling_goal", "steer_goal", "persistence_coupling"})
+# ``goal_doses`` is #54's dose axis, and it is here against the reasoning that
+# kept the coupling's dose out: signature 1's primary *is* the shift between two
+# dose levels of one arm (``docs/preregistration.md`` section 7), so refusing
+# that pair refuses the measurement. The cost is real and stated rather than
+# hidden -- an arm at one dose and an arm at another now pass parity even when
+# they also differ in the dial, so a dose and a dial can be confounded in one
+# comparison, exactly as a router and a coupling goal already can. Which goals
+# were paid for is *not* varying (``goal_fields``): two arms paid for
+# different goals are not two doses of one experiment.
+VARYING_FIELDS = frozenset(
+    {"router", "coupling_goal", "steer_goal", "persistence_coupling", "goal_doses"}
+)
 
 # The coupling's own parameters, asserted only between arms that have a
 # coupling. An uncoupled arm has no dose; a default it carries inert must not
@@ -276,12 +287,16 @@ class ArmFingerprint:
     # so a legacy fingerprint reads as one; it is a confound like any other field.
     exploration_draw: str = "uniform"
     # #39. Every run recorded before the dial existed was the live economy under a
-    # new name, so a legacy fingerprint reads as ``value``. The dial varies; the
-    # doses of the goal fields the arms were paid under (#33) are asserted equal,
-    # as the coupling's dose is: two arms at different doses are a sweep, not the
-    # contrast. Empty when no goal field was attached.
+    # new name, so a legacy fingerprint reads as ``value``. The dial varies, and so
+    # does the dose of the goal fields the arms were paid under (#33, #54) -- see
+    # ``VARYING_FIELDS`` for why that reversed. ``goal_fields`` names them in
+    # the order their doses are given; it is asserted equal, because two arms paid
+    # for different goals are a different experiment and not a dose apart. Both
+    # empty when no goal field was attached, which is every run before #54 and
+    # every fixture run that hand-built its doses without naming a goal.
     persistence_coupling: str = "value"
     goal_doses: tuple[float, ...] = ()
+    goal_fields: tuple[str, ...] = ()
     # #40. What the ledger relaxes toward. Every run recorded before the mode
     # existed relaxed toward zero, so a legacy fingerprint reads as ``decay``.
     # Deliberately *not* a varying field: #26's setpoint ledger is derived and
@@ -404,6 +419,8 @@ def fingerprint_arm(
         exploration_rate=config.exploration_rate,
         exploration_draw=config.exploration_draw,
         persistence_coupling=config.persistence_coupling,
+        goal_fields=tuple(config.goal_fields),
+        goal_doses=tuple(config.goal_doses),
         ledger_mode=config.ledger_mode,
         confidence_head_learning_rate=config.confidence_head_learning_rate,
         wealth_update_frequency=config.wealth_update_frequency,
@@ -479,10 +496,18 @@ def assert_parity(arms: Sequence[ArmFingerprint]) -> None:
     if len(arms) < 2:
         return
 
+    # Distinct in some variable under test, which is not the same as distinct in
+    # the label: #54's two dose groups of one arm carry one label -- the dose is
+    # not in it -- and are the comparison signature 1's primary is read on, while
+    # the same arm handed over twice is the mistake this catches.
     labels = [arm.arm for arm in arms]
-    if len(set(labels)) != len(labels):
+    signatures = [tuple(getattr(arm, name) for name in sorted(VARYING_FIELDS)) for arm in arms]
+    if len(set(signatures)) != len(signatures):
         raise ParityError(
-            f"Arms must be distinct in router, coupling goal or steer goal, got {labels}"
+            "Arms must be distinct in at least one variable under test "
+            f"{sorted(VARYING_FIELDS)}; "
+            f"two of {labels} agree on every one of them, so this is one arm compared "
+            "with itself"
         )
 
     reference = arms[0]

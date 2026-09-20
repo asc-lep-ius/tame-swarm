@@ -41,10 +41,19 @@ import torch
 
 
 class GoalField(Protocol):
-    """What the layer needs from a goal field: a setpoint, a dose, and a direction per token."""
+    """What the layer needs from a goal field: a setpoint, a dose, and a direction per token.
 
-    setpoint: float
-    dose: float
+    Both read-only, so a frozen field satisfies this: the layer never writes
+    either, and a mutable attribute satisfies a read-only protocol member while
+    the reverse is not true -- ``ConstantGoalField`` is frozen because a dose that
+    can be edited after attachment is a dose the fingerprint no longer describes.
+    """
+
+    @property
+    def setpoint(self) -> float: ...
+
+    @property
+    def dose(self) -> float: ...
 
     def direction(self, hidden_states: torch.Tensor) -> torch.Tensor: ...
 

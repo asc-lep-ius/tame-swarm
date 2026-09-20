@@ -287,6 +287,7 @@ def test_fingerprint_arm_reads_the_training_config():
     assert arm.persistence_coupling == "decoupled"
     assert arm.ledger_mode == "setpoint"
     assert arm.goal_doses == ()
+    assert arm.goal_fields == ()
     assert arm.confidence_head_learning_rate == 0.011
     assert arm.wealth_update_frequency == 19
     assert arm.coupling_goal is None
@@ -449,6 +450,31 @@ def test_fingerprint_arm_records_the_injection_the_field_made():
     assert arm.steer_goal == "truthful"
     assert arm.steer_strength == 4.0
     assert arm.steer_layers == (13, 16)
+
+
+def test_two_arms_that_differ_only_in_the_goal_dose_fingerprint_differently():
+    """#54's dose axis, end to end: the config's two tuples reach the fingerprint.
+
+    And the pairing, which is the half that would fail silently: an arm that pays
+    for no goal records the fixture's empty tuples, so every summary written
+    before the flag existed reads as what it was.
+    """
+
+    def arm_at(**kwargs):
+        return fingerprint_arm(
+            TrainingConfig(mob_layers_start=13, mob_layers_end=22, **kwargs),
+            eval_split_fingerprint="s",
+            data_order="d",
+            converted_layers=9,
+        )
+
+    low = arm_at(goal_fields=("truthful", "safe"), goal_doses=(0.017, 0.017))
+    high = arm_at(goal_fields=("truthful", "safe"), goal_doses=(0.068, 0.017))
+
+    assert low.goal_fields == high.goal_fields == ("truthful", "safe")
+    assert (low.goal_doses, high.goal_doses) == ((0.017, 0.017), (0.068, 0.017))
+    assert low != high
+    assert arm_at().goal_doses == () and arm_at().goal_fields == ()
 
 
 def test_dataset_config_is_omitted_when_the_dataset_has_none():
