@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, NamedTuple
 import torch
 import torch.nn.functional as F
 
+from .experts import SELF_PREDICTION_RANGE
 from .ledger import (
     PERSISTENCE_DECOUPLED,
     PERSISTENCE_SHUFFLED,
@@ -112,6 +113,10 @@ class WealthUpdateMixin:
     _cached_stress: torch.Tensor | None
     # What #59's charge took from every cell at the last settlement.
     last_stress_charge: float
+    # #60: each cell's prediction of the value it would realise, captured in the
+    # forward where the hidden states are, and scored in the settlement where
+    # the realised values are.
+    _cached_predictions: torch.Tensor | None
     _loss_feedback_pending: bool
     _cached_calibration_loss: torch.Tensor | None
     last_value_summary: ValueSummary | None
@@ -327,6 +332,40 @@ class WealthUpdateMixin:
 
         self._cached_calibration_loss = objective * weight
 
+    def _self_scores(
+        self,
+        values: torch.Tensor,
+        selected_experts: torch.Tensor,
+        valid_mask: torch.Tensor,
+        seq_len: int,
+    ) -> torch.Tensor | None:
+        """Each cell's Brier score on the tokens it held: ``-(prediction - realised)^2``.
+
+        Strictly proper, so the prediction that maximises it is the cell's own
+        expectation of what it will realise -- which is what makes a wrong
+        self-model cost something rather than merely look wrong. Bounded by the
+        clamp both sides carry (``SELF_PREDICTION_RANGE``), because an unbounded
+        quadratic lets one outlying token empty a ledger.
+
+        Zero for a cell that held nothing: a cell with no tokens made no
+        prediction anybody can score, and charging it for that would be charging
+        it for losing the auction.
+        """
+        if self.config.self_score_mu <= 0.0 or self._cached_predictions is None:
+            return None
+        predictions = self._cached_predictions[:, :seq_len, :]
+        scores = torch.zeros(self.config.num_experts, device=values.device)
+        clamped_values = values.clamp(-SELF_PREDICTION_RANGE, SELF_PREDICTION_RANGE)
+        for expert_idx in range(self.config.num_experts):
+            held_slots = selected_experts == expert_idx
+            held = held_slots.any(dim=-1) & valid_mask
+            if not held.any():
+                continue
+            realised = (clamped_values * held_slots).sum(dim=-1)[held]
+            predicted = predictions[..., expert_idx][held]
+            scores[expert_idx] = -((predicted - realised) ** 2).mean()
+        return scores
+
     def _stress_for(self, seq_len: int) -> torch.Tensor | None:
         """This step's transmitted stress, trimmed to the tokens the loss reached (#59).
 
@@ -345,6 +384,7 @@ class WealthUpdateMixin:
         self._cached_values = None
         self._cached_goal_terms = None
         self._cached_stress = None
+        self._cached_predictions = None
 
     def update_wealth_from_loss(
         self,
@@ -451,6 +491,7 @@ class WealthUpdateMixin:
                     values=values,
                     usage_count=self.expert_usage_count,
                     stress=self._stress_for(seq_len),
+                    self_score=self._self_scores(values, selected_experts, valid_mask, seq_len),
                 ),
                 self._vcg_charges,
             )
@@ -465,6 +506,7 @@ class WealthUpdateMixin:
             self._cached_values = None
             self._cached_goal_terms = None
             self._cached_stress = None
+            self._cached_predictions = None
 
         self._compute_and_cache_calibration_loss(values, selected_experts, valid_mask)
 

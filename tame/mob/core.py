@@ -167,7 +167,12 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
             )
 
         self.confidence_heads = nn.ModuleList(
-            [ConfidenceHead(config.hidden_dim, expert_id=i) for i in range(config.num_experts)]
+            [
+                ConfidenceHead(
+                    config.hidden_dim, expert_id=i, self_model=config.self_score_mu > 0.0
+                )
+                for i in range(config.num_experts)
+            ]
         )
 
         # One attribute for whichever gate this arm runs, so nothing downstream
@@ -238,6 +243,7 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         # is one they cannot rule out.
         self.stress_override: torch.Tensor | None = None
         self.last_stress_charge: float = 0.0
+        self._cached_predictions: torch.Tensor | None = None
         self.last_goal_terms: torch.Tensor | None = None
         self._loss_feedback_pending: bool = False
         self._cached_calibration_loss: torch.Tensor | None = None
@@ -361,6 +367,7 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
                 self._cached_stress = self._transmitted_stress(
                     contributions, routing_weights.detach(), routing_hidden_states
                 )
+                self._cached_predictions = self._self_predictions(routing_hidden_states)
             self._register_value_hook(output, contributions)
         elif expects_feedback:
             self._warn_once(
@@ -583,6 +590,20 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
             delattr(self, "coupling")
         self._last_coupling_metrics = None
         self.last_stats = None
+
+    def _self_predictions(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
+        """What each cell predicts it will realise on this token (#60).
+
+        Read off the same detached hidden states the reports are, from each
+        head's own second projection, and cached for the settlement to score.
+        ``None`` when nothing prices it, so the recorded economy runs the
+        arithmetic it always ran.
+        """
+        if self.config.self_score_mu <= 0.0:
+            return None
+        return torch.cat(
+            [head.forward_prediction(hidden_states) for head in self.confidence_heads], dim=-1
+        )
 
     def _transmitted_stress(
         self,

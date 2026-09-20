@@ -108,6 +108,10 @@ class Settlement:
     # transmits none. Not per expert: every cell at the layer is charged the
     # same, which is the mechanism rather than an implementation shortcut.
     stress: torch.Tensor | None = None
+    # #60's Brier score per expert, over the tokens it held: negative, bounded,
+    # and zero for a cell that held nothing. Per *expert*, unlike the stress,
+    # because a self-model is exactly the thing a cell owns.
+    self_score: torch.Tensor | None = None
     # How often each expert has held a token. A ledger-side count rather than a
     # step quantity, read only by the inference path's re-entry gift.
     usage_count: torch.Tensor | None = None
@@ -484,6 +488,8 @@ class WealthUpdater:
     # token. Zero in every recorded arm, and ``settle`` adds exactly nothing
     # when it is.
     stress_lambda: float = 0.0
+    # #60's price on a cell's self-model. Zero in every recorded arm.
+    self_score_mu: float = 0.0
 
     def __post_init__(self) -> None:
         if self.mode not in SUPPORTED_LEDGER_MODES:
@@ -609,6 +615,12 @@ class WealthUpdater:
             transfer += gift
         stress = self.stress_charge(settlement)
         transfer -= stress
+        if self.self_score_mu > 0.0 and settlement.self_score is not None:
+            # A payment for the accuracy of a cell's own prediction, added to
+            # the same transfer: #60 makes the self-model load-bearing by
+            # making a wrong one cost something, and a cost that arrives
+            # through a fourth update path is the thing #40 removed.
+            transfer = transfer + self.self_score_mu * settlement.self_score
 
         wealth += transfer
         self.floor(wealth)
@@ -657,4 +669,5 @@ class WealthUpdater:
                 else None
             ),
             stress_lambda=config.stress_lambda,
+            self_score_mu=config.self_score_mu,
         )

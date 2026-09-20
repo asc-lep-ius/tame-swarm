@@ -343,6 +343,10 @@ class ArmFingerprint:
     stress_gamma: float = 0.0
     stress_gate_sigma: float = 1.0
     stress_gate_mode: str = "fixed"
+    # #60's price on the self-model. Asserted equal rather than varying: #60's
+    # contrast is `value` against `shuffled` *at* a price, so two arms that
+    # differ in it are two experiments rather than two arms of one.
+    self_score_mu: float = 0.0
     # #46's readiness register: one field per autonomy the tissue may be granted,
     # named exactly as the flag in ``readiness.ReadinessConfig``. Off in every run
     # there has been, so a legacy fingerprint reads as a run that granted none.

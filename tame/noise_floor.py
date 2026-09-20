@@ -91,6 +91,7 @@ NOT_A_FLOOR_KNOB: dict[str, str] = {
             "stress_gamma",
             "stress_gate_sigma",
             "stress_gate_mode",
+            "self_score_mu",
             "exploration_rate",
             "exploration_draw",
             "wealth_update_frequency",
