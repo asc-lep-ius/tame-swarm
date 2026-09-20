@@ -1089,14 +1089,16 @@ CI runs the non-GPU tests under `pytest-xdist` (#51): `-n auto` is physical core
 <a name="the-local-gate-50"></a>
 
 `.claude/gates.sh` is what checks the tree before a push rather than after it
-(#50). All three slots are filled, and 93–96 seconds is what a tree change costs
-on this box.
+(#50). All three slots are filled, and 112–125 seconds is what a tree change costs
+on this box at 1078 tests (93–96 when #51 filled the tests slot at 856). The
+budget moved from 110 to 180 seconds on 2026-09-20 at the operator's decision,
+and the note above `GATE_BUDGET_S` in `.claude/gates.sh` is the record of why.
 
 | Gate | Command | Cost on the RTX 5070 Ti box |
 |---|---|---|
 | lint | `uv run ruff check . && uv run ruff format --check .` | < 1 s (116 files, cache deleted first) |
-| types | `uv run pyright tame scripts` | 62 s |
-| tests | `uv run pytest tests/ -x --tb=short -m 'not gpu' -n auto` | 34 s (12 workers) |
+| types | `uv run pyright tame scripts` | 60–65 s |
+| tests | `uv run pytest tests/ -x --tb=short -m 'not gpu' -n auto` | 50–62 s (12 workers, 1078 tests; 34 s at 856) |
 
 The tests slot was empty when #50 installed the file, and #51 is what filled it.
 The Stop hook's timeout is 300 seconds, and a 143-second suite is already enough
@@ -1108,7 +1110,8 @@ while the bare `uv run pytest` takes 130–137 for 851, the difference being the
 `slow` test that `addopts` also deselect. What settles it is neither figure but
 the whole hook: `run_all_gates` runs lint and types first, so a serial suite here
 would cost a Stop invocation about 220 seconds. Under `-n auto` with pinned
-worker threads the suite is 34 and the hook is 93–96. The command mirrors CI's
+worker threads the suite was 34 and the hook 93–96 at 856 tests, and 50–62 and
+112–125 at 1078 on 2026-09-20. The command mirrors CI's
 `test` job exactly, because a gate that runs a different invocation from the
 pipeline can pass here and fail there.
 

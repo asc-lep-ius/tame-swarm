@@ -195,10 +195,14 @@ CPU-minute, and was not asked. The tooling is #56's; the readout is #57's.
 5. **The dose unit is a property of the configuration.** One unit of goal
    error is priced at the injection's held-out cost measured at #25's
    configuration (#28: 0.017 nats). A run at another `adapter_rank`,
-   `max_seq_length`, batch size, step count or model re-measures that cost
-   before its dose is called a reference dose, or its dose axis is labelled
-   unpriced, as the fixture's is. Cheaper runs are bought with seeds and
-   readouts, not with knobs.
+   `max_seq_length`, batch size, step count, corpus or model re-measures that
+   cost before its dose is called a reference dose, or its dose axis is
+   labelled unpriced, as the fixture's is. Cheaper runs are bought with seeds
+   and readouts, not with knobs; a knob turned for a reason — a corpus whose
+   shape makes routing load-bearing, a cell share the organism can notice —
+   is a configuration change, priced and labelled as one, and keeping the
+   configuration is always the option that costs nothing and compares to
+   everything recorded.
 6. **One primary, still.** A run whose question needs two contrasts declares
    one and names the other as the secondary it is, with the reason;
    `run_seeds.py --primary` carries one field and a second is not bolted on
