@@ -103,3 +103,39 @@ now:       #57 (the readout, CPU)  |  #56 (the power rule and helper)  |  #42 (+
 then:      #44, re-declared under #57 and section 8, with its power row
 filed, opened later:  #48 (the hand-off if #57 reads "no"), #49
 ```
+
+## Amended 2026-09-20, second: after the pre-mortem on the redesign
+
+A council in pre-mortem form (`~/tame-runs/39-stakes-dial/body/COUNCIL3-direction.md`)
+vetoed the redesign as first written, for naming no step that keeps the CPU
+gate inside its budget; the operator's answer was that testing more takes
+longer and that is expected, so `GATE_BUDGET_S` moved from 110 to 180 with its
+measurement note (`f23c6a3`). The seats' other objections became the plan's
+own text: the routing read pins every number to a checkpoint and fixes its
+threshold before running; the coupling's stress is an unsigned magnitude the
+cell reduces by acting and cannot steer by reporting, with a farming
+guardrail; the core carries an echo check; the perturbation readout carries a
+discriminator a single lag cannot pass; #56 and #57 are a stack, not siblings.
+
+8. **Bind the tissue before testing its stake.** #59 builds the channel the
+   literature names — the tissue's error as the cell's own stress, paracrine,
+   gated, charged against continuation — and measures it against today's
+   attributed term on the fixture. #42 carries the organism's margin to the
+   cells through it. #44 runs only on a bound tissue.
+9. **Make the self-model load-bearing before testing self-reference.** #60:
+   more cells than slots, and a scored self-prediction under the constitution.
+   #47 and #44 follow it.
+10. **Measure whether routing matters before building a substrate where it
+    would.** #58 reads #39's checkpoints; #48 opens only on its line.
+
+### Order of work, amended again
+
+```
+now:      gate budget (f23c6a3); #39 close-out (verdict, note, !40 -> !39 -> main)
+then:     #56 -> #57 (one stack, off 39-gpu-arms-read)   |   #58 (own branch, forward passes)
+then:     #59  |  #60  (off the #57 stack)
+then:     #42 (with #59) -> #43
+then:     #47, #45 (with #60)
+last:     #44, re-declared under #57 and section 8, on a bound tissue
+reserve:  #48, on #58's line and #57's reading
+```
