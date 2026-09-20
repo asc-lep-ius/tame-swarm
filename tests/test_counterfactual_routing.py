@@ -111,13 +111,53 @@ def test_the_read_is_the_log_probability_of_the_token_that_followed(body, batche
     assert torch.equal(read.log_probs, read_probe(body, batches, DEVICE).log_probs)
 
 
+def test_two_draws_are_two_routes_and_the_noise_is_finite():
+    """The defect this test exists for: 32 alternatives that were all one route.
+
+    ``-torch.log(u).clamp_min(tiny)`` binds the clamp to the log and the minus
+    to the clamp, so the exponential came back negative, the second log
+    returned NaN for every element, and ``topk`` over a row of NaN returns a
+    *fixed* index pair. Every draw was the same constant route, the read still
+    produced plausible-looking gaps, and nothing caught it -- the routes did
+    differ from the executed one, which is all the first version of this test
+    asserted.
+    """
+    from counterfactual_routing import GumbelTopKRoute
+
+    from mob.auction import VCGAuctioneer
+
+    gate = VCGAuctioneer(num_experts=4, top_k=2)
+    torch.manual_seed(0)
+    confidences = torch.rand(2, 5, 4) + 0.1
+    wealth = torch.tensor([75.0, 120.0, 60.0, 90.0])
+
+    draws = []
+    for seed in (0, 1, 2):
+        generator = torch.Generator()
+        generator.manual_seed(seed)
+        route = GumbelTopKRoute(gate, generator, 1.0, None)
+        assert torch.isfinite(route._gumbel(confidences)).all()
+        draws.append(route(confidences, wealth).selected_experts)
+
+    assert not torch.equal(draws[0], draws[1])
+    assert not torch.equal(draws[1], draws[2])
+    # A Gumbel at scale one is a perturbation of the bid order, not a
+    # randomisation of it: most tokens keep the route they executed.
+    executed = gate(confidences, wealth).selected_experts
+    kept = (draws[0] == executed).all(dim=-1).float().mean()
+    assert 0.2 < float(kept) < 1.0
+
+
 def test_an_alternative_route_is_a_different_route_at_the_same_compute(body, batches):
     executed = win_share(body, batches)
 
     with alternative_routes(body, seed=1, scale=1.0, subset=None, device=DEVICE):
         alternative = win_share(body, batches)
+    with alternative_routes(body, seed=2, scale=1.0, subset=None, device=DEVICE):
+        other = win_share(body, batches)
 
     assert not torch.equal(alternative, executed)
+    assert not torch.equal(alternative, other)
     # Equal compute is the point: the same number of slots, other experts in
     # them, so the shares still sum to top_k.
     assert float(alternative.sum()) == pytest.approx(float(executed.sum()))
@@ -256,3 +296,43 @@ def test_a_checkpoint_that_does_not_reproduce_its_recorded_loss_is_refused(body,
         )
     with pytest.raises(ValueError, match="records no eval/loss"):
         verify_recorded_loss(body, split, 2, DEVICE, {"checkpoint": "x"}, tolerance=1e-5)
+
+
+def test_the_own_route_effect_is_separated_from_the_stream_it_changes(body, batches):
+    """What the mask buys: a token whose own route moved, against one whose did not.
+
+    Rerouting every token at once moves the stream every later token sees, so a
+    gap at token t is t's own route *and* everything upstream of it. Counting
+    the two populations apart -- draw-token pairs whose route moved, and pairs
+    where only the stream did -- is what makes the difference between them the
+    route's own effect, with the second number as its control.
+    """
+    executed = read_probe(body, batches, DEVICE)
+
+    read = counterfactual_gaps(
+        body, batches, DEVICE, executed, alternatives=6, scale=1.0, subset=None, seed=0
+    )
+
+    assert 0.0 < read["moved_fraction"] < 1.0
+    assert 0.0 <= read["moved_better"] <= 1.0
+    assert 0.0 <= read["unmoved_better"] <= 1.0
+    # The mask has to be the read's own, per draw: a token counted as moved in
+    # a draw that left it alone would put the upstream effect into the route's.
+    with alternative_routes(body, seed=0, scale=1.0, subset=None, device=DEVICE) as wrappers:
+        drawn = read_probe(body, batches, DEVICE, wrappers)
+    assert drawn.rerouted is not None
+    assert drawn.rerouted.shape == executed.log_probs.shape
+    assert read_probe(body, batches, DEVICE).rerouted is None
+
+
+def test_a_subset_read_moves_fewer_tokens_than_a_full_one(body, batches):
+    executed = read_probe(body, batches, DEVICE)
+
+    full = counterfactual_gaps(
+        body, batches, DEVICE, executed, alternatives=4, scale=1.0, subset=None, seed=0
+    )
+    tenth = counterfactual_gaps(
+        body, batches, DEVICE, executed, alternatives=4, scale=1.0, subset=0.1, seed=0
+    )
+
+    assert tenth["moved_fraction"] < full["moved_fraction"]

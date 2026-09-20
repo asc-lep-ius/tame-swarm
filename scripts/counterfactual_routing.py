@@ -90,6 +90,7 @@ class ProbeRead:
 
     log_probs: torch.Tensor
     token_ids: torch.Tensor
+    rerouted: torch.Tensor | None = None
 
     @property
     def loss(self) -> float:
@@ -120,7 +121,10 @@ def probe_batches(
 
 
 def read_probe(
-    model: torch.nn.Module, batches: list[dict[str, torch.Tensor]], device: torch.device
+    model: torch.nn.Module,
+    batches: list[dict[str, torch.Tensor]],
+    device: torch.device,
+    wrappers: dict[int, GumbelTopKRoute] | None = None,
 ) -> ProbeRead:
     """The log-probability of the token that actually followed, per scoreable position.
 
@@ -130,6 +134,7 @@ def read_probe(
     """
     log_probs: list[torch.Tensor] = []
     token_ids: list[torch.Tensor] = []
+    rerouted: list[torch.Tensor] = []
     was_training = model.training
     model.eval()
     try:
@@ -148,9 +153,24 @@ def read_probe(
                 )
                 log_probs.append(token_log_probs[shift_mask].detach().cpu())
                 token_ids.append(shift_labels[shift_mask].detach().cpu())
+                if wrappers:
+                    # The route at position t is what produced the prediction of
+                    # token t+1, so the mask shifts with the labels.
+                    moved = torch.zeros_like(shift_mask)
+                    for wrapper in wrappers.values():
+                        assert wrapper.rerouted is not None
+                        moved |= wrapper.rerouted[..., :-1]
+                    rerouted.append(moved[shift_mask].detach().cpu())
     finally:
         model.train(was_training)
-    return ProbeRead(torch.cat(log_probs), torch.cat(token_ids))
+    return ProbeRead(
+        torch.cat(log_probs),
+        torch.cat(token_ids),
+        torch.cat(rerouted) if rerouted else None,
+    )
+
+
+_TINY = torch.finfo(torch.float32).tiny
 
 
 class GumbelTopKRoute(torch.nn.Module):
@@ -179,6 +199,25 @@ class GumbelTopKRoute(torch.nn.Module):
         self.generator = generator
         self.scale = scale
         self.subset = subset
+        self.rerouted: torch.Tensor | None = None
+
+    def _gumbel(self, like: torch.Tensor) -> torch.Tensor:
+        """A standard Gumbel per expert per token, from this read's own generator.
+
+        Written in three named steps rather than as one nested expression: as
+        one, ``-torch.log(u).clamp_min(tiny)`` binds the clamp to the log and
+        the minus to the clamp, so the exponential comes back negative and the
+        second log returns NaN for every element -- and ``topk`` over a row of
+        NaN returns a *fixed* index pair, which reads as a perturbed route that
+        never varies. That was the first version of this function, and it made
+        32 draws into one constant route; ``tests/test_counterfactual_routing.py``
+        pins both halves of it now.
+        """
+        uniform = torch.rand(
+            like.shape, generator=self.generator, device=self.generator.device
+        ).clamp_min(_TINY)
+        exponential = (-torch.log(uniform)).clamp_min(_TINY)
+        return (-torch.log(exponential)).to(like.device)
 
     def forward(
         self,
@@ -188,23 +227,22 @@ class GumbelTopKRoute(torch.nn.Module):
     ):
         outcome = self.gate(confidences, wealth, staleness=staleness)
         bids = confidences * wealth.detach().to(confidences.dtype).unsqueeze(0).unsqueeze(0)
-        noise = -torch.log(
-            -torch.log(
-                torch.rand(
-                    bids.shape, generator=self.generator, device=self.generator.device
-                ).clamp_min(torch.finfo(torch.float32).tiny)
-            ).clamp_min(torch.finfo(torch.float32).tiny)
-        ).to(bids.device)
-        scores = torch.log(bids.float().clamp_min(torch.finfo(torch.float32).tiny))
-        selected = torch.topk(scores + self.scale * noise, self.gate.top_k, dim=-1).indices
+        scores = torch.log(bids.float().clamp_min(_TINY))
+        selected = torch.topk(scores + self.scale * self._gumbel(bids), self.gate.top_k, dim=-1)
+        selected = selected.indices
         if self.subset is not None:
-            rerouted = (
-                torch.rand(
-                    bids.shape[:-1], generator=self.generator, device=self.generator.device
-                ).to(bids.device)
-                < self.subset
+            drawn = torch.rand(
+                bids.shape[:-1], generator=self.generator, device=self.generator.device
+            ).to(bids.device)
+            selected = torch.where(
+                (drawn < self.subset).unsqueeze(-1), selected, outcome.selected_experts
             )
-            selected = torch.where(rerouted.unsqueeze(-1), selected, outcome.selected_experts)
+        # Which tokens this layer actually moved, as a set rather than a draw:
+        # a Gumbel that does not reorder the top-k leaves the route alone, and a
+        # token nobody moved is one the read has nothing to say about. Recorded
+        # on the wrapper because only the caller knows how to fold the layers
+        # together.
+        self.rerouted = (selected != outcome.selected_experts).any(dim=-1)
         weights = self.gate._compute_routing_weights(
             bids, torch.gather(bids, -1, selected), selected
         )
@@ -214,12 +252,19 @@ class GumbelTopKRoute(torch.nn.Module):
 @contextmanager
 def alternative_routes(
     model: torch.nn.Module, seed: int, scale: float, subset: float | None, device: torch.device
-) -> Iterator[None]:
-    """Every converted layer routes a Gumbel-top-k alternative for the duration."""
+) -> Iterator[dict[int, GumbelTopKRoute]]:
+    """Every converted layer routes a Gumbel-top-k alternative for the duration.
+
+    Yields the wrappers, whose ``rerouted`` mask is what the caller reads after
+    the forward: a token whose route no layer moved is one this draw says
+    nothing about, and counting it as evidence either way is what made the
+    subset read uninterpretable.
+    """
     layers = mob_layers_by_index(model)
     generator = torch.Generator(device="cpu" if device.type == "cpu" else device)
     generator.manual_seed(seed)
     original = {index: layer.gate for index, layer in layers.items()}
+    wrappers: dict[int, GumbelTopKRoute] = {}
     try:
         for index, layer in layers.items():
             gate = original[index]
@@ -228,8 +273,9 @@ def alternative_routes(
                     f"layer {index} is gated by {type(gate).__name__}, not the auction; a "
                     "counterfactual route is defined against the arm's own bids"
                 )
-            layer.gate = GumbelTopKRoute(gate, generator, scale, subset)
-        yield
+            wrappers[index] = GumbelTopKRoute(gate, generator, scale, subset)
+            layer.gate = wrappers[index]
+        yield wrappers
     finally:
         for index, layer in layers.items():
             layer.gate = original[index]
@@ -272,18 +318,37 @@ def counterfactual_gaps(
 ) -> dict[str, Any]:
     """Executed against the best of ``alternatives`` equal-compute routes, per token."""
     best = executed.log_probs.clone()
-    median_rank = torch.zeros_like(executed.log_probs)
+    better = torch.zeros_like(executed.log_probs)
+    moved_better = torch.zeros(())
+    moved_total = torch.zeros(())
+    still_better = torch.zeros(())
+    still_total = torch.zeros(())
     for draw in range(alternatives):
-        with alternative_routes(model, seed + draw, scale, subset, device):
-            alternative = read_probe(model, batches, device)
+        with alternative_routes(model, seed + draw, scale, subset, device) as wrappers:
+            alternative = read_probe(model, batches, device, wrappers)
         if alternative.tokens != executed.tokens:
             raise ValueError("an alternative route read a different number of tokens")
         best = torch.maximum(best, alternative.log_probs)
-        median_rank += (alternative.log_probs > executed.log_probs).float()
+        improved = alternative.log_probs > executed.log_probs
+        better += improved.float()
+        assert alternative.rerouted is not None
+        moved = alternative.rerouted
+        moved_better += float((improved & moved).sum())
+        moved_total += float(moved.sum())
+        still_better += float((improved & ~moved).sum())
+        still_total += float((~moved).sum())
     gap = best - executed.log_probs
     return {
         "best_minus_executed": gap,
-        "alternatives_better_than_executed": median_rank / alternatives,
+        "alternatives_better_than_executed": better / alternatives,
+        # The confound, separated rather than bounded: among draw-token pairs
+        # whose own route moved, how often the change helped -- against the same
+        # rate on the pairs whose route did not move, where only the stream
+        # upstream of them changed. The difference is the route's own effect and
+        # the second number is its control.
+        "moved_better": float(moved_better / moved_total) if float(moved_total) else float("nan"),
+        "unmoved_better": float(still_better / still_total) if float(still_total) else float("nan"),
+        "moved_fraction": float(moved_total) / (alternatives * executed.tokens),
     }
 
 
@@ -415,6 +480,10 @@ def read_one(
     reading["counterfactual/alternatives_better"] = float(
         read["alternatives_better_than_executed"].mean()
     )
+    reading["counterfactual/moved_better"] = read["moved_better"]
+    reading["counterfactual/unmoved_better"] = read["unmoved_better"]
+    reading["counterfactual/own_route_effect"] = read["moved_better"] - read["unmoved_better"]
+    reading["counterfactual/moved_fraction"] = read["moved_fraction"]
     if floor is not None:
         fragile = gap > floor
         reading.update(
@@ -444,10 +513,12 @@ def read_one(
             args.noise_scale,
             args.subset,
             args.seed,
-        )["best_minus_executed"]
-        reading["counterfactual/mean_gap_subset"] = float(bounded.mean())
+        )
+        reading["counterfactual/mean_gap_subset"] = float(bounded["best_minus_executed"].mean())
+        reading["counterfactual/moved_better_subset"] = bounded["moved_better"]
+        reading["counterfactual/unmoved_better_subset"] = bounded["unmoved_better"]
         if floor is not None:
-            subset_fragile = float((bounded > floor).float().mean())
+            subset_fragile = float((bounded["best_minus_executed"] > floor).float().mean())
             reading["counterfactual/fragile_fraction_subset"] = subset_fragile
             reading["counterfactual/subset_disagreement"] = abs(
                 subset_fragile - reading["counterfactual/fragile_fraction"]
