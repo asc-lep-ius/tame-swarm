@@ -33,6 +33,12 @@ chat = [
 ]
 dev = [
     "tame-swarm[train,serve,chat]",
+    # scripts/power.py's non-central t (#56). Already in the lock as mlflow's
+    # transitive dependency; named here because a power calculation that silently
+    # depends on somebody else's dependency is one `uv lock` away from reading
+    # the normal approximation instead, which is the error the script exists to
+    # stop. Not a runtime dependency: nothing under tame/ imports it.
+    "scipy>=1.11",
     "pytest>=7.0.0",
     "pytest-xdist>=3.5.0",
     "ruff>=0.4.0",
