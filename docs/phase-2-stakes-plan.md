@@ -67,3 +67,39 @@ Every autonomy the core acquires is off by default, fingerprinted, and gated by 
 - Lineage and population selection: #43's ledger is designed so a population can share it; the work is #49's.
 - Any care-for-others metric, any capability gating beyond the training loop, any contestability channel: #49.
 - Any claim about sentience. Language output is behaviour, not testimony; a Phase 2 result is a preregistered behavioural contrast and nothing more.
+
+## Amended 2026-09-20: the readout before the budget
+
+#39's body run (24 runs at `79c1b17`, README `#stakes-dial-cell`) read its
+primary at −0.0098 [−0.0225, −0.0011] with the loss guardrail holding: not
+"no", the sign against the stakes position, and the `shuffled` control on the
+`value` side. The dial as measured separates a live ledger from a pinned one,
+not a cell's own value from another cell's, and the contrast that would —
+`value` minus `shuffled` — sits at dz ≈ 0.15 under the current readout, about
+350 runs a side. Two councils on 2026-09-20
+(`~/tame-runs/39-stakes-dial/body/COUNCIL.md`, `COUNCIL2.md`) and the operator's
+priorities — the vision over the schedule, and GPU-hours as the binding
+constraint — settled what follows.
+
+5. **The readout before the budget.** Every design decision, estimator choice
+   and power calculation happens on the CPU fixture first; a GPU run is
+   confirmatory, preregistered with a power row (`docs/preregistration.md`
+   section 8, #56). Signature 1's readout is redesigned on the fixture and
+   applied forward only (#57); #39's rows stay as read. "Cut cost per run" by
+   shrinking knobs is rejected: the dose unit and the replicate floor are
+   properties of the configuration.
+6. **#44 does not run as declared.** Its primary has the shape #39 could not
+   resolve; it is re-declared by #57 under section 8 before it runs, and #43's
+   budget constant is derived before #44 needs it.
+7. **#48 stays deferred, with its case now on the record.** All three arms of
+   #39 sat within 0.006 of held-out loss on the 1.7B body, so routing is not
+   load-bearing for the organism there; a substrate where it is remains the
+   hand-off if #57 reads "no".
+
+### Order of work, amended
+
+```
+now:       #57 (the readout, CPU)  |  #56 (the power rule and helper)  |  #42 (+ #45, #47)  ->  #43
+then:      #44, re-declared under #57 and section 8, with its power row
+filed, opened later:  #48 (the hand-off if #57 reads "no"), #49
+```
