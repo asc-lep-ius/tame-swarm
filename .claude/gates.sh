@@ -32,15 +32,20 @@ LINT_CMD="uv run ruff check . && uv run ruff format --check ."
 # what the issues' verification block asks for and is what CI's reviewer reads.
 TYPE_CMD="uv run pyright tame scripts"
 
-# 110, against the 93–96s the three gates measure together on prometheus (62s of
-# it pyright, 34s the parallel suite, lint under a second). The default is 60, which
-# this gate is over on every single run, and a row that is advisory every time is
-# a row that stops being read. The margin is there to show drift from what the
-# gates cost now, not to leave room for them to grow.
+# 180, raised 2026-09-20 from 110 by the operator's decision after the pre-mortem
+# on the Phase 2 redesign. The three gates measured 113–124 s on prometheus that
+# day at 1078 CPU tests (62 s pyright, 50 s the parallel suite, lint under a
+# second), already over the 110 this file was written against at 856 tests, and
+# the redesign (#56, #57, the coupling and self-model mechanisms) adds fixture
+# and constitution suites on purpose. Testing more takes longer, and that is
+# expected rather than drift; the margin above 124 s is what makes the next
+# measurement legible as growth rather than as a budget nobody reads. The row
+# stays a drift indicator: growth past 180 s is a measurement to record here,
+# not a reason to empty TEST_CMD.
 #
 # Measured on prometheus, and that is a caveat rather than a detail: see the note
 # above TEST_CMD. On a slower box this budget is wrong by as much as the box is.
-GATE_BUDGET_S="110"
+GATE_BUDGET_S="180"
 
 # Filled since #51, and empty before it. What follows is the measurement #50
 # exists to write down and the one #51 overturned, in that order, because the
