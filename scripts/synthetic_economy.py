@@ -470,12 +470,27 @@ class DifferentiatedEconomy(SyntheticEconomy):
         self.last_types = types
         return x, target
 
-    def add_goal_field(self, expert_type: int, setpoint: float, dose: float) -> TypeGoalField:
-        """Attach a goal field on one type's correction (#33, #39); see ``TypeGoalField``."""
+    def add_goal_field(
+        self,
+        expert_type: int,
+        setpoint: float,
+        dose: float,
+        resting_sigma: float | None = None,
+    ) -> TypeGoalField:
+        """Attach a goal field on one type's correction (#33, #39); see ``TypeGoalField``.
+
+        ``resting_sigma`` makes the field a stress source as well as a payment
+        (#59): the layer charges every cell for the magnitude of this field's
+        error in units of that spread. It is measured on a run of this fixture
+        at no charge, the way the body's is measured on the pristine model
+        before conversion -- ``scripts/measure_stress_coupling.py`` does the
+        measuring, because a spread the mechanism measured on itself while the
+        mechanism was running is not a resting spread.
+        """
         if not 0 <= expert_type < self.num_types:
             raise ValueError(f"expert_type must lie in [0, {self.num_types}), got {expert_type}")
         field = TypeGoalField(self, expert_type, setpoint, dose)
-        self.mob.attach_goal_field(field)
+        self.mob.attach_goal_field(field, resting_sigma=resting_sigma)
         return field
 
     def goal_fields(self) -> Sequence[TypeGoalField]:
@@ -492,6 +507,12 @@ class DifferentiatedEconomy(SyntheticEconomy):
         after attachment is a field the run's record no longer describes.
         """
         fields = list(self.mob.goal_fields)
+        # Carried across the rebuild rather than defaulted away: a field that
+        # came back without its resting spread would stop being a stress source
+        # (#59) at exactly the step the perturbation is applied, and the charge
+        # would go quiet in the phase the primary is read on -- which is how
+        # this was found.
+        sigmas = list(self.mob._resting_sigmas)
         stepped = None
         for index, field in enumerate(fields):
             if isinstance(field, TypeGoalField) and field.expert_type == expert_type:
@@ -500,8 +521,8 @@ class DifferentiatedEconomy(SyntheticEconomy):
         if stepped is None:
             raise ValueError(f"no goal field is attached on type {expert_type}")
         self.mob.detach_goal_fields()
-        for field in fields:
-            self.mob.attach_goal_field(field)
+        for field, sigma in zip(fields, sigmas, strict=True):
+            self.mob.attach_goal_field(field, resting_sigma=sigma)
         return stepped
 
     def goal_reading(self, field: TypeGoalField, selected: torch.Tensor) -> float:
