@@ -161,15 +161,17 @@ results were read is a new run, not this one.
 Written 2026-09-20 after #39's body run was read, binding every run after it,
 and the reason it exists is the number that run produced: the contrast that
 isolates self-reference, `value` minus `shuffled`, read at a paired effect size
-of dz ≈ 0.15 under section 1's readout — about 350 runs a side for 80% power, a
+of dz ≈ 0.15 under section 1's readout — about 350 paired seeds a side for 80%
+power under a paired t, 700 runs an arm since a seed runs at both dose levels, a
 month of the one GPU — while `value` minus `decoupled` read at dz ≈ 0.87, about
-11. The fixture could have said so before the run for a CPU-minute, and was not
-asked. The tooling is #56's; the readout is #57's.
+13 seeds and 26 runs an arm. The fixture could have said so before the run for a
+CPU-minute, and was not asked. The tooling is #56's; the readout is #57's.
 
 1. **A GPU run is confirmatory.** Its arms, its readout and its primary were
    designed on the CPU fixture, and its issue carries a power row before it
-   launches: the paired effect size the fixture measured with that readout, the
-   runs a side that buys at 80% power, and the GPU-hours that implies. A GPU run
+   launches: the paired effect size the fixture measured with that readout, the paired
+   seeds a side that buys at 80% power under a paired t, the runs an arm that
+   means, and the GPU-hours that implies. A GPU run
    with no power row is exploratory whatever its issue says, and its rows are
    labelled so.
 2. **A readout changes forward only.** An estimator chosen after a run's sign
@@ -184,7 +186,7 @@ asked. The tooling is #56's; the readout is #57's.
    — and is written beside the power row as an assumption, not a measurement.
 4. **Replicates are spent where the floor is unmeasured.** A replicate measures
    the run-to-run floor and nothing else. At a configuration whose floor is
-   recorded at zero under `strict` — #39's body arms, six groups of six, at the
+   recorded at zero under `strict` — #39's body arms, six groups of four runs, every one of them, at the
    `ArmFingerprint` knobs they carry — a sweep's replicate budget goes to seeds
    and its summary names the recorded floor it borrows. Any knob that moves
    re-measures the floor first: #31 closed the nondeterminism by naming a

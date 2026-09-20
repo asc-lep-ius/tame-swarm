@@ -76,7 +76,7 @@ primary at −0.0098 [−0.0225, −0.0011] with the loss guardrail holding: not
 `value` side. The dial as measured separates a live ledger from a pinned one,
 not a cell's own value from another cell's, and the contrast that would —
 `value` minus `shuffled` — sits at dz ≈ 0.15 under the current readout, about
-350 runs a side. Two councils on 2026-09-20
+350 paired seeds a side under a paired t, 700 runs an arm. Two councils on 2026-09-20
 (`~/tame-runs/39-stakes-dial/body/COUNCIL.md`, `COUNCIL2.md`) and the operator's
 priorities — the vision over the schedule, and GPU-hours as the binding
 constraint — settled what follows.
@@ -91,8 +91,8 @@ constraint — settled what follows.
 6. **#44 does not run as declared.** Its primary has the shape #39 could not
    resolve; it is re-declared by #57 under section 8 before it runs, and #43's
    budget constant is derived before #44 needs it.
-7. **#48 stays deferred, with its case now on the record.** All three arms of
-   #39 sat within 0.006 of held-out loss on the 1.7B body, so routing is not
+7. **#48 stays deferred, with its case now on the record.** The arm means of
+   #39 sat within 0.003 of held-out loss on the 1.7B body, so routing is not
    load-bearing for the organism there; a substrate where it is remains the
    hand-off if #57 reads "no".
 
