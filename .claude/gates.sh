@@ -33,15 +33,17 @@ LINT_CMD="uv run ruff check . && uv run ruff format --check ."
 TYPE_CMD="uv run pyright tame scripts"
 
 # 180, raised 2026-09-20 from 110 by the operator's decision after the pre-mortem
-# on the Phase 2 redesign. The three gates measured 113–124 s on prometheus that
-# day at 1078 CPU tests (62 s pyright, 50 s the parallel suite, lint under a
-# second), already over the 110 this file was written against at 856 tests, and
-# the redesign (#56, #57, the coupling and self-model mechanisms) adds fixture
-# and constitution suites on purpose. Testing more takes longer, and that is
-# expected rather than drift; the margin above 124 s is what makes the next
-# measurement legible as growth rather than as a budget nobody reads. The row
-# stays a drift indicator: growth past 180 s is a measurement to record here,
-# not a reason to empty TEST_CMD.
+# on the Phase 2 redesign. The three gates measured 112–125 s on prometheus that
+# day at 1078 CPU tests (60–65 s pyright, 50–62 s the parallel suite, lint under
+# a second), already over the 110 this file was written against at 856 tests,
+# and the redesign (#56, #57, the coupling and self-model mechanisms) adds
+# fixture and constitution suites on purpose. Testing more takes longer, and
+# that is expected rather than drift; the margin above 125 s is what makes the
+# next measurement legible as growth rather than as a budget nobody reads. The
+# row stays a drift indicator: growth past 180 s is a measurement to record
+# here, not a reason to empty TEST_CMD — until the whole gate nears the Stop
+# hook's 300 s timeout, which is the ceiling the TEST_CMD note below argues
+# from and the point at which emptying the slot is the right answer.
 #
 # Measured on prometheus, and that is a caveat rather than a detail: see the note
 # above TEST_CMD. On a slower box this budget is wrong by as much as the box is.
