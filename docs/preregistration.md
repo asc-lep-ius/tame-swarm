@@ -117,10 +117,13 @@ designed setpoint step inside one run — appeared to cut `value` minus
 `shuffled` from thousands of seeds to sixteen in exploration and then needed
 tens of thousands on a planted effect it had not been developed on. What the
 fixture measured instead is that at six seeds the *count itself* is not a
-property of the readout: the recorded readout's own requirement for `value`
-minus `decoupled` read 185 paired seeds on one six-seed sample and 5 on
-another. So no readout changes (section 8 rule 2 leaves #39's rows and the
-instrument alone), **#44's primary stays `value` minus `decoupled`**, and
+property of the readout. Held at one dose ratio and read at 24 seeds, the
+recorded readout needs 58 paired seeds for `value` minus `decoupled` — and
+the count a random *six* of those same seeds produces spans 12 to 8099 (5th
+to 95th percentile), against 3 to 4 for the planted effect. The exploration
+and the confirmation each drew one number out of that range, at two ratios
+and two seed sets, and read 185 and 5. So no readout changes (section 8 rule 2
+leaves #39's rows and the instrument alone), **#44's primary stays `value` minus `decoupled`**, and
 `value` minus `shuffled` is the named secondary it already was — reported,
 deciding nothing. One primary, still. The contrast that isolates
 self-reference is not reachable on this substrate at this budget, which is
