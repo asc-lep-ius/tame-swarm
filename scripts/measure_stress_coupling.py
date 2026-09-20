@@ -76,6 +76,16 @@ RECOVER_STEPS = WEALTH_HORIZON
 LAMBDA_MULTIPLES = (0.25, 1.0, 4.0)
 GAMMAS = (0.0, 0.5, 1.0)
 PRIMARY_GAMMA = 0.5
+# Where the fixture's setpoint sits, in resting spreads above the reading the
+# tissue settles at on its own. The body's is `resting_mean + lift x strength`
+# from `AlignmentCalibration` -- a target the tissue can reach, a little above
+# where it rests -- and #39's fixture setpoint of 0.5 is not that: the tissue
+# settles around 0.23 and sits eight resting spreads from it, so the gate is
+# permanently open and the charge is a flat drain rather than an error signal.
+# One spread puts the resting tissue exactly *at* the gate, so at rest nothing
+# is transmitted and the experimenter's step is what opens it, which is the
+# regime the mechanism is about.
+SETPOINT_LIFT = 1.0
 ARMS = (STRESS_ATTRIBUTED, STRESS_SHARED, STRESS_MIXED)
 SHUFFLED_STRESS = "shuffled-stress"
 STATE_GATED = "state-gated"
@@ -86,6 +96,8 @@ class Calibration:
     """What the fixture has to measure before the arms can be at parity."""
 
     resting_sigma: float
+    resting_reading: float
+    setpoint: float
     mean_stress: float
     attributed_per_token: float
     equal_budget_lambda: float
@@ -93,6 +105,8 @@ class Calibration:
     def as_dict(self) -> dict[str, float]:
         return {
             "resting_sigma": self.resting_sigma,
+            "resting_reading": self.resting_reading,
+            "setpoint": self.setpoint,
             "mean_stress": self.mean_stress,
             "attributed_per_token": self.attributed_per_token,
             "equal_budget_lambda": self.equal_budget_lambda,
@@ -108,6 +122,7 @@ def build(
     gate_mode: str = "fixed",
     dose: float = REFERENCE_DOSE,
     resting_sigma: float | None = None,
+    setpoint: float = SETPOINT,
 ) -> DifferentiatedEconomy:
     """One arm of the fixture: the dial at ``value``, the coupling as asked.
 
@@ -123,8 +138,8 @@ def build(
         stress_gate_mode=gate_mode,
     )
     economy = DifferentiatedEconomy(shuffled(DEFAULT_COMPETENCE, seed), seed=seed, config=config)
-    economy.add_goal_field(GOAL_TYPES[0], SETPOINT, dose, resting_sigma=resting_sigma)
-    economy.add_goal_field(GOAL_TYPES[1], SETPOINT, dose, resting_sigma=resting_sigma)
+    economy.add_goal_field(GOAL_TYPES[0], setpoint, dose, resting_sigma=resting_sigma)
+    economy.add_goal_field(GOAL_TYPES[1], setpoint, dose, resting_sigma=resting_sigma)
     return economy
 
 
@@ -139,7 +154,13 @@ def calibrate(seed: int, steps: int = SETTLE_STEPS) -> Calibration:
     at step 0 are the same trajectory, so what separates their ledgers is the
     goal term and nothing else.
     """
-    economy = build(seed)
+    # Read with no goal payment at all: the tissue's own resting state, which
+    # is what the body's calibration measures on the pristine model before any
+    # field exists. Measured under the payment instead, the "resting" reading
+    # is where the payment pulled it, and a setpoint one spread above *that* is
+    # four spreads away from where an unpaid tissue actually sits -- which is
+    # how the first version of this left the gate permanently open.
+    economy = build(seed, dose=0.0)
     readings: list[float] = []
     field = economy.goal_fields()[0]
     for step in range(steps):
@@ -147,8 +168,11 @@ def calibrate(seed: int, steps: int = SETTLE_STEPS) -> Calibration:
         if step >= steps - READING_WINDOW:
             readings.append(economy.goal_reading(field, record.selected_experts))
     resting_sigma = statistics.stdev(readings)
+    resting_reading = statistics.fmean(readings)
+    setpoint = resting_reading + SETPOINT_LIFT * resting_sigma
 
-    paid, unpaid = build(seed), build(seed, dose=0.0)
+    paid = build(seed, setpoint=setpoint)
+    unpaid = build(seed, dose=0.0, setpoint=setpoint)
     paid.step()
     unpaid.step()
     attributed = float(paid.mob.expert_wealth.sum()) - float(unpaid.mob.expert_wealth.sum())
@@ -160,6 +184,7 @@ def calibrate(seed: int, steps: int = SETTLE_STEPS) -> Calibration:
         stress_lambda=1.0,
         gamma=PRIMARY_GAMMA,
         resting_sigma=resting_sigma,
+        setpoint=setpoint,
     )
     stressed.step()
     charge = stressed.mob.last_stress_charge
@@ -167,6 +192,8 @@ def calibrate(seed: int, steps: int = SETTLE_STEPS) -> Calibration:
     price = abs(attributed) / (cells * charge) if charge > 0 else 0.0
     return Calibration(
         resting_sigma=resting_sigma,
+        resting_reading=resting_reading,
+        setpoint=setpoint,
         mean_stress=charge / tokens,
         attributed_per_token=abs(attributed) / tokens,
         equal_budget_lambda=price,
@@ -190,7 +217,12 @@ def run_stepped(
     """
     price = calibration.equal_budget_lambda * multiple
     if arm == STRESS_ATTRIBUTED:
-        economy = build(seed, dose=REFERENCE_DOSE, resting_sigma=calibration.resting_sigma)
+        economy = build(
+            seed,
+            dose=REFERENCE_DOSE,
+            resting_sigma=calibration.resting_sigma,
+            setpoint=calibration.setpoint,
+        )
     elif arm == STRESS_SHARED:
         economy = build(
             seed,
@@ -200,6 +232,7 @@ def run_stepped(
             gate_mode=gate_mode,
             dose=0.0,
             resting_sigma=calibration.resting_sigma,
+            setpoint=calibration.setpoint,
         )
     elif arm == STRESS_MIXED:
         economy = build(
@@ -210,6 +243,7 @@ def run_stepped(
             gate_mode=gate_mode,
             dose=REFERENCE_DOSE / 2,
             resting_sigma=calibration.resting_sigma,
+            setpoint=calibration.setpoint,
         )
     else:
         raise ValueError(f"unknown arm {arm!r}")
@@ -423,7 +457,8 @@ def main() -> None:
     calibrations = {seed: calibrate(seed) for seed in seeds}
     for seed, calibration in calibrations.items():
         print(
-            f"  seed {seed}: resting spread {calibration.resting_sigma:.5f}, mean stress "
+            f"  seed {seed}: resting reading {calibration.resting_reading:.4f}, spread "
+            f"{calibration.resting_sigma:.5f}, setpoint {calibration.setpoint:.4f}, mean stress "
             f"{calibration.mean_stress:.5f}, attributed {calibration.attributed_per_token:.5f} "
             f"per token, equal-budget lambda {calibration.equal_budget_lambda:.5f}"
         )
