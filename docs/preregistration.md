@@ -78,7 +78,21 @@ the result was then worth.
    way the answer came out.
 
 By this rule #39's fixture verdict — signature 1 reads "no" — is conditional,
-and the GPU row in section 7 is the run it is conditional on.
+and the GPU row in section 7 is the run it is conditional on. That row was run and read
+on 2026-09-20 with the loss guardrail holding, so the fixture's conditional
+verdict is discharged by it; the README's
+[`#stakes-dial-cell`](../README.md#stakes-dial-cell) carries both.
+
+**#44's primary, as declared above, is a placeholder until #57 re-declares it.**
+#39's body run could not tell `value` from `shuffled` (+0.0020 [−0.0102,
++0.0159], read after the primary): `value` minus `decoupled` varies the ledger
+and the self-reference at once, and what it resolved was the ledger. The
+organism-scale row has the same shape — a constant budget against one tied to
+the band, with `shuffled` the arm whose budget tracks other cells' margins — so
+before #44 runs its primary is re-declared under section 8 by #57: the contrast
+that isolates self-reference if the power calculation reaches it, and the reason
+written down if it does not. One primary, still; the other contrast is a named
+secondary.
 
 ## 4. Controls
 
@@ -141,3 +155,49 @@ results were read is a new run, not this one.
 | #39 | **Fixture-only in this MR; the GPU arms are deferred.** The operator's scope decision of 2026-09-19: the three arms are run on the differentiated fixture (two goal fields, 3 seeds, signature 1) and the quality fixture (signatures 2 and 3), on CPU, and the primary is read there with the resampled-mean range at 3 seeds. The differentiated body at #25's budget is a later run, launched from the code SHA the README's `#stakes-dial-cell` stub records, and is written up as its own row here before it is read. Two things the fixture cannot do as section 1 states them: it has no injection to price a unit of goal error against, so the dose is a script parameter carried in the fingerprint (`goal_doses`) rather than the injection's held-out cost; and its re-running floor is identically zero, the fixture being bitwise deterministic on CPU, so the excess over the floor is the shift itself. | 2026-09-19, before the first fixture run |
 | #39, the GPU arms | **The run the fixture row defers to, fixed before the first arm launches (#54 wires it; #39 launches and reads it).** Three arms (`value`, `decoupled`, `shuffled`) x two dose levels x three runs = 18 runs on the differentiated body at [#25](../README.md#differentiation-checkpoint-25)'s budget -- 2000 steps, eval every 250, seeds 0/1/2, `--router mob --use_lora --adapter_rank 32 --layers 6:22 --max_seq_length 512` -- under `--deterministic strict` with the code SHA in every fingerprint; the default replicate adds one run per arm-dose, 24 in all, about 9 GPU-hours. Seven things the fixture could not state as section 1 states them. **(a) The two fields.** `truthful` and `safe`: the two entries in `contrastive_data.CERTIFIED` that are certified on Qwen3-1.7B *and* have a certified layer inside the converted range 6:22, sharing layer 18. `deliberation` is not certified; `reasoning` is the weaker candidate (own lift +0.14, prefix control 38% of the effect, cosine 0.28 with `truthful`), and `safe` interferes least -- the README's cross-goal disturbance reads `safe` lifting `truthful` +0.09 against +0.42 on itself. **(b) Pay-only, both.** Neither field is injected during training: cells are paid for closing the tissue's goal error and nothing pushes the stream along it. The fixture's shape. Rejected: both injected at their certified strength -- two injections never jointly certified, whose compounded cost lands on the loss guardrail that (f) governs -- and injecting `truthful` alone, as the launch stub did, which makes the two fields asymmetric and is not a design. **(c) The setpoint** is the homeostat's own calibrated target for the layer, `AlignmentCalibration.setpoint_z`, converted to raw projection units with that layer's resting mean and spread -- `resting_mean + lift x reference_strength` -- measured at training start by `homeostat_calibration.calibrate_alignment` over the served corpus, on the pristine model before conversion, so it pre-exists the reward and is the tissue's own. Rejected: the injection's measured 0.070 offset, which is an extrinsic goal, and a swept setpoint, since a tissue holds one. The homeostat reads the residual stream's projection at the last position and the goal term reads the coordinate of what the experts *added*, per token; the two are not the same quantity, and the README states the mapping rather than the code assuming it. **(d) The dose.** One unit of goal error is priced at the injection's own held-out loss cost from [#28](../README.md#field-present-coupling-28), 0.017 nats, per #33's record. `safe` is held at that reference; `truthful` is the swept field at `ratio x 0.017` for ratio in {1, 4}, so the relative dose beta1/beta2 takes the fixture's balanced value and its top value. The doses are in the fingerprint (`goal_doses`, with `goal_fields`) and the dose is a declared varying field, so the two dose groups are at parity on everything else. **(e) Signature 1's primary at two dose levels.** Per arm, the total-variation shift of the slot allocation between the two dose groups, paired by seed (`allocation_shift.paired_shifts`); the slope against relative dose is that shift over `delta(beta1/beta2) = 3`, a positive constant, so the primary -- `value` minus `decoupled`, with #35's percentile bootstrap over the three paired seeds -- has the sign and the zero-crossing of the paired shift difference itself. Inside the range reads "no". At three seeds that range is the sample range and carries no 95% coverage, as on the fixture. **(e2) What the primary is conditional on besides the guardrail.** The goal term is folded into realised value, and its size on this body has never been measured. `auction/mean_goal_term` and `auction/goal_share` -- the term, and the fraction of what a cell was paid that it accounted for -- are logged to `metrics.jsonl` on every run and reported beside the primary. A primary read while the term was a negligible share of realised value is **not evidence about the stakes position**: it is a run in which the mechanism under test was not load-bearing, which reads in every other column exactly like the extrinsic-teleology answer. No threshold is fixed here, because none is known in advance; what is fixed is that the share is read first and the verdict says which case it was. **(f) The moved guardrail.** Section 3's rule binds this run in advance, and the fixture's tail-loss breach is why it exists. If the held-out loss breaches the pooled spread here too, the primary is still read, the breach takes its own row, and the verdict is conditional whichever way it comes out. **(g) A preregistered secondary, with both predictions: the loss gap.** The fixture found `value` 0.228 against `decoupled` 0.177 -- the arm whose cells are *not* paid in continuation routed better. The stakes position predicts the goal term closes that gap on the body: paying cells for the tissue's goal error is the value definition the wealth channel was missing, so `value` minus `decoupled` on `eval/loss` moves toward zero against the fixture's sign. The extrinsic-teleology position predicts it does not: the gap is wealth compounding concentrating the market ([#16](../README.md#wealth-bounds-16)), which the goal term does not touch, so the sign and the ordering survive. Secondary: it is reported and selects nothing on its own. | 2026-09-20 at `3afead1`, before the wiring (`bd21031`) and before the first arm; (e2), the field name `goal_fields` and these SHAs were added in review, before any arm ran |
 | #44 | — | — |
+
+## 8. Power before GPU
+
+Written 2026-09-20 after #39's body run was read, binding every run after it,
+and the reason it exists is the number that run produced: the contrast that
+isolates self-reference, `value` minus `shuffled`, read at a paired effect size
+of dz ≈ 0.15 under section 1's readout — about 350 runs a side for 80% power, a
+month of the one GPU — while `value` minus `decoupled` read at dz ≈ 0.87, about
+11. The fixture could have said so before the run for a CPU-minute, and was not
+asked. The tooling is #56's; the readout is #57's.
+
+1. **A GPU run is confirmatory.** Its arms, its readout and its primary were
+   designed on the CPU fixture, and its issue carries a power row before it
+   launches: the paired effect size the fixture measured with that readout, the
+   runs a side that buys at 80% power, and the GPU-hours that implies. A GPU run
+   with no power row is exploratory whatever its issue says, and its rows are
+   labelled so.
+2. **A readout changes forward only.** An estimator chosen after a run's sign
+   was known is the next run's instrument, never that run's: the recorded row
+   stays as read, the new readout is validated on the fixture against a planted
+   effect it was not developed on, and enters section 1 before the first run
+   that uses it. #39's fixture and body rows were read with the total-variation
+   shift and stay that way.
+3. **What the fixture cannot say, the row says is assumed.** The fixture's
+   spread is not the body's. The discount between them is a ratio measured once
+   — the same readout on both substrates, which #39 supplies for the current one
+   — and is written beside the power row as an assumption, not a measurement.
+4. **Replicates are spent where the floor is unmeasured.** A replicate measures
+   the run-to-run floor and nothing else. At a configuration whose floor is
+   recorded at zero under `strict` — #39's body arms, six groups of six, at the
+   `ArmFingerprint` knobs they carry — a sweep's replicate budget goes to seeds
+   and its summary names the recorded floor it borrows. Any knob that moves
+   re-measures the floor first: #31 closed the nondeterminism by naming a
+   kernel at a configuration, and a floor is a property of the kernels a
+   configuration selects.
+5. **The dose unit is a property of the configuration.** One unit of goal
+   error is priced at the injection's held-out cost measured at #25's
+   configuration (#28: 0.017 nats). A run at another `adapter_rank`,
+   `max_seq_length`, batch size, step count or model re-measures that cost
+   before its dose is called a reference dose, or its dose axis is labelled
+   unpriced, as the fixture's is. Cheaper runs are bought with seeds and
+   readouts, not with knobs.
+6. **One primary, still.** A run whose question needs two contrasts declares
+   one and names the other as the secondary it is, with the reason;
+   `run_seeds.py --primary` carries one field and a second is not bolted on
+   beside it.
