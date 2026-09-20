@@ -66,7 +66,15 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tame"))
 
-from allocation_shift import paired_shifts  # noqa: E402
+from allocation_shift import (  # noqa: E402
+    DEFAULT_READOUT,
+    HELD_TYPE_PREFIX,
+    READING_PREFIX,
+    READOUTS,
+    SWEPT_TYPE_PREFIX,
+    Readout,
+    paired_shifts,
+)
 from compare_runs import (  # noqa: E402
     DEFAULT_RESAMPLES,
     assert_groups_at_parity,
@@ -101,6 +109,16 @@ ARMS = (PERSISTENCE_VALUE, PERSISTENCE_DECOUPLED, PERSISTENCE_SHUFFLED)
 SEEDS = (0, 1, 2)
 STEPS = 600
 TAIL = 100
+# One wealth memory horizon: at decay 0.997 the ledger has forgotten what
+# happened 333 steps ago to within 1/e (#16). Nothing integrated is read before
+# it, because a reading taken inside the transient is reading the heads learning
+# what their experts are worth rather than the market they settled into.
+WEALTH_HORIZON = 333
+# The window one logged reading of the allocation averages over (#57 candidate
+# 3). Fifty steps is 100 tokens a slot at this fixture's batch, enough that a
+# window's shares are not counting noise, and short enough that the tail after
+# one horizon holds six of them.
+READING_WINDOW = 50
 # The dose of the second goal field, in per-token loss per unit of goal error.
 # Chosen against the fixture's own scale -- realised value per unit share reads
 # about 0.24 and the per-token loss about 0.18 at the recorded steady state -- so
@@ -216,25 +234,78 @@ def _record_tokens(economy: SyntheticEconomy, records: TokenRecords, paid: torch
                 records.add(expert, report, value, was_paid)
 
 
-def run_differentiated(
-    arm: str, ratio: float, seed: int, steps: int = STEPS
-) -> tuple[dict[str, float], TokenRecords]:
-    """One arm at one relative dose: the tail metrics and the per-token records."""
-    config = replace(BASE_CONFIG, persistence_coupling=arm)
+def build_differentiated(arm: str, ratio: float, seed: int, **overrides) -> DifferentiatedEconomy:
+    """The fixture #39 read signature 1 on: two goal fields at a relative dose.
+
+    ``overrides`` are ``MoBConfig`` fields, and every one of them is a deviation
+    from the recorded configuration -- #57's mechanism ablation switches one
+    ledger mechanic at a time through here and labels the arm with it.
+    """
+    config = replace(BASE_CONFIG, persistence_coupling=arm, **overrides)
     economy = DifferentiatedEconomy(shuffled(DEFAULT_COMPETENCE, seed), seed=seed, config=config)
     economy.add_goal_field(GOAL_TYPES[0], SETPOINT, ratio * REFERENCE_DOSE)
     economy.add_goal_field(GOAL_TYPES[1], SETPOINT, REFERENCE_DOSE)
+    return economy
+
+
+def type_wins(economy: DifferentiatedEconomy, selected: torch.Tensor) -> dict[int, torch.Tensor]:
+    """Slots won per expert, counted separately on each goal type's tokens.
+
+    #57's candidate 2 reads the allocation where the swept goal is about the
+    tokens in front of the cell; the aggregate averages that over the three
+    types the goal pays nothing on.
+    """
+    assert economy.last_types is not None
+    counts = {}
+    for expert_type in GOAL_TYPES:
+        held = selected[economy.last_types == expert_type]
+        counts[expert_type] = torch.bincount(
+            held.flatten(), minlength=economy.config.num_experts
+        ).float()
+    return counts
+
+
+def share_columns(wins: torch.Tensor, prefix: str) -> dict[str, float]:
+    """A win-share column per expert, or nothing when the window saw no token."""
+    total = float(wins.sum())
+    if total == 0.0:
+        return {}
+    return {f"{prefix}{i}": float(wins[i] / total) for i in range(wins.numel())}
+
+
+def run_differentiated(
+    arm: str, ratio: float, seed: int, steps: int = STEPS
+) -> tuple[dict[str, float], TokenRecords]:
+    """One arm at one relative dose: the tail metrics and the per-token records.
+
+    The tail accumulation is #39's, untouched and bitwise reproducible; what #57
+    adds is recording, not trajectory -- the type-conditioned counts and the
+    windowed readings are read off the same steps and consume no randomness.
+    """
+    economy = build_differentiated(arm, ratio, seed)
     wins = torch.zeros(economy.config.num_experts)
+    by_type = {expert_type: torch.zeros(economy.config.num_experts) for expert_type in GOAL_TYPES}
+    window = torch.zeros(economy.config.num_experts)
+    readings: dict[str, float] = {}
     losses: list[float] = []
     on_type: list[float] = []
     records = TokenRecords()
     for step in range(steps):
         record = economy.step()
+        window += torch.bincount(
+            record.selected_experts.flatten(), minlength=economy.config.num_experts
+        ).float()
+        if (step + 1) % READING_WINDOW == 0:
+            if step + 1 > WEALTH_HORIZON:
+                readings.update(share_columns(window, f"{READING_PREFIX}{step + 1}_e"))
+            window = torch.zeros(economy.config.num_experts)
         if step < steps - TAIL:
             continue
         wins += torch.bincount(
             record.selected_experts.flatten(), minlength=economy.config.num_experts
         ).float()
+        for expert_type, counts in type_wins(economy, record.selected_experts).items():
+            by_type[expert_type] += counts
         losses.append(record.loss)
         on_type.append(economy.on_type_share(record.selected_experts))
         assert economy.last_types is not None
@@ -248,6 +319,9 @@ def run_differentiated(
         metrics[f"goal/type{expert_type}_share"] = float(
             share[economy.expert_types == expert_type].sum()
         )
+    metrics.update(share_columns(by_type[GOAL_TYPES[0]], SWEPT_TYPE_PREFIX))
+    metrics.update(share_columns(by_type[GOAL_TYPES[1]], HELD_TYPE_PREFIX))
+    metrics.update(readings)
     return metrics, records
 
 
@@ -425,7 +499,22 @@ def pooled_spread(groups: list[dict[str, Any]], metric: str) -> float:
     return (sum(s**2 for s in spreads) / len(spreads)) ** 0.5 if spreads else float("nan")
 
 
-def signature_one(out: Path, seeds: tuple[int, ...], steps: int, resamples: int) -> dict[str, Any]:
+def primary_name(readout: Readout) -> str:
+    """The primary's metric name, which carries the readout unless it is the recorded one.
+
+    #39's groups are on disk under ``PRIMARY``; a group read with another readout
+    must not be able to pass for one of them (section 8, rule 2).
+    """
+    return PRIMARY if readout is DEFAULT_READOUT else f"{PRIMARY}@{readout.name}"
+
+
+def signature_one(
+    out: Path,
+    seeds: tuple[int, ...],
+    steps: int,
+    resamples: int,
+    readout: Readout = DEFAULT_READOUT,
+) -> dict[str, Any]:
     """Run every arm at every ratio, write the groups, and read the primary."""
     groups: dict[str, dict[float, dict[str, Any]]] = {}
     preference: dict[str, dict[str, float]] = {}
@@ -454,7 +543,7 @@ def signature_one(out: Path, seeds: tuple[int, ...], steps: int, resamples: int)
                 doses,
                 per_seed,
                 steps,
-                PRIMARY if ratio == RATIOS[0] else None,
+                primary_name(readout) if ratio == RATIOS[0] else None,
             )
     for ratio in RATIOS:
         for arm in ARMS[1:]:
@@ -471,7 +560,10 @@ def signature_one(out: Path, seeds: tuple[int, ...], steps: int, resamples: int)
     )
 
     shifts = {
-        arm: {ratio: paired_shifts(groups[arm][RATIOS[0]], groups[arm][ratio]) for ratio in RATIOS}
+        arm: {
+            ratio: paired_shifts(groups[arm][RATIOS[0]], groups[arm][ratio], readout)
+            for ratio in RATIOS
+        }
         for arm in ARMS
     }
     slopes = {arm: per_seed_slopes(shifts[arm]) for arm in ARMS}
@@ -482,13 +574,16 @@ def signature_one(out: Path, seeds: tuple[int, ...], steps: int, resamples: int)
         "floor": floor,
         "preference": preference,
         "resamples": resamples,
+        "readout": readout,
     }
 
 
 def print_signature_one(result: dict[str, Any]) -> None:
     shifts, slopes, groups = result["shifts"], result["slopes"], result["groups"]
-    resamples = result["resamples"]
-    print("\n== signature 1: allocation shift (TV) from the balanced ratio, per seed ==")
+    resamples, readout = result["resamples"], result["readout"]
+    print(f"\n== signature 1: the shift from the balanced ratio, per seed ({readout.name}) ==")
+    if readout is not DEFAULT_READOUT:
+        print(f"  readout: {readout.describe}")
     for arm in ARMS:
         for ratio in RATIOS[1:]:
             per_seed = "  ".join(f"s{s}={v:.3f}" for s, v in shifts[arm][ratio].items())
@@ -498,7 +593,7 @@ def print_signature_one(result: dict[str, Any]) -> None:
     for arm in ARMS:
         per_seed = "  ".join(f"s{s}={v:+.4f}" for s, v in slopes[arm].items())
         print(f"  {arm:<10} {per_seed}")
-    print(f"\n== primary: {PRIMARY}, value minus decoupled ==")
+    print(f"\n== primary: {primary_name(readout)}, value minus decoupled ==")
     print(
         contrast_line(
             "value - decoupled", slopes[PERSISTENCE_DECOUPLED], slopes[PERSISTENCE_VALUE], resamples
@@ -612,7 +707,24 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=STEPS)
     parser.add_argument("--resamples", type=int, default=DEFAULT_RESAMPLES)
     parser.add_argument("--skip-quality", action="store_true", help="signature 1 only")
+    parser.add_argument(
+        "--readout",
+        type=str,
+        default=DEFAULT_READOUT.name,
+        choices=sorted(READOUTS),
+        help=(
+            "Which readout signature 1's primary is read with (#57). The default is the one "
+            "#39's recorded rows were read with; a group read with another carries the "
+            f"readout in its primary's name (default: {DEFAULT_READOUT.name})"
+        ),
+    )
     args = parser.parse_args()
+    readout = READOUTS[args.readout]
+    if readout.within_run:
+        parser.error(
+            f"{readout.name} is not read between two dose groups; it is the estimator study's "
+            "protocol (scripts/estimator_study.py --candidate setpoint-step)"
+        )
     seeds = tuple(int(part) for part in args.seeds.split(","))
     code_sha, code_dirty = code_identity()
     print(f"code {code_sha} dirty={code_dirty}; groups under {args.out}")
@@ -620,7 +732,7 @@ def main() -> None:
         f"arms {ARMS}; seeds {seeds}; {args.steps} steps, tail {TAIL}; goal types {GOAL_TYPES} "
         f"at setpoint {SETPOINT}, reference dose {REFERENCE_DOSE}, ratios {RATIOS}"
     )
-    result = signature_one(args.out, seeds, args.steps, args.resamples)
+    result = signature_one(args.out, seeds, args.steps, args.resamples, readout)
     print_signature_one(result)
     quality = (
         None if args.skip_quality else signatures_two_and_three(seeds, args.steps, args.resamples)
@@ -633,6 +745,7 @@ def main() -> None:
         "reference_dose": REFERENCE_DOSE,
         "ratios": RATIOS,
         "setpoint": SETPOINT,
+        "readout": readout.name,
         "shifts": {
             arm: {str(r): v for r, v in shifts.items()} for arm, shifts in result["shifts"].items()
         },

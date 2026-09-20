@@ -481,6 +481,42 @@ class DifferentiatedEconomy(SyntheticEconomy):
     def goal_fields(self) -> Sequence[TypeGoalField]:
         return [field for field in self.mob.goal_fields if isinstance(field, TypeGoalField)]
 
+    def step_goal_setpoint(self, expert_type: int, delta: float) -> TypeGoalField:
+        """Move one attached field's setpoint by ``delta``: the experimenter's step (#57).
+
+        A thermostat is tested by moving the target, not the electricity price,
+        and the error that follows is in the tissue's own variable and the cells'
+        own units. The step is the experimenter's and never the cell's: nothing
+        in the economy can reach this, and the fields stay frozen -- the list is
+        rebuilt in place rather than edited, because a field that can be written
+        after attachment is a field the run's record no longer describes.
+        """
+        fields = list(self.mob.goal_fields)
+        stepped = None
+        for index, field in enumerate(fields):
+            if isinstance(field, TypeGoalField) and field.expert_type == expert_type:
+                stepped = replace(field, setpoint=field.setpoint + delta)
+                fields[index] = stepped
+        if stepped is None:
+            raise ValueError(f"no goal field is attached on type {expert_type}")
+        self.mob.detach_goal_fields()
+        for field in fields:
+            self.mob.attach_goal_field(field)
+        return stepped
+
+    def goal_reading(self, field: TypeGoalField, selected: torch.Tensor) -> float:
+        """What the tissue is holding along one field's direction, averaged over tokens.
+
+        The same quantity ``closed_form_goal_terms`` prices the goal error
+        against: the on-type competence the winners delivered at their share.
+        Read here so an experiment can watch the regulated variable itself rather
+        than infer it from what the cells were paid.
+        """
+        k = self.config.top_k
+        delivered = self.competence[selected] / k
+        on_field = self.expert_types[selected] == field.expert_type
+        return float((delivered * on_field).sum(dim=-1).mean())
+
     def closed_form_goal_terms(self, selected: torch.Tensor) -> torch.Tensor:
         """What the goal fields pay every winner slot, per unit share, from the planted numbers.
 

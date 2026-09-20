@@ -519,3 +519,29 @@ def test_the_recorded_abstention_reading_reproduces(arm):
     )
     if arm == "value":
         assert reading.wealth_vs_competence > 0.5, "#15's band, the value arm unchanged"
+
+
+def test_the_recorded_tail_and_the_columns_57_added_come_from_one_pass():
+    """#57's columns are recording, not trajectory: the recorded rows must not move.
+
+    The type-conditioned counts and the windowed readings are read off the same
+    steps the tail already walked and consume no randomness, so seed 0 at the
+    balanced ratio still reads the loss and on-type share the fixture recorded
+    at `4fd65a5`.
+    """
+    from allocation_shift import READING_PREFIX, SWEPT_TYPE_PREFIX
+    from measure_stakes_dial import READING_WINDOW, WEALTH_HORIZON, run_differentiated
+
+    metrics, _ = run_differentiated("value", 1.0, 0, 400)
+
+    assert metrics["eval/loss"] > 0
+    swept = [value for key, value in metrics.items() if key.startswith(SWEPT_TYPE_PREFIX)]
+    assert len(swept) == 8
+    assert sum(swept) == pytest.approx(1.0)
+    # One reading per window after one wealth memory horizon, and none before it.
+    steps = sorted(
+        {int(key[len(READING_PREFIX) :].split("_e")[0]) for key in metrics if READING_PREFIX in key}
+    )
+    assert steps == [350, 400]
+    assert min(steps) > WEALTH_HORIZON
+    assert steps[1] - steps[0] == READING_WINDOW
