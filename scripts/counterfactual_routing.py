@@ -408,16 +408,13 @@ def read_one(
         "script_dirty": code_identity()[1],
     }
     read = counterfactual_gaps(
-        model,
-        batches,
-        device,
-        executed,
-        args.alternatives,
-        args.noise_scale,
-        args.subset,
-        args.seed,
+        model, batches, device, executed, args.alternatives, args.noise_scale, None, args.seed
     )
     gap = read["best_minus_executed"]
+    reading["counterfactual/mean_gap"] = float(gap.mean())
+    reading["counterfactual/alternatives_better"] = float(
+        read["alternatives_better_than_executed"].mean()
+    )
     if floor is not None:
         fragile = gap > floor
         reading.update(
@@ -427,16 +424,34 @@ def read_one(
                 "counterfactual/best_route_gap_on_fragile": float(gap[fragile].mean())
                 if bool(fragile.any())
                 else 0.0,
-                "counterfactual/mean_gap": float(gap.mean()),
-                "counterfactual/alternatives_better": float(
-                    read["alternatives_better_than_executed"].mean()
-                ),
+                "counterfactual/gap_p50": float(gap.median()),
+                "counterfactual/gap_p95": float(gap.quantile(0.95)),
                 "fragile_token_index": torch.nonzero(fragile).flatten().tolist(),
                 "fragile_token_ids": executed.token_ids[fragile].tolist(),
             }
         )
-    else:
-        reading["counterfactual/mean_gap"] = float(gap.mean())
+    if args.subset is not None:
+        # The upstream confound, bounded in the same model load: rerouting every
+        # token at once measures the reroutes *and* the stream they change, so
+        # the same read on a tenth of tokens is what says which it was. The two
+        # must agree within the floor, or the disagreement is the finding.
+        bounded = counterfactual_gaps(
+            model,
+            batches,
+            device,
+            executed,
+            args.alternatives,
+            args.noise_scale,
+            args.subset,
+            args.seed,
+        )["best_minus_executed"]
+        reading["counterfactual/mean_gap_subset"] = float(bounded.mean())
+        if floor is not None:
+            subset_fragile = float((bounded > floor).float().mean())
+            reading["counterfactual/fragile_fraction_subset"] = subset_fragile
+            reading["counterfactual/subset_disagreement"] = abs(
+                subset_fragile - reading["counterfactual/fragile_fraction"]
+            )
     if args.floor_against is not None:
         against_model, against_batches, _, against = read_checkpoint(
             Path(args.floor_against), args.probe_tokens, args.batch_size, args.device
@@ -520,10 +535,17 @@ def summarise(readings: dict[str, dict[str, Any]], group: Path | None) -> dict[s
     }
 
 
-def checkpoints_of(group: Path) -> dict[str, Path]:
-    """Every seed's last checkpoint under a ``run_seeds.py`` group, keyed by seed."""
+def checkpoints_of(group: Path, include_replicates: bool = False) -> dict[str, Path]:
+    """Every seed's last checkpoint under a ``run_seeds.py`` group, keyed by seed.
+
+    The replicate is left out by default: it is seed 0 again, it is what the
+    floor pass reads, and a group summary that carried it would table one seed
+    twice as though it were two.
+    """
     found: dict[str, Path] = {}
     for run in sorted((group / "runs").glob("seed*")):
+        if not include_replicates and run.name.endswith("-replicate"):
+            continue
         checkpoints = sorted(
             run.glob(CHECKPOINT_GLOB), key=lambda path: int(path.name.split("-")[-1])
         )

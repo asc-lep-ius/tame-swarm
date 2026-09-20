@@ -223,7 +223,10 @@ def test_the_last_checkpoint_of_every_seed_is_the_one_read(tmp_path):
 
     found = checkpoints_of(tmp_path)
 
-    assert set(found) == {"0", "1", "0-replicate"}
+    # The replicate is seed 0 again and is what the floor pass reads; a group
+    # summary carrying it would table one seed twice as though it were two.
+    assert set(found) == {"0", "1"}
+    assert set(checkpoints_of(tmp_path, include_replicates=True)) == {"0", "1", "0-replicate"}
     assert all(path.name == "checkpoint-2000" for path in found.values())
     with pytest.raises(FileNotFoundError, match="no checkpoints"):
         checkpoints_of(tmp_path / "nowhere")
