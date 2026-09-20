@@ -10,6 +10,8 @@ import math
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "tame"))
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
@@ -20,6 +22,7 @@ from run_seeds import (  # noqa: E402
     format_table,
     goal_term_metrics,
     measure_replication,
+    parse_sweep_args,
     replication_std,
 )
 
@@ -165,3 +168,11 @@ def test_the_sweep_takes_a_dose_per_goal_and_reaches_the_fingerprint_with_it():
 
     assert build_parser().parse_args([]).goal_dose is None
     assert parse_goal_doses(build_parser().parse_args([]).goal_dose or ()) == ((), ())
+
+
+def test_borrowing_a_floor_and_measuring_one_are_not_asked_for_together(capsys):
+    """#56: --floor_recorded_at is what a sweep does *instead* of a replicate."""
+    with pytest.raises(SystemExit):
+        parse_sweep_args(["--floor_recorded_at", "runs/value", "--replicate"])
+
+    assert "--no-replicate" in capsys.readouterr().err

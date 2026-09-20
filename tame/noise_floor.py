@@ -1,0 +1,233 @@
+"""The run-to-run floor: what it is a property of, and when it may be borrowed (#31, #56).
+
+A replicate is one seed run twice. It measures the run-to-run floor and nothing
+else, and it costs a quarter of a four-run group. #31 closed the nondeterminism
+that made the floor worth measuring every time -- it named the kernel (the
+memory-efficient attention backward), fixed it with ``--deterministic strict``,
+and put the code SHA in the fingerprint -- and #39's body sweep then spent six
+replicates, about two GPU-hours, to record a floor of exactly zero in all six
+groups. Preregistration section 8, rule 4 is what came of that: replicates are
+spent where the floor is *unmeasured*, and a sweep at a configuration whose floor
+is already recorded names the floor it borrows instead of re-measuring it.
+
+The clause that makes the rule safe is "at a configuration". A floor is a
+property of the kernels a configuration selects, so it travels between two arms
+of one sweep -- they differ in the ledger's arithmetic, not in which kernels run
+-- and does not travel to a run at another shape, precision or device.
+:data:`FLOOR_KNOBS` is that boundary, written as a list rather than left to
+judgement, and :data:`NOT_A_FLOOR_KNOB` is its complement with the reason each
+field is in it: a field that is merely absent is indistinguishable from one that
+was forgotten, which is the argument ``parity.NOT_A_CONFOUND`` already makes for
+the parity check.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, fields
+from pathlib import Path
+from typing import Any
+
+from parity import ArmFingerprint
+
+# What a floor is a property of: the shape, the precision, the device and the
+# kernel set. Two runs that agree on all of these run the same kernels over the
+# same tensors, which is what makes one run's measured spread the other's floor.
+FLOOR_KNOBS = frozenset(
+    {
+        "router",
+        "model_id",
+        "dtype",
+        "device",
+        "dataset",
+        "max_steps",
+        "batch_size",
+        "gradient_accumulation_steps",
+        "max_seq_length",
+        "num_experts",
+        "top_k",
+        "adapter_rank",
+        "requested_layers",
+        "converted_layers",
+        "use_lora",
+        "lora_rank",
+        "lora_alpha",
+        "lora_dropout",
+        "gradient_checkpointing",
+        "deterministic",
+        "strict_determinism",
+    }
+)
+
+_VARIES = "varies between the two runs a floor is measured from; a floor that matched here \
+would be a floor of nothing"
+_ARM = "the arm's own variable: a floor is borrowed across arms of one sweep, or it buys nothing"
+_OPTIMISER = "decides what the weights become, never which kernels compute them"
+_MEASUREMENT = "read under no_grad with the economy frozen, after the trajectory it would have \
+to move"
+_CODE = "decided by code_drift, where a missing SHA has to count as drift and a field-equality \
+check would read two absences as agreement"
+_REGISTER = "a register of what the tissue was allowed to do, not of what the arithmetic did"
+
+# Every remaining fingerprint field, with the reason a floor does not depend on
+# it. Pinned against the dataclass by ``tests/test_noise_floor.py``, so a field
+# added later cannot join neither list by nobody thinking about it.
+NOT_A_FLOOR_KNOB: dict[str, str] = {
+    **dict.fromkeys(("seed", "data_order"), _VARIES),
+    **dict.fromkeys(
+        (
+            "coupling_goal",
+            "coupling_beta",
+            "coupling_warmup_steps",
+            "steer_goal",
+            "steer_strength",
+            "steer_layers",
+            "persistence_coupling",
+            "goal_doses",
+            "goal_fields",
+            "ledger_mode",
+            "exploration_rate",
+            "exploration_draw",
+            "wealth_update_frequency",
+        ),
+        _ARM,
+    ),
+    **dict.fromkeys(
+        (
+            "learning_rate",
+            "warmup_steps",
+            "weight_decay",
+            "calibration_loss_weight",
+            "confidence_head_learning_rate",
+        ),
+        _OPTIMISER,
+    ),
+    **dict.fromkeys(("probe_tokens", "eval_split"), _MEASUREMENT),
+    **dict.fromkeys(("code_sha", "code_dirty"), _CODE),
+    **dict.fromkeys(
+        (
+            "autonomy_plasticity",
+            "autonomy_exploration",
+            "autonomy_setpoints",
+            "autonomy_evaluation",
+            "autonomy_dormancy",
+            "rotating_stream",
+            "rotating_stream_date",
+            "rotating_refresh_days",
+            "rotating_stream_overdue_days",
+            "rotating_stream_cutoff",
+            "canary_set",
+            "canary_set_date",
+            "canary_refresh_days",
+        ),
+        _REGISTER,
+    ),
+}
+
+
+class BorrowedFloorError(ValueError):
+    """Raised when a recorded floor may not stand in for the one a sweep did not measure."""
+
+
+def unclassified_floor_fields() -> tuple[str, ...]:
+    """Fingerprint fields that are neither a floor knob nor declared not to be one."""
+    classified = FLOOR_KNOBS | set(NOT_A_FLOOR_KNOB)
+    return tuple(field.name for field in fields(ArmFingerprint) if field.name not in classified)
+
+
+def floor_knobs(fingerprint: dict[str, Any]) -> dict[str, Any]:
+    """The knob values a floor is a property of, as JSON round-trips them.
+
+    Sequences come back from ``seed_summary.json`` as lists and go out as
+    tuples, so both sides are coerced before they are compared -- the same trap
+    ``parity.SEQUENCE_FIELDS`` exists for, met here on a different path.
+    """
+    return {
+        key: tuple(value) if isinstance(value, list) else value
+        for key, value in sorted(fingerprint.items())
+        if key in FLOOR_KNOBS
+    }
+
+
+def differing_floor_knobs(recorded: dict[str, Any], own: dict[str, Any]) -> tuple[str, ...]:
+    """Which floor knobs two fingerprints disagree on; empty when the floor travels."""
+    left, right = floor_knobs(recorded), floor_knobs(own)
+    return tuple(sorted(key for key in set(left) | set(right) if left.get(key) != right.get(key)))
+
+
+@dataclass(frozen=True)
+class BorrowedFloor:
+    """A floor measured by another sweep, and the evidence it applies to this one."""
+
+    path: str
+    arm: str
+    replicate_seed: int | None
+    replication_std: dict[str, float]
+    knobs: dict[str, Any]
+
+    @property
+    def is_zero(self) -> bool:
+        return all(value == 0.0 for value in self.replication_std.values())
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "path": self.path,
+            "arm": self.arm,
+            "replicate_seed": self.replicate_seed,
+            "replication_std": self.replication_std,
+            "knobs": {
+                key: list(value) if isinstance(value, tuple) else value
+                for key, value in self.knobs.items()
+            },
+            "is_zero": self.is_zero,
+        }
+
+
+def borrow_floor(path: Path, fingerprints: dict[Any, dict[str, Any]]) -> BorrowedFloor:
+    """The floor recorded under ``path``, checked against the fingerprints borrowing it.
+
+    Refuses three ways, because each is a different mistake. A summary with no
+    recorded floor has nothing to lend -- including one that borrowed its own,
+    since a floor relayed twice is a floor nobody measured at the configuration
+    that quotes it. A summary whose replicate failed recorded the failure, not a
+    floor. And a summary at different floor knobs measured a different
+    configuration's kernels, which is rule 4's whole clause.
+    """
+    summary_path = path / "seed_summary.json"
+    if not summary_path.exists():
+        raise BorrowedFloorError(
+            f"no seed_summary.json under {path} -- --floor_recorded_at names a directory "
+            "written by scripts/run_seeds.py whose replicate ran"
+        )
+    summary = json.loads(summary_path.read_text())
+    recorded = summary.get("replication_std")
+    if not recorded:
+        borrowed = summary.get("floor_recorded_at")
+        why = "it borrowed its own floor" if borrowed else "it recorded none"
+        raise BorrowedFloorError(
+            f"{summary_path} has no measured floor to lend: {why}"
+            + (f" ({summary['replication_error']})" if summary.get("replication_error") else "")
+        )
+    prints = summary.get("fingerprints") or {}
+    if not prints:
+        raise BorrowedFloorError(
+            f"{summary_path} carries no arm fingerprints, so the configuration its floor was "
+            "measured at cannot be read (every summary recorded before #6)"
+        )
+    lender = next(iter(prints.values()))
+    for seed, fingerprint in fingerprints.items():
+        differing = differing_floor_knobs(lender, fingerprint)
+        if differing:
+            theirs, ours = floor_knobs(lender), floor_knobs(fingerprint)
+            raise BorrowedFloorError(
+                f"the floor recorded at {path} was measured at other knobs than this sweep's "
+                f"seed {seed} runs, so it is not this configuration's floor: "
+                + ", ".join(f"{key} {theirs.get(key)!r} vs {ours.get(key)!r}" for key in differing)
+            )
+    return BorrowedFloor(
+        path=str(path),
+        arm=summary.get("arm", "unknown"),
+        replicate_seed=summary.get("replicate_seed"),
+        replication_std=dict(recorded),
+        knobs=floor_knobs(lender),
+    )

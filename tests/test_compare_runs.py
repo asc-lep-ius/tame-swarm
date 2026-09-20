@@ -406,3 +406,48 @@ def test_a_floor_from_one_group_is_quoted_alone_and_from_none_prints_n_a():
     assert math.isnan(comparison["eval/loss"]["replication_std"])
     assert "n/a" in format_table(comparison, "a", "b").splitlines()[2]
     assert "NOT measured" in replication_note(group_b, group_b)
+
+
+def _with_borrowed_floor(group: dict, path: str, arm: str, floor: dict[str, float]) -> dict:
+    """A group that spent its replicate budget on seeds (#56, section 8 rule 4)."""
+    return {
+        **group,
+        "replicate_seed": None,
+        "replication_std": None,
+        "floor_recorded_at": {
+            "path": path,
+            "arm": arm,
+            "replicate_seed": 0,
+            "replication_std": floor,
+            "is_zero": all(value == 0.0 for value in floor.values()),
+        },
+    }
+
+
+def test_a_borrowed_floor_is_quoted_and_the_note_says_whose_runs_it_is():
+    """A floor nobody surfaces is a floor nobody applies -- and one nobody labels
+    is another sweep's runs wearing this one's authority."""
+    group_a = _with_borrowed_floor(
+        _group("mob", {"eval/loss": [2.79, 2.80, 2.81]}),
+        "~/tame-runs/39-stakes-dial/body/r1/value",
+        "mob",
+        {"eval/loss": 0.0},
+    )
+    group_b = _with_borrowed_floor(
+        _group("mob", {"eval/loss": [2.78, 2.79, 2.80]}),
+        "~/tame-runs/39-stakes-dial/body/r1/value",
+        "mob",
+        {"eval/loss": 0.0},
+    )
+
+    assert pooled_replication_std(group_a, group_b, "eval/loss") == 0.0
+    note = replication_note(group_a, group_b)
+    assert "BORROWED by both groups and measured by neither" in note
+    assert "39-stakes-dial/body/r1/value" in note
+
+    measured = _with_replicate(
+        _group("mob", {"eval/loss": [2.79, 2.80, 2.81]}), 0, {"eval/loss": 0.0012}
+    )
+    mixed = replication_note(measured, group_b)
+    assert "1 group(s)" in mixed
+    assert "The other group borrowed its floor" in mixed

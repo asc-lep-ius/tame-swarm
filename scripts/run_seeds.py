@@ -27,6 +27,12 @@ contains that, but nothing said how much of it was run-to-run. ``--replicate``
 as ``replication_std``, which ``compare_runs.py`` quotes beside every delta.
 Under ``--deterministic strict``, the default since #31, the pair is bitwise
 identical and the floor reads zero -- which is then the check that it still does.
+
+Checking that it still does is worth a quarter of a sweep exactly once per
+configuration. ``--no-replicate --floor_recorded_at <run dir>`` is #56's other
+half: the sweep spends those runs on seeds and records the floor it borrows,
+with the knobs that floor was measured at (``tame/noise_floor.py``), so a
+borrowed floor is refused rather than assumed when the configuration moved.
 """
 
 import argparse
@@ -52,6 +58,7 @@ from determinism import DETERMINISM_DEFAULT, DETERMINISM_MODES  # noqa: E402
 from goal_field import GOAL_ERROR_UNIT_COST, parse_goal_doses  # noqa: E402
 from mob.auction import EXPLORATION_DRAW_STALENESS, SUPPORTED_EXPLORATION_DRAWS  # noqa: E402
 from mob.ledger import PERSISTENCE_VALUE, SUPPORTED_PERSISTENCE_COUPLINGS  # noqa: E402
+from noise_floor import BorrowedFloor, BorrowedFloorError, borrow_floor  # noqa: E402
 from parity import arm_label  # noqa: E402
 from train import TAMETrainer, TrainingConfig  # noqa: E402
 
@@ -373,6 +380,21 @@ def build_parser() -> argparse.ArgumentParser:
             "replication_std, the run-to-run floor compare_runs.py quotes (default: on)"
         ),
     )
+    # #56, and preregistration section 8 rule 4: a replicate measures the
+    # run-to-run floor and nothing else, so a sweep at a configuration whose floor
+    # is already recorded spends that quarter of its runs on seeds instead -- and
+    # names the floor it borrows, rather than leaving the column empty.
+    parser.add_argument(
+        "--floor_recorded_at",
+        type=str,
+        default=None,
+        metavar="RUN_DIR",
+        help=(
+            "With --no-replicate: the sweep whose replicate measured this configuration's "
+            "run-to-run floor. It travels into seed_summary.json with the knobs it was "
+            "measured at, and a floor measured at other knobs is refused, not borrowed"
+        ),
+    )
     # #35: the metric this sweep is to be read on, declared before it is read.
     # It travels in the summary so compare_runs.py puts the interval on the
     # contrast that was chosen in advance rather than the largest row found.
@@ -388,10 +410,27 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def parse_sweep_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """The sweep's flags, plus the one combination argparse cannot refuse on its own."""
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.floor_recorded_at is not None and args.replicate:
+        parser.error(
+            "--floor_recorded_at borrows the floor a replicate would measure, so it goes with "
+            "--no-replicate; this sweep asked for both"
+        )
+    return args
+
+
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(message)s")
 
-    args = build_parser().parse_args()
+    args = parse_sweep_args()
+    if args.floor_recorded_at is not None:
+        # Read before any run: a lender with no floor to lend is a refusal worth
+        # having now rather than after the GPU-hours. The knob check needs this
+        # sweep's own fingerprints and happens below, on what the runs recorded.
+        borrow_floor(Path(args.floor_recorded_at), {})
 
     seeds = [int(part) for part in args.seeds.split(",")]
     if len(seeds) < 2:
@@ -464,10 +503,33 @@ def main() -> None:
     replicate_metrics: dict[str, float] | None = None
     replication: dict[str, float] | None = None
     replication_error: str | None = None
+    borrowed: BorrowedFloor | None = None
     if replicate_seed is not None:
         replicate_metrics, replication, replication_error = measure_replication(
             replicate_seed, config, per_seed[replicate_seed], fingerprints[replicate_seed]
         )
+    elif args.floor_recorded_at is not None:
+        # A refusal here is recorded rather than raised, for the reason
+        # ``measure_replication`` records a failed replicate: the seeds are
+        # already spent, and a summary that says its floor is unmeasured is worth
+        # more than a crash that throws the runs away with it.
+        try:
+            borrowed = borrow_floor(Path(args.floor_recorded_at), fingerprints)
+        except BorrowedFloorError as exc:
+            replication_error = str(exc)
+            logger.error("the recorded floor was refused, so this sweep has none: %s", exc)
+        if borrowed is not None:
+            replication_error = (
+                f"no replicate: the floor is borrowed from {args.floor_recorded_at} "
+                "(section 8, rule 4)"
+            )
+            if not borrowed.is_zero:
+                logger.warning(
+                    "the borrowed floor is not zero (%s); a nonzero floor is one pair of runs "
+                    "at one degree of freedom, so borrowing it spends this sweep's replicate "
+                    "budget on a weaker number than measuring it would have",
+                    borrowed.replication_std,
+                )
 
     arm = arm_label(args.router, args.coupling_goal, args.steer_goal, args.persistence_coupling)
     if args.primary is not None and args.primary not in stats:
@@ -478,7 +540,14 @@ def main() -> None:
         )
     print("\n" + format_table(stats, replication))
     print(f"\narm: {arm} | seeds: {seeds} | steps: {args.steps} | primary: {args.primary}")
-    if replicate_seed is None:
+    if borrowed is not None:
+        print(
+            f"replicate: none (--no-replicate); the floor is borrowed from {borrowed.path}, "
+            f"arm {borrowed.arm}, measured on seed {borrowed.replicate_seed} at the same "
+            f"{len(borrowed.knobs)} floor knobs"
+            + (" and recorded as zero" if borrowed.is_zero else " and NOT zero")
+        )
+    elif replicate_seed is None:
         print("replicate: none (--no-replicate); the run-to-run floor is not measured")
     elif replication_error is not None:
         print(f"replicate: seed {replicate_seed} unmeasured -- {replication_error}")
@@ -512,6 +581,10 @@ def main() -> None:
                 "replicate": replicate_metrics,
                 "replication_std": replication,
                 "replication_error": replication_error,
+                # #56: the floor this sweep did not measure, and the evidence it
+                # applies -- the lender, the seed its replicate ran, and the
+                # floor knobs both configurations agree on.
+                "floor_recorded_at": borrowed.as_dict() if borrowed is not None else None,
             },
             indent=2,
         )
