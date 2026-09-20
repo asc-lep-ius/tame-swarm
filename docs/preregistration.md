@@ -57,6 +57,29 @@ Guardrails that must not move, at both scales: held-out loss within the pooled
 spread across all arms; `r(wealth, competence)` on the quality fixture within
 #15's band in the `value` arm; the shadow and live ledgers identical at step 0.
 
+**When one of them moves.** Fixed here before #39's GPU run, binding at both
+scales, and written because #39's fixture run met the case with no rule for it
+(#52): the tail loss moved about five times the pooled spread and the primary
+was read anyway, which section 2's null rule says to do and nothing said what
+the result was then worth.
+
+1. **The primary is read and reported as declared.** A breach is not grounds to
+   withhold a result, and "the guardrail moved, so we ran it again" is how a
+   null becomes a search.
+2. **The breach gets its own row** — which guardrail, how far it moved in units
+   of the pooled spread, and in which arms — not a clause inside the primary's
+   sentence.
+3. **The verdict is labelled *conditional*, and a conditional verdict selects
+   nothing.** No mechanism is adopted, dropped, tuned or reverted on it. It
+   selects again only from a run where that guardrail holds, or one where the
+   breach is itself the preregistered primary.
+4. **Symmetric.** A "yes" read with a moved guardrail is conditional on exactly
+   the same terms as a "no". The label is a property of the run, not of which
+   way the answer came out.
+
+By this rule #39's fixture verdict — signature 1 reads "no" — is conditional,
+and the GPU row in section 7 is the run it is conditional on.
+
 ## 4. Controls
 
 - **Decoupled arm.** Allocation reads a pinned wealth, re-entry is uniform, the
@@ -78,8 +101,12 @@ spread across all arms; `r(wealth, competence)` on the quality fixture within
 
 ## 5. Stopping rules for organism-scale runs
 
-Copied verbatim into #44 before it runs. If any preregistered signature exceeds
-the primary interval at the organism scale:
+Copied verbatim into #44 before it runs, together with section 3's
+moved-guardrail rule. A signature read with a guardrail moved is *conditional*
+and selects nothing, and these five rules still fire on it: they are what the
+maker may not do next, so the label that discounts a result is never also the
+licence to act on it. If any preregistered signature exceeds the primary
+interval at the organism scale:
 
 1. No further mechanism change to that arm.
 2. None of its checkpoints is deleted.
@@ -112,4 +139,5 @@ results were read is a new run, not this one.
 | Run | Deviation | Written on |
 |---|---|---|
 | #39 | **Fixture-only in this MR; the GPU arms are deferred.** The operator's scope decision of 2026-09-19: the three arms are run on the differentiated fixture (two goal fields, 3 seeds, signature 1) and the quality fixture (signatures 2 and 3), on CPU, and the primary is read there with the resampled-mean range at 3 seeds. The differentiated body at #25's budget is a later run, launched from the code SHA the README's `#stakes-dial-cell` stub records, and is written up as its own row here before it is read. Two things the fixture cannot do as section 1 states them: it has no injection to price a unit of goal error against, so the dose is a script parameter carried in the fingerprint (`goal_doses`) rather than the injection's held-out cost; and its re-running floor is identically zero, the fixture being bitwise deterministic on CPU, so the excess over the floor is the shift itself. | 2026-09-19, before the first fixture run |
+| #39, the GPU arms | **The run the fixture row defers to, fixed before the first arm launches (#54 wires it; #39 launches and reads it).** Three arms (`value`, `decoupled`, `shuffled`) x two dose levels x three runs = 18 runs on the differentiated body at [#25](../README.md#differentiation-checkpoint-25)'s budget -- 2000 steps, eval every 250, seeds 0/1/2, `--router mob --use_lora --adapter_rank 32 --layers 6:22 --max_seq_length 512` -- under `--deterministic strict` with the code SHA in every fingerprint; the default replicate adds one run per arm-dose, 24 in all, about 9 GPU-hours. Seven things the fixture could not state as section 1 states them. **(a) The two fields.** `truthful` and `safe`: the two entries in `contrastive_data.CERTIFIED` that are certified on Qwen3-1.7B *and* have a certified layer inside the converted range 6:22, sharing layer 18. `deliberation` is not certified; `reasoning` is the weaker candidate (own lift +0.14, prefix control 38% of the effect, cosine 0.28 with `truthful`), and `safe` interferes least -- the README's cross-goal disturbance reads `safe` lifting `truthful` +0.09 against +0.42 on itself. **(b) Pay-only, both.** Neither field is injected during training: cells are paid for closing the tissue's goal error and nothing pushes the stream along it. The fixture's shape. Rejected: both injected at their certified strength -- two injections never jointly certified, whose compounded cost lands on the loss guardrail that (f) governs -- and injecting `truthful` alone, as the launch stub did, which makes the two fields asymmetric and is not a design. **(c) The setpoint** is the homeostat's own calibrated target for the layer, `AlignmentCalibration.setpoint_z`, converted to raw projection units with that layer's resting mean and spread -- `resting_mean + lift x reference_strength` -- measured at training start by `homeostat_calibration.calibrate_alignment` over the served corpus, on the pristine model before conversion, so it pre-exists the reward and is the tissue's own. Rejected: the injection's measured 0.070 offset, which is an extrinsic goal, and a swept setpoint, since a tissue holds one. The homeostat reads the residual stream's projection at the last position and the goal term reads the coordinate of what the experts *added*, per token; the two are not the same quantity, and the README states the mapping rather than the code assuming it. **(d) The dose.** One unit of goal error is priced at the injection's own held-out loss cost from [#28](../README.md#field-present-coupling-28), 0.017 nats, per #33's record. `safe` is held at that reference; `truthful` is the swept field at `ratio x 0.017` for ratio in {1, 4}, so the relative dose beta1/beta2 takes the fixture's balanced value and its top value. The doses are in the fingerprint (`goal_doses`, with `goal_field_goals`) and the dose is a declared varying field, so the two dose groups are at parity on everything else. **(e) Signature 1's primary at two dose levels.** Per arm, the total-variation shift of the slot allocation between the two dose groups, paired by seed (`allocation_shift.paired_shifts`); the slope against relative dose is that shift over `delta(beta1/beta2) = 3`, a positive constant, so the primary -- `value` minus `decoupled`, with #35's percentile bootstrap over the three paired seeds -- has the sign and the zero-crossing of the paired shift difference itself. Inside the range reads "no". At three seeds that range is the sample range and carries no 95% coverage, as on the fixture. **(f) The moved guardrail.** Section 3's rule binds this run in advance, and the fixture's tail-loss breach is why it exists. If the held-out loss breaches the pooled spread here too, the primary is still read, the breach takes its own row, and the verdict is conditional whichever way it comes out. **(g) A preregistered secondary, with both predictions: the loss gap.** The fixture found `value` 0.228 against `decoupled` 0.177 -- the arm whose cells are *not* paid in continuation routed better. The stakes position predicts the goal term closes that gap on the body: paying cells for the tissue's goal error is the value definition the wealth channel was missing, so `value` minus `decoupled` on `eval/loss` moves toward zero against the fixture's sign. The extrinsic-teleology position predicts it does not: the gap is wealth compounding concentrating the market ([#16](../README.md#wealth-bounds-16)), which the goal term does not touch, so the sign and the ordering survive. Secondary: it is reported and selects nothing on its own. | 2026-09-20, before the first arm |
 | #44 | — | — |
