@@ -81,6 +81,11 @@ DEFAULT_ALTERNATIVES = 32
 DEFAULT_NOISE_SCALE = 1.0
 DEFAULT_SUBSET = 0.1
 DEFAULT_PROBE_TOKENS = 4096
+# Below this many draw-token pairs a rate is not reported at all. Under a full
+# reroute the unmoved population is empty or a handful, and a rate over six
+# pairs recorded beside one over a million is the shape of a number nobody can
+# read -- #58's own trap list calls it a number with no run directory behind it.
+MIN_POPULATION = 100
 CHECKPOINT_GLOB = "checkpoint-*"
 
 
@@ -183,8 +188,17 @@ class GumbelTopKRoute(torch.nn.Module):
     ``subset`` leaves a fraction of tokens on their executed route, which is how
     the upstream confound is bounded: a rerouted token changes the stream every
     later token sees, so a read where every token is rerouted at once measures
-    that too. At 10% the two estimates must agree within the floor, or the
-    confound is the finding.
+    that too. The mask is drawn once per draw and shared by every layer, so the
+    fraction is of *tokens*; drawn per layer it would be of layer-token pairs,
+    and sixteen converted layers turn a tenth of those into six tenths of the
+    tokens.
+
+    One limit worth naming: ``rerouted`` compares this layer's Gumbel route
+    against the gate's choice *under the perturbed stream*, not against the
+    route the clean forward executed, so a token whose route the upstream
+    perturbation flipped indirectly is counted in the stream-only control.
+    Measured at 0.8% of unmoved layer-token pairs at ``subset`` 0.1 and 1.3% at
+    a full reroute -- small, and stated rather than assumed away.
     """
 
     def __init__(
@@ -193,13 +207,31 @@ class GumbelTopKRoute(torch.nn.Module):
         generator: torch.Generator,
         scale: float,
         subset: float | None,
+        shared_mask: dict[tuple[int, ...], torch.Tensor] | None = None,
     ):
         super().__init__()
         self.gate = gate
         self.generator = generator
         self.scale = scale
         self.subset = subset
+        # One mask per draw and per token, shared by every layer of that draw.
+        # Drawn per layer instead -- which is what the first version did -- a
+        # token is left alone only with probability (1 - subset)^layers, so
+        # `--subset 0.1` rerouted 61% of tokens across sixteen converted
+        # layers and the "stream only" population was 39% of them rather than
+        # 90%. The dict is keyed by batch shape because a read walks batches.
+        self.shared_mask = {} if shared_mask is None else shared_mask
         self.rerouted: torch.Tensor | None = None
+
+    def _token_mask(self, shape: tuple[int, ...], device: torch.device) -> torch.Tensor:
+        """Which tokens this draw reroutes, drawn once and reused by every layer."""
+        key = tuple(shape)
+        if key not in self.shared_mask:
+            drawn = torch.rand(shape, generator=self.generator, device=self.generator.device).to(
+                device
+            )
+            self.shared_mask[key] = drawn < (self.subset or 0.0)
+        return self.shared_mask[key]
 
     def _gumbel(self, like: torch.Tensor) -> torch.Tensor:
         """A standard Gumbel per expert per token, from this read's own generator.
@@ -231,11 +263,10 @@ class GumbelTopKRoute(torch.nn.Module):
         selected = torch.topk(scores + self.scale * self._gumbel(bids), self.gate.top_k, dim=-1)
         selected = selected.indices
         if self.subset is not None:
-            drawn = torch.rand(
-                bids.shape[:-1], generator=self.generator, device=self.generator.device
-            ).to(bids.device)
             selected = torch.where(
-                (drawn < self.subset).unsqueeze(-1), selected, outcome.selected_experts
+                self._token_mask(bids.shape[:-1], bids.device).unsqueeze(-1),
+                selected,
+                outcome.selected_experts,
             )
         # Which tokens this layer actually moved, as a set rather than a draw:
         # a Gumbel that does not reorder the top-k leaves the route alone, and a
@@ -265,6 +296,7 @@ def alternative_routes(
     generator.manual_seed(seed)
     original = {index: layer.gate for index, layer in layers.items()}
     wrappers: dict[int, GumbelTopKRoute] = {}
+    shared_mask: dict[tuple[int, ...], torch.Tensor] = {}
     try:
         for index, layer in layers.items():
             gate = original[index]
@@ -273,7 +305,7 @@ def alternative_routes(
                     f"layer {index} is gated by {type(gate).__name__}, not the auction; a "
                     "counterfactual route is defined against the arm's own bids"
                 )
-            wrappers[index] = GumbelTopKRoute(gate, generator, scale, subset)
+            wrappers[index] = GumbelTopKRoute(gate, generator, scale, subset, shared_mask)
             layer.gate = wrappers[index]
         yield wrappers
     finally:
@@ -321,8 +353,16 @@ def counterfactual_gaps(
     better = torch.zeros_like(executed.log_probs)
     moved_better = torch.zeros(())
     moved_total = torch.zeros(())
+    moved_magnitude = torch.zeros(())
     still_better = torch.zeros(())
     still_total = torch.zeros(())
+    still_magnitude = torch.zeros(())
+    # #58's second guardrail: on the tokens the body is most sure of, the
+    # executed route must not be beaten by the median alternative, or what the
+    # read measures is a router that does not route rather than a scale that
+    # does not matter. Confident is the top quartile of executed log-probability.
+    confident = executed.log_probs >= float(executed.log_probs.quantile(0.75))
+    confident_better = torch.zeros(())
     for draw in range(alternatives):
         with alternative_routes(model, seed + draw, scale, subset, device) as wrappers:
             alternative = read_probe(model, batches, device, wrappers)
@@ -333,22 +373,59 @@ def counterfactual_gaps(
         better += improved.float()
         assert alternative.rerouted is not None
         moved = alternative.rerouted
+        # The rate says how often a draw helps; the magnitude says by how much.
+        # A symmetric perturbation gives a rate near one half whatever its size,
+        # so the rate alone cannot tell "the route does not matter" from "the
+        # route matters and the perturbation is symmetric".
+        swing = (alternative.log_probs - executed.log_probs).abs()
         moved_better += float((improved & moved).sum())
         moved_total += float(moved.sum())
+        moved_magnitude += float(swing[moved].sum())
         still_better += float((improved & ~moved).sum())
         still_total += float((~moved).sum())
+        still_magnitude += float(swing[~moved].sum())
+        confident_better += float((improved & confident).sum())
     gap = best - executed.log_probs
+
+    def rate(hits: torch.Tensor, population: torch.Tensor) -> float | None:
+        """A rate, or ``None`` where too few pairs stand behind it to be one.
+
+        Under a full reroute every token moves at some layer, so the unmoved
+        population is empty or a handful, and a rate over six pairs recorded
+        beside one over a million is a number nobody can read -- #58's own trap
+        list calls it a number with no run directory behind it.
+        """
+        return float(hits / population) if float(population) >= MIN_POPULATION else None
+
     return {
         "best_minus_executed": gap,
         "alternatives_better_than_executed": better / alternatives,
         # The confound, separated rather than bounded: among draw-token pairs
-        # whose own route moved, how often the change helped -- against the same
-        # rate on the pairs whose route did not move, where only the stream
-        # upstream of them changed. The difference is the route's own effect and
-        # the second number is its control.
-        "moved_better": float(moved_better / moved_total) if float(moved_total) else float("nan"),
-        "unmoved_better": float(still_better / still_total) if float(still_total) else float("nan"),
-        "moved_fraction": float(moved_total) / (alternatives * executed.tokens),
+        # whose own route moved, how often the change helped *and by how much* --
+        # against the same pair on the tokens whose route did not move, where
+        # only the stream upstream of them changed. The difference is the
+        # route's own effect and the second is its control. The magnitude is
+        # there because a symmetric perturbation gives a rate near one half
+        # whatever its size, so the rate alone cannot tell "the route does not
+        # matter" from "the route matters and the perturbation is symmetric".
+        "moved_better": rate(moved_better, moved_total),
+        "unmoved_better": rate(still_better, still_total),
+        "moved_swing": rate(moved_magnitude, moved_total),
+        "unmoved_swing": rate(still_magnitude, still_total),
+        "moved_pairs": float(moved_total),
+        "unmoved_pairs": float(still_total),
+        "moved_fraction": (
+            float(moved_total) / (alternatives * executed.tokens) if alternatives else float("nan")
+        ),
+        # #58's second guardrail, on the quarter of tokens the body is surest
+        # of: the executed route must not be beaten by the median alternative,
+        # or what the read measures is a router that does not route rather than
+        # a scale that does not matter.
+        "confident_better": (
+            float(confident_better / (alternatives * float(confident.sum())))
+            if alternatives and float(confident.sum())
+            else float("nan")
+        ),
     }
 
 
@@ -449,6 +526,33 @@ def verify_recorded_loss(
         )
 
 
+def _separation(read: dict[str, Any], suffix: str) -> dict[str, Any]:
+    """The own-route-against-stream pair, its magnitudes, and the pairs behind each.
+
+    ``own_route_effect`` is ``None`` unless both populations cleared
+    ``MIN_POPULATION``: a difference of two rates, one of which stands on six
+    pairs, is not a reading and must not reach a table as one.
+    """
+    moved, unmoved = read["moved_better"], read["unmoved_better"]
+    swing, unmoved_swing = read["moved_swing"], read["unmoved_swing"]
+    return {
+        f"counterfactual/moved_better{suffix}": moved,
+        f"counterfactual/unmoved_better{suffix}": unmoved,
+        f"counterfactual/moved_swing{suffix}": swing,
+        f"counterfactual/unmoved_swing{suffix}": unmoved_swing,
+        f"counterfactual/own_route_effect{suffix}": (
+            moved - unmoved if moved is not None and unmoved is not None else None
+        ),
+        f"counterfactual/own_route_swing{suffix}": (
+            swing - unmoved_swing if swing is not None and unmoved_swing is not None else None
+        ),
+        f"counterfactual/moved_pairs{suffix}": read["moved_pairs"],
+        f"counterfactual/unmoved_pairs{suffix}": read["unmoved_pairs"],
+        f"counterfactual/moved_fraction{suffix}": read["moved_fraction"],
+        f"counterfactual/confident_better{suffix}": read["confident_better"],
+    }
+
+
 def read_one(
     checkpoint: Path,
     args: argparse.Namespace,
@@ -480,10 +584,7 @@ def read_one(
     reading["counterfactual/alternatives_better"] = float(
         read["alternatives_better_than_executed"].mean()
     )
-    reading["counterfactual/moved_better"] = read["moved_better"]
-    reading["counterfactual/unmoved_better"] = read["unmoved_better"]
-    reading["counterfactual/own_route_effect"] = read["moved_better"] - read["unmoved_better"]
-    reading["counterfactual/moved_fraction"] = read["moved_fraction"]
+    reading.update(_separation(read, ""))
     if floor is not None:
         fragile = gap > floor
         reading.update(
@@ -515,8 +616,7 @@ def read_one(
             args.seed,
         )
         reading["counterfactual/mean_gap_subset"] = float(bounded["best_minus_executed"].mean())
-        reading["counterfactual/moved_better_subset"] = bounded["moved_better"]
-        reading["counterfactual/unmoved_better_subset"] = bounded["unmoved_better"]
+        reading.update(_separation(bounded, "_subset"))
         if floor is not None:
             subset_fragile = float((bounded["best_minus_executed"] > floor).float().mean())
             reading["counterfactual/fragile_fraction_subset"] = subset_fragile
@@ -524,8 +624,14 @@ def read_one(
                 subset_fragile - reading["counterfactual/fragile_fraction"]
             )
     if args.floor_against is not None:
-        against_model, against_batches, _, against = read_checkpoint(
+        against_model, against_batches, against_split, against = read_checkpoint(
             Path(args.floor_against), args.probe_tokens, args.batch_size, args.device
+        )
+        # The floor every effect is read against is defined by this checkpoint,
+        # so it gets the same proof of restoration the read's own does: #29's
+        # trap does not stop applying because a checkpoint is the reference.
+        verify_recorded_loss(
+            against_model, against_split, args.batch_size, device, against, args.loss_tolerance
         )
         replicate = read_probe(against_model, against_batches, device)
         difference = (replicate.log_probs - executed.log_probs).abs()

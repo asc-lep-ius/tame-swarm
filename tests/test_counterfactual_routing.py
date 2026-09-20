@@ -7,6 +7,7 @@ the gate comes back afterwards, that zeroing the cells is reversible, and that a
 subset read leaves most tokens on the route they executed.
 """
 
+import math
 import sys
 from pathlib import Path
 
@@ -164,16 +165,27 @@ def test_an_alternative_route_is_a_different_route_at_the_same_compute(body, bat
     assert torch.equal(win_share(body, batches), executed)
 
 
-def test_a_subset_read_leaves_most_tokens_on_the_route_they_executed(body, batches):
-    """The upstream confound is bounded by rerouting a tenth, not everything."""
-    executed = win_share(body, batches)
+def test_a_subset_read_reroutes_the_fraction_of_tokens_it_says(body, batches):
+    """`--subset 0.1` means a tenth of tokens, not a tenth of layer-token pairs.
 
-    with alternative_routes(body, seed=1, scale=1.0, subset=0.1, device=DEVICE):
-        subset = win_share(body, batches)
-    with alternative_routes(body, seed=1, scale=1.0, subset=None, device=DEVICE):
-        everything = win_share(body, batches)
+    The first version drew the mask independently inside each converted layer,
+    so a token was left alone only with probability (1 - subset) ** layers: on
+    the body's sixteen converted layers `--subset 0.1` rerouted 61% of tokens
+    and the stream-only control was 39% of them rather than 90%. One mask per
+    draw, shared across the layers, is what makes the flag mean what it says.
+    """
+    executed = read_probe(body, batches, DEVICE)
 
-    assert float((subset - executed).abs().sum()) < float((everything - executed).abs().sum())
+    tenth = counterfactual_gaps(
+        body, batches, DEVICE, executed, alternatives=8, scale=1.0, subset=0.1, seed=0
+    )
+    everything = counterfactual_gaps(
+        body, batches, DEVICE, executed, alternatives=8, scale=1.0, subset=None, seed=0
+    )
+
+    assert tenth["moved_fraction"] < everything["moved_fraction"]
+    # Two converted layers here, so a per-layer draw would read about 0.19.
+    assert tenth["moved_fraction"] == pytest.approx(0.1, abs=0.06)
 
 
 def test_the_gate_comes_back_even_when_the_read_raises(body, batches):
@@ -314,8 +326,11 @@ def test_the_own_route_effect_is_separated_from_the_stream_it_changes(body, batc
     )
 
     assert 0.0 < read["moved_fraction"] < 1.0
-    assert 0.0 <= read["moved_better"] <= 1.0
-    assert 0.0 <= read["unmoved_better"] <= 1.0
+    assert read["moved_pairs"] + read["unmoved_pairs"] == pytest.approx(6 * executed.tokens)
+    assert 0.0 <= (read["moved_better"] or 0.0) <= 1.0
+    # The magnitude rides beside the rate, because a symmetric perturbation
+    # gives a rate near one half whatever its size.
+    assert (read["moved_swing"] or 0.0) > 0.0
     # The mask has to be the read's own, per draw: a token counted as moved in
     # a draw that left it alone would put the upstream effect into the route's.
     with alternative_routes(body, seed=0, scale=1.0, subset=None, device=DEVICE) as wrappers:
@@ -325,14 +340,35 @@ def test_the_own_route_effect_is_separated_from_the_stream_it_changes(body, batc
     assert read_probe(body, batches, DEVICE).rerouted is None
 
 
-def test_a_subset_read_moves_fewer_tokens_than_a_full_one(body, batches):
+def test_a_rate_with_too_few_pairs_behind_it_is_not_reported_as_a_rate(body, batches):
+    """Under a full reroute the unmoved population is empty, and an empty rate is not one.
+
+    The recorded every-token read had `moved_fraction` exactly 1.0, so its
+    `unmoved_better` stood on nothing and was tabled anyway. `None` is what a
+    population under `MIN_POPULATION` now produces, so `compare_runs.py` cannot
+    read it as a number.
+    """
+    from counterfactual_routing import MIN_POPULATION
+
     executed = read_probe(body, batches, DEVICE)
 
-    full = counterfactual_gaps(
-        body, batches, DEVICE, executed, alternatives=4, scale=1.0, subset=None, seed=0
-    )
-    tenth = counterfactual_gaps(
-        body, batches, DEVICE, executed, alternatives=4, scale=1.0, subset=0.1, seed=0
+    read = counterfactual_gaps(
+        body, batches, DEVICE, executed, alternatives=2, scale=8.0, subset=None, seed=0
     )
 
-    assert tenth["moved_fraction"] < full["moved_fraction"]
+    assert read["unmoved_pairs"] < MIN_POPULATION
+    assert read["unmoved_better"] is None
+    assert read["unmoved_swing"] is None
+
+
+def test_a_read_with_no_alternatives_is_the_floor_pass_and_does_not_divide_by_zero(body, batches):
+    """`--alternatives 0` is step 1 of #58's own procedure; it must still run."""
+    executed = read_probe(body, batches, DEVICE)
+
+    read = counterfactual_gaps(
+        body, batches, DEVICE, executed, alternatives=0, scale=1.0, subset=None, seed=0
+    )
+
+    assert math.isnan(read["moved_fraction"])
+    assert math.isnan(read["confident_better"])
+    assert bool((read["best_minus_executed"] == 0).all())
