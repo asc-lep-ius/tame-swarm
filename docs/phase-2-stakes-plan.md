@@ -127,6 +127,15 @@ discriminator a single lag cannot pass; #56 and #57 are a stack, not siblings.
    #47 and #44 follow it.
 10. **Measure whether routing matters before building a substrate where it
     would.** #58 reads #39's checkpoints; #48 opens only on its line.
+11. **The body configuration is a fork, and keeping it is an option.** Three
+    causes keep the organism from caring about its cells: an objective whose
+    shape does not need routing (a corpus knob), cells that own too little of
+    the output (rank, upcycling, a smaller body), and a goal the organism is
+    indifferent to (#42's margins as setpoints, actuators through cells only).
+    #58's fragile fraction and adapter footprint inform the choice and do not
+    make it; #60 carries the options with their costs, the current
+    configuration first, and the operator settles it before any body
+    confirmation. Section 8 rule 5 names the corpus as a knob.
 
 ### Order of work, amended again
 
