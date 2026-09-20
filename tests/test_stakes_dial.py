@@ -27,6 +27,7 @@ from synthetic_economy import (  # noqa: E402
     shuffled,
 )
 
+from goal_field import GOAL_ERROR_UNIT_COST  # noqa: E402
 from mob import (  # noqa: E402
     PERSISTENCE_DECOUPLED,
     PERSISTENCE_SHUFFLED,
@@ -323,13 +324,39 @@ def test_a_field_with_a_negative_dose_is_refused():
 # --- The fingerprint ---------------------------------------------------------------------
 
 
-def test_the_dial_is_the_variable_under_test_and_the_dose_is_a_confound():
+def test_the_dial_and_the_dose_are_both_variables_under_test_and_the_goals_are_not():
+    """#54 reversed the dose, and says why in ``parity.VARYING_FIELDS``.
+
+    The dose was a confound while the only comparison anyone made was between
+    arms at one dose. Signature 1's primary on the body *is* the shift between
+    two dose levels of one arm, so refusing that pair refuses the measurement.
+    Which goals were paid for did not reverse: two arms paid for different goals
+    are a different experiment, not a dose apart.
+    """
     decoupled = replace(BASE, persistence_coupling=PERSISTENCE_DECOUPLED)
     assert_parity([BASE, decoupled])
     assert {BASE.arm, decoupled.arm} == {"mob", "mob~decoupled"}
 
-    with pytest.raises(ParityError, match="goal_doses"):
-        assert_parity([BASE, replace(decoupled, goal_doses=(0.5,))])
+    paid = replace(BASE, goal_fields=("truthful",), goal_doses=(GOAL_ERROR_UNIT_COST,))
+    assert_parity([paid, replace(paid, goal_doses=(4 * GOAL_ERROR_UNIT_COST,))])
+
+    with pytest.raises(ParityError, match="goal_fields"):
+        assert_parity([paid, replace(paid, router="softmax", goal_fields=("safe",))])
+
+
+def test_two_dose_groups_of_one_arm_carry_one_label_and_the_same_arm_twice_is_still_refused():
+    """What the label check gave up, and what replaced it.
+
+    The dose is not in ``arm_label``, so the two dose groups of the primary read
+    as one arm in every table; distinctness is over the variables under test
+    instead, which still catches the mistake the label check was there for.
+    """
+    paid = replace(BASE, goal_fields=("truthful",), goal_doses=(GOAL_ERROR_UNIT_COST,))
+    other_dose = replace(paid, goal_doses=(4 * GOAL_ERROR_UNIT_COST,))
+    assert paid.arm == other_dose.arm == "mob"
+
+    with pytest.raises(ParityError, match="distinct"):
+        assert_parity([paid, paid])
 
 
 # --- The goal fields on the differentiated fixture ---------------------------------------

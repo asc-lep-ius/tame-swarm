@@ -45,14 +45,25 @@ class ValueSummary(NamedTuple):
     ``mean_realised_value`` is the calibration check -- a trained head's report
     should sit at the mean of the value it realises, not above it, which the
     clamped target this replaced could not deliver. Slots handed out by
-    exploration are excluded from all four: they were not traded, so they say
+    exploration are excluded from all six: they were not traded, so they say
     nothing about the market.
+
+    ``mean_goal_term`` and ``goal_share`` are #54's, and they exist because
+    without them a null cannot be told from a mechanism that never mattered. The
+    goal term (#33) is *already inside* ``mean_realised_value`` by the time this
+    is built, so the share is the fraction of what a cell was paid that the goal
+    accounted for, not a ratio of two independent quantities. Both are absolute
+    values: the term is signed per slot and the signs would otherwise cancel into
+    a small mean over a large effect. Zero with no field attached, which is every
+    arm before #54 and the correct reading of one.
     """
 
     mean_realised_value: torch.Tensor
     mean_report: torch.Tensor
     mean_price: torch.Tensor
     mean_surplus: torch.Tensor
+    mean_goal_term: torch.Tensor
+    goal_share: torch.Tensor
 
 
 def realised_values(contributions: torch.Tensor, output_gradient: torch.Tensor) -> torch.Tensor:
@@ -432,7 +443,7 @@ class WealthUpdateMixin:
             self.last_realised_values = values
             self.last_goal_terms = goal_terms
             self.last_value_summary = self._summarise_values(
-                values, confidences, selected_experts, payments, explored, valid_mask
+                values, confidences, selected_experts, payments, explored, valid_mask, goal_terms
             )
             self._loss_feedback_pending = False
             self._cached_values = None
@@ -501,6 +512,7 @@ class WealthUpdateMixin:
         payments: torch.Tensor | None,
         explored: torch.Tensor | None,
         valid_mask: torch.Tensor,
+        goal_terms: torch.Tensor | None = None,
     ) -> ValueSummary:
         traded = valid_mask.unsqueeze(-1).expand_as(values)
         if explored is not None:
@@ -508,7 +520,7 @@ class WealthUpdateMixin:
 
         zero = torch.zeros((), device=values.device)
         if not traded.any():
-            return ValueSummary(zero, zero, zero, zero)
+            return ValueSummary(zero, zero, zero, zero, zero, zero)
 
         realised = values[traded]
         reports = torch.gather(confidences.float(), -1, selected_experts)[traded]
@@ -517,11 +529,24 @@ class WealthUpdateMixin:
         else:
             price = torch.zeros_like(realised)
 
+        # Absolute, and against the absolute value the term is already part of:
+        # "of what this cell was paid, how much was the goal". A share near zero
+        # on a run launched to price a goal is the state #54 exists to make
+        # visible -- the term present, attached, fingerprinted and too small to
+        # decide anything, which reads in every other column exactly like the
+        # extrinsic-teleology answer.
+        goal = goal_terms.float()[traded].abs() if goal_terms is not None else None
+        mean_goal = goal.mean() if goal is not None else zero
+        scale = realised.abs().mean()
+        share = mean_goal / scale if goal is not None and float(scale) > 0 else zero
+
         return ValueSummary(
             mean_realised_value=realised.mean(),
             mean_report=reports.mean(),
             mean_price=price.mean(),
             mean_surplus=(realised - price).mean(),
+            mean_goal_term=mean_goal,
+            goal_share=share,
         )
 
     def _settle_in_forward(

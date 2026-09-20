@@ -5,6 +5,7 @@ what a unit test can pin is that the floor is the same estimator ``aggregate``
 uses across seeds, at n = 2, so ``compare_runs.py`` can pool the two.
 """
 
+import json
 import math
 import sys
 from pathlib import Path
@@ -17,10 +18,12 @@ from run_seeds import (  # noqa: E402
     aggregate,
     build_parser,
     format_table,
+    goal_term_metrics,
     measure_replication,
     replication_std,
 )
 
+from goal_field import parse_goal_doses  # noqa: E402
 from parity import arm_label  # noqa: E402
 from train import TrainingConfig  # noqa: E402
 
@@ -109,3 +112,56 @@ def test_the_sweep_takes_the_stakes_dial_and_names_the_arm_by_it():
     assert build_parser().parse_args([]).persistence_coupling == "value"
     assert arm_label("mob", None, "truthful", "decoupled") == "mob@truthful~decoupled"
     assert arm_label("mob", None, None, "value") == "mob"
+
+
+def test_the_goal_term_reading_is_lifted_out_of_the_run_s_own_metrics_file(tmp_path):
+    """The share the preregistration reads before the primary has to reach the summary.
+
+    It is a training-step measurement, so it is in ``metrics.jsonl`` and never in
+    ``eval_history``, which is where every other headline metric comes from. Last
+    line wins, because the summary describes the run as it ended.
+    """
+    lines = [
+        {"step": 0, "train/loss": 3.1, "auction/mean_goal_term": 0.001, "auction/goal_share": 0.01},
+        {"step": 10, "eval/loss": 2.9},
+        {
+            "step": 20,
+            "train/loss": 2.8,
+            "auction/mean_goal_term": 0.004,
+            "auction/goal_share": 0.07,
+        },
+    ]
+    (tmp_path / "metrics.jsonl").write_text("\n".join(json.dumps(line) for line in lines) + "\n")
+
+    assert goal_term_metrics(tmp_path) == {
+        "auction/mean_goal_term": 0.004,
+        "auction/goal_share": 0.07,
+    }
+
+
+def test_an_arm_with_no_auction_contributes_no_goal_term_row(tmp_path):
+    """Empty, not zero: the dense arm has no economy, which is not a term of size nothing."""
+    (tmp_path / "metrics.jsonl").write_text(json.dumps({"step": 0, "train/loss": 3.1}) + "\n")
+
+    assert goal_term_metrics(tmp_path) == {}
+    assert goal_term_metrics(tmp_path / "nowhere") == {}
+
+
+def test_the_sweep_takes_a_dose_per_goal_and_reaches_the_fingerprint_with_it():
+    """#54's dose axis, from the flag to the tuples the fingerprint carries.
+
+    The arm label is deliberately *not* asked to change: the two dose groups of
+    signature 1's primary are one arm read at two doses, and putting the dose in
+    the label would rename every table row the fixture already recorded.
+    """
+    args = build_parser().parse_args(["--goal_dose", "truthful=0.068,safe=0.017"])
+    goals, doses = parse_goal_doses(args.goal_dose)
+
+    assert (goals, doses) == (("truthful", "safe"), (0.068, 0.017))
+    config = TrainingConfig(
+        mob_layers_start=6, mob_layers_end=22, goal_fields=goals, goal_doses=doses
+    )
+    assert (config.goal_fields, config.goal_doses) == (goals, doses)
+
+    assert build_parser().parse_args([]).goal_dose is None
+    assert parse_goal_doses(build_parser().parse_args([]).goal_dose or ()) == ((), ())

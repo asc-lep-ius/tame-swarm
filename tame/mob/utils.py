@@ -301,6 +301,11 @@ def get_mob_statistics(model: nn.Module) -> dict[str, torch.Tensor | list[torch.
         ).mean()
         statistics["mean_report"] = torch.stack([s.mean_report for s in summaries]).mean()
         statistics["mean_win_surplus"] = torch.stack([s.mean_surplus for s in summaries]).mean()
+        # #54. Zero on every arm that pays for no goal, which is the honest
+        # reading of one; on an arm that does, this is what says whether the term
+        # was big enough for a null about it to mean anything.
+        statistics["mean_goal_term"] = torch.stack([s.mean_goal_term for s in summaries]).mean()
+        statistics["goal_share"] = torch.stack([s.goal_share for s in summaries]).mean()
 
     return statistics
 
