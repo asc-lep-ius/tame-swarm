@@ -791,6 +791,32 @@ the same kind (a different attention-backward kernel, a floor-sized effect),
 declared rather than refused, so #32's arms can still be read against #28's
 under that flag.
 
+**The floors on record, and borrowing one ([#56](https://gitlab.hephaestus/mipkovich/tame-swarm/-/issues/56)).**
+A replicate measures the run-to-run floor and nothing else, and it is a quarter
+of a four-run group. [#39](#stakes-dial-cell)'s body sweep spent six of them —
+about two GPU-hours — to record a floor of exactly zero in all six groups, at
+one configuration. Preregistration section 8, rule 4 is what came of that:
+replicates are spent where the floor is *unmeasured*, and a sweep at a
+configuration whose floor is recorded names the floor it borrows instead
+(`run_seeds.py --no-replicate --floor_recorded_at <run dir>`). The recorded
+zeros, and the knobs each was measured at:
+
+| Floor | Run directory | Measured at |
+|---|---|---|
+| Zero on every row, six groups (`value`/`decoupled`/`shuffled` × r1/r4), seed 0 run twice per group | `~/tame-runs/39-stakes-dial/body/r{1,4}/{value,decoupled,shuffled}` | Qwen3-1.7B, `cuda`, bfloat16, `mob`, `--use_lora` (LoRA rank 16, alpha 32, dropout 0.05), `--adapter_rank 32`, 4 experts, `top_k` 2, `--layers 6:22` (16 converted), `--max_seq_length 512`, batch 2 × 2 accumulation, 2000 steps, wikitext-2-raw-v1, no gradient checkpointing, `strict`; code `79c1b17`, clean |
+| Zero on every row, β 0.3 arm, 2000 steps, field on and coupled | [#32](#dose-sweep-32)'s sweep | the same configuration, code `91558b6` |
+| `eval/loss` 0.00037, an expert's win share 0.010 — **not** zero, and the floor for every arm recorded before #31 | #25's replication pair | the same configuration under `warn`, at no recorded SHA |
+
+What may be borrowed is fixed in code rather than by judgement:
+`tame/noise_floor.py` lists the twenty-one fingerprint fields a floor is a
+property of — the shape, the precision, the device, the kernel set — and
+declares a reason for every other field it is not, the way `parity.py` declares
+`NOT_A_CONFOUND`. Two arms of one sweep differ in the ledger's arithmetic and
+not in which kernels run, so a floor travels between them; a run at another
+`adapter_rank` or `max_seq_length` is refused by name, and a borrowed floor is
+never lent onwards. `compare_runs.py` quotes a borrowed floor in the `repl_std`
+column and says under the table whose runs it is.
+
 **Multi-seed harness.** `scripts/run_seeds.py` runs one configuration over
 several seeds and reports mean ± std for every headline metric:
 
@@ -863,6 +889,35 @@ noise gives you for free, not a bar that promises anything. Correcting across
 metrics is deliberately *not* done: the declared primary is what the comparison
 rests on, and a correction would only be needed if the secondaries were being
 read as results.
+
+**Power before GPU ([#56](https://gitlab.hephaestus/mipkovich/tame-swarm/-/issues/56)).**
+A comparison read the way the paragraphs above describe still needs enough runs
+to have been able to come back "yes", and that is a number the fixture can hand
+over for a CPU-minute. [`docs/preregistration.md`](docs/preregistration.md)
+section 8 is the rule — a GPU run is confirmatory, carries a power row before it
+launches, changes its readout forward only, borrows a recorded floor rather than
+re-measuring it, and goes back to the fixture rather than to a budget request
+when it does not fit the 15 GPU-hour ceiling — and `scripts/power.py` is what
+makes it a command. It turns a paired effect size into the paired seeds a side
+that buys 80% power under a paired t (`scipy.stats.nct`, never the normal
+approximation, which reads 10 where the exact calculation reads 13), the runs an
+arm that means and the GPU-hours that implies; reads that effect size off two
+`allocation_shift.py --json` files with `ρ`, the seed-level correlation the
+pairing rests on, printed beside it; plans a sequential design in batches with a
+family-wise boundary over its looks (AdaStop's shape); and measures what a
+readout calls a difference when there is none, by splitting one arm's runs in
+two (Colas et al. 2018). Its first three answers about this project's own
+numbers are worth stating here: [#39](#stakes-dial-cell)'s primary needs 13
+paired seeds and 27 GPU-hours, its self-reference contrast needs 348 and about
+700, and at three paired seeds the percentile range excludes zero a quarter of
+the time under any symmetric null — that last one is arithmetic (all three
+deltas share a sign with probability 2 × 0.5³), not a property of any arm.
+
+```bash
+uv run python scripts/power.py --dz 0.87            # 13 paired seeds, 26 runs an arm
+uv run python scripts/power.py --shifts shift_value.json shift_decoupled.json
+uv run python scripts/power.py --dz 0.87 --plan     # refused: 26.6 GPU-h over the ceiling
+```
 
 **Noise floor.** Measured by running one configuration three times at a fixed
 step budget and reading the spread `run_seeds.py` reports. Current number —

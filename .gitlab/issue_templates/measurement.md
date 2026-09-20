@@ -42,6 +42,8 @@
 | Command | <!-- the exact `uv run python scripts/…` invocation, so a re-run is a copy --> |
 | Code | <!-- commit SHA the numbers come from; the fingerprint does not carry it --> |
 | Cost | <!-- GPU-hours or CPU-minutes, stated before running; the GPU is one box --> |
+| Power | <!-- REQUIRED before a confirmatory GPU run, and filled from the fixture rather than from hope (preregistration section 8, `scripts/power.py`): the paired effect size dz the fixture measured, the readout it was measured with, the paired seeds a side that buys at 80% power under a paired t, the runs an arm that means, and the GPU-hours that implies — with the fixture-to-body discount beside it as a stated assumption, never as a measurement. A run with no power row is exploratory whatever this issue says, and its rows are labelled so: #39 spent 8.2 GPU-hours to learn that the contrast it was about needed 700. Over the 15 GPU-hour ceiling the design goes back to the fixture (#57, #48), never to a budget request, and never to a smaller fingerprint knob — that invalidates the dose unit and the recorded floor both. Example: "dz 0.87 (TV shift, fixture, 3 seeds, `power.py --shifts`) → 13 paired seeds a side, 26 runs an arm, ~27 GPU-h over three arms; fixture→body discount assumed 1×" --> |
+| Replicate | <!-- measured, or borrowed with `--no-replicate --floor_recorded_at <run dir>` naming the sweep whose replicate measured this configuration's floor (section 8 rule 4). A replicate measures the run-to-run floor and nothing else, so at a configuration whose floor is recorded it is a quarter of the sweep spent on a known number --> |
 
 ## Noise floor and resolution
 
