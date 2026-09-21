@@ -46,6 +46,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tame"))
 
 from allocation_shift import DEFAULT_READOUT  # noqa: E402
 from measure_stakes_dial import (  # noqa: E402
+    FIXTURE,
     GOAL_TYPES,
     RATIOS,
     READING_WINDOW,
@@ -54,6 +55,7 @@ from measure_stakes_dial import (  # noqa: E402
     STEPS,
     TAIL,
     WEALTH_HORIZON,
+    fixture_fingerprint,
     share_columns,
     type_wins,
 )
@@ -176,6 +178,26 @@ def sweep_lever_one(seeds: tuple[int, ...], steps: int) -> dict[str, Any]:
                 "shuffled": other,
                 "dz": dz,
                 "paired_seeds_at_80": pairs,
+                # Recorded per grid cell rather than per run: the two ratios are
+                # what this grid varies, and a cell whose fingerprint says it ran
+                # at the recorded fixture is a cell no later comparison can
+                # refuse. `parity.assert_parity` refuses two of these against
+                # each other, which is the point of writing them down.
+                "fingerprints": {
+                    arm: {
+                        str(seed): fixture_fingerprint(
+                            FIXTURE,
+                            seed,
+                            arm,
+                            (RATIOS[0] * REFERENCE_DOSE, REFERENCE_DOSE),
+                            steps,
+                            cells=cells,
+                            contribution_scale=scale,
+                        ).as_dict()
+                        for seed in seeds
+                    }
+                    for arm in (PERSISTENCE_VALUE, PERSISTENCE_SHUFFLED)
+                },
             }
             print(
                 f"  {cells:>6}{sets:>7}{scale:>7.1f}"

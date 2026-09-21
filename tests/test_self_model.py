@@ -10,20 +10,26 @@ is pinned here is the knob that survives -- how much of the token the cells own
 """
 
 import sys
-from dataclasses import replace
+from dataclasses import asdict, replace
 from pathlib import Path
 
+import pytest
 import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "tame"))
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
+from measure_stakes_dial import FIXTURE, fixture_fingerprint  # noqa: E402
 from synthetic_economy import (  # noqa: E402
     BASE_CONFIG,
     DEFAULT_COMPETENCE,
     DifferentiatedEconomy,
     shuffled,
 )
+
+from parity import ArmFingerprint, ParityError, assert_parity  # noqa: E402
+
+from .arm_fingerprints import BASE
 
 
 def economy(**overrides) -> DifferentiatedEconomy:
@@ -77,3 +83,53 @@ def test_the_contribution_scale_is_what_the_cells_own_of_the_output():
     # And it reaches the loss, which is what makes it a ratio the organism can
     # notice rather than a number in a config.
     assert plain.step().loss != louder.step().loss
+
+
+def test_parity_refuses_two_arms_that_own_different_amounts_of_the_token():
+    """The confound that withdrew the grid, made unrepeatable.
+
+    The scale multiplies realised value, reward and price and leaves the wealth
+    band where it is, so two arms at different scales are two economies rather
+    than two arms of one: at 2x the `value` arm spends most of its cell-steps on
+    the ceiling while `shuffled` piles at the floor. Nothing in the run record
+    said so, which is why the grid was read as a contrast for a day.
+    """
+    with pytest.raises(ParityError, match="contribution_scale"):
+        assert_parity(
+            [
+                replace(BASE, persistence_coupling="value"),
+                replace(BASE, persistence_coupling="shuffled", contribution_scale=2.0),
+            ]
+        )
+
+
+def test_a_fingerprint_recorded_before_the_scale_existed_reads_as_the_recorded_fixture():
+    """Every run before #60 owned exactly one unit of the token, so a legacy row is 1.0."""
+    recorded = {key: value for key, value in asdict(BASE).items() if key != "contribution_scale"}
+
+    assert ArmFingerprint(**recorded) == BASE
+    assert BASE.contribution_scale == 1.0
+
+
+def test_the_fixture_fingerprint_carries_the_grid_cell_it_actually_ran_at():
+    """It carried the recorded fixture's cell count whatever the grid asked for.
+
+    A run at four cells and twice the correction fingerprinted as eight cells at
+    one, so two rows of #60's grid compared clean against each other and against
+    every run recorded before the grid existed.
+    """
+    run = fixture_fingerprint(
+        FIXTURE, seed=0, arm="value", doses=(0.25,), steps=10, cells=16, contribution_scale=2.0
+    )
+
+    assert run.num_experts == 16
+    assert run.contribution_scale == 2.0
+    with pytest.raises(ParityError, match="contribution_scale"):
+        assert_parity(
+            [
+                run,
+                fixture_fingerprint(
+                    FIXTURE, seed=0, arm="shuffled", doses=(0.25,), steps=10, cells=16
+                ),
+            ]
+        )

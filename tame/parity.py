@@ -343,6 +343,17 @@ class ArmFingerprint:
     stress_gamma: float = 0.0
     stress_gate_sigma: float = 1.0
     stress_gate_mode: str = "fixed"
+    # #60's lever 1: what the cells own of the token, as a multiple of the
+    # recorded fixture's planted correction. Asserted equal rather than varying,
+    # and that is the finding rather than a convention. The scale multiplies
+    # realised value, reward and price while `initial_wealth`, `min_wealth` and
+    # `max_wealth` stay where they are, so two arms at different scales run
+    # against different effective wealth bands: at 2x the `value` arm spends
+    # 84-86% of its cell-steps on the ceiling and at 4x every ledger is exactly
+    # `max_wealth`. They are two economies and not two arms of one, which is the
+    # confound that withdrew #60's grid. A legacy fingerprint reads as 1.0,
+    # which is what every run before #60 was.
+    contribution_scale: float = 1.0
     # #46's readiness register: one field per autonomy the tissue may be granted,
     # named exactly as the flag in ``readiness.ReadinessConfig``. Off in every run
     # there has been, so a legacy fingerprint reads as a run that granted none.
