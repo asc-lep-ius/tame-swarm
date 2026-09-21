@@ -404,3 +404,23 @@ def test_the_confident_token_guardrail_is_pinned_by_direction_and_denominator(bo
         body, batches, DEVICE, hopeless, alternatives=4, scale=1.0, subset=None, seed=0
     )
     assert certain["confident_better"] == pytest.approx(1.0)
+
+    # Which tokens count as confident is half the published claim, and the three
+    # cases above do not pin it: a review mutated the selection to the *bottom*
+    # quartile and every test in this module stayed green. Penalise the top
+    # quartile and the confident set moves down a band, where the alternatives
+    # do not all win; read on the bottom quartile it would be the penalised
+    # tokens, which they all beat, and this would read 1.0.
+    penalised = executed.log_probs.clone()
+    penalised[penalised >= float(penalised.quantile(0.75))] -= 100.0
+    moved_band = counterfactual_gaps(
+        body,
+        batches,
+        DEVICE,
+        ProbeRead(penalised, executed.token_ids, executed.rerouted),
+        alternatives=4,
+        scale=1.0,
+        subset=None,
+        seed=0,
+    )
+    assert moved_band["confident_better"] < 1.0

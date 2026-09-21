@@ -418,7 +418,7 @@ The differentiation checkpoint is one uncoupled arm at the ablation's own config
 
 **What the read says about the *allocation* is a different thing, and it took three passes to measure it properly.** Rerouting every token at once moves the stream every later token sees, so a gap at token *t* is *t*'s own route and everything upstream of it together. The read draws one mask per draw, shared across the sixteen converted layers, reroutes a tenth of tokens (realised 0.0977), and counts two populations: draw-token pairs whose own route changed, and pairs where only the stream upstream of them did. Two statistics, and they disagree:
 
-- **By sign, nothing.** A draw improves a token whose own route it changed as often as one whose route it left alone — 0.497 against 0.501 on `value` at the reference dose, within 0.004 in five groups and 0.009 on r4 `decoupled`.
+- **By sign, nothing.** A draw improves a token whose own route it changed as often as one whose route it left alone — 0.497 against 0.501 on `value` at the reference dose, within 0.005 in five groups and 0.009 on r4 `decoupled`.
 - **By magnitude, a little.** Moving a token's own route swings its log-probability by **0.031 nats** against **0.026** for the stream alone — an own-route effect of about +0.005 nats, a fifth again on top of what the stream does, and invisible to the rate.
 
 The rate was the statistic the first write-up quoted, and on its own it cannot tell "the route does not matter" from "the route matters and the perturbation is symmetric". The magnitude says it is the second, weakly.
