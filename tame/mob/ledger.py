@@ -104,6 +104,10 @@ class Settlement:
     # other paths.
     values: torch.Tensor | None = None
     output: torch.Tensor | None = None
+    # #59's transmitted stress for this step, per token, or None on a layer that
+    # transmits none. Not per expert: every cell at the layer is charged the
+    # same, which is the mechanism rather than an implementation shortcut.
+    stress: torch.Tensor | None = None
     # How often each expert has held a token. A ledger-side count rather than a
     # step quantity, read only by the inference path's re-entry gift.
     usage_count: torch.Tensor | None = None
@@ -476,6 +480,10 @@ class WealthUpdater:
     # one's -- the invariant
     # ``test_the_shadow_ledger_is_the_live_ledger_at_step_zero_and_not_after`` pins.
     pinned_at: float | None = None
+    # #59's metabolic charge, in wealth per unit of transmitted stress per
+    # token. Zero in every recorded arm, and ``settle`` adds exactly nothing
+    # when it is.
+    stress_lambda: float = 0.0
 
     def __post_init__(self) -> None:
         if self.mode not in SUPPORTED_LEDGER_MODES:
@@ -561,7 +569,7 @@ class WealthUpdater:
             return wealth
         return torch.full_like(wealth, self.pinned_at)
 
-    def settle(self, wealth: torch.Tensor, settlement: Settlement, charge: Charge) -> None:
+    def settle(self, wealth: torch.Tensor, settlement: Settlement, charge: Charge) -> float:
         """Relax the ledger, pay what the step earned, charge what it was priced at.
 
         The charge is passed in rather than held because it is the layer's --
@@ -569,6 +577,21 @@ class WealthUpdater:
         call the settlement makes. Wealth moves by a single transfer: the rebate
         is netted inside the charge, and the gift is added after it because it
         prices no holding and is not part of the trade.
+
+        Returns what the stress charged every cell this step, which the layer
+        records: the calibration that prices the two channels against each
+        other reads it, and so does the sweep that reports what the charge
+        cost. Returned rather than stored because this class is frozen -- a
+        ledger whose parameters can be written after construction is one the
+        fingerprint no longer describes.
+
+        #59's metabolic charge is the last term and it is the same number for
+        every cell: ``lambda`` times the layer's transmitted stress summed over
+        the step's tokens, paid winner or not, so the only way to lower it is to
+        act. It is a term in this one settlement rather than a fourth update
+        path, for the reason this class exists at all -- and at
+        ``stress_lambda = 0``, which is every recorded arm, it adds exactly
+        nothing and the arithmetic is the one that was recorded.
         """
         self.relax(wealth)
 
@@ -584,9 +607,21 @@ class WealthUpdater:
         gift = self.reward.gift(wealth, settlement)
         if gift is not None:
             transfer += gift
+        stress = self.stress_charge(settlement)
+        transfer -= stress
 
         wealth += transfer
         self.floor(wealth)
+        return stress
+
+    def stress_charge(self, settlement: Settlement) -> float:
+        """What the tissue's error costs every cell at this layer this step (#59)."""
+        if self.stress_lambda <= 0.0 or settlement.stress is None:
+            return 0.0
+        stress = settlement.stress
+        if settlement.valid_mask is not None:
+            stress = stress * settlement.valid_mask.to(stress.dtype)
+        return self.stress_lambda * float(stress.sum())
 
     @classmethod
     def for_experts(cls, config: MoBConfig) -> WealthUpdater:
@@ -621,4 +656,5 @@ class WealthUpdater:
                 if config.persistence_coupling == PERSISTENCE_DECOUPLED
                 else None
             ),
+            stress_lambda=config.stress_lambda,
         )

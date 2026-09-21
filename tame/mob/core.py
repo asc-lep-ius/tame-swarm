@@ -23,11 +23,12 @@ from .auction import (
     routing_diagnostics,
 )
 from .experts import ConfidenceHead, Expert, LightweightExpert
-from .goal import GoalField, goal_terms
+from .goal import GoalField, goal_reading, goal_terms
 from .ledger import WealthUpdater
 from .mob_config import MoBConfig
 from .routing_trace import DEFAULT_TRACE_TOKENS, RoutingTrace
 from .softmax_router import SoftmaxRouter
+from .stress import StressConfig, layer_stress
 from .wealth import ValueSummary, WealthUpdateMixin, realised_values
 
 logger = logging.getLogger(__name__)
@@ -221,6 +222,22 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         # Empty by default, so the value definition is what it always was.
         self.goal_fields: list[GoalField] = []
         self._cached_goal_terms: torch.Tensor | None = None
+        # #59: the layer's transmitted stress for the step, and the resting
+        # spread each attached field's error is measured in. Empty until a
+        # caller attaches a field with one, which is what makes the charge
+        # opt-in rather than a default nobody chose.
+        self._cached_stress: torch.Tensor | None = None
+        self._resting_sigmas: list[float | None] = []
+        self.stress_config: StressConfig = config.stress
+        # #59's control, and the only way anything outside this layer can write
+        # its stress: a replayed trajectory from another run, so the cell pays a
+        # charge of the right shape that its own actions cannot lower. If
+        # binding survives it, the effect was the drain and not the stress.
+        # Named on the layer rather than hidden in the experiment for the reason
+        # ``economy_damage.ForcedSubset`` is: a substitution a reader cannot see
+        # is one they cannot rule out.
+        self.stress_override: torch.Tensor | None = None
+        self.last_stress_charge: float = 0.0
         self.last_goal_terms: torch.Tensor | None = None
         self._loss_feedback_pending: bool = False
         self._cached_calibration_loss: torch.Tensor | None = None
@@ -340,6 +357,9 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
             with torch.no_grad():
                 self._cached_goal_terms = goal_terms(
                     contributions, routing_weights.detach(), self.goal_fields, routing_hidden_states
+                )
+                self._cached_stress = self._transmitted_stress(
+                    contributions, routing_weights.detach(), routing_hidden_states
                 )
             self._register_value_hook(output, contributions)
         elif expects_feedback:
@@ -564,14 +584,53 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         self._last_coupling_metrics = None
         self.last_stats = None
 
-    def attach_goal_field(self, field: GoalField) -> None:
+    def _transmitted_stress(
+        self,
+        contributions: torch.Tensor,
+        routing_weights: torch.Tensor,
+        hidden_states: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """The stress this layer transmits this step, or ``None`` when it charges none.
+
+        The first field attached with a resting spread is the layer's own and
+        the rest are its neighbourhood, which on the body is the converted
+        layers above and below carrying the same goal and on the fixture is the
+        layer's other goal field (``mob.stress.layer_stress`` says so). ``None``
+        rather than zero when nothing is attached: a layer with no stress source
+        is not one whose stress measured nothing.
+        """
+        if not self.stress_config.live:
+            return None
+        if self.stress_override is not None:
+            return self.stress_override.expand(contributions.shape[:2])
+        sources = [
+            (field, sigma)
+            for field, sigma in zip(self.goal_fields, self._resting_sigmas, strict=True)
+            if sigma is not None
+        ]
+        if not sources:
+            return None
+        readings = [
+            goal_reading(contributions, routing_weights, field.direction(hidden_states))[0]
+            for field, _ in sources
+        ]
+        return layer_stress(
+            readings,
+            [field.setpoint for field, _ in sources],
+            [sigma for _, sigma in sources],
+            self.stress_config,
+        )
+
+    def attach_goal_field(self, field: GoalField, resting_sigma: float | None = None) -> None:
         """Add a goal field to what every winner is paid for, from the next settlement."""
         if field.dose < 0.0:
             raise ValueError(f"a goal field's dose must be non-negative, got {field.dose}")
         self.goal_fields.append(field)
+        self._resting_sigmas.append(resting_sigma)
 
     def detach_goal_fields(self) -> None:
         self.goal_fields = []
+        self._resting_sigmas = []
         self._cached_goal_terms = None
 
     def get_router_z_loss(self) -> torch.Tensor:

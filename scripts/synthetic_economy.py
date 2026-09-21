@@ -395,6 +395,7 @@ class DifferentiatedEconomy(SyntheticEconomy):
         head_learning_rate: float = 1e-2,
         num_types: int = DEFAULT_NUM_TYPES,
         type_signal: float = DEFAULT_TYPE_SIGNAL,
+        contribution_scale: float = 1.0,
     ):
         if not 1 <= num_types <= competence.numel():
             raise ValueError(f"num_types must lie in [1, {competence.numel()}], got {num_types}")
@@ -405,6 +406,12 @@ class DifferentiatedEconomy(SyntheticEconomy):
             )
         self.num_types = num_types
         self.type_signal = type_signal
+        # #60's lever 1, second ratio: how much of the output the cells own. The
+        # planted corrections are orthonormal, so one is the recorded fixture and
+        # a larger scale is a body whose experts carry more of what the token
+        # wants -- the fixture's analogue of raising the adapter rank, which on
+        # the real body is 3.7% of the residual norm.
+        self.contribution_scale = contribution_scale
         # Assigned before the base class plants, since ``_plant`` reads them. The
         # expert types cycle through the type set and are then shuffled with a
         # generator of their own, so the assignment is fixed by the seed alone.
@@ -431,7 +438,7 @@ class DifferentiatedEconomy(SyntheticEconomy):
         # a percent (``CORRECTION_STD x sqrt(hidden_dim / rank)``), so prices and
         # rewards here are on the same scale the constants were derived on.
         basis = torch.linalg.qr(torch.randn(config.hidden_dim, self.num_types * rank))[0]
-        self.type_corrections = torch.stack(
+        self.type_corrections = self.contribution_scale * torch.stack(
             [basis[:, t * rank : (t + 1) * rank] for t in range(self.num_types)]
         )
         # The input direction that announces each type, orthonormal so the types
@@ -470,16 +477,73 @@ class DifferentiatedEconomy(SyntheticEconomy):
         self.last_types = types
         return x, target
 
-    def add_goal_field(self, expert_type: int, setpoint: float, dose: float) -> TypeGoalField:
-        """Attach a goal field on one type's correction (#33, #39); see ``TypeGoalField``."""
+    def add_goal_field(
+        self,
+        expert_type: int,
+        setpoint: float,
+        dose: float,
+        resting_sigma: float | None = None,
+    ) -> TypeGoalField:
+        """Attach a goal field on one type's correction (#33, #39); see ``TypeGoalField``.
+
+        ``resting_sigma`` makes the field a stress source as well as a payment
+        (#59): the layer charges every cell for the magnitude of this field's
+        error in units of that spread. It is measured on a run of this fixture
+        at no charge, the way the body's is measured on the pristine model
+        before conversion -- ``scripts/measure_stress_coupling.py`` does the
+        measuring, because a spread the mechanism measured on itself while the
+        mechanism was running is not a resting spread.
+        """
         if not 0 <= expert_type < self.num_types:
             raise ValueError(f"expert_type must lie in [0, {self.num_types}), got {expert_type}")
         field = TypeGoalField(self, expert_type, setpoint, dose)
-        self.mob.attach_goal_field(field)
+        self.mob.attach_goal_field(field, resting_sigma=resting_sigma)
         return field
 
     def goal_fields(self) -> Sequence[TypeGoalField]:
         return [field for field in self.mob.goal_fields if isinstance(field, TypeGoalField)]
+
+    def step_goal_setpoint(self, expert_type: int, delta: float) -> TypeGoalField:
+        """Move one attached field's setpoint by ``delta``: the experimenter's step (#57).
+
+        A thermostat is tested by moving the target, not the electricity price,
+        and the error that follows is in the tissue's own variable and the cells'
+        own units. The step is the experimenter's and never the cell's: nothing
+        in the economy can reach this, and the fields stay frozen -- the list is
+        rebuilt in place rather than edited, because a field that can be written
+        after attachment is a field the run's record no longer describes.
+        """
+        fields = list(self.mob.goal_fields)
+        # Carried across the rebuild rather than defaulted away: a field that
+        # came back without its resting spread would stop being a stress source
+        # (#59) at exactly the step the perturbation is applied, and the charge
+        # would go quiet in the phase the primary is read on -- which is how
+        # this was found.
+        sigmas = list(self.mob._resting_sigmas)
+        stepped = None
+        for index, field in enumerate(fields):
+            if isinstance(field, TypeGoalField) and field.expert_type == expert_type:
+                stepped = replace(field, setpoint=field.setpoint + delta)
+                fields[index] = stepped
+        if stepped is None:
+            raise ValueError(f"no goal field is attached on type {expert_type}")
+        self.mob.detach_goal_fields()
+        for field, sigma in zip(fields, sigmas, strict=True):
+            self.mob.attach_goal_field(field, resting_sigma=sigma)
+        return stepped
+
+    def goal_reading(self, field: TypeGoalField, selected: torch.Tensor) -> float:
+        """What the tissue is holding along one field's direction, averaged over tokens.
+
+        The same quantity ``closed_form_goal_terms`` prices the goal error
+        against: the on-type competence the winners delivered at their share.
+        Read here so an experiment can watch the regulated variable itself rather
+        than infer it from what the cells were paid.
+        """
+        k = self.config.top_k
+        delivered = self.competence[selected] / k
+        on_field = self.expert_types[selected] == field.expert_type
+        return float((delivered * on_field).sum(dim=-1).mean())
 
     def closed_form_goal_terms(self, selected: torch.Tensor) -> torch.Tensor:
         """What the goal fields pay every winner slot, per unit share, from the planted numbers.

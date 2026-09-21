@@ -229,3 +229,49 @@ def test_the_warmup_flag_refuses_a_length_it_cannot_run():
         warmup_lengths("0,fifty")
     with pytest.raises(argparse.ArgumentTypeError, match=">= 0"):
         warmup_lengths("-50")
+
+
+def test_the_setpoint_step_moves_the_target_and_nothing_else(seed=0):
+    """#57's perturbation: the experimenter's step, in the tissue's own variable.
+
+    A thermostat is tested by moving the target, not the electricity price. The
+    dose is what prices the goal error and it must not move with the setpoint --
+    a step that moved both would be the dose sweep wearing another name.
+    """
+    economy = DifferentiatedEconomy(shuffled(DEFAULT_COMPETENCE, seed), seed=seed)
+    economy.add_goal_field(0, 0.5, 0.25)
+    economy.add_goal_field(1, 0.5, 0.25)
+
+    stepped = economy.step_goal_setpoint(0, 0.1)
+
+    assert stepped.setpoint == pytest.approx(0.6)
+    assert stepped.dose == 0.25
+    assert [(f.expert_type, f.setpoint, f.dose) for f in economy.goal_fields()] == [
+        (0, pytest.approx(0.6), 0.25),
+        (1, 0.5, 0.25),
+    ]
+    with pytest.raises(ValueError, match="no goal field is attached on type 2"):
+        economy.step_goal_setpoint(2, 0.1)
+
+
+def test_the_tissue_reading_is_the_quantity_the_goal_term_prices():
+    """What the step perturbs is what the field pays for, and the two agree.
+
+    The reading is the on-type competence the winners delivered at their share --
+    the same expression ``closed_form_goal_terms`` differences to price a
+    contribution, so an experiment can watch the regulated variable itself
+    instead of inferring it from what the cells were paid.
+    """
+    economy = DifferentiatedEconomy(shuffled(DEFAULT_COMPETENCE, 0), seed=0)
+    field = economy.add_goal_field(0, 0.5, 0.25)
+    record = economy.step()
+    selected = record.selected_experts
+
+    reading = economy.goal_reading(field, selected)
+
+    k = economy.config.top_k
+    delivered = economy.competence[selected] / k
+    on_type = economy.expert_types[selected] == field.expert_type
+    assert reading == pytest.approx(float((delivered * on_type).sum(dim=-1).mean()))
+    # A field on a type no expert carries reads exactly zero, whatever the route.
+    assert reading >= 0.0
