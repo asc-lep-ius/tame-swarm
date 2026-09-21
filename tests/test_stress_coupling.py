@@ -25,7 +25,12 @@ from synthetic_economy import (  # noqa: E402
     shuffled,
 )
 
-from mob.ledger import LEDGER_SETPOINT, Settlement, WealthUpdater  # noqa: E402
+from mob.ledger import (  # noqa: E402
+    LEDGER_SETPOINT,
+    Charge,
+    Settlement,
+    WealthUpdater,
+)
 from mob.stress import (  # noqa: E402
     STRESS_ATTRIBUTED,
     STRESS_GATE_STATE,
@@ -200,17 +205,24 @@ def test_invariant_6_the_charge_lands_in_the_one_settlement_and_nowhere_else(mon
     """
     coupled = economy(stress_coupling=STRESS_SHARED, stress_lambda=0.01, stress_gamma=0.5)
     updater = coupled.mob.wealth_updater
-    terms: list[tuple[torch.Tensor, torch.Tensor, float]] = []
+    terms: list[tuple[torch.Tensor, torch.Tensor, float, float]] = []
     real_settle = WealthUpdater.settle
 
     # Patched on the class: `WealthUpdater` is frozen, which is the property
     # that makes `settle` return the charge rather than store it.
-    def spying(self, wealth: torch.Tensor, settlement, charge) -> float:
+    def spying(self, wealth: torch.Tensor, settlement: Settlement, charge: Charge) -> float:
         before = wealth.clone()
         # The two signed pieces `settle` composes beside the relaxation: what
         # the reward paid, and what the auction charged. Recomputed from the
-        # same settlement rather than differenced out of the ledger.
-        paid = self.reward(wealth.clone(), settlement)
+        # same settlement rather than differenced out of the ledger -- and
+        # against a *relaxed* ledger, which is what `settle` hands the reward
+        # and what `RewardSignal`'s own contract promises. Today's signal
+        # ignores the values and reads only the shape, so the two agree; a
+        # signal that honoured the contract would have broken this test for a
+        # reason that has nothing to do with the invariant.
+        relaxed = before.clone()
+        self.relax(relaxed)
+        paid = self.reward(relaxed, settlement)
         priced = charge(
             settlement.payments,
             settlement.selected_experts,
@@ -219,8 +231,16 @@ def test_invariant_6_the_charge_lands_in_the_one_settlement_and_nowhere_else(mon
             settlement.rebates,
             settlement.valid_mask,
         )
+        # The fifth term, pinned rather than assumed: `settle` adds a gift
+        # after the charge when the signal offers one, and this equation leaves
+        # it out. Today's returns None; asserting it means a signal that starts
+        # offering one fails here instead of quietly unbalancing the check.
+        assert self.reward.gift(relaxed, settlement) is None
         stress = real_settle(self, wealth, settlement, charge)
-        terms.append((before, paid - priced, stress))
+        # `self.decay`, not the enclosing scope's: one layer today, and the
+        # equation should be about the ledger that settled rather than about
+        # there being only one.
+        terms.append((before, paid - priced, stress, self.decay))
         return stress
 
     monkeypatch.setattr(WealthUpdater, "settle", spying)
@@ -228,12 +248,14 @@ def test_invariant_6_the_charge_lands_in_the_one_settlement_and_nowhere_else(mon
         coupled.step()
 
     assert terms, "the settlement never ran"
-    assert any(stress > 0.0 for _, _, stress in terms)
-    for index, (before, transfer, stress) in enumerate(terms):
+    assert any(stress > 0.0 for _, _, stress, _ in terms)
+    # The fixture relaxes toward zero, so the setpoint half of `relax` is not
+    # exercised here. Asserted rather than left to a dead branch a reader would
+    # take for coverage.
+    assert updater.mode != LEDGER_SETPOINT
+    for index, (before, transfer, stress, decay) in enumerate(terms):
         after = terms[index + 1][0] if index + 1 < len(terms) else coupled.mob.expert_wealth
-        relaxed = before * updater.decay
-        if updater.mode == LEDGER_SETPOINT:
-            relaxed = relaxed + updater.rate * updater.setpoint
+        relaxed = before * decay
         # Every cell pays the same stress, winner or not: that is the invariant,
         # and it is why the charge is a scalar subtracted from the whole vector.
         assert torch.allclose(after, relaxed + transfer - stress, atol=1e-5), (
@@ -342,8 +364,9 @@ def test_a_replayed_charge_round_trips_to_the_donors_own_total():
 
     for charge, magnitude in zip(recorded, magnitudes, strict=True):
         assert magnitude * donor.equal_budget_lambda * donor.tokens == pytest.approx(charge)
-    # The bug's own signature, so the guard is against a scale and not a typo:
-    # dividing by the price alone leaves a magnitude `tokens` times too large.
+    # The same assertion in the bug's own units rather than a second guard --
+    # it follows from the one above, and it is here because `tokens x` is the
+    # shape of what went wrong and a reader should see it written that way.
     assert magnitudes[0] * donor.tokens == pytest.approx(recorded[0] / donor.equal_budget_lambda)
     # And a donor that charged nothing lends nothing rather than dividing by zero.
     assert replay_magnitudes(recorded, replace(donor, equal_budget_lambda=0.0)) == [0.0, 0.0, 0.0]
