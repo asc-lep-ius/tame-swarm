@@ -432,6 +432,15 @@ def within_control_excess(
     out either way.
     """
     seeds = sorted(runs[PERSISTENCE_DECOUPLED], key=str)
+    if len(seeds) < 2:
+        # With one seed the rotation lands on itself, and imposing a curve's own
+        # fit returns its own residual exactly -- so the null would be 0.0 and
+        # the contrast would revert, silently, to the non-negative raw excess
+        # this function exists to give a null.
+        raise ValueError(
+            f"a control arm of {len(seeds)} seed(s) has no neighbour to be read against, so "
+            "the excess has no null; the setpoint stage needs at least two control seeds"
+        )
     excess: dict[str, float] = {}
     for index, seed in enumerate(seeds):
         other = seeds[(index + 1) % len(seeds)]
