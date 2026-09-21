@@ -124,7 +124,9 @@ discriminator a single lag cannot pass; #56 and #57 are a stack, not siblings.
    cells through it. #44 runs only on a bound tissue.
 9. **Make the self-model load-bearing before testing self-reference.** #60:
    more cells than slots, and a scored self-prediction under the constitution.
-   #47 and #44 follow it.
+   Both of #60's readings were withdrawn on 2026-09-21 and the scored
+   self-prediction moved to #66, to be rebuilt on dense counterfactual targets;
+   README `#self-model` carries what survives. #47 and #44 follow it.
 10. **Measure whether routing matters before building a substrate where it
     would.** #58 reads #39's checkpoints; #48 opens only on its line.
 11. **The body configuration is a fork, and keeping it is an option.** Three

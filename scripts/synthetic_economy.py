@@ -395,6 +395,7 @@ class DifferentiatedEconomy(SyntheticEconomy):
         head_learning_rate: float = 1e-2,
         num_types: int = DEFAULT_NUM_TYPES,
         type_signal: float = DEFAULT_TYPE_SIGNAL,
+        contribution_scale: float = 1.0,
     ):
         if not 1 <= num_types <= competence.numel():
             raise ValueError(f"num_types must lie in [1, {competence.numel()}], got {num_types}")
@@ -405,6 +406,12 @@ class DifferentiatedEconomy(SyntheticEconomy):
             )
         self.num_types = num_types
         self.type_signal = type_signal
+        # #60's lever 1, second ratio: how much of the output the cells own. The
+        # planted corrections are orthonormal, so one is the recorded fixture and
+        # a larger scale is a body whose experts carry more of what the token
+        # wants -- the fixture's analogue of raising the adapter rank, which on
+        # the real body is 3.7% of the residual norm.
+        self.contribution_scale = contribution_scale
         # Assigned before the base class plants, since ``_plant`` reads them. The
         # expert types cycle through the type set and are then shuffled with a
         # generator of their own, so the assignment is fixed by the seed alone.
@@ -431,7 +438,7 @@ class DifferentiatedEconomy(SyntheticEconomy):
         # a percent (``CORRECTION_STD x sqrt(hidden_dim / rank)``), so prices and
         # rewards here are on the same scale the constants were derived on.
         basis = torch.linalg.qr(torch.randn(config.hidden_dim, self.num_types * rank))[0]
-        self.type_corrections = torch.stack(
+        self.type_corrections = self.contribution_scale * torch.stack(
             [basis[:, t * rank : (t + 1) * rank] for t in range(self.num_types)]
         )
         # The input direction that announces each type, orthonormal so the types
