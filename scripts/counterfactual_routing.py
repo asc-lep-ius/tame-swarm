@@ -63,6 +63,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tame"))
 
+from counterfactual_summary import checkpoints_of, separation, summarise  # noqa: E402
+
 from evaluation import HeldOutSplit, evaluate  # noqa: E402
 from mob import mob_layers_by_index  # noqa: E402
 from mob.auction import VCGAuctioneer  # noqa: E402
@@ -86,7 +88,6 @@ DEFAULT_PROBE_TOKENS = 4096
 # pairs recorded beside one over a million is the shape of a number nobody can
 # read -- #58's own trap list calls it a number with no run directory behind it.
 MIN_POPULATION = 100
-CHECKPOINT_GLOB = "checkpoint-*"
 
 
 @dataclass(frozen=True)
@@ -197,8 +198,11 @@ class GumbelTopKRoute(torch.nn.Module):
     against the gate's choice *under the perturbed stream*, not against the
     route the clean forward executed, so a token whose route the upstream
     perturbation flipped indirectly is counted in the stream-only control.
-    Measured at 0.8% of unmoved layer-token pairs at ``subset`` 0.1 and 1.3% at
-    a full reroute -- small, and stated rather than assumed away.
+    This read does not measure how often that happens: it never records the
+    clean forward's route, so there is nothing to compare against. A review
+    measured it at under 2% of unmoved layer-token pairs on one checkpoint, and
+    that figure has no run directory behind it -- which is #58's own trap --
+    so it is named here as unmeasured by this instrument rather than quoted.
     """
 
     def __init__(
@@ -526,33 +530,6 @@ def verify_recorded_loss(
         )
 
 
-def _separation(read: dict[str, Any], suffix: str) -> dict[str, Any]:
-    """The own-route-against-stream pair, its magnitudes, and the pairs behind each.
-
-    ``own_route_effect`` is ``None`` unless both populations cleared
-    ``MIN_POPULATION``: a difference of two rates, one of which stands on six
-    pairs, is not a reading and must not reach a table as one.
-    """
-    moved, unmoved = read["moved_better"], read["unmoved_better"]
-    swing, unmoved_swing = read["moved_swing"], read["unmoved_swing"]
-    return {
-        f"counterfactual/moved_better{suffix}": moved,
-        f"counterfactual/unmoved_better{suffix}": unmoved,
-        f"counterfactual/moved_swing{suffix}": swing,
-        f"counterfactual/unmoved_swing{suffix}": unmoved_swing,
-        f"counterfactual/own_route_effect{suffix}": (
-            moved - unmoved if moved is not None and unmoved is not None else None
-        ),
-        f"counterfactual/own_route_swing{suffix}": (
-            swing - unmoved_swing if swing is not None and unmoved_swing is not None else None
-        ),
-        f"counterfactual/moved_pairs{suffix}": read["moved_pairs"],
-        f"counterfactual/unmoved_pairs{suffix}": read["unmoved_pairs"],
-        f"counterfactual/moved_fraction{suffix}": read["moved_fraction"],
-        f"counterfactual/confident_better{suffix}": read["confident_better"],
-    }
-
-
 def read_one(
     checkpoint: Path,
     args: argparse.Namespace,
@@ -584,7 +561,7 @@ def read_one(
     reading["counterfactual/alternatives_better"] = float(
         read["alternatives_better_than_executed"].mean()
     )
-    reading.update(_separation(read, ""))
+    reading.update(separation(read, ""))
     if floor is not None:
         fragile = gap > floor
         reading.update(
@@ -616,7 +593,7 @@ def read_one(
             args.seed,
         )
         reading["counterfactual/mean_gap_subset"] = float(bounded["best_minus_executed"].mean())
-        reading.update(_separation(bounded, "_subset"))
+        reading.update(separation(bounded, "_subset"))
         if floor is not None:
             subset_fragile = float((bounded["best_minus_executed"] > floor).float().mean())
             reading["counterfactual/fragile_fraction_subset"] = subset_fragile
@@ -654,83 +631,6 @@ def read_one(
                     (executed.log_probs[fragile] - without.log_probs[fragile]).mean()
                 )
     return reading
-
-
-def summarise(readings: dict[str, dict[str, Any]], group: Path | None) -> dict[str, Any]:
-    """``run_seeds.py``'s summary shape, so ``compare_runs.py`` tables it unchanged."""
-    per_seed = {
-        seed: {
-            key: value
-            for key, value in reading.items()
-            if isinstance(value, (int, float)) and "/" in key
-        }
-        for seed, reading in readings.items()
-    }
-    fingerprints = {
-        seed: reading["arm_fingerprint"]
-        for seed, reading in readings.items()
-        if reading.get("arm_fingerprint")
-    }
-    return {
-        "arm": next(
-            (
-                reading["arm_fingerprint"].get("persistence_coupling", "unknown")
-                for reading in readings.values()
-                if reading.get("arm_fingerprint")
-            ),
-            "unknown",
-        ),
-        "router": "mob",
-        "group": str(group) if group else None,
-        "seeds": sorted(per_seed, key=str),
-        "primary": None,
-        "per_seed": per_seed,
-        "fingerprints": fingerprints,
-        "stats": {
-            metric: {
-                "mean": sum(values) / len(values),
-                "std": float(torch.tensor(values).std()) if len(values) > 1 else float("nan"),
-                "n": len(values),
-            }
-            for metric, values in (
-                (
-                    metric,
-                    [row[metric] for row in per_seed.values() if metric in row],
-                )
-                for metric in sorted({key for row in per_seed.values() for key in row})
-            )
-        },
-        "replicate_seed": None,
-        "replicate": None,
-        "replication_std": None,
-        "replication_error": (
-            "exploratory read, not a run: the floor is the replicate pair's per-token spread "
-            "(#58), recorded per reading rather than as a seed spread"
-        ),
-        "floor_recorded_at": None,
-        "readings": readings,
-    }
-
-
-def checkpoints_of(group: Path, include_replicates: bool = False) -> dict[str, Path]:
-    """Every seed's last checkpoint under a ``run_seeds.py`` group, keyed by seed.
-
-    The replicate is left out by default: it is seed 0 again, it is what the
-    floor pass reads, and a group summary that carried it would table one seed
-    twice as though it were two.
-    """
-    found: dict[str, Path] = {}
-    for run in sorted((group / "runs").glob("seed*")):
-        if not include_replicates and run.name.endswith("-replicate"):
-            continue
-        checkpoints = sorted(
-            run.glob(CHECKPOINT_GLOB), key=lambda path: int(path.name.split("-")[-1])
-        )
-        if checkpoints:
-            found[run.name.replace("seed", "")] = checkpoints[-1]
-    if not found:
-        raise FileNotFoundError(f"no checkpoints under {group}/runs/seed*/")
-    return found
 
 
 def main() -> None:

@@ -20,13 +20,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 from counterfactual_routing import (  # noqa: E402
     FOOTPRINT_LINE,
     FRAGILE_FRACTION_LINE,
+    ProbeRead,
     adapters_zeroed,
     alternative_routes,
-    checkpoints_of,
     counterfactual_gaps,
     read_probe,
-    summarise,
 )
+from counterfactual_summary import checkpoints_of, summarise  # noqa: E402
 
 from mob import apply_mob_to_model, mob_layers_by_index  # noqa: E402
 from mob.softmax_router import SoftmaxRouter  # noqa: E402
@@ -372,3 +372,35 @@ def test_a_read_with_no_alternatives_is_the_floor_pass_and_does_not_divide_by_ze
     assert math.isnan(read["moved_fraction"])
     assert math.isnan(read["confident_better"])
     assert bool((read["best_minus_executed"] == 0).all())
+
+
+def test_the_confident_token_guardrail_is_pinned_by_direction_and_denominator(body, batches):
+    """#58's second guardrail carries the conclusion, so its definition is pinned.
+
+    Selecting the bottom quartile, dropping the `alternatives` factor from the
+    denominator, or counting a tie as an improvement would each leave every
+    other test in this file green -- and this instrument has published a wrong
+    number twice already, both times caught after the fact.
+    """
+    executed = read_probe(body, batches, DEVICE)
+
+    # A noise scale small enough to reorder no top-k: no alternative differs
+    # from the executed route, so nothing can beat it and a tie is not a win.
+    quiet = counterfactual_gaps(
+        body, batches, DEVICE, executed, alternatives=4, scale=1e-9, subset=None, seed=0
+    )
+    assert quiet["moved_fraction"] == 0.0
+    assert quiet["confident_better"] == 0.0
+
+    loud = counterfactual_gaps(
+        body, batches, DEVICE, executed, alternatives=4, scale=1.0, subset=None, seed=0
+    )
+    assert 0.0 < loud["confident_better"] < 1.0
+
+    # The denominator is draws x confident tokens, so a read where every
+    # alternative beats the executed route on every token reads exactly 1.0.
+    hopeless = ProbeRead(executed.log_probs - 100.0, executed.token_ids, executed.rerouted)
+    certain = counterfactual_gaps(
+        body, batches, DEVICE, hopeless, alternatives=4, scale=1.0, subset=None, seed=0
+    )
+    assert certain["confident_better"] == pytest.approx(1.0)
