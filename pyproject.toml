@@ -39,6 +39,13 @@ dev = [
     # the normal approximation instead, which is the error the script exists to
     # stop. Not a runtime dependency: nothing under tame/ imports it.
     "scipy>=1.11",
+    # tests/test_issue_templates.py renders the issue templates rather than
+    # modelling a renderer, for scipy's reason one door along: the hand-written
+    # model was wrong four ways in its first two commits, each one a place it
+    # and a real GFM renderer disagreed. In the lock transitively (rich, via
+    # mlflow); named here because a check that silently depends on somebody
+    # else's dependency is one `uv lock` away from not running.
+    "markdown-it-py>=3.0",
     "pytest>=7.0.0",
     "pytest-xdist>=3.5.0",
     "ruff>=0.4.0",

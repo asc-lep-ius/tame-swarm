@@ -317,7 +317,7 @@ def batch_looks(maximum: int, batch: int) -> list[int]:
 
 
 def maximum_grid(batch: int, cap: int) -> list[int]:
-    """Every maximum a plan at this batch may declare, up to ``cap`` and ending on it.
+    """Every maximum a plan at this batch may declare, up to ``cap`` (at least 2) and ending on it.
 
     Its own function so a test oracle checking ``plan_maximum`` against brute
     force walks the same points rather than a description of them: the two
