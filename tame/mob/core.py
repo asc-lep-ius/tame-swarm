@@ -602,7 +602,11 @@ class MixtureOfBidders(WealthUpdateMixin, nn.Module):
         if self.config.self_score_mu <= 0.0:
             return None
         return torch.cat(
-            [head.forward_prediction(hidden_states) for head in self.confidence_heads], dim=-1
+            [
+                cast(ConfidenceHead, head).forward_prediction(hidden_states)
+                for head in self.confidence_heads
+            ],
+            dim=-1,
         )
 
     def _transmitted_stress(
