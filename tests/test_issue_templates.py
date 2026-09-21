@@ -42,9 +42,14 @@ TEMPLATES = sorted((Path(__file__).parent.parent / ".gitlab" / "issue_templates"
 # disable the preset raises rather than differing. A URL-shaped defect in a cell
 # is outside what this file sees, and that is the price.
 RENDERER = MarkdownIt("gfm-like", {"html": True}).disable("linkify")
-# `|---|:--|` and friends: the one row of a table that emits no `<tr>`.
+# `|---|:--|` and friends: the one row of a table that emits no `<tr>`. Matched
+# against the stripped line, because GFM takes a delimiter row with trailing
+# space or up to three of indent and this would have called one a written row.
 DELIMITER = re.compile(r"^\|[\s\-:|]+\|$")
-FENCE = re.compile(r"^\s*(```|~~~)")
+# The opener is captured, not just detected: CommonMark closes a fence only with
+# the same character, so a ``` inside a ~~~ block closes nothing. A bare toggle
+# desynchronised there and hid every table below it from all four checks.
+FENCE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
 # The last of a row's guidance, which is what a truncated cell loses first.
 TAIL = 40
 
@@ -66,12 +71,19 @@ def source_rows(path: Path) -> list[tuple[int, str]]:
     opposite of what happened.
     """
     rows: list[tuple[int, str]] = []
-    fenced = False
+    opener: str | None = None
     for number, line in enumerate(path.read_text().split("\n"), 1):
-        if FENCE.match(line):
-            fenced = not fenced
-        elif not fenced and line.strip().startswith("|"):
+        fence = FENCE.match(line)
+        if fence and opener is None:
+            opener = fence.group(1)[0]
+        elif fence and fence.group(1)[0] == opener:
+            opener = None
+        elif opener is None and line.strip().startswith("|"):
             rows.append((number, line))
+    # Without this the file simply ends inside the fence, every table below it
+    # vanishes from the check, and the renderer agrees at zero -- so nothing
+    # raises while the issue renders its whole table as a code block.
+    assert opener is None, f"{path.name} leaves a `{opener}` code fence open to the end of the file"
     return rows
 
 
@@ -88,14 +100,51 @@ def tables(path: Path) -> list[list[tuple[int, str]]]:
     return grouped
 
 
-def emitted_rows(path: Path) -> list[str]:
-    """Each `<tr>` the renderer produced, in document order."""
-    return re.findall(r"<tr>.*?</tr>", RENDERER.render(path.read_text()), re.S)
+def emitted_tables(path: Path) -> list[list[str]]:
+    """Each rendered table's `<tr>`s, in document order."""
+    html = RENDERER.render(path.read_text())
+    return [
+        re.findall(r"<tr>.*?</tr>", table, re.S)
+        for table in re.findall(r"<table>.*?</table>", html, re.S)
+    ]
 
 
-def written_rows(path: Path) -> list[tuple[int, str]]:
-    """The source rows that should each become a `<tr>`: every one but the delimiters."""
-    return [(number, line) for number, line in source_rows(path) if not DELIMITER.match(line)]
+def written_tables(path: Path) -> list[list[tuple[int, str]]]:
+    """Each source table's rows that should become a `<tr>`: every one but the delimiters."""
+    return [
+        [(number, line) for number, line in rows if not DELIMITER.match(line.strip())]
+        for rows in tables(path)
+    ]
+
+
+def paired(path: Path) -> list[tuple[int, str, str]]:
+    """Every source row beside the `<tr>` it produced, per table rather than per file.
+
+    Per table because a file-level count is a sum and two defects cancel it: a
+    row indented into a code block and a pair of adjacent tables elsewhere leave
+    the totals equal while every row after the first defect is paired with the
+    wrong `<tr>` -- including, in the construction that found this, a source row
+    against a *rendered delimiter row*. Grouping first localises the mismatch to
+    the table it happened in, which is also the only way to name it.
+    """
+    written, emitted = written_tables(path), emitted_tables(path)
+    assert len(written) == len(emitted), (
+        f"{path.name} writes {len(written)} runs of table rows and the renderer makes "
+        f"{len(emitted)} of them into tables. A run wrote no table at all -- a missing "
+        "delimiter row, or rows the renderer read into a neighbouring table"
+    )
+    rows: list[tuple[int, str, str]] = []
+    for source, rendered in zip(written, emitted, strict=True):
+        assert len(source) == len(rendered), (
+            f"{path.name}: the table starting at line {source[0][0] if source else '?'} writes "
+            f"{len(source)} rows the renderer should emit and it emits {len(rendered)}. A row "
+            "is being swallowed by an unclosed comment, indented into a code block, dropped "
+            "with its table, or read into a table it does not belong to"
+        )
+        rows += [
+            (number, line, html) for (number, line), html in zip(source, rendered, strict=True)
+        ]
+    return rows
 
 
 def normalised(text: str) -> str:
@@ -123,19 +172,11 @@ def test_every_row_the_source_writes_is_a_row_the_renderer_emits(path: Path):
     that lost its leading pipe, a delimiter row of the wrong width -- each
     changes this count, and none of them is visible in a diff.
 
-    Row for row rather than as a file-level sum, because sums cancel: two tables
-    with no blank line between them lose a `<table>` and gain a `<tr>` for the
-    swallowed delimiter row, and the arithmetic came out even.
+    `paired` is what asserts it, table by table, and the guidance check below
+    reads the same pairing -- so a mismatch is a failure there too rather than a
+    bare `zip() argument 2 is shorter` with no file and no line in it.
     """
-    written = written_rows(path)
-    emitted = emitted_rows(path)
-
-    assert written, f"{path.name} writes no table rows"
-    assert len(emitted) == len(written), (
-        f"{path.name} writes {len(written)} rows the renderer should emit and it emits "
-        f"{len(emitted)}. A row is being swallowed by an unclosed comment, indented into a "
-        "code block, dropped with its table, or read into a table it does not belong to"
-    )
+    assert paired(path), f"{path.name} writes no table rows"
 
 
 @pytest.mark.parametrize("path", TEMPLATES, ids=lambda path: path.name)
@@ -147,7 +188,9 @@ def test_the_end_of_every_rows_guidance_survives_into_that_rows_own_cell(path: P
     every `Dependencies` row in the repository, their `#N or n/a` supplied by
     the row below.
     """
-    for (number, line), rendered in zip(written_rows(path), emitted_rows(path), strict=True):
+    # `paired` raises before this runs when the rows cannot be lined up, so a
+    # row is never checked against a `<tr>` that is not its own.
+    for number, line, rendered in paired(path):
         said = guidance(line)
         if said is None:
             continue
