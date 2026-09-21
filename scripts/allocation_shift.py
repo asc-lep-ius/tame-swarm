@@ -135,6 +135,17 @@ def setpoint_step_shift(result: dict[str, float]) -> float:
     and the seed spread it has to clear is the spread of a *difference* rather
     than of two end-of-training allocations.
     """
+    # Checked before the rename, or a run that has `routing/win_share_e*` and no
+    # step columns is refused with "a run reports no 'routing/win_share_e'
+    # column" -- naming a column it does have, from a traceback rather than a
+    # message. Every one of #39's recorded groups takes that path.
+    for prefix in (STEP_PRE_PREFIX, STEP_POST_PREFIX):
+        if not any(key.startswith(prefix) for key in result):
+            raise ValueError(
+                f"a run reports no {prefix!r} column, so it did not take a setpoint step; "
+                "--readout setpoint-step reads a run measure_stakes_dial.py stepped, not one "
+                "of two dose groups"
+            )
     return total_variation(
         {
             key.replace(STEP_PRE_PREFIX, WIN_SHARE_PREFIX): value
@@ -313,25 +324,33 @@ def main() -> None:
             f"{readout.name} reads inside one run, and its floor is that run's own replicate"
         )
 
-    group_a, group_b = load_group(Path(args.group_a)), load_group(Path(args.group_b))
-    assert_groups_at_parity(group_a, group_b)
-    if readout.within_run:
-        # The two groups are two arms, and each run already carries its own
-        # before and after: the contrast is the primary itself rather than a
-        # distance between dose levels.
-        readings_a = per_seed_readings(group_a, readout)
-        readings_b = per_seed_readings(group_b, readout)
-        contrast = {
-            seed: readings_b[seed] - readings_a[seed]
-            for seed in sorted(set(readings_a) & set(readings_b), key=str)
-        }
-    else:
-        contrast = paired_shifts(group_a, group_b, readout)
-    floor = None
-    if args.floor_a is not None:
-        floor_a, floor_b = load_group(Path(args.floor_a)), load_group(Path(args.floor_b))
-        assert_identical_fingerprints(floor_a, floor_b)
-        floor = paired_shifts(floor_a, floor_b, readout)
+    # Every reader below raises ValueError on a group it cannot read with the
+    # chosen readout -- a run with no step columns, two groups sharing no logged
+    # reading. At the CLI boundary that is a usage error and prints as one, the
+    # way dose_slope.py and compare_runs.py already do, rather than as a
+    # traceback the operator reads past to find the sentence.
+    try:
+        group_a, group_b = load_group(Path(args.group_a)), load_group(Path(args.group_b))
+        assert_groups_at_parity(group_a, group_b)
+        if readout.within_run:
+            # The two groups are two arms, and each run already carries its own
+            # before and after: the contrast is the primary itself rather than a
+            # distance between dose levels.
+            readings_a = per_seed_readings(group_a, readout)
+            readings_b = per_seed_readings(group_b, readout)
+            contrast = {
+                seed: readings_b[seed] - readings_a[seed]
+                for seed in sorted(set(readings_a) & set(readings_b), key=str)
+            }
+        else:
+            contrast = paired_shifts(group_a, group_b, readout)
+        floor = None
+        if args.floor_a is not None:
+            floor_a, floor_b = load_group(Path(args.floor_a)), load_group(Path(args.floor_b))
+            assert_identical_fingerprints(floor_a, floor_b)
+            floor = paired_shifts(floor_a, floor_b, readout)
+    except ValueError as exc:
+        parser.error(str(exc))
     print(format_report(contrast, floor, args.resamples, args.seed, readout))
     if args.json:
         Path(args.json).write_text(json.dumps({"contrast": contrast, "floor": floor}, indent=2))

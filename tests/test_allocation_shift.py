@@ -49,6 +49,81 @@ BODY_SHIFT = {
     "2": 0.1573638916015625,
 }
 
+# The same for #39's *fixture* half, from
+# `fixture/signature1/value@r{1.0,4.0}/seed_summary.json`, with the shifts
+# `fixture/stakes_dial.json` records under `shifts.value["4.0"]`. Eight experts
+# here against the body's four, which is the point of pinning both: the readout
+# sums over whatever experts a run reports.
+FIXTURE_VALUE_R1 = {
+    "0": (
+        0.30906251072883606,
+        0.21968750655651093,
+        0.0023437500931322575,
+        0.16124999523162842,
+        0.0021875000093132257,
+        0.0024999999441206455,
+        0.1795312464237213,
+        0.12343750149011612,
+    ),
+    "1": (
+        0.2498437464237213,
+        0.22437499463558197,
+        0.0018749999580904841,
+        0.1340624988079071,
+        0.0026562500279396772,
+        0.006562499795109034,
+        0.1743749976158142,
+        0.20624999701976776,
+    ),
+    "2": (
+        0.24687500298023224,
+        0.014999999664723873,
+        0.0034374999813735485,
+        0.04546875134110451,
+        0.00390625,
+        0.2867187559604645,
+        0.1993750035762787,
+        0.19921875,
+    ),
+}
+FIXTURE_VALUE_R4 = {
+    "0": (
+        0.21281249821186066,
+        0.49562498927116394,
+        0.002031249925494194,
+        0.12734374403953552,
+        0.0015625000232830644,
+        0.0015625000232830644,
+        0.15656250715255737,
+        0.0024999999441206455,
+    ),
+    "1": (
+        0.47843751311302185,
+        0.46000000834465027,
+        0.05453125014901161,
+        0.0014062500558793545,
+        0.0015625000232830644,
+        0.0015625000232830644,
+        0.0012499999720603228,
+        0.0012499999720603228,
+    ),
+    "2": (
+        0.18671874701976776,
+        0.002812500111758709,
+        0.015468750149011612,
+        0.0031250000465661287,
+        0.003281249897554517,
+        0.48921874165534973,
+        0.1509374976158142,
+        0.1484375,
+    ),
+}
+FIXTURE_SHIFT = {
+    "0": 0.27593749365769327,
+    "1": 0.5168750119046308,
+    "2": 0.21453124936670065,
+}
+
 
 def _run(*shares: float, loss: float = 2.6) -> dict[str, float]:
     return {"eval/loss": loss, **{f"routing/win_share_e{i}": s for i, s in enumerate(shares)}}
@@ -129,6 +204,21 @@ def test_a_floor_pair_must_be_a_replication():
     extra = {"fingerprints": {**prints, "0": {**prints["0"], "extra": 1}}}
     with pytest.raises(ValueError, match=r"differs on \['extra'\]"):
         assert_identical_fingerprints(same, extra)
+
+
+def test_the_default_readout_reproduces_the_recorded_fixture_shift_bit_for_bit():
+    """#57's criterion names the fixture and the body, and only the body was pinned.
+
+    The fixture half was covered by a `slow` test that re-runs the economy and
+    compares at `abs=0.01`, which would not have caught a readout that moved a
+    recorded number in the fourth decimal -- the size #25's floor puts on a real
+    effect here.
+    """
+    group_r1 = {"per_seed": {seed: _run(*shares) for seed, shares in FIXTURE_VALUE_R1.items()}}
+    group_r4 = {"per_seed": {seed: _run(*shares) for seed, shares in FIXTURE_VALUE_R4.items()}}
+
+    assert paired_shifts(group_r1, group_r4) == FIXTURE_SHIFT
+    assert paired_shifts(group_r1, group_r4, DEFAULT_READOUT) == FIXTURE_SHIFT
 
 
 def test_the_default_readout_reproduces_the_recorded_body_shift_bit_for_bit():
