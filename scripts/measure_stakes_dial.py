@@ -136,6 +136,8 @@ WEALTH_BANDS = 5
 FLOOR_BAND, MIDDLE_BAND = 0, 2
 PRIMARY = "signature1/allocation_shift_slope"
 DEFAULT_OUT = Path.home() / "tame-runs" / "39-stakes-dial" / "fixture"
+# The substrate label every fingerprint from this fixture carries.
+FIXTURE = "differentiated-fixture"
 
 
 @dataclass
@@ -158,6 +160,8 @@ def fixture_fingerprint(
     arm: str,
     doses: tuple[float, ...],
     steps: int,
+    cells: int = BASE_CONFIG.num_experts,
+    contribution_scale: float = 1.0,
     readiness: ReadinessConfig = READINESS_OFF,
 ) -> ArmFingerprint:
     """A fingerprint for a fixture run: what the arms share, the dial, the doses, the code.
@@ -165,6 +169,11 @@ def fixture_fingerprint(
     ``readiness`` is #46's register, taken here as ``parity.fingerprint_arm`` takes
     it, so a fixture run that granted an autonomy cannot record itself as one that
     did not. Every flag is off until the issue that earns one turns it on.
+
+    ``cells`` and ``contribution_scale`` are #60's two ratios, taken as arguments
+    for the same reason: a grid run at four cells or at twice the correction
+    recorded itself as the recorded fixture while it was neither, so the
+    fingerprint said two incomparable runs were at parity.
     """
     code_sha, code_dirty = code_identity()
     return ArmFingerprint(
@@ -181,7 +190,7 @@ def fixture_fingerprint(
         learning_rate=1e-2,
         warmup_steps=0,
         weight_decay=0.0,
-        num_experts=BASE_CONFIG.num_experts,
+        num_experts=cells,
         top_k=BASE_CONFIG.top_k,
         adapter_rank=BASE_CONFIG.adapter_rank,
         requested_layers=(0,),
@@ -208,6 +217,7 @@ def fixture_fingerprint(
         code_dirty=code_dirty,
         persistence_coupling=arm,
         goal_doses=doses,
+        contribution_scale=contribution_scale,
         autonomy_plasticity=readiness.autonomy_plasticity,
         autonomy_exploration=readiness.autonomy_exploration,
         autonomy_setpoints=readiness.autonomy_setpoints,
@@ -538,7 +548,7 @@ def signature_one(
             doses = (ratio * REFERENCE_DOSE, REFERENCE_DOSE)
             groups[arm][ratio] = write_group(
                 out / "signature1" / f"{arm}@r{ratio}",
-                "differentiated-fixture",
+                FIXTURE,
                 arm,
                 doses,
                 per_seed,

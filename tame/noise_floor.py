@@ -71,6 +71,10 @@ to move"
 _CODE = "decided by code_drift, which borrow_floor runs on the lender and each borrower: a \
 missing SHA has to count as drift, and a field-equality check would read two absences as agreement"
 _REGISTER = "a register of what the tissue was allowed to do, not of what the arithmetic did"
+_MAGNITUDE = "scales what the same kernels compute rather than choosing a kernel, shape or \
+precision; and the fixture it belongs to replicates bitwise on CPU, so there is no spread for a \
+scale to move. It is still asserted equal for parity -- two scales are two economies -- which is \
+a different question from whose floor they share"
 
 # Every remaining fingerprint field, with the reason a floor does not depend on
 # it. Pinned against the dataclass by ``tests/test_noise_floor.py``, so a field
@@ -89,6 +93,11 @@ NOT_A_FLOOR_KNOB: dict[str, str] = {
             "goal_doses",
             "goal_fields",
             "ledger_mode",
+            "stress_coupling",
+            "stress_lambda",
+            "stress_gamma",
+            "stress_gate_sigma",
+            "stress_gate_mode",
             "exploration_rate",
             "exploration_draw",
             "wealth_update_frequency",
@@ -106,6 +115,7 @@ NOT_A_FLOOR_KNOB: dict[str, str] = {
         _OPTIMISER,
     ),
     **dict.fromkeys(("probe_tokens", "eval_split"), _MEASUREMENT),
+    "contribution_scale": _MAGNITUDE,
     **dict.fromkeys(("code_sha", "code_dirty"), _CODE),
     **dict.fromkeys(
         (

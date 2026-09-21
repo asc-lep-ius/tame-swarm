@@ -66,8 +66,20 @@ DATA_ORDER_PROBE_BATCHES = 8
 # were paid for is *not* varying (``goal_fields``): two arms paid for
 # different goals are not two doses of one experiment.
 VARYING_FIELDS = frozenset(
-    {"router", "coupling_goal", "steer_goal", "persistence_coupling", "goal_doses"}
+    {
+        "router",
+        "coupling_goal",
+        "steer_goal",
+        "persistence_coupling",
+        "goal_doses",
+        "stress_coupling",
+    }
 )
+
+# #59's coupling parameters, asserted only between arms that charge something.
+# An ``attributed`` arm carries them inert at zero, the way an uncoupled arm
+# carries the coupling's beta, and #59's window sweep varies them on purpose.
+STRESS_FIELDS = frozenset({"stress_lambda", "stress_gamma", "stress_gate_sigma"})
 
 # The coupling's own parameters, asserted only between arms that have a
 # coupling. An uncoupled arm has no dose; a default it carries inert must not
@@ -319,6 +331,32 @@ class ArmFingerprint:
     # fingerprint -- the field is carried on ``TrainingConfig`` for that reason,
     # and #25's two arms ran different code and fingerprinted equal.
     ledger_mode: str = "decay"
+    # #59's coupling channel. Every run recorded before it charged nothing, so a
+    # legacy fingerprint reads as ``attributed`` at ``stress_lambda`` zero --
+    # which is what those runs were. ``stress_coupling`` is a varying field, the
+    # one thing #59's three arms differ in; the three parameters are not, for
+    # the reason the coupling's dose is not: two arms at different lambdas are a
+    # window sweep rather than the contrast, and they are asserted equal among
+    # arms that charge anything at all.
+    stress_coupling: str = "attributed"
+    stress_lambda: float = 0.0
+    stress_gamma: float = 0.0
+    stress_gate_sigma: float = 1.0
+    stress_gate_mode: str = "fixed"
+    # #60's lever 1: what the cells own of the token, as a multiple of the
+    # recorded fixture's planted correction. Asserted equal rather than varying,
+    # and that is the finding rather than a convention. The scale multiplies
+    # realised value, reward and price while `initial_wealth`, `min_wealth` and
+    # `max_wealth` stay where they are, so two arms at different scales run
+    # against different effective wealth bands: at 2x most of the `value` arm's
+    # cell-steps are on the ceiling and at 4x every ledger is exactly
+    # `max_wealth`. They are two economies and not two arms of one, which is the
+    # confound that withdrew #60's grid; the occupancy table under README
+    # `#self-model` is the one copy of those numbers, because a measurement
+    # restated in a comment is one that goes stale without anything noticing --
+    # this one said "84-86%" against a table that said 21.2%. A legacy
+    # fingerprint reads as 1.0, which is what every run before #60 was.
+    contribution_scale: float = 1.0
     # #46's readiness register: one field per autonomy the tissue may be granted,
     # named exactly as the flag in ``readiness.ReadinessConfig``. Off in every run
     # there has been, so a legacy fingerprint reads as a run that granted none.
@@ -511,6 +549,12 @@ def _coupling_disagreements(arms: Sequence[ArmFingerprint]) -> list[str]:
     return _disagreements_among(coupled, COUPLING_FIELDS, "among the coupled arms")
 
 
+def _stress_disagreements(arms: Sequence[ArmFingerprint]) -> list[str]:
+    """The coupling's price, spread and gate, among the arms that charge anything."""
+    charged = [arm for arm in arms if arm.stress_lambda > 0.0]
+    return _disagreements_among(charged, STRESS_FIELDS, "among the stress-coupled arms")
+
+
 def assert_parity(arms: Sequence[ArmFingerprint]) -> None:
     """Refuse a comparison whose arms differ on anything but the variables under test.
 
@@ -543,6 +587,7 @@ def assert_parity(arms: Sequence[ArmFingerprint]) -> None:
             | REPORTED_FIELDS
             | FIELD_FIELDS
             | COUPLING_FIELDS
+            | STRESS_FIELDS
             | DRIFT_FIELDS
             | ROTATION_FIELDS
         ):
@@ -556,6 +601,7 @@ def assert_parity(arms: Sequence[ArmFingerprint]) -> None:
                 )
     disagreements.extend(_field_disagreements(arms))
     disagreements.extend(_coupling_disagreements(arms))
+    disagreements.extend(_stress_disagreements(arms))
 
     if disagreements:
         raise ParityError(
