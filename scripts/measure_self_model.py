@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import statistics
 import sys
 from dataclasses import replace
@@ -57,7 +58,6 @@ from measure_stakes_dial import (  # noqa: E402
     WEALTH_HORIZON,
     fixture_fingerprint,
     share_columns,
-    type_wins,
 )
 from power import pairs_for_power  # noqa: E402
 from sweep_wealth_bounds import CEILING_TOLERANCE, FLOOR_TOLERANCE  # noqa: E402
@@ -109,8 +109,9 @@ def run_arm(
 ) -> dict[str, float]:
     """One arm at one dose, at a cell count and a contribution scale.
 
-    The guardrail columns are read over the same tail the shares are, and they
-    are the columns #60's grid was published without. The scale multiplies value,
+    The guardrail columns are the ones #60's grid was published without:
+    occupancy over the same tail the shares are read on, and the correlation on
+    the ledger that tail ends at. The scale multiplies value,
     reward and price but not the wealth band, so the thing to watch is the band:
     occupancy at each bound says whether an arm is still an economy or a clamp,
     and ``r(wealth, competence)`` says whether the ledger still tracks who is
@@ -129,7 +130,6 @@ def run_arm(
     economy.add_goal_field(GOAL_TYPES[0], SETPOINT, ratio * REFERENCE_DOSE)
     economy.add_goal_field(GOAL_TYPES[1], SETPOINT, REFERENCE_DOSE)
     wins = torch.zeros(cells)
-    by_type = {expert_type: torch.zeros(cells) for expert_type in GOAL_TYPES}
     losses: list[float] = []
     on_type: list[float] = []
     # The two bounds take the two tolerances #16 measured, and that is not a
@@ -140,13 +140,16 @@ def run_arm(
     floor = BASE_CONFIG.min_wealth * (1 + FLOOR_TOLERANCE)
     at_ceiling = 0
     at_floor = 0
+    # The reading window is the tail, or the whole run when it is shorter than
+    # one: a smoke run at 40 steps that divides by 100 reports two and a half
+    # times less occupancy than it saw, which is the direction that hides a
+    # clamp rather than inventing one.
+    window = min(steps, TAIL)
     for step in range(steps):
         record = economy.step()
-        if step < steps - TAIL:
+        if step < steps - window:
             continue
         wins += torch.bincount(record.selected_experts.flatten(), minlength=cells).float()
-        for expert_type, counts in type_wins(economy, record.selected_experts).items():
-            by_type[expert_type] += counts
         losses.append(record.loss)
         on_type.append(economy.on_type_share(record.selected_experts))
         wealth = economy.mob.expert_wealth
@@ -155,14 +158,38 @@ def run_arm(
     metrics = share_columns(wins, "routing/win_share_e")
     metrics["eval/loss"] = statistics.fmean(losses)
     metrics["routing/on_type_share"] = statistics.fmean(on_type)
-    cell_steps = cells * TAIL
-    metrics["guardrail/ceiling_occupancy"] = at_ceiling / cell_steps
-    metrics["guardrail/floor_occupancy"] = at_floor / cell_steps
-    metrics["guardrail/interior_occupancy"] = 1.0 - (at_ceiling + at_floor) / cell_steps
-    # NaN when every ledger is on the same bound, and left as NaN: a clamped arm
-    # has no correlation to report and a zero there would read as one that does.
-    metrics["guardrail/wealth_vs_competence"] = pearson(economy.mob.expert_wealth, competence)
+    metrics.update(
+        band_occupancy(at_ceiling, at_floor, cells * window, economy.mob.expert_wealth, competence)
+    )
     return metrics
+
+
+def band_occupancy(
+    at_ceiling: int,
+    at_floor: int,
+    cell_steps: int,
+    wealth: torch.Tensor,
+    competence: torch.Tensor,
+) -> dict[str, float]:
+    """Where in the wealth band one arm spent its reading window, and whether it tracked.
+
+    ``cell_steps`` is recorded beside the rates it divides: a rate whose
+    denominator is not in the record is a rate the next reader has to guess at,
+    and guessing it wrong is exactly what hid a clamp here once. The interior is
+    the column that says whether an arm is still an economy rather than a pair of
+    bounds, which is the reading #60's grid was published without.
+
+    The correlation is NaN when every ledger is on one bound, and is left that
+    way: a clamped arm has no correlation to report, and a zero there reads as
+    one that does.
+    """
+    return {
+        CELL_STEPS_COLUMN: float(cell_steps),
+        "guardrail/ceiling_occupancy": at_ceiling / cell_steps,
+        "guardrail/floor_occupancy": at_floor / cell_steps,
+        "guardrail/interior_occupancy": 1.0 - (at_ceiling + at_floor) / cell_steps,
+        CORRELATION_COLUMN: pearson(wealth, competence),
+    }
 
 
 def contrast_dz(shifts_a: dict[str, float], shifts_b: dict[str, float]) -> tuple[float, int]:
@@ -178,44 +205,111 @@ def contrast_dz(shifts_a: dict[str, float], shifts_b: dict[str, float]) -> tuple
     return dz, pairs_for_power(dz)
 
 
-GUARDRAIL_COLUMNS = (
+OCCUPANCY_COLUMNS = (
     "guardrail/ceiling_occupancy",
     "guardrail/floor_occupancy",
     "guardrail/interior_occupancy",
-    "guardrail/wealth_vs_competence",
 )
+CORRELATION_COLUMN = "guardrail/wealth_vs_competence"
+# The cell-steps the occupancies are a rate over, summed across the pool.
+CELL_STEPS_COLUMN = "guardrail/cell_steps"
+# How many of the pooled readings had no correlation to give, and out of how
+# many. A mean with three of six seeds clamped is a different number from the
+# same mean with none, and without the count they print identically.
+CLAMPED_COLUMN = "guardrail/clamped_readings"
+READINGS_COLUMN = "guardrail/readings"
+# The two dose levels the readout differences. Guardrails are kept apart by
+# dose because the readout *is* the difference between them: a band that moves
+# with the dose is invisible in a number pooled across it.
+DOSE_BALANCED = "balanced"
+DOSE_DOSED = "dosed"
+
+
+def pooled(readings: list[dict[str, float]]) -> dict[str, float]:
+    """One arm at one dose, over the seeds, with the correlation NaN-aware.
+
+    ``statistics.fmean`` propagates a single NaN over the whole pool, and one
+    seed whose every ledger sits on a bound is exactly the case where the other
+    five are worth reading. So the mean is taken over the readings that have a
+    correlation and the count of the ones that did not travels beside it; NaN
+    survives only where nothing was readable at all, which is the reading
+    "a clamped cell is not read" asks for.
+    """
+    summary: dict[str, float] = {
+        column: statistics.fmean(reading[column] for reading in readings)
+        for column in OCCUPANCY_COLUMNS
+    }
+    summary[CELL_STEPS_COLUMN] = sum(reading[CELL_STEPS_COLUMN] for reading in readings)
+    readable = [
+        reading[CORRELATION_COLUMN]
+        for reading in readings
+        if not math.isnan(reading[CORRELATION_COLUMN])
+    ]
+    summary[CORRELATION_COLUMN] = statistics.fmean(readable) if readable else float("nan")
+    summary[CLAMPED_COLUMN] = len(readings) - len(readable)
+    summary[READINGS_COLUMN] = len(readings)
+    return summary
 
 
 def shifts_for(
     arm: str, seeds: tuple[int, ...], cells: int, scale: float, steps: int
-) -> tuple[dict[str, float], dict[str, float]]:
+) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
     """One arm's allocation shift between the two dose levels, per seed, and its guardrails.
 
     The guardrails come back from the same runs rather than from a second pass:
     reading the band costs nothing on top of a run that has already happened, and
     a guardrail measured on a different run is a guardrail for a different run.
+    They are returned per dose level for the reason the arms are returned
+    separately -- the contrast is a difference between two things, and a
+    guardrail pooled over the difference cannot say which side moved.
     """
     shifts: dict[str, float] = {}
-    readings: list[dict[str, float]] = []
+    readings: dict[str, list[dict[str, float]]] = {DOSE_BALANCED: [], DOSE_DOSED: []}
     for seed in seeds:
         balanced = run_arm(arm, RATIOS[0], seed, cells, scale, steps)
         dosed = run_arm(arm, DOSE_RATIO, seed, cells, scale, steps)
         shifts[str(seed)] = DEFAULT_READOUT.reading(balanced, dosed)
-        readings.extend((balanced, dosed))
-    guardrails = {
-        column: statistics.fmean(reading[column] for reading in readings)
-        for column in GUARDRAIL_COLUMNS
+        readings[DOSE_BALANCED].append(balanced)
+        readings[DOSE_DOSED].append(dosed)
+    return shifts, {dose: pooled(rows) for dose, rows in readings.items()}
+
+
+def cell_fingerprints(
+    cells: int, scale: float, seeds: tuple[int, ...], steps: int
+) -> dict[str, Any]:
+    """One fingerprint per arm per seed, recorded per grid cell rather than per run.
+
+    The two ratios are what this grid varies, so a cell whose fingerprint says it
+    ran at the recorded fixture is a cell no later comparison can refuse.
+    ``parity.assert_parity`` refuses two of these against each other, which is
+    the whole point of writing them down.
+    """
+    return {
+        arm: {
+            str(seed): fixture_fingerprint(
+                FIXTURE,
+                seed,
+                arm,
+                (RATIOS[0] * REFERENCE_DOSE, REFERENCE_DOSE),
+                steps,
+                cells=cells,
+                contribution_scale=scale,
+            ).as_dict()
+            for seed in seeds
+        }
+        for arm in (PERSISTENCE_VALUE, PERSISTENCE_SHUFFLED)
     }
-    return shifts, guardrails
 
 
-def band_columns(arm: str, bands: dict[str, float]) -> str:
-    """One arm's guardrail block, under the headings ``sweep_lever_one`` prints."""
+def band_columns(arm: str, dose: str, bands: dict[str, float]) -> str:
+    """One arm at one dose, under the headings ``sweep_lever_one`` prints."""
+    clamped = int(bands[CLAMPED_COLUMN])
+    unreadable = f"  {clamped}/{int(bands[READINGS_COLUMN])} clamped" if clamped else ""
     return (
-        f"{arm:>10}"
+        f"{arm:>10}{dose:>10}"
         f"{100 * bands['guardrail/ceiling_occupancy']:>7.1f}%"
         f"{100 * bands['guardrail/floor_occupancy']:>7.1f}%"
-        f"{bands['guardrail/wealth_vs_competence']:>+9.3f}"
+        f"{bands[CORRELATION_COLUMN]:>+9.3f}{unreadable}"
     )
 
 
@@ -224,7 +318,7 @@ def sweep_lever_one(seeds: tuple[int, ...], steps: int) -> dict[str, Any]:
     print("\n== lever 1: the two ratios, value minus shuffled at the recorded readout ==")
     print(
         f"  {'cells':>6}{'sets':>7}{'scale':>7}{'value':>9}{'shuffled':>10}{'dz':>8}{'seeds':>8}"
-        f"{'arm':>10}{'ceil%':>8}{'floor%':>8}{'r(w,c)':>9}"
+        f"{'arm':>10}{'dose':>10}{'ceil%':>8}{'floor%':>8}{'r(w,c)':>9}"
     )
     grid: dict[str, Any] = {}
     for cells in CELL_COUNTS:
@@ -245,37 +339,28 @@ def sweep_lever_one(seeds: tuple[int, ...], steps: int) -> dict[str, Any]:
                 # two arms clamping at *different* bounds: a mean over both would
                 # have hidden exactly the asymmetry that produced the contrast.
                 "guardrails": {PERSISTENCE_VALUE: value_bands, PERSISTENCE_SHUFFLED: other_bands},
-                # Recorded per grid cell rather than per run: the two ratios are
-                # what this grid varies, and a cell whose fingerprint says it ran
-                # at the recorded fixture is a cell no later comparison can
-                # refuse. `parity.assert_parity` refuses two of these against
-                # each other, which is the point of writing them down.
-                "fingerprints": {
-                    arm: {
-                        str(seed): fixture_fingerprint(
-                            FIXTURE,
-                            seed,
-                            arm,
-                            (RATIOS[0] * REFERENCE_DOSE, REFERENCE_DOSE),
-                            steps,
-                            cells=cells,
-                            contribution_scale=scale,
-                        ).as_dict()
-                        for seed in seeds
-                    }
-                    for arm in (PERSISTENCE_VALUE, PERSISTENCE_SHUFFLED)
-                },
+                "fingerprints": cell_fingerprints(cells, scale, seeds, steps),
             }
-            print(
+            # Every side of the contrast on a line of its own rather than a
+            # mean over the thing being contrasted: what withdrew this grid is
+            # that the two arms clamped at different bounds, and at different
+            # doses, inside what printed as one row.
+            blocks = [
+                band_columns(arm, dose, bands[dose])
+                for arm, bands in (
+                    (PERSISTENCE_VALUE, value_bands),
+                    (PERSISTENCE_SHUFFLED, other_bands),
+                )
+                for dose in (DOSE_BALANCED, DOSE_DOSED)
+            ]
+            contrast = (
                 f"  {cells:>6}{sets:>7}{scale:>7.1f}"
                 f"{statistics.fmean(value.values()):>9.4f}"
                 f"{statistics.fmean(other.values()):>10.4f}{dz:>+8.3f}{pairs:>8}"
-                f"{band_columns(PERSISTENCE_VALUE, value_bands)}"
             )
-            # The second arm's bands on their own line under the same headings:
-            # the contrast is one row, and the thing that withdrew it is that the
-            # two arms were clamping at different bounds inside it.
-            print(f"  {'':>55}{band_columns(PERSISTENCE_SHUFFLED, other_bands)}")
+            print(contrast + blocks[0])
+            for block in blocks[1:]:
+                print(f"  {'':>55}{block}")
     return grid
 
 

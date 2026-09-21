@@ -9,6 +9,7 @@ is pinned here is the knob that survives -- how much of the token the cells own
 -- and that leaving it alone leaves the recorded fixture exactly where it was.
 """
 
+import math
 import sys
 from dataclasses import asdict, replace
 from pathlib import Path
@@ -19,7 +20,14 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent / "tame"))
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
-from measure_stakes_dial import FIXTURE, fixture_fingerprint  # noqa: E402
+from measure_self_model import (  # noqa: E402
+    CLAMPED_COLUMN,
+    CORRELATION_COLUMN,
+    READINGS_COLUMN,
+    pooled,
+    run_arm,
+)
+from measure_stakes_dial import FIXTURE, RATIOS, TAIL, fixture_fingerprint  # noqa: E402
 from synthetic_economy import (  # noqa: E402
     BASE_CONFIG,
     DEFAULT_COMPETENCE,
@@ -27,6 +35,7 @@ from synthetic_economy import (  # noqa: E402
     shuffled,
 )
 
+from mob import PERSISTENCE_VALUE  # noqa: E402
 from parity import ArmFingerprint, ParityError, assert_parity  # noqa: E402
 
 from .arm_fingerprints import BASE
@@ -66,12 +75,12 @@ def test_the_recorded_economy_is_bitwise_what_it_was_at_scale_one():
 
 def test_more_cells_than_slots_is_a_knob_and_the_recorded_count_is_the_default():
     assert BASE_CONFIG.num_experts == 8
-    wide = economy(cells=4)
+    narrow = economy(cells=4)
 
-    assert wide.config.num_experts == 4
-    assert wide.mob.expert_wealth.numel() == 4
+    assert narrow.config.num_experts == 4
+    assert narrow.mob.expert_wealth.numel() == 4
     for _ in range(3):
-        wide.step()
+        narrow.step()
 
 
 def test_the_contribution_scale_is_what_the_cells_own_of_the_output():
@@ -90,9 +99,10 @@ def test_parity_refuses_two_arms_that_own_different_amounts_of_the_token():
 
     The scale multiplies realised value, reward and price and leaves the wealth
     band where it is, so two arms at different scales are two economies rather
-    than two arms of one: at 2x the `value` arm spends most of its cell-steps on
-    the ceiling while `shuffled` piles at the floor. Nothing in the run record
-    said so, which is why the grid was read as a contrast for a day.
+    than two arms of one: as the scale rises the `value` arm climbs to the
+    ceiling while `shuffled` piles at the floor. The occupancy table under README
+    `#self-model` carries the numbers; nothing in the run record carried them,
+    which is why the grid was read as a contrast for a day.
     """
     with pytest.raises(ParityError, match="contribution_scale"):
         assert_parity(
@@ -133,3 +143,51 @@ def test_the_fixture_fingerprint_carries_the_grid_cell_it_actually_ran_at():
                 ),
             ]
         )
+
+
+def test_the_occupancy_rate_is_over_the_window_actually_read():
+    """The denominator was the tail length, not the steps the run had to give.
+
+    A smoke run shorter than the tail counted its clamps over `cells x TAIL`
+    cell-steps it never saw, so every occupancy came out scaled down by
+    `steps / TAIL` — 3 of 400 where it was 3 of 160. The direction is the one
+    that hides a clamp rather than inventing one, which is why it survived a
+    reading of the printed table.
+    """
+    short = run_arm(PERSISTENCE_VALUE, RATIOS[0], seed=0, cells=4, scale=1.0, steps=7)
+    full = run_arm(PERSISTENCE_VALUE, RATIOS[0], seed=0, cells=4, scale=1.0, steps=TAIL + 5)
+
+    assert short["guardrail/cell_steps"] == 4 * 7
+    assert full["guardrail/cell_steps"] == 4 * TAIL
+
+
+def test_one_clamped_seed_does_not_swallow_the_seeds_that_had_a_correlation():
+    """`fmean` propagates a single NaN over the whole pool.
+
+    At 2x one seed in six can have every ledger on a bound while the other five
+    are perfectly readable, and the pooled column printed `nan` for all six — so
+    the guardrail went blind in exactly the regime #66, #67 and #69 are specified
+    in. NaN survives only where nothing was readable.
+    """
+
+    def reading(correlation: float) -> dict[str, float]:
+        return {
+            "guardrail/ceiling_occupancy": 0.5,
+            "guardrail/floor_occupancy": 0.25,
+            "guardrail/interior_occupancy": 0.25,
+            "guardrail/cell_steps": 800.0,
+            CORRELATION_COLUMN: correlation,
+        }
+
+    mixed = pooled([reading(0.6), reading(float("nan")), reading(0.2)])
+
+    assert mixed[CORRELATION_COLUMN] == pytest.approx(0.4)
+    assert mixed[CLAMPED_COLUMN] == 1
+    assert mixed[READINGS_COLUMN] == 3
+    # And the occupancies still pool over every reading, clamped or not.
+    assert mixed["guardrail/ceiling_occupancy"] == pytest.approx(0.5)
+
+    blind = pooled([reading(float("nan")), reading(float("nan"))])
+
+    assert math.isnan(blind[CORRELATION_COLUMN])
+    assert blind[CLAMPED_COLUMN] == 2
