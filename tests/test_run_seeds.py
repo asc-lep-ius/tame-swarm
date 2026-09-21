@@ -291,6 +291,55 @@ def test_a_floor_from_other_code_is_refused_by_the_sweep_and_allowed_when_named(
     assert allowed["floor_recorded_at"]["code_sha"] is None
 
 
+def test_an_allowed_code_drift_reaches_the_line_that_is_pasted_into_a_measurement_row(
+    tmp_path, monkeypatch, capsys
+):
+    """`--allow-code-drift` may waive the check; it may not waive saying so.
+
+    `compare_runs.assert_same_code` is explicit that a comparison made across
+    drift is "made and never made silently", and this is the escape that claims
+    to mirror it. The dataclass carrying the reasons is not enough on its own:
+    the printed line is what a measurement row is pasted from, and deleting the
+    clause from it left the whole suite green.
+    """
+    legacy = write_lender(tmp_path / "legacy", replace(BASE, seed=0, code_sha="c" * 40))
+    borrower = replace(BASE, code_sha="f" * 40, code_dirty=False)
+
+    summary = sweep_for(
+        tmp_path,
+        monkeypatch,
+        borrower,
+        [
+            "--seeds",
+            "1,2",
+            "--no-replicate",
+            "--floor_recorded_at",
+            str(legacy),
+            "--allow-code-drift",
+        ],
+    )
+
+    assert summary["floor_recorded_at"]["code_drift_allowed"]
+    printed = capsys.readouterr().out
+    assert "borrowed across allowed code drift" in printed
+    assert "different code" in printed
+
+
+def test_a_borrow_with_nothing_waived_says_nothing_about_drift(tmp_path, monkeypatch, capsys):
+    identified = replace(BASE, code_sha="c" * 40, code_dirty=False)
+    lender = write_lender(tmp_path / "clean", replace(identified, seed=0))
+
+    summary = sweep_for(
+        tmp_path,
+        monkeypatch,
+        identified,
+        ["--seeds", "1,2", "--no-replicate", "--floor_recorded_at", str(lender)],
+    )
+
+    assert summary["floor_recorded_at"]["code_drift_allowed"] == []
+    assert "allowed code drift" not in capsys.readouterr().out
+
+
 def test_a_lender_that_never_measured_a_floor_stops_the_sweep_before_the_runs(
     tmp_path, monkeypatch
 ):

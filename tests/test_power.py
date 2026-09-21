@@ -280,21 +280,42 @@ def test_the_pair_ceiling_the_message_quotes_is_the_one_the_search_used():
     )
 
 
-def test_the_maximum_is_not_searched_where_the_search_would_be_wrong():
-    """The binary search needs the sequence's power to rise with the maximum.
-
-    It does at a batch of three -- zero drops over three effect sizes and twenty
-    grid points each -- and it does not at one or two, where the first look has
-    no degrees of freedom worth a t and the boundary swamps the design. A
-    reviewer measured a 4.3x over-recommendation of a preregistered maximum at
-    batch 1, from the tool whose job is refusing designs that cost too much. So
-    the batch is refused there rather than the contract quietly weakened.
-    """
+def test_a_batch_below_three_is_refused_by_the_operators_decision_and_the_degrees_of_freedom():
+    """#56 fixed the batch at three, and below it the first look has no spread worth a t."""
     for batch in (-3, 0, 1, 2):
-        with pytest.raises(ValueError, match="not monotone in the maximum"):
+        with pytest.raises(ValueError, match="no spread worth a t"):
             plan_maximum(1.0, batch, alpha=0.05, draws=2000, seed=0, power=0.80, cap=30)
 
     assert plan_maximum(1.5, BATCH_SEEDS, 0.05, 8000, 0, 0.80, 48) > 0
+
+
+def test_the_maximum_is_the_smallest_by_construction_and_not_by_a_curve_assumption():
+    """A binary search needed the sequence's power to rise with the maximum. It does not.
+
+    The statistic is estimated by simulation, so where the power gradient is
+    shallow the Monte Carlo noise wins: at 2000 draws the binary search returned
+    48 and 51 where the smallest is 42, which at #39's body knobs is 12 to 18
+    GPU-hours of preregistered maximum bought for nothing. Both cases are pinned
+    here against brute force, at the batch the guard above allows.
+    """
+
+    def brute_force(dz, draws, seed, power, cap):
+        grid = [count for count in range(BATCH_SEEDS, cap + 1, BATCH_SEEDS)]
+        reached = (
+            count
+            for count in grid
+            if sequential_plan(dz, batch_looks(count, BATCH_SEEDS), 0.05, draws, seed).power
+            >= power
+        )
+        return next(reached, grid[-1])
+
+    for seed in (1, 2):
+        found = plan_maximum(0.6, BATCH_SEEDS, 0.05, 2000, seed, 0.50, 60)
+        assert found == brute_force(0.6, 2000, seed, 0.50, 60) == 42
+
+    # A target nothing in the grid reaches costs one probe of the cap and
+    # returns it, rather than walking every point to say so.
+    assert plan_maximum(0.05, BATCH_SEEDS, 0.05, 2000, 0, 0.99, 30) == 30
 
 
 def test_a_nonsense_batch_is_a_usage_error_and_not_a_sequence_wearing_the_label(

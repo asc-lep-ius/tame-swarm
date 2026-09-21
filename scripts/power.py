@@ -328,42 +328,50 @@ def plan_maximum(
     dz = 1.5, and 0.306 at #39's dz = 0.867. Raising the maximum is what moves
     that, and it is the first thing to try.
 
-    Binary-searched over the batch grid, which needs the sequence's power not to
-    fall as the maximum rises. **That holds at ``batch >= 3`` and not below it**,
-    which is why the batch is refused below three rather than merely defaulted
-    there. Measured at 40000 draws, seed 0, alpha 0.05: at batch 3, zero drops
-    over three effect sizes and twenty grid points each, and the search returns
-    the true smallest every time, including the close call at dz 0.867
-    (36 reads 0.796, 39 reads 0.827). At batch 1 the same sweep has ten drops
-    and the search over-reads a 0.10 target by 4.3x; at batch 2, eight. The
-    reason is the first look: a batch of one has no degrees of freedom at all
-    and a batch of two has one, so the boundary swamps the early looks and the
-    sequence's power moves with which looks happen to land where.
+    **Scanned upward, not binary-searched**, so the answer is the smallest by
+    construction rather than by an assumption about the curve. A binary search
+    needs the sequence's power not to fall as the maximum rises, and it does
+    fall: the statistic is estimated by simulation, so where the power gradient
+    is shallow the Monte Carlo noise wins. At ``--draws 2000`` the search
+    returned 48 and 51 where the smallest is 42 (dz 0.6, seeds 1 and 2, target
+    0.5), and even at 40000 draws dz 0.3 drops six times over a twenty-point
+    grid at batch 3. The threshold was never the batch; it is the noise against
+    the gradient, and ``--draws`` and ``--seed`` are both flags.
 
-    The search runs at the caller's ``draws`` rather than at a cheaper count, so
+    The cap is probed first, in one simulation, so an unreachable target costs
+    one step rather than the whole grid; a reachable one costs the index of the
+    answer, which at this project's own ceiling is a grid of three.
+
+    ``batch >= 3`` is required for two reasons that are not this one. It is the
+    operator's decision of 2026-09-20 recorded in #56 -- "batches of three
+    paired seeds, stop on decision" -- and below it the first look has no
+    spread worth a t: a batch of one has no degrees of freedom at all and a
+    batch of two has one, so the Pocock boundary swamps the early looks and a
+    ``--batch -3`` plan printed a fixed-n test wearing the label of a sequence.
+
+    The scan runs at the caller's ``draws`` rather than at a cheaper count, so
     it is the *same* simulation the plan is printed from. A search an order
     coarser settled on a maximum reading 0.80 that printed 0.792 beneath itself,
     which is a default that contradicts its own table.
     """
     if batch < BATCH_SEEDS:
         raise ValueError(
-            f"a plan's maximum cannot be searched at a batch of {batch}: the sequence's power "
-            f"is not monotone in the maximum below {BATCH_SEEDS} and the search would return a "
-            "maximum that is not the smallest"
+            f"a plan's maximum cannot be searched at a batch of {batch}: below {BATCH_SEEDS} "
+            "paired seeds the first look has no spread worth a t, which is the operator's "
+            "reason for fixing the batch at three in #56"
         )
     ceiling = max(cap, 2)
     grid = [count for count in range(batch, ceiling + 1, batch) if count >= 2]
     if not grid or grid[-1] != ceiling:
         grid.append(ceiling)
-    low, high, answer = 0, len(grid) - 1, grid[-1]
-    while low <= high:
-        middle = (low + high) // 2
-        looks = batch_looks(grid[middle], batch)
-        if looks and sequential_plan(dz, looks, alpha, draws, seed).power >= power:
-            answer, high = grid[middle], middle - 1
-        else:
-            low = middle + 1
-    return answer
+
+    def reaches(maximum: int) -> bool:
+        looks = batch_looks(maximum, batch)
+        return bool(looks) and sequential_plan(dz, looks, alpha, draws, seed).power >= power
+
+    if not reaches(grid[-1]):
+        return grid[-1]
+    return next(candidate for candidate in grid if reaches(candidate))
 
 
 def null_calibration(
@@ -615,22 +623,29 @@ def _plan_block(dz: float, budget: Budget, args: argparse.Namespace) -> tuple[li
     The refusal is read against the plan's **own** cost and not against the fixed
     design's. ``--max-seeds`` names a maximum the fixed-n requirement never
     implied, so gating on the requirement alone printed a 246 GPU-h schedule
-    under a ceiling line reading "12.3 against 15 -- inside it".
+    under a ceiling line reading "12.3 against 15 -- inside it". A fixed design
+    already over the ceiling short-circuits before the *search* runs, since it
+    is refused whatever the search would find -- but never before pricing a
+    maximum the operator named, which is the one number they asked about.
     """
-    # Before the search, not after: the search is the expensive part of this
-    # function, and a fixed design already over the ceiling is refused whatever
-    # it would have found.
-    if args.over_ceiling is None and not budget.fits:
-        return [], {}
-    maximum = args.max_seeds or plan_maximum(
-        dz,
-        args.batch,
-        args.alpha,
-        args.draws,
-        args.seed,
-        args.power,
-        max(budget.seeds_affordable, args.batch),
-    )
+    if args.max_seeds is not None:
+        maximum = args.max_seeds
+    else:
+        # The search is the expensive part of this function, and a fixed design
+        # already over the ceiling is refused whatever it would have found. Only
+        # the *search* is skipped: a maximum the operator named gets its own
+        # ceiling line either way, because that line is what prices their ask.
+        if args.over_ceiling is None and not budget.fits:
+            return [], {}
+        maximum = plan_maximum(
+            dz,
+            args.batch,
+            args.alpha,
+            args.draws,
+            args.seed,
+            args.power,
+            max(budget.seeds_affordable, args.batch),
+        )
     planned = replace(budget, seeds=maximum)
     blocks: list[str] = []
     if planned.hours > budget.hours:
