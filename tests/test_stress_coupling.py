@@ -17,6 +17,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent / "tame"))
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
+from measure_stress_coupling import Calibration, replay_magnitudes  # noqa: E402
 from synthetic_economy import (  # noqa: E402
     BASE_CONFIG,
     DEFAULT_COMPETENCE,
@@ -180,47 +181,65 @@ def test_invariant_3_the_setpoint_and_the_resting_spread_are_read_only_after_cal
     assert list(coupled.mob._resting_sigmas) == sigmas
 
 
-def test_invariant_6_the_charge_lands_in_the_one_settlement_and_nowhere_else():
-    """The ledger reconstructs from the recorded inflow with the charge in it.
+def test_invariant_6_the_charge_lands_in_the_one_settlement_and_nowhere_else(monkeypatch):
+    """The wealth update is exactly `settle`'s four terms, the charge among them.
 
     #40 exists so that every wealth path settles once; a charge that moved
-    wealth anywhere else would be the fourth path that issue removed. The
-    reconstruction is `measure_ledger_stability.py`'s -- `decay^T w_0 + the
-    relaxation toward the setpoint + the discounted inflow` -- and it is the
-    only form of this check that can fail for the reason the invariant names.
-    An earlier version asserted `charge > 0` and that some cell had lost
-    wealth, which is true whenever any cell lost any wealth to anything.
+    wealth anywhere else would be the fourth path that issue removed.
+
+    **Spying on the terms, not backing them out of the wealth.** An earlier
+    version of this test measured the inflow as
+    `w_next - (w * decay + setpoint * (1 - decay))` and then reconstructed
+    `w_next` from it, which telescopes: it held to 4e-16 on an arbitrary random
+    path and held again with a deliberately wrong decay. A charge applied twice,
+    applied per-winner, or applied outside the settlement would have been
+    absorbed into the measured "inflow" and the assertion would still have
+    passed. `measure_ledger_stability.py` avoids this by recording the inflow
+    independently, and so does this: each term is captured as `settle` computes
+    it, and the equation is checked against wealth the test never fed itself.
     """
     coupled = economy(stress_coupling=STRESS_SHARED, stress_lambda=0.01, stress_gamma=0.5)
-    # The same two constants `measure_ledger_stability._replay` reads: the
-    # relaxation is toward `initial_wealth` under `setpoint` mode and toward
-    # zero under `decay`, which is what the fixture runs.
-    decay = coupled.config.wealth_decay
-    setpoint = (
-        coupled.config.initial_wealth if coupled.config.ledger_mode == LEDGER_SETPOINT else 0.0
-    )
-    coupled.step()
+    updater = coupled.mob.wealth_updater
+    terms: list[tuple[torch.Tensor, torch.Tensor, float]] = []
+    real_settle = WealthUpdater.settle
 
-    start = coupled.mob.expert_wealth.clone().double()
-    inflow: list[torch.Tensor] = []
+    # Patched on the class: `WealthUpdater` is frozen, which is the property
+    # that makes `settle` return the charge rather than store it.
+    def spying(self, wealth: torch.Tensor, settlement, charge) -> float:
+        before = wealth.clone()
+        # The two signed pieces `settle` composes beside the relaxation: what
+        # the reward paid, and what the auction charged. Recomputed from the
+        # same settlement rather than differenced out of the ledger.
+        paid = self.reward(wealth.clone(), settlement)
+        priced = charge(
+            settlement.payments,
+            settlement.selected_experts,
+            settlement.num_tokens,
+            self.reward.multiplier,
+            settlement.rebates,
+            settlement.valid_mask,
+        )
+        stress = real_settle(self, wealth, settlement, charge)
+        terms.append((before, paid - priced, stress))
+        return stress
+
+    monkeypatch.setattr(WealthUpdater, "settle", spying)
     for _ in range(6):
-        before = coupled.mob.expert_wealth.clone().double()
         coupled.step()
-        after = coupled.mob.expert_wealth.double()
-        # What the settlement put in, backed out of the relaxation: the charge
-        # is part of it, so a charge applied anywhere else shows up as a gap.
-        inflow.append(after - (before * decay + setpoint * (1.0 - decay)))
 
-    steps = len(inflow)
-    weights = torch.tensor([decay**j for j in range(steps)], dtype=torch.float64)
-    reconstructed = (
-        start * decay**steps
-        + setpoint * (1.0 - decay) * float(weights.sum())
-        + (torch.stack(inflow) * weights.flip(0).unsqueeze(-1)).sum(dim=0)
-    )
-
-    assert coupled.mob.last_stress_charge > 0.0
-    assert torch.allclose(reconstructed, coupled.mob.expert_wealth.double(), atol=1e-5)
+    assert terms, "the settlement never ran"
+    assert any(stress > 0.0 for _, _, stress in terms)
+    for index, (before, transfer, stress) in enumerate(terms):
+        after = terms[index + 1][0] if index + 1 < len(terms) else coupled.mob.expert_wealth
+        relaxed = before * updater.decay
+        if updater.mode == LEDGER_SETPOINT:
+            relaxed = relaxed + updater.rate * updater.setpoint
+        # Every cell pays the same stress, winner or not: that is the invariant,
+        # and it is why the charge is a scalar subtracted from the whole vector.
+        assert torch.allclose(after, relaxed + transfer - stress, atol=1e-5), (
+            f"step {index}: wealth moved by something other than "
+            "relax + reward - price - stress, so the charge is not in the one settlement"
+        )
 
 
 def test_a_coupling_whose_name_and_price_disagree_is_refused():
@@ -273,8 +292,10 @@ def test_a_replayed_charge_is_the_size_of_the_charge_it_replaces():
     the drain it was matching -- 32x on this fixture -- which drove it to the
     wealth floor and made the contrast a comparison against an erased ledger.
 
-    The existing seam test pins `lambda * override * tokens`, which is true
-    whatever scale the caller picks, so only this one fails on that bug.
+    This pins the seam's arithmetic, which is true whatever scale the caller
+    picks -- so it documents the mechanism and would *not* have caught the bug.
+    `test_a_replayed_charge_round_trips_to_the_donors_own_total` is the one that
+    would, because it reaches the caller's scaling.
     """
     donor = economy(seed=0, stress_coupling=STRESS_SHARED, stress_lambda=0.01, stress_gamma=0.5)
     for _ in range(8):
@@ -292,6 +313,40 @@ def test_a_replayed_charge_is_the_size_of_the_charge_it_replaces():
     replaying.mob.stress_override = torch.tensor(recorded / 0.01)
     replaying.step()
     assert replaying.mob.last_stress_charge == pytest.approx(recorded * tokens, rel=1e-6)
+
+
+def test_a_replayed_charge_round_trips_to_the_donors_own_total():
+    """The scaling the control arm's whole validity rests on, at the caller's level.
+
+    `read_control` divided a recorded per-step *total* by a price and handed it
+    to a seam that reads a per-token *magnitude*, so the control arm paid
+    `tokens` times the drain it was matching -- 32x here -- and sat at the
+    wealth floor while `shared` did not. No test could have caught it: the
+    arithmetic lived inside `read_control`, and nothing imports that module.
+
+    Round-tripping is the whole check. Undo the donor's price and token count,
+    then put them back, and the donor's own total must come out.
+    """
+    donor = Calibration(
+        resting_sigma=0.04,
+        resting_reading=0.18,
+        setpoint=0.22,
+        mean_stress=0.125,
+        attributed_per_token=0.03,
+        equal_budget_lambda=0.0008,
+        tokens=32,
+    )
+    recorded = [0.1137, 0.2028, 0.0044]
+
+    magnitudes = replay_magnitudes(recorded, donor)
+
+    for charge, magnitude in zip(recorded, magnitudes, strict=True):
+        assert magnitude * donor.equal_budget_lambda * donor.tokens == pytest.approx(charge)
+    # The bug's own signature, so the guard is against a scale and not a typo:
+    # dividing by the price alone leaves a magnitude `tokens` times too large.
+    assert magnitudes[0] * donor.tokens == pytest.approx(recorded[0] / donor.equal_budget_lambda)
+    # And a donor that charged nothing lends nothing rather than dividing by zero.
+    assert replay_magnitudes(recorded, replace(donor, equal_budget_lambda=0.0)) == [0.0, 0.0, 0.0]
 
 
 def test_the_setpoint_step_does_not_silently_switch_the_charge_off():

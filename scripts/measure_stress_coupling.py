@@ -110,8 +110,9 @@ class Calibration:
     # too: `last_stress_charge` is a per-step *total* over the layer's tokens,
     # while `stress_override` is a per-token magnitude the layer expands to all
     # of them. Replaying a total as a magnitude charged the control arm
-    # `tokens` times the drain it was supposed to match.
-    tokens: int = 1
+    # `tokens` times the drain it was supposed to match. No default: the one
+    # value that would silently restore that bug is 1.
+    tokens: int
 
     def as_dict(self) -> dict[str, float]:
         return {
@@ -441,6 +442,24 @@ def read_arms(
     } | {"_curves": {arm: {s: r["residual_curve"] for s, r in runs[arm].items()} for arm in ARMS}}
 
 
+def replay_magnitudes(recorded: list[float], donor: Calibration) -> list[float]:
+    """A donor's recorded charges as the per-token magnitudes the replay seam takes.
+
+    `last_stress_charge` is a per-step **total** over the layer's tokens;
+    `stress_override` is a per-token magnitude that the layer expands to all of
+    them. Undoing the donor's own price and its token count leaves the donor's
+    stress trajectory, which the recipient then pays at its own equal-budget
+    price -- so the control replays the shape and keeps the budget.
+
+    Its own function so a test can reach it. Replaying the total unscaled
+    charged the control arm `tokens` times the drain it was matching, and no
+    test could have caught that while this arithmetic lived inside
+    `read_control`, which nothing imports.
+    """
+    scale = donor.equal_budget_lambda * donor.tokens
+    return [charge / scale if scale > 0 else 0.0 for charge in recorded]
+
+
 def read_control(
     seeds: tuple[int, ...], calibrations: dict[int, Calibration], resamples: int
 ) -> dict[str, Any]:
@@ -451,13 +470,7 @@ def read_control(
     for index, seed in enumerate(seeds):
         donor = seeds[(index + 1) % len(seeds)]
         recorded = run_stepped(donor, STRESS_SHARED, calibrations[donor])["charges"]
-        # The donor's charge is a per-step total over its tokens; the override
-        # is a per-token magnitude. Undo the donor's own price *and* its token
-        # count, so what is replayed is the donor's stress trajectory and what
-        # prices it is the recipient's own budget.
-        donated = calibrations[donor]
-        scale = donated.equal_budget_lambda * donated.tokens
-        charges = [charge / scale if scale > 0 else 0.0 for charge in recorded]
+        charges = replay_magnitudes(recorded, calibrations[donor])
         shared[str(seed)] = run_stepped(seed, STRESS_SHARED, calibrations[seed])["residual_stress"]
         replayed[str(seed)] = run_stepped(seed, STRESS_SHARED, calibrations[seed], replay=charges)[
             "residual_stress"
