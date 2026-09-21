@@ -723,7 +723,8 @@ def main() -> None:
     if readout.within_run:
         parser.error(
             f"{readout.name} is not read between two dose groups; it is the estimator study's "
-            "protocol (scripts/estimator_study.py --candidate setpoint-step)"
+            "protocol (scripts/estimator_study.py --stage setpoint, or --stage validate "
+            f"--chosen {readout.name})"
         )
     seeds = tuple(int(part) for part in args.seeds.split(","))
     code_sha, code_dirty = code_identity()

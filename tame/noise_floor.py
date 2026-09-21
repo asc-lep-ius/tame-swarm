@@ -24,11 +24,14 @@ the parity check.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, fields
+import logging
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
-from parity import ArmFingerprint
+from parity import ArmFingerprint, code_drift
+
+logger = logging.getLogger(__name__)
 
 # What a floor is a property of: the shape, the precision, the device and the
 # kernel set. Two runs that agree on all of these run the same kernels over the
@@ -59,14 +62,14 @@ FLOOR_KNOBS = frozenset(
     }
 )
 
-_VARIES = "varies between the two runs a floor is measured from; a floor that matched here \
-would be a floor of nothing"
+_VARIES = "varies between the sweep that measured the floor and the sweep that borrows it; \
+requiring equality here would let a floor be borrowed only by the seed that measured it"
 _ARM = "the arm's own variable: a floor is borrowed across arms of one sweep, or it buys nothing"
 _OPTIMISER = "decides what the weights become, never which kernels compute them"
 _MEASUREMENT = "read under no_grad with the economy frozen, after the trajectory it would have \
 to move"
-_CODE = "decided by code_drift, where a missing SHA has to count as drift and a field-equality \
-check would read two absences as agreement"
+_CODE = "decided by code_drift, which borrow_floor runs on the lender and each borrower: a \
+missing SHA has to count as drift, and a field-equality check would read two absences as agreement"
 _REGISTER = "a register of what the tissue was allowed to do, not of what the arithmetic did"
 
 # Every remaining fingerprint field, with the reason a floor does not depend on
@@ -169,6 +172,14 @@ class BorrowedFloor:
     replicate_seed: int | None
     replication_std: dict[str, float]
     knobs: dict[str, Any]
+    code_sha: str | None = None
+    code_dirty: bool | None = None
+    # What `--allow-code-drift` waived, empty when it waived nothing. Recorded
+    # for `compare_runs.assert_same_code`'s reason: a comparison made across
+    # drift is made, and never made silently. Without this the escape leaves no
+    # trace at all -- the printed line reads as unqualified agreement and the
+    # summary says only what SHA the lender had, not that it disagreed.
+    code_drift_allowed: list[str] = field(default_factory=list)
 
     @property
     def is_zero(self) -> bool:
@@ -184,19 +195,56 @@ class BorrowedFloor:
                 key: list(value) if isinstance(value, tuple) else value
                 for key, value in self.knobs.items()
             },
+            # Outside `knobs` because it is not a floor knob: the code identity
+            # is decided by `code_drift` rather than by field equality. It is
+            # recorded all the same, or a reader of a borrowed floor has no way
+            # to ask what kernels measured it.
+            "code_sha": self.code_sha,
+            "code_dirty": self.code_dirty,
+            "code_drift_allowed": list(self.code_drift_allowed),
             "is_zero": self.is_zero,
         }
 
 
-def borrow_floor(path: Path, fingerprints: dict[Any, dict[str, Any]]) -> BorrowedFloor:
+def _drift_between(lender: dict[str, Any], own: dict[str, Any]) -> list[str]:
+    """``parity.code_drift`` on a recorded lender and one borrower; empty when they agree.
+
+    A schema this version cannot build is drift too, and said as such: a
+    fingerprint nobody can reconstruct is a fingerprint nobody can check, and
+    the alternative is a silent pass.
+    """
+    try:
+        arms = [ArmFingerprint(**lender), ArmFingerprint(**own)]
+    except TypeError as exc:
+        return [f"  a fingerprint does not match this version's schema ({exc})"]
+    return code_drift(arms)
+
+
+def borrow_floor(
+    path: Path,
+    fingerprints: dict[Any, dict[str, Any]],
+    allow_code_drift: bool = False,
+) -> BorrowedFloor:
     """The floor recorded under ``path``, checked against the fingerprints borrowing it.
 
-    Refuses three ways, because each is a different mistake. A summary with no
+    Refuses four ways, because each is a different mistake. A summary with no
     recorded floor has nothing to lend -- including one that borrowed its own,
     since a floor relayed twice is a floor nobody measured at the configuration
     that quotes it. A summary whose replicate failed recorded the failure, not a
-    floor. And a summary at different floor knobs measured a different
+    floor. A summary at different floor knobs measured a different
     configuration's kernels, which is rule 4's whole clause.
+
+    And the fourth is the one the floor knobs cannot state. A floor is a property
+    of the kernels a configuration selects, and the code is what selects them --
+    #31's whole finding. ``code_sha`` and ``code_dirty`` are deliberately not
+    floor knobs, because a *missing* SHA has to count as drift and a
+    field-equality check reads two absences as agreement; so the check is
+    ``parity.code_drift``, run here on the lender against each borrower.
+    ``allow_code_drift`` is the operator saying it anyway, and it mirrors
+    ``compare_runs.py --allow-code-drift`` so the runs recorded before #31 stay
+    borrowable when somebody names the decision -- including that escape's other
+    half, which is that the waived reasons are logged and carried on the
+    borrowed floor. A waiver nothing records is the silence the check replaced.
     """
     summary_path = path / "seed_summary.json"
     if not summary_path.exists():
@@ -220,6 +268,7 @@ def borrow_floor(path: Path, fingerprints: dict[Any, dict[str, Any]]) -> Borrowe
             "measured at cannot be read (every summary recorded before #6)"
         )
     lender = next(iter(prints.values()))
+    waived: list[str] = []
     for seed, fingerprint in fingerprints.items():
         differing = differing_floor_knobs(lender, fingerprint)
         if differing:
@@ -229,10 +278,32 @@ def borrow_floor(path: Path, fingerprints: dict[Any, dict[str, Any]]) -> Borrowe
                 f"seed {seed} runs, so it is not this configuration's floor: "
                 + ", ".join(f"{key} {theirs.get(key)!r} vs {ours.get(key)!r}" for key in differing)
             )
+        # After the knobs, because a sweep at another shape is the coarser
+        # mismatch and its message is the more useful one when both apply.
+        drift = _drift_between(lender, fingerprint)
+        if drift and not allow_code_drift:
+            raise BorrowedFloorError(
+                f"the floor recorded at {path} was measured by other code than this sweep's "
+                f"seed {seed} runs, and a floor is a property of the kernels the code selects "
+                "(#31). Pass --allow-code-drift to borrow it anyway:\n" + "\n".join(drift)
+            )
+        for reason in drift:
+            if reason not in waived:
+                waived.append(reason)
+    if waived:
+        logger.warning(
+            "code drift allowed by --allow-code-drift; the floor borrowed from %s was not "
+            "measured by this sweep's code:\n%s",
+            path,
+            "\n".join(waived),
+        )
     return BorrowedFloor(
         path=str(path),
         arm=summary.get("arm", "unknown"),
         replicate_seed=summary.get("replicate_seed"),
         replication_std=dict(recorded),
         knobs=floor_knobs(lender),
+        code_sha=lender.get("code_sha"),
+        code_dirty=lender.get("code_dirty"),
+        code_drift_allowed=waived,
     )
