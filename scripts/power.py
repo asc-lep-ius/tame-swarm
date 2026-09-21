@@ -316,6 +316,20 @@ def batch_looks(maximum: int, batch: int) -> list[int]:
     return looks
 
 
+def maximum_grid(batch: int, cap: int) -> list[int]:
+    """Every maximum a plan at this batch may declare, up to ``cap`` and ending on it.
+
+    Its own function so a test oracle checking ``plan_maximum`` against brute
+    force walks the same points rather than a description of them: the two
+    agreed only while ``cap`` happened to be a multiple of ``batch``.
+    """
+    ceiling = max(cap, 2)
+    grid = [count for count in range(batch, ceiling + 1, batch) if count >= 2]
+    if not grid or grid[-1] != ceiling:
+        grid.append(ceiling)
+    return grid
+
+
 def plan_maximum(
     dz: float, batch: int, alpha: float, draws: int, seed: int, power: float, cap: int
 ) -> int:
@@ -328,19 +342,36 @@ def plan_maximum(
     dz = 1.5, and 0.306 at #39's dz = 0.867. Raising the maximum is what moves
     that, and it is the first thing to try.
 
-    **Scanned upward, not binary-searched**, so the answer is the smallest by
-    construction rather than by an assumption about the curve. A binary search
-    needs the sequence's power not to fall as the maximum rises, and it does
-    fall: the statistic is estimated by simulation, so where the power gradient
+    **Scanned upward, not binary-searched**: whenever the target is reachable at
+    the cap, the answer is the smallest grid point that reaches it, and no
+    assumption about the curve is needed to say so. A binary search does need
+    one -- that the sequence's power not fall as the maximum rises -- and it
+    falls: the statistic is estimated by simulation, so where the power gradient
     is shallow the Monte Carlo noise wins. At ``--draws 2000`` the search
     returned 48 and 51 where the smallest is 42 (dz 0.6, seeds 1 and 2, target
     0.5), and even at 40000 draws dz 0.3 drops six times over a twenty-point
     grid at batch 3. The threshold was never the batch; it is the noise against
     the gradient, and ``--draws`` and ``--seed`` are both flags.
 
-    The cap is probed first, in one simulation, so an unreachable target costs
-    one step rather than the whole grid; a reachable one costs the index of the
-    answer, which at this project's own ceiling is a grid of three.
+    The cap is probed first, in one simulation. **If the cap misses the target
+    the cap is returned without scanning, and that is a decision rather than a
+    shortcut**: where the curve is not monotone there are smaller maxima that
+    reach while the cap does not -- at 2000 draws and dz 0.3, seed 5, a maximum
+    of 6 reads 0.080 against the cap's 0.075 -- and preregistering one of those
+    would be preregistering the noise. Being told the design does not reach is
+    the better answer. It is also what makes an unreachable target cost one step
+    instead of the whole grid.
+
+    A reachable target costs the index of the answer, which at this project's
+    own 15 GPU-hour ceiling is a grid of three points. Raising the ceiling is
+    what makes that visible: at ``--ceiling 1000`` the grid is 163 points and a
+    run takes about 2 minutes at dz 0.3 and about 6 at dz 0.25, against 30 and
+    50 seconds for the binary search this replaced. Expected, not hung. Do not
+    buy it back by drawing once at the cap and slicing columns per candidate:
+    ``standard_normal((draws, M))`` is not a column prefix of
+    ``(draws, cap)``, so that would silently change every plan this tool has
+    ever printed, and a plan here is reproducible from the seed printed beside
+    it.
 
     ``batch >= 3`` is required for two reasons that are not this one. It is the
     operator's decision of 2026-09-20 recorded in #56 -- "batches of three
@@ -360,10 +391,7 @@ def plan_maximum(
             "paired seeds the first look has no spread worth a t, which is the operator's "
             "reason for fixing the batch at three in #56"
         )
-    ceiling = max(cap, 2)
-    grid = [count for count in range(batch, ceiling + 1, batch) if count >= 2]
-    if not grid or grid[-1] != ceiling:
-        grid.append(ceiling)
+    grid = maximum_grid(batch, cap)
 
     def reaches(maximum: int) -> bool:
         looks = batch_looks(maximum, batch)

@@ -29,6 +29,7 @@ from power import (  # noqa: E402
     format_requirement,
     load_shift,
     main,
+    maximum_grid,
     normal_approximation,
     null_calibration,
     paired_effect,
@@ -300,7 +301,10 @@ def test_the_maximum_is_the_smallest_by_construction_and_not_by_a_curve_assumpti
     """
 
     def brute_force(dz, draws, seed, power, cap):
-        grid = [count for count in range(BATCH_SEEDS, cap + 1, BATCH_SEEDS)]
+        # `maximum_grid` rather than a second description of it: the two agreed
+        # only while `cap` was a multiple of the batch, and an oracle that walks
+        # different points fails for reasons unrelated to what it guards.
+        grid = maximum_grid(BATCH_SEEDS, cap)
         reached = (
             count
             for count in grid
@@ -313,8 +317,39 @@ def test_the_maximum_is_the_smallest_by_construction_and_not_by_a_curve_assumpti
         found = plan_maximum(0.6, BATCH_SEEDS, 0.05, 2000, seed, 0.50, 60)
         assert found == brute_force(0.6, 2000, seed, 0.50, 60) == 42
 
-    # A target nothing in the grid reaches costs one probe of the cap and
-    # returns it, rather than walking every point to say so.
+    # A cap that is not a multiple of the batch: the grid ends on it, and the
+    # oracle and the code have to agree there too. They did not while the oracle
+    # described the grid instead of sharing it.
+    assert maximum_grid(BATCH_SEEDS, 47)[-1] == 47
+    assert plan_maximum(0.6, BATCH_SEEDS, 0.05, 2000, 1, 0.50, 47) == brute_force(
+        0.6, 2000, 1, 0.50, 47
+    )
+
+
+def test_a_target_the_cap_misses_returns_the_cap_and_not_a_smaller_point_that_reaches():
+    """The probe is a decision about what may be preregistered, not a shortcut.
+
+    Where the curve is not monotone there are smaller maxima that reach while
+    the cap does not, and they are Monte Carlo noise: at 2000 draws, dz 0.3 and
+    seed 5, a maximum of 6 reads 0.080 against the cap's 0.075. Preregistering
+    that 6 would be preregistering the noise, so the answer is that the design
+    does not reach. This is the one branch that is a choice rather than a
+    search, and it is pinned here so it stays one.
+    """
+    reaching = sequential_plan(0.3, batch_looks(6, BATCH_SEEDS), 0.05, 2000, 5).power
+    at_the_cap = sequential_plan(0.3, batch_looks(30, BATCH_SEEDS), 0.05, 2000, 5).power
+    assert reaching > 0.0775 > at_the_cap
+
+    assert plan_maximum(0.3, BATCH_SEEDS, 0.05, 2000, 5, 0.0775, 30) == 30
+
+    # The same rule at a cap that is not a multiple of the batch, where it
+    # decides between two different answers on the same design: 44 misses 0.50
+    # so 44 is returned, and 47 reaches it so the scan runs and finds 42.
+    assert plan_maximum(0.6, BATCH_SEEDS, 0.05, 2000, 1, 0.50, 44) == 44
+    assert plan_maximum(0.6, BATCH_SEEDS, 0.05, 2000, 1, 0.50, 47) == 42
+
+    # And a target nothing reaches at all still costs one probe and returns the
+    # cap, rather than walking every point to say the same thing.
     assert plan_maximum(0.05, BATCH_SEEDS, 0.05, 2000, 0, 0.99, 30) == 30
 
 
