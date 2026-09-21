@@ -395,6 +395,18 @@ def build_parser() -> argparse.ArgumentParser:
             "measured at, and a floor measured at other knobs is refused, not borrowed"
         ),
     )
+    # The escape compare_runs.py already carries, on the path that now runs the
+    # same check: a floor is a property of the kernels the code selects, so a
+    # lender at another SHA -- or at none, which is every summary before #31 --
+    # is refused unless the operator names the decision.
+    parser.add_argument(
+        "--allow-code-drift",
+        action="store_true",
+        help=(
+            "Borrow a floor measured by other code than this sweep runs. Without it a lender "
+            "at a different SHA, a dirty tree, or no recorded SHA at all is refused"
+        ),
+    )
     # #35: the metric this sweep is to be read on, declared before it is read.
     # It travels in the summary so compare_runs.py puts the interval on the
     # contrast that was chosen in advance rather than the largest row found.
@@ -419,6 +431,11 @@ def parse_sweep_args(argv: list[str] | None = None) -> argparse.Namespace:
             "--floor_recorded_at borrows the floor a replicate would measure, so it goes with "
             "--no-replicate; this sweep asked for both"
         )
+    if args.allow_code_drift and args.floor_recorded_at is None:
+        parser.error(
+            "--allow-code-drift decides whether a borrowed floor may come from other code, "
+            "so it goes with --floor_recorded_at; this sweep borrows nothing"
+        )
     return args
 
 
@@ -430,7 +447,12 @@ def main() -> None:
         # Read before any run: a lender with no floor to lend is a refusal worth
         # having now rather than after the GPU-hours. The knob check needs this
         # sweep's own fingerprints and happens below, on what the runs recorded.
-        borrow_floor(Path(args.floor_recorded_at), {})
+        try:
+            borrow_floor(Path(args.floor_recorded_at), {}, args.allow_code_drift)
+        except BorrowedFloorError as exc:
+            # Before any run rather than after the GPU-hours, and as a usage
+            # error rather than a traceback: what is wrong is the command line.
+            raise SystemExit(f"--floor_recorded_at: {exc}") from exc
 
     seeds = [int(part) for part in args.seeds.split(",")]
     if len(seeds) < 2:
@@ -514,7 +536,9 @@ def main() -> None:
         # already spent, and a summary that says its floor is unmeasured is worth
         # more than a crash that throws the runs away with it.
         try:
-            borrowed = borrow_floor(Path(args.floor_recorded_at), fingerprints)
+            borrowed = borrow_floor(
+                Path(args.floor_recorded_at), fingerprints, args.allow_code_drift
+            )
         except BorrowedFloorError as exc:
             replication_error = str(exc)
             logger.error("the recorded floor was refused, so this sweep has none: %s", exc)
@@ -546,6 +570,19 @@ def main() -> None:
             f"arm {borrowed.arm}, measured on seed {borrowed.replicate_seed} at the same "
             f"{len(borrowed.knobs)} floor knobs"
             + (" and recorded as zero" if borrowed.is_zero else " and NOT zero")
+            # Never unqualified: this line is what is pasted into a measurement
+            # row, and a waived drift that reaches it as agreement is the
+            # silence `--allow-code-drift` is not allowed to buy.
+            + (
+                ", borrowed across allowed code drift:\n" + "\n".join(borrowed.code_drift_allowed)
+                if borrowed.code_drift_allowed
+                else ""
+            )
+        )
+    elif args.floor_recorded_at is not None:
+        print(
+            f"replicate: none (--no-replicate), and the floor offered by "
+            f"{args.floor_recorded_at} was REFUSED, so this sweep has none -- {replication_error}"
         )
     elif replicate_seed is None:
         print("replicate: none (--no-replicate); the run-to-run floor is not measured")

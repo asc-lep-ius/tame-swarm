@@ -42,7 +42,7 @@ import json
 import math
 import statistics
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -76,6 +76,10 @@ ARMS = 3
 DEFAULT_DRAWS = 40_000
 # Random splits per null calibration. Same reasoning, one order cheaper.
 DEFAULT_SPLITS = 2_000
+# The pair count past which a search gives up and the readout is the finding.
+# Named rather than written at each of its four uses: a caller that raises it and
+# a message that still says 100000 is a wrong sentence about a real number.
+MAX_PAIRS = 100_000
 
 
 def paired_t_power(dz: float, pairs: int, alpha: float = ALPHA) -> float:
@@ -102,15 +106,18 @@ def paired_t_power(dz: float, pairs: int, alpha: float = ALPHA) -> float:
 
 
 def pairs_for_power(
-    dz: float, power: float = TARGET_POWER, alpha: float = ALPHA, maximum: int = 100_000
+    dz: float, power: float = TARGET_POWER, alpha: float = ALPHA, maximum: int = MAX_PAIRS
 ) -> int:
     """The smallest pair count reaching ``power``; ``maximum`` when nothing under it does.
 
     Walked from the normal approximation rather than bisected: the approximation
     always under-reads (it drops the degrees of freedom), so it is a lower bound
     a few steps below the answer, and the walk keeps every evaluation in the
-    range where the non-central t is well conditioned. A bisection reads the
-    power at 50000 pairs on the way, where it is a NaN.
+    range where the non-central t is well conditioned. A bisection cannot: the
+    non-central t returns NaN from a non-centrality of about 8 upward, patchily
+    -- at dz 0.15 it is NaN at 5000 and at 10000 pairs and 1.0 at 20000 -- so a
+    midpoint can land on one at any step, and a bisection has no way to tell a
+    NaN that means "far above the target" from one that means "far below".
     """
     if dz == 0.0:
         return maximum
@@ -232,10 +239,13 @@ def sequential_boundary(looks: list[int], alpha: float, draws: int, seed: int) -
     which is the same count ``compare_runs.MIN_PAIRS_FOR_COVERAGE`` was set at
     for the bootstrap's coverage, arrived at from the other direction.
 
-    Under the null the paired differences are exchangeable draws of mean zero;
-    the statistic is scale-free, so standard normals carry no assumption beyond
-    that. The boundary is the ``1 - alpha`` quantile of the maximum |t| over the
-    looks, which is Pocock's constant form: one number every look is read
+    Under the null the paired differences are exchangeable draws of mean zero,
+    and the statistic is scale-free -- but drawing them as standard normals is
+    an assumption and not a free one: heavy-tailed per-seed differences inflate
+    the small-n |t| tail and would make this boundary anti-conservative. That is
+    exactly what AdaStop's permutation avoids and what the seed counts here do
+    not allow. The boundary is the ``1 - alpha`` quantile of the maximum |t| over
+    the looks, which is Pocock's constant form: one number every look is read
     against, at the price of a higher bar than a single final test.
     """
     if not looks:
@@ -273,8 +283,9 @@ class Plan:
 def sequential_plan(dz: float, looks: list[int], alpha: float, draws: int, seed: int) -> Plan:
     """Simulate the design at ``dz``: its power, where it stops, and what that costs.
 
-    The same generator seed draws the null and the alternative, so a plan is
-    reproducible from the numbers printed beside it and a reader can rerun it.
+    The boundary is drawn from ``seed`` and the alternative from ``seed + 1``, so
+    the two simulations are independent and a plan is reproducible from the one
+    number printed beside it.
     """
     boundary = sequential_boundary(looks, alpha, draws, seed)
     generator = np.random.default_rng(seed + 1)
@@ -303,6 +314,92 @@ def batch_looks(maximum: int, batch: int) -> list[int]:
     if not looks or looks[-1] != maximum:
         looks.append(maximum)
     return looks
+
+
+def maximum_grid(batch: int, cap: int) -> list[int]:
+    """Every maximum a plan at this batch may declare, up to ``cap`` (at least 2) and ending on it.
+
+    Its own function so a test oracle checking ``plan_maximum`` against brute
+    force walks the same points rather than a description of them: the two
+    agreed only while ``cap`` happened to be a multiple of ``batch``.
+    """
+    ceiling = max(cap, 2)
+    grid = [count for count in range(batch, ceiling + 1, batch) if count >= 2]
+    if not grid or grid[-1] != ceiling:
+        grid.append(ceiling)
+    return grid
+
+
+def plan_maximum(
+    dz: float, batch: int, alpha: float, draws: int, seed: int, power: float, cap: int
+) -> int:
+    """The smallest preregistered maximum whose *sequence* reaches ``power``, up to ``cap``.
+
+    The fixed-n requirement is the wrong default, and reading it as one is how a
+    perfectly powerable design gets sent back to the fixture. A Pocock boundary
+    is higher than a single final test, so a sequence that stops at the fixed n
+    reaches less power than the fixed design does: 0.494 against 0.833 at
+    dz = 1.5, and 0.306 at #39's dz = 0.867. Raising the maximum is what moves
+    that, and it is the first thing to try.
+
+    **Scanned upward, not binary-searched**: whenever the target is reachable at
+    the cap, the answer is the smallest grid point that reaches it, and no
+    assumption about the curve is needed to say so. A binary search does need
+    one -- that the sequence's power not fall as the maximum rises -- and it
+    falls: the statistic is estimated by simulation, so where the power gradient
+    is shallow the Monte Carlo noise wins. At ``--draws 2000`` the search
+    returned 48 and 51 where the smallest is 42 (dz 0.6, seeds 1 and 2, target
+    0.5), and even at 40000 draws dz 0.3 drops six times over a twenty-point
+    grid at batch 3. The threshold was never the batch; it is the noise against
+    the gradient, and ``--draws`` and ``--seed`` are both flags.
+
+    The cap is probed first, in one simulation. **If the cap misses the target
+    the cap is returned without scanning, and that is a decision rather than a
+    shortcut**: where the curve is not monotone there are smaller maxima that
+    reach while the cap does not -- at 2000 draws and dz 0.3, seed 5, a maximum
+    of 6 reads 0.080 against the cap's 0.075 -- and preregistering one of those
+    would be preregistering the noise. Being told the design does not reach is
+    the better answer. It is also what makes an unreachable target cost one step
+    instead of the whole grid.
+
+    A reachable target costs the index of the answer, which at this project's
+    own 15 GPU-hour ceiling is a grid of three points. Raising the ceiling is
+    what makes that visible: at ``--ceiling 1000`` the grid is 163 points and a
+    run takes about 2 minutes at dz 0.3 and about 6 at dz 0.25, against 30 and
+    50 seconds for the binary search this replaced. Expected, not hung. Do not
+    buy it back by drawing once at the cap and slicing columns per candidate:
+    ``standard_normal((draws, M))`` is not a column prefix of
+    ``(draws, cap)``, so that would silently change every plan this tool has
+    ever printed, and a plan here is reproducible from the seed printed beside
+    it.
+
+    ``batch >= 3`` is required for two reasons that are not this one. It is the
+    operator's decision of 2026-09-20 recorded in #56 -- "batches of three
+    paired seeds, stop on decision" -- and below it the first look has no
+    spread worth a t: a batch of one has no degrees of freedom at all and a
+    batch of two has one, so the Pocock boundary swamps the early looks and a
+    ``--batch -3`` plan printed a fixed-n test wearing the label of a sequence.
+
+    The scan runs at the caller's ``draws`` rather than at a cheaper count, so
+    it is the *same* simulation the plan is printed from. A search an order
+    coarser settled on a maximum reading 0.80 that printed 0.792 beneath itself,
+    which is a default that contradicts its own table.
+    """
+    if batch < BATCH_SEEDS:
+        raise ValueError(
+            f"a plan's maximum cannot be searched at a batch of {batch}: below {BATCH_SEEDS} "
+            "paired seeds the first look has no spread worth a t, which is the operator's "
+            "reason for fixing the batch at three in #56"
+        )
+    grid = maximum_grid(batch, cap)
+
+    def reaches(maximum: int) -> bool:
+        looks = batch_looks(maximum, batch)
+        return bool(looks) and sequential_plan(dz, looks, alpha, draws, seed).power >= power
+
+    if not reaches(grid[-1]):
+        return grid[-1]
+    return next(candidate for candidate in grid if reaches(candidate))
 
 
 def null_calibration(
@@ -337,6 +434,12 @@ def null_calibration(
         spread = statistics.stdev(deltas)
         if spread > 0:
             t_calls += int(abs(statistics.fmean(deltas)) / (spread / math.sqrt(pairs)) > critical)
+        else:
+            # A discrete readout produces splits with no spread at all. One whose
+            # mean is nonzero is an infinite t and therefore a call; dropping it
+            # from the numerator while keeping it in the denominator is what
+            # would understate the rate this function exists to measure.
+            t_calls += int(statistics.fmean(deltas) != 0.0)
     return {
         "pairs": float(pairs),
         "splits": float(splits),
@@ -364,21 +467,25 @@ def format_effect(effect: Effect) -> str:
     return "\n".join(lines)
 
 
-def format_requirement(dz: float, budget: Budget, power: float, alpha: float) -> str:
+def format_requirement(
+    dz: float, budget: Budget, power: float, alpha: float, maximum: int = MAX_PAIRS
+) -> str:
     pairs = budget.seeds
     lines = [
         f"dz {dz:+.4f} at {power:.0%} power, alpha {alpha} two-sided, paired t (scipy.stats.nct)",
         f"  paired seeds a side      {pairs}"
-        + (f"   (power {paired_t_power(dz, pairs, alpha):.3f}" if pairs < 100_000 else ""),
+        + (f"   (power {paired_t_power(dz, pairs, alpha):.3f}" if pairs < maximum else ""),
     ]
-    if pairs < 100_000:
+    if pairs < maximum:
         lines[-1] += f", {paired_t_power(dz, pairs - 1, alpha):.3f} at {pairs - 1})"
         lines.append(
             f"  the normal approximation {normal_approximation(dz, power, alpha):.1f}"
             "   -- what it would have under-read by"
         )
     else:
-        lines.append("  no pair count under 100000 reaches this power; the readout is the problem")
+        lines.append(
+            f"  no pair count under {maximum} reaches this power; the readout is the problem"
+        )
     lines += [
         f"  runs an arm              {budget.runs_per_arm}   ({budget.runs_per_seed} runs a seed)",
         f"  runs in the sweep        {budget.runs}   ({budget.arms} arms)",
@@ -388,14 +495,15 @@ def format_requirement(dz: float, budget: Budget, power: float, alpha: float) ->
     return "\n".join(lines)
 
 
-def format_ceiling(budget: Budget, over_ceiling: str | None) -> str:
+def format_ceiling(budget: Budget, over_ceiling: str | None, what: str = "") -> str:
+    label = f"ceiling ({what})" if what else "ceiling"
     if budget.fits:
         return (
-            f"ceiling: {budget.hours:.1f} GPU-h against {budget.ceiling:.0f} -- inside it. "
+            f"{label}: {budget.hours:.1f} GPU-h against {budget.ceiling:.0f} -- inside it. "
             "The ceiling is a dead band: stop when the sign is settled, not at the ceiling."
         )
     lines = [
-        f"ceiling: {budget.hours:.1f} GPU-h against {budget.ceiling:.0f} -- OVER, by "
+        f"{label}: {budget.hours:.1f} GPU-h against {budget.ceiling:.0f} -- OVER, by "
         f"{budget.hours / budget.ceiling:.0f}x. The ceiling affords {budget.seeds_affordable} "
         f"paired seeds a side at these knobs.",
         "  A design over the ceiling is a design problem, sent back to the fixture (#57, "
@@ -412,7 +520,7 @@ def format_ceiling(budget: Budget, over_ceiling: str | None) -> str:
     return "\n".join(lines)
 
 
-def format_plan(plan: Plan, budget: Budget, batch: int, alpha: float) -> str:
+def format_plan(plan: Plan, budget: Budget, batch: int, alpha: float, power: float) -> str:
     single_look = float(student_t.ppf(1 - alpha / 2, plan.looks[-1] - 1))
     per_seed_hours = budget.runs_per_seed * budget.arms * budget.hours_per_run
     lines = [
@@ -432,10 +540,27 @@ def format_plan(plan: Plan, budget: Budget, batch: int, alpha: float) -> str:
         f"  power over the whole sequence {plan.power:.3f}; expected spend "
         f"{plan.expected_seeds:.1f} seeds, {plan.expected_seeds * per_seed_hours:.1f} GPU-h"
     )
-    if plan.power < TARGET_POWER:
+    if plan.power < power:
+        affordable = budget.seeds_affordable
         lines.append(
-            f"  this plan does not reach {TARGET_POWER:.0%}: the maximum is the binding "
-            "constraint, not the batch size. The readout or the substrate is what moves it."
+            f"  this plan does not reach {power:.0%}: the maximum is the binding constraint, "
+            "not the batch size."
+        )
+        # Which lever actually moves it, because naming the wrong one costs a
+        # redesign cycle. A Pocock boundary is higher than a single final test,
+        # so a maximum set at the fixed-n requirement under-powers the sequence
+        # by construction -- and there the answer is more seeds, not a different
+        # readout. Only once the maximum is everything the ceiling affords is
+        # the substrate the thing left to change.
+        lines.append(
+            f"  Raise the maximum first: the ceiling affords {affordable} paired seeds a side "
+            f"and this plan stops at {plan.looks[-1]}. The readout or the substrate is what "
+            "moves it only once the maximum is already there."
+            if plan.looks[-1] < affordable
+            else f"  The maximum is already at or past everything the ceiling affords "
+            f"({affordable} paired seeds a side, and this plan stops at {plan.looks[-1]}), so a "
+            "longer sweep is not the lever: the readout or the substrate is what moves it "
+            "(section 8, rules 3 and 5)."
         )
     return "\n".join(lines)
 
@@ -493,22 +618,22 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
-    args = build_parser().parse_args()
-    if args.dz is None and args.shifts is None and args.null_calibrate is None:
-        build_parser().error("nothing to compute: pass --dz, --shifts or --null-calibrate")
-    record: dict[str, object] = {}
-    blocks: list[str] = []
-
-    dz = args.dz
-    if args.shifts is not None:
-        effect = paired_effect(
-            f"{args.shifts[0].stem} minus {args.shifts[1].stem}",
-            load_shift(args.shifts[0]),
-            load_shift(args.shifts[1]),
+def _effect_block(args: argparse.Namespace) -> tuple[list[str], dict[str, object], float | None]:
+    """``--shifts``: the measured effect, and the dz the requirement is priced at."""
+    effect = paired_effect(
+        f"{args.shifts[0].stem} minus {args.shifts[1].stem}",
+        load_shift(args.shifts[0]),
+        load_shift(args.shifts[1]),
+    )
+    blocks = [format_effect(effect)]
+    if len(effect.deltas) < MIN_PAIRS_FOR_COVERAGE:
+        blocks.append(
+            f"  measured on {len(effect.deltas)} seeds: dz is itself an estimate with a "
+            f"wide interval below {MIN_PAIRS_FOR_COVERAGE} pairs, and the seed count it "
+            "implies inherits that. Plan the first batch on it, never the whole sweep."
         )
-        blocks.append(format_effect(effect))
-        record["effect"] = {
+    fragment: dict[str, object] = {
+        "effect": {
             "label": effect.label,
             "deltas": effect.deltas,
             "mean": effect.mean,
@@ -516,82 +641,181 @@ def main() -> None:
             "dz": effect.dz,
             "rho": effect.rho,
         }
-        if len(effect.deltas) < MIN_PAIRS_FOR_COVERAGE:
-            blocks.append(
-                f"  measured on {len(effect.deltas)} seeds: dz is itself an estimate with a "
-                f"wide interval below {MIN_PAIRS_FOR_COVERAGE} pairs, and the seed count it "
-                "implies inherits that. Plan the first batch on it, never the whole sweep."
-            )
-        dz = dz if dz is not None else effect.dz
+    }
+    return blocks, fragment, effect.dz
 
-    if dz is not None:
-        pairs = pairs_for_power(dz, args.power, args.alpha)
-        budget = Budget(pairs, args.runs_per_seed, args.arms, args.hours_per_run, args.ceiling)
-        blocks.append(format_requirement(dz, budget, args.power, args.alpha))
-        blocks.append(format_ceiling(budget, args.over_ceiling))
-        record["requirement"] = {
-            "dz": dz,
-            "power": args.power,
-            "alpha": args.alpha,
-            "paired_seeds": pairs,
-            "runs_per_arm": budget.runs_per_arm,
-            "runs": budget.runs,
-            "gpu_hours": budget.hours,
-            "normal_approximation": normal_approximation(dz, args.power, args.alpha),
-            "ceiling_gpu_hours": args.ceiling,
-            "fits_ceiling": budget.fits,
-        }
-        if args.plan and (budget.fits or args.over_ceiling is not None):
-            maximum = args.max_seeds or min(pairs, max(budget.seeds_affordable, args.batch))
-            looks = batch_looks(maximum, args.batch)
-            if looks:
-                plan = sequential_plan(dz, looks, args.alpha, args.draws, args.seed)
-                blocks.append(format_plan(plan, budget, args.batch, args.alpha))
-                record["plan"] = {
-                    "looks": plan.looks,
-                    "boundary": plan.boundary,
-                    "stop_by": plan.stop_by,
-                    "power": plan.power,
-                    "expected_seeds": plan.expected_seeds,
-                    "draws": plan.draws,
-                    "seed": plan.seed,
-                }
 
-    if args.discount is not None:
-        fixture_dz, body_dz = args.discount
-        ratio = body_dz / fixture_dz if fixture_dz else float("inf")
+def _plan_block(dz: float, budget: Budget, args: argparse.Namespace) -> tuple[list[str], dict]:
+    """``--plan``: the sequential design, refused when what it would spend is over the ceiling.
+
+    The refusal is read against the plan's **own** cost and not against the fixed
+    design's. ``--max-seeds`` names a maximum the fixed-n requirement never
+    implied, so gating on the requirement alone printed a 246 GPU-h schedule
+    under a ceiling line reading "12.3 against 15 -- inside it". A fixed design
+    already over the ceiling short-circuits before the *search* runs, since it
+    is refused whatever the search would find -- but never before pricing a
+    maximum the operator named, which is the one number they asked about.
+    """
+    if args.max_seeds is not None:
+        maximum = args.max_seeds
+    else:
+        # The search is the expensive part of this function, and a fixed design
+        # already over the ceiling is refused whatever it would have found. Only
+        # the *search* is skipped: a maximum the operator named gets its own
+        # ceiling line either way, because that line is what prices their ask.
+        if args.over_ceiling is None and not budget.fits:
+            return [], {}
+        maximum = plan_maximum(
+            dz,
+            args.batch,
+            args.alpha,
+            args.draws,
+            args.seed,
+            args.power,
+            max(budget.seeds_affordable, args.batch),
+        )
+    planned = replace(budget, seeds=maximum)
+    blocks: list[str] = []
+    if planned.hours > budget.hours:
+        blocks.append(format_ceiling(planned, args.over_ceiling, "the plan's maximum"))
+    if args.over_ceiling is None and not planned.fits:
+        return blocks, {}
+    looks = batch_looks(maximum, args.batch)
+    if not looks:
         blocks.append(
-            f"fixture-to-body discount: dz {body_dz:+.4f} on the body over {fixture_dz:+.4f} on "
-            f"the fixture = {ratio:+.2f}x. **An assumption, not a measurement** (section 8, "
-            "rule 3): it is one readout's ratio on one pair of substrates, and it is written "
-            "beside a power row so the reader can see what was assumed, never folded into it."
+            f"no sequential plan: a maximum of {maximum} cannot be looked at, since a look "
+            "needs two paired seeds to have a spread at all"
         )
-        record["discount"] = {"fixture_dz": fixture_dz, "body_dz": body_dz, "ratio": ratio}
+        return blocks, {}
+    plan = sequential_plan(dz, looks, args.alpha, args.draws, args.seed)
+    blocks.append(format_plan(plan, budget, args.batch, args.alpha, args.power))
+    return blocks, {
+        "looks": plan.looks,
+        "boundary": plan.boundary,
+        "stop_by": plan.stop_by,
+        "power": plan.power,
+        "expected_seeds": plan.expected_seeds,
+        "gpu_hours_at_maximum": planned.hours,
+        "draws": plan.draws,
+        "seed": plan.seed,
+    }
 
-    if args.null_calibrate is not None:
-        values = list(load_shift(args.null_calibrate).values())
-        calibration = null_calibration(
-            values, args.pairs, args.splits, args.alpha, args.seed, args.resamples
+
+def _requirement_block(dz: float, args: argparse.Namespace) -> tuple[list[str], dict[str, object]]:
+    """``--dz``, or the dz ``--shifts`` measured: what it costs and whether it may be spent."""
+    pairs = pairs_for_power(dz, args.power, args.alpha)
+    budget = Budget(pairs, args.runs_per_seed, args.arms, args.hours_per_run, args.ceiling)
+    blocks = [
+        format_requirement(dz, budget, args.power, args.alpha),
+        format_ceiling(budget, args.over_ceiling),
+    ]
+    requirement: dict[str, object] = {
+        "dz": dz,
+        "power": args.power,
+        "alpha": args.alpha,
+        "paired_seeds": pairs,
+        "runs_per_arm": budget.runs_per_arm,
+        "runs": budget.runs,
+        "gpu_hours": budget.hours,
+        "normal_approximation": normal_approximation(dz, args.power, args.alpha),
+        "ceiling_gpu_hours": args.ceiling,
+        "fits_ceiling": budget.fits,
+        # Without this a plan written past the ceiling lands in the machine
+        # record as `fits_ceiling: false` plus a schedule, with no trace of the
+        # preregistration row that authorised it -- and this record is what
+        # fills the measurement template's Power row.
+        "over_ceiling": args.over_ceiling,
+    }
+    fragment: dict[str, object] = {"requirement": requirement}
+    if args.plan:
+        plan_blocks, plan_record = _plan_block(dz, budget, args)
+        blocks += plan_blocks
+        if plan_record:
+            fragment["plan"] = plan_record
+    return blocks, fragment
+
+
+def _discount_block(args: argparse.Namespace) -> tuple[list[str], dict[str, object]]:
+    """``--discount``: one readout's dz on both substrates, as a stated assumption."""
+    fixture_dz, body_dz = args.discount
+    ratio = body_dz / fixture_dz if fixture_dz else float("inf")
+    return [
+        f"fixture-to-body discount: dz {body_dz:+.4f} on the body over {fixture_dz:+.4f} on "
+        f"the fixture = {ratio:+.2f}x. **An assumption, not a measurement** (section 8, "
+        "rule 3): it is one readout's ratio on one pair of substrates, and it is written "
+        "beside a power row so the reader can see what was assumed, never folded into it."
+    ], {"discount": {"fixture_dz": fixture_dz, "body_dz": body_dz, "ratio": ratio}}
+
+
+def _calibration_block(args: argparse.Namespace) -> tuple[list[str], dict[str, object]]:
+    """``--null-calibrate``: what the readout calls between two halves of one arm."""
+    values = list(load_shift(args.null_calibrate).values())
+    calibration = null_calibration(
+        values, args.pairs, args.splits, args.alpha, args.seed, args.resamples
+    )
+    lines = [
+        f"null calibration on {len(values)} readings of one arm, split into two halves of "
+        f"{args.pairs} over {args.splits} random splits:",
+        f"  percentile bootstrap excludes zero  {calibration['bootstrap_false_positive_rate']:.3f}",
+        f"  paired t at alpha {args.alpha}            "
+        f"{calibration['paired_t_false_positive_rate']:.3f}",
+        "  a rate above alpha is the readout's, not the arm's: the two halves are one arm.",
+    ]
+    if args.pairs < MIN_PAIRS_FOR_COVERAGE:
+        lines.append(
+            f"  at {args.pairs} pairs the percentile interval is the sample range "
+            f"(compare_runs, #35), so it excludes zero exactly when all {args.pairs} "
+            f"deltas share a sign: {2 * 0.5**args.pairs:.3f} under any symmetric null, "
+            "whatever the readout. That is the number above, and it is arithmetic rather "
+            "than a property of this arm."
         )
-        lines = [
-            f"null calibration on {len(values)} readings of one arm, split into two halves of "
-            f"{args.pairs} over {args.splits} random splits:",
-            "  percentile bootstrap excludes zero  "
-            f"{calibration['bootstrap_false_positive_rate']:.3f}",
-            f"  paired t at alpha {args.alpha}            "
-            f"{calibration['paired_t_false_positive_rate']:.3f}",
-            "  a rate above alpha is the readout's, not the arm's: the two halves are one arm.",
-        ]
-        if args.pairs < MIN_PAIRS_FOR_COVERAGE:
-            lines.append(
-                f"  at {args.pairs} pairs the percentile interval is the sample range "
-                f"(compare_runs, #35), so it excludes zero exactly when all {args.pairs} "
-                f"deltas share a sign: {2 * 0.5**args.pairs:.3f} under any symmetric null, "
-                "whatever the readout. That is the number above, and it is arithmetic rather "
-                "than a property of this arm."
-            )
-        blocks.append("\n".join(lines))
-        record["null_calibration"] = calibration
+    return ["\n".join(lines)], {"null_calibration": calibration}
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.dz is None and args.shifts is None and args.null_calibrate is None:
+        parser.error("nothing to compute: pass --dz, --shifts or --null-calibrate")
+    if args.plan and args.batch < BATCH_SEEDS:
+        # `--batch -3` printed "batches of -3 paired seeds ... over 1 looks" at a
+        # boundary of 2.443 against a single final test's 2.447: a fixed-n test
+        # wearing the label of a family-wise-controlled sequence. Three is the
+        # project's floor for a quoted number (#13) and the count below which
+        # the maximum search's own contract stops holding.
+        parser.error(
+            f"--batch {args.batch}: a plan's batches are at least {BATCH_SEEDS} paired seeds. "
+            "Below that the first look has no spread worth a t, the Pocock boundary swamps "
+            "the design, and the sequence's power stops rising with the maximum"
+        )
+    record: dict[str, object] = {}
+    blocks: list[str] = []
+    dz = args.dz
+    # Every reader below raises ValueError on input it cannot use -- a shift file
+    # with one seed, a calibration with fewer readings than the split needs. At
+    # the CLI boundary that is a usage error and prints as one, the way
+    # dose_slope.py and allocation_shift.py already do, rather than as a
+    # traceback the operator has to read past to find the sentence.
+    try:
+        if args.shifts is not None:
+            shift_blocks, shift_record, measured = _effect_block(args)
+            blocks += shift_blocks
+            record |= shift_record
+            dz = dz if dz is not None else measured
+        if dz is not None:
+            requirement_blocks, requirement_record = _requirement_block(dz, args)
+            blocks += requirement_blocks
+            record |= requirement_record
+        if args.discount is not None:
+            discount_blocks, discount_record = _discount_block(args)
+            blocks += discount_blocks
+            record |= discount_record
+        if args.null_calibrate is not None:
+            calibration_blocks, calibration_record = _calibration_block(args)
+            blocks += calibration_blocks
+            record |= calibration_record
+    except ValueError as exc:
+        parser.error(str(exc))
 
     print("\n\n".join(blocks))
     if args.json is not None:

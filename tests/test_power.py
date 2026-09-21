@@ -18,16 +18,24 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "tame"))
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 from power import (  # noqa: E402
+    BATCH_SEEDS,
     Budget,
     _look_statistics,
+    _plan_block,
     batch_looks,
+    build_parser,
     format_ceiling,
+    format_plan,
+    format_requirement,
     load_shift,
+    main,
+    maximum_grid,
     normal_approximation,
     null_calibration,
     paired_effect,
     paired_t_power,
     pairs_for_power,
+    plan_maximum,
     sequential_boundary,
     sequential_plan,
 )
@@ -173,3 +181,215 @@ def test_the_power_of_a_pair_count_no_one_can_reach_is_not_a_nan():
     """scipy's non-central t returns NaN far from any solution; the walk must not stop there."""
     assert not math.isnan(paired_t_power(0.15, 60_000))
     assert paired_t_power(0.15, 60_000) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_a_maximum_named_past_the_ceiling_is_refused_even_when_the_fixed_design_fits():
+    """The refusal reads the plan's own cost, not the fixed design's.
+
+    ``--max-seeds`` names a maximum the fixed-n requirement never implied, so a
+    gate on the requirement alone printed a 40-look schedule rising to 246
+    GPU-hours directly beneath a ceiling line reading "12.3 against 15 -- inside
+    it". Found by a reviewer running it; the acceptance criterion is that the
+    helper refuses to plan past the ceiling without a preregistration row.
+    """
+    args = build_parser().parse_args(["--dz", "1.5", "--plan", "--max-seeds", "120"])
+    budget = Budget(6, args.runs_per_seed, args.arms, args.hours_per_run, args.ceiling)
+    assert budget.fits  # the fixed design is inside the ceiling; the plan is not
+
+    blocks, record = _plan_block(1.5, budget, args)
+
+    assert record == {}
+    assert "REFUSED" in "\n".join(blocks)
+    assert "look" not in "\n".join(blocks)
+    assert "246.0 GPU-h against 15" in "\n".join(blocks)
+
+    named = build_parser().parse_args(
+        ["--dz", "1.5", "--plan", "--max-seeds", "120", "--over-ceiling", "row 9, dated"]
+    )
+    allowed, plan_record = _plan_block(1.5, budget, named)
+    assert plan_record["looks"][-1] == 120
+    assert "row 9, dated" in "\n".join(allowed)
+
+
+def test_the_plan_maximum_is_what_the_sequence_needs_and_not_what_a_fixed_design_needs():
+    """A Pocock boundary is higher than a single final test, so the fixed n under-powers.
+
+    At dz 1.5 the fixed requirement is 6 paired seeds for 0.833, and a sequence
+    that stops at 6 reaches 0.49. Defaulting the maximum to the fixed n is what
+    made ``--plan`` report an under-powered design at every dz, and the message
+    beneath it then named the readout as the lever when the maximum was the one
+    still free to move.
+    """
+    fixed = pairs_for_power(1.5)
+    assert fixed == 6
+    assert sequential_plan(1.5, batch_looks(fixed, 3), 0.05, 8000, 0).power < 0.6
+
+    chosen = plan_maximum(1.5, batch=3, alpha=0.05, draws=8000, seed=0, power=0.80, cap=48)
+
+    assert chosen > fixed
+    assert sequential_plan(1.5, batch_looks(chosen, 3), 0.05, 8000, 0).power >= 0.80
+    # The smallest such maximum, not merely one that works: a batch below it
+    # does not reach the target.
+    assert sequential_plan(1.5, batch_looks(chosen - 3, 3), 0.05, 8000, 0).power < 0.80
+
+
+def test_an_under_powered_plan_names_the_lever_that_is_still_free():
+    short = Budget(6, runs_per_seed=2, arms=3, hours_per_run=8.2 / 24, ceiling=100.0)
+    at_the_wall = Budget(6, runs_per_seed=2, arms=3, hours_per_run=8.2 / 24, ceiling=15.0)
+    plan = sequential_plan(0.867, batch_looks(6, 3), alpha=0.05, draws=8000, seed=0)
+    assert plan.power < 0.80
+
+    room = format_plan(plan, short, batch=3, alpha=0.05, power=0.80)
+    assert "Raise the maximum first" in room
+    assert f"affords {short.seeds_affordable}" in room
+
+    # And once the maximum is everything the ceiling affords, it is not: there
+    # the substrate is the only thing left, which is section 8's rule 3.
+    wall = format_plan(
+        sequential_plan(0.867, batch_looks(7, 3), alpha=0.05, draws=8000, seed=0),
+        at_the_wall,
+        batch=3,
+        alpha=0.05,
+        power=0.80,
+    )
+    assert "Raise the maximum first" not in wall
+    assert "already at or past everything the ceiling affords" in wall
+    # The sentence names both numbers, because the maximum can sit *past* the
+    # affordance under --over-ceiling and "already everything" was false there.
+    assert "and this plan stops at 7" in wall
+
+
+def test_a_discrete_readout_with_no_spread_is_a_call_and_not_a_skipped_split():
+    """A zero-spread split with a nonzero mean is an infinite t, so it is a rejection.
+
+    Dropping it from the numerator while keeping it in the denominator is what
+    understates the rate this function exists to measure -- on exactly the
+    readouts that produce ties, which is every count-valued one.
+    """
+    tied = [1.0, 1.0, 1.0, 0.0, 0.0, 0.0]
+
+    calibration = null_calibration(tied, pairs=3, splits=200, alpha=0.05, seed=0, resamples=200)
+
+    assert calibration["paired_t_false_positive_rate"] > 0.0
+
+
+def test_the_pair_ceiling_the_message_quotes_is_the_one_the_search_used():
+    budget = Budget(500, runs_per_seed=2, arms=3, hours_per_run=8.2 / 24, ceiling=15.0)
+
+    assert "under 500 reaches this power" in format_requirement(
+        0.01, budget, power=0.80, alpha=0.05, maximum=500
+    )
+
+
+def test_a_batch_below_three_is_refused_by_the_operators_decision_and_the_degrees_of_freedom():
+    """#56 fixed the batch at three, and below it the first look has no spread worth a t."""
+    for batch in (-3, 0, 1, 2):
+        with pytest.raises(ValueError, match="no spread worth a t"):
+            plan_maximum(1.0, batch, alpha=0.05, draws=2000, seed=0, power=0.80, cap=30)
+
+    assert plan_maximum(1.5, BATCH_SEEDS, 0.05, 8000, 0, 0.80, 48) > 0
+
+
+def test_the_maximum_is_the_smallest_by_construction_and_not_by_a_curve_assumption():
+    """A binary search needed the sequence's power to rise with the maximum. It does not.
+
+    The statistic is estimated by simulation, so where the power gradient is
+    shallow the Monte Carlo noise wins: at 2000 draws the binary search returned
+    48 and 51 where the smallest is 42, which at #39's body knobs is 12 to 18
+    GPU-hours of preregistered maximum bought for nothing. Both cases are pinned
+    here against brute force, at the batch the guard above allows.
+    """
+
+    def brute_force(dz, draws, seed, power, cap):
+        # `maximum_grid` rather than a second description of it: the two agreed
+        # only while `cap` was a multiple of the batch, and an oracle that walks
+        # different points fails for reasons unrelated to what it guards.
+        grid = maximum_grid(BATCH_SEEDS, cap)
+        reached = (
+            count
+            for count in grid
+            if sequential_plan(dz, batch_looks(count, BATCH_SEEDS), 0.05, draws, seed).power
+            >= power
+        )
+        return next(reached, grid[-1])
+
+    for seed in (1, 2):
+        found = plan_maximum(0.6, BATCH_SEEDS, 0.05, 2000, seed, 0.50, 60)
+        assert found == brute_force(0.6, 2000, seed, 0.50, 60) == 42
+
+    # The oracle walks `maximum_grid` too, so its shape needs a pin that does
+    # not: a wrong grid would otherwise satisfy both sides of the comparison.
+    assert maximum_grid(BATCH_SEEDS, 10) == [3, 6, 9, 10]
+    assert maximum_grid(BATCH_SEEDS, 12) == [3, 6, 9, 12]
+
+    # A cap that is not a multiple of the batch: the grid ends on it, and the
+    # oracle and the code have to agree there too. They did not while the oracle
+    # described the grid instead of sharing it.
+    assert maximum_grid(BATCH_SEEDS, 47)[-1] == 47
+    assert plan_maximum(0.6, BATCH_SEEDS, 0.05, 2000, 1, 0.50, 47) == brute_force(
+        0.6, 2000, 1, 0.50, 47
+    )
+
+
+def test_a_target_the_cap_misses_returns_the_cap_and_not_a_smaller_point_that_reaches():
+    """The probe is a decision about what may be preregistered, not a shortcut.
+
+    Where the curve is not monotone there are smaller maxima that reach while
+    the cap does not, and they are Monte Carlo noise: at 2000 draws, dz 0.3 and
+    seed 5, a maximum of 6 reads 0.080 against the cap's 0.075. Preregistering
+    that 6 would be preregistering the noise, so the answer is that the design
+    does not reach. This is the one branch that is a choice rather than a
+    search, and it is pinned here so it stays one.
+    """
+    reaching = sequential_plan(0.3, batch_looks(6, BATCH_SEEDS), 0.05, 2000, 5).power
+    at_the_cap = sequential_plan(0.3, batch_looks(30, BATCH_SEEDS), 0.05, 2000, 5).power
+    assert reaching > 0.0775 > at_the_cap
+
+    assert plan_maximum(0.3, BATCH_SEEDS, 0.05, 2000, 5, 0.0775, 30) == 30
+
+    # The same rule at a cap that is not a multiple of the batch, where it
+    # decides between two different answers on the same design: 44 misses 0.50
+    # so 44 is returned, and 47 reaches it so the scan runs and finds 42.
+    assert plan_maximum(0.6, BATCH_SEEDS, 0.05, 2000, 1, 0.50, 44) == 44
+    assert plan_maximum(0.6, BATCH_SEEDS, 0.05, 2000, 1, 0.50, 47) == 42
+
+    # And a target nothing reaches at all still costs one probe and returns the
+    # cap, rather than walking every point to say the same thing.
+    assert plan_maximum(0.05, BATCH_SEEDS, 0.05, 2000, 0, 0.99, 30) == 30
+
+
+def test_a_nonsense_batch_is_a_usage_error_and_not_a_sequence_wearing_the_label(
+    monkeypatch, capsys
+):
+    """``--batch -3`` printed "batches of -3 paired seeds ... over 1 looks".
+
+    At a boundary of 2.443 against a single final test's 2.447: a fixed-n test
+    wearing the label of a family-wise-controlled sequence. argparse takes any
+    integer, so the refusal is ``main``'s, and it has to name the flag -- the
+    degenerate cases used to surface as `range() arg 3 must not be zero` or as
+    nothing at all.
+    """
+    monkeypatch.setattr(sys, "argv", ["power.py", "--dz", "1.5", "--plan", "--batch", "-3"])
+
+    with pytest.raises(SystemExit):
+        main()
+
+    assert "at least 3 paired seeds" in capsys.readouterr().err
+
+
+def test_a_maximum_too_small_to_look_at_says_so_rather_than_printing_nothing(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["power.py", "--dz", "1.5", "--plan", "--max-seeds", "1"])
+
+    main()
+
+    assert "a maximum of 1 cannot be looked at" in capsys.readouterr().out
+
+
+def test_a_design_already_over_the_ceiling_does_not_pay_for_a_search_it_cannot_use():
+    args = build_parser().parse_args(["--dz", "0.867", "--plan"])
+    over = Budget(13, args.runs_per_seed, args.arms, args.hours_per_run, args.ceiling)
+    assert not over.fits
+
+    blocks, record = _plan_block(0.867, over, args)
+
+    assert (blocks, record) == ([], {})
