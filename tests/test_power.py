@@ -317,13 +317,14 @@ def test_the_maximum_is_the_smallest_by_construction_and_not_by_a_curve_assumpti
         found = plan_maximum(0.6, BATCH_SEEDS, 0.05, 2000, seed, 0.50, 60)
         assert found == brute_force(0.6, 2000, seed, 0.50, 60) == 42
 
-    # A cap that is not a multiple of the batch: the grid ends on it, and the
-    # oracle and the code have to agree there too. They did not while the oracle
-    # described the grid instead of sharing it.
     # The oracle walks `maximum_grid` too, so its shape needs a pin that does
     # not: a wrong grid would otherwise satisfy both sides of the comparison.
     assert maximum_grid(BATCH_SEEDS, 10) == [3, 6, 9, 10]
     assert maximum_grid(BATCH_SEEDS, 12) == [3, 6, 9, 12]
+
+    # A cap that is not a multiple of the batch: the grid ends on it, and the
+    # oracle and the code have to agree there too. They did not while the oracle
+    # described the grid instead of sharing it.
     assert maximum_grid(BATCH_SEEDS, 47)[-1] == 47
     assert plan_maximum(0.6, BATCH_SEEDS, 0.05, 2000, 1, 0.50, 47) == brute_force(
         0.6, 2000, 1, 0.50, 47
