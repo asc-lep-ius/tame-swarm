@@ -20,14 +20,6 @@ CONFIDENCE_LOGIT_MAX = 20.0
 # than by a bias every token shares.
 CONFIDENCE_INITIAL_LOGIT = -4.0
 
-# #60's self-prediction. The range the Brier score is bounded over, in the same
-# loss-reduction units the report is: predictions and realised values are both
-# clamped to it before they are differenced, so the score lies in
-# [-(2 * SELF_PREDICTION_RANGE)^2, 0] and a single wild token cannot empty a
-# ledger. Four is well above any realised value the fixture or the body has
-# produced, so the clamp binds on outliers and nothing else.
-SELF_PREDICTION_RANGE = 4.0
-
 
 class ConfidenceHead(nn.Module):
     """Each expert's report of the value it expects to deliver on a token.
@@ -51,37 +43,13 @@ class ConfidenceHead(nn.Module):
     ``CONFIDENCE_INITIAL_LOGIT``.
     """
 
-    def __init__(self, hidden_dim: int, expert_id: int = 0, self_model: bool = False):
+    def __init__(self, hidden_dim: int, expert_id: int = 0):
         super().__init__()
         self.proj = nn.Linear(hidden_dim, 1, bias=True)
         self.expert_id = expert_id
 
         nn.init.xavier_uniform_(self.proj.weight, gain=0.1)
         nn.init.constant_(self.proj.bias, CONFIDENCE_INITIAL_LOGIT)
-
-        # #60's self-model: what this cell predicts it will realise on a token
-        # it holds, scored by a proper rule and paid for. A *separate*
-        # projection rather than a second output of the bid's, which is what
-        # keeps the auction's price report-independent: a cell cannot move its
-        # scoring payment by shading its bid, or its bid by shading its
-        # prediction, so the constitution's misreport property holds for the
-        # composite report by construction rather than by re-derivation.
-        #
-        # Built only where something prices it, and that is not an optimisation.
-        # A parameter created unconditionally would consume two draws from the
-        # generator every recorded fixture number was produced under -- seed 1's
-        # r(wealth, competence) moved from 0.51 to 0.49 on the first attempt --
-        # and would add a tensor to every checkpoint, so #39's would no longer
-        # restore under #29's strict load. At mu = 0 this module is the module
-        # that has always been here.
-        self.prediction: nn.Linear | None = None
-        if self_model:
-            self.prediction = nn.Linear(hidden_dim, 1, bias=True)
-            # Predicting nothing, for the reason the bid starts at nothing: an
-            # upcycled expert has realised no value, and a self-model that
-            # claims otherwise at step 0 claims something it cannot know.
-            nn.init.xavier_uniform_(self.prediction.weight, gain=0.1)
-            nn.init.constant_(self.prediction.bias, 0.0)
 
     def forward_logits(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -92,23 +60,6 @@ class ConfidenceHead(nn.Module):
         """
         logits = self.proj(x)
         return torch.clamp(logits, min=CONFIDENCE_LOGIT_MIN, max=CONFIDENCE_LOGIT_MAX)
-
-    def forward_prediction(self, x: torch.Tensor) -> torch.Tensor:
-        """This cell's prediction of the value it will realise, in the report's units (#60).
-
-        Signed and not softplussed, unlike the bid: an expert can realise
-        *negative* value on a token it holds, and a self-model that cannot say
-        so is not a model of itself. Clamped to the range the score is bounded
-        over.
-        """
-        if self.prediction is None:
-            raise ValueError(
-                "this head has no self-model to read: it was built at self_score_mu = 0, "
-                "where #60's prediction is not priced and not created"
-            )
-        return torch.clamp(
-            self.prediction(x), min=-SELF_PREDICTION_RANGE, max=SELF_PREDICTION_RANGE
-        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """

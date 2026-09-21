@@ -1,4 +1,4 @@
-"""Does a cell's self-model become load-bearing? The two levers, on the fixture (#60).
+"""Does a cell's self-model become load-bearing? Lever 1, on the fixture (#60).
 
 #39's body run found a cell paid in continuation for its own value behaves like
 one paid for another cell's. The reading is that with four experts and two slots
@@ -7,20 +7,18 @@ is realised value whatever the report said, so a wrong self-model costs a cell
 nothing. A constraint nothing depends on is outside the closure that makes a
 self (Montévil & Mossio), which is what "decorative" means here.
 
-Two levers, measured separately, never together (a sweep that moves two knobs at
-once is collinear, and the grid is the guard):
+**Lever 1, the two ratios.** Cells per slot -- `num_experts` in {4, 8, 16} at
+`top_k` 2, which is 6, 28 and 120 possible sets per token -- against the cells'
+share of the output, the planted correction's scale in {1, 2, 4}. The full grid,
+so the table can say which ratio binds rather than which sweep was run.
 
-- **Lever 1, the two ratios.** Cells per slot -- `num_experts` in {4, 8, 16} at
-  `top_k` 2, which is 6, 28 and 120 possible sets per token -- against the cells'
-  share of the output, the planted correction's scale in {1, 2, 4}. The full
-  grid, so the table can say which ratio binds rather than which sweep was run.
-- **Lever 2, a self-prediction that costs something.** Each head emits a
-  prediction of its own realised value beside its bid and is paid
-  `mu x -(prediction - realised)^2`, a bounded strictly proper rule. The scored
-  output is a separate projection from the bid, so the auction's price stays
-  report-independent and the constitution is untouched by construction.
+**Lever 2 is not here.** It was built on this branch -- a scored self-prediction
+each cell is paid for -- and stripped from it: the score's target was the value a
+cell realised if it held the token and zero if it did not, so the payment moved
+with the allocation and therefore with the bid. It is redesigned on dense
+counterfactual targets under #66.
 
-The contrast under both is `value` minus `shuffled` -- the one #39 could not
+The contrast is `value` minus `shuffled` -- the one #39 could not
 separate -- read with the readout #57 left in place, which is the recorded
 total-variation shift between the two dose groups. **#57 read "no" on every
 candidate readout**, and #60 is gated on that: what this script can say is
@@ -76,9 +74,6 @@ SEEDS = (0, 1, 2)
 # fixture's orthonormal correction, which is what the cells own of the output.
 CELL_COUNTS = (4, 8, 16)
 CONTRIBUTION_SCALES = (1.0, 2.0, 4.0)
-# Lever 2's prices. Zero is the recorded economy and is asserted to reproduce it
-# bitwise; the rest are the sweep.
-SELF_SCORE_MU = (0.0, 0.5, 2.0)
 DOSE_RATIO = RATIOS[-1]
 
 
@@ -106,11 +101,10 @@ def run_arm(
     seed: int,
     cells: int = len(DEFAULT_COMPETENCE),
     scale: float = 1.0,
-    mu: float = 0.0,
     steps: int = STEPS,
 ) -> dict[str, float]:
-    """One arm at one dose, at a cell count, a contribution scale and a price."""
-    config = replace(BASE_CONFIG, num_experts=cells, persistence_coupling=arm, self_score_mu=mu)
+    """One arm at one dose, at a cell count and a contribution scale."""
+    config = replace(BASE_CONFIG, num_experts=cells, persistence_coupling=arm)
     economy = DifferentiatedEconomy(
         shuffled(competence_for(cells), seed),
         seed=seed,
@@ -152,13 +146,13 @@ def contrast_dz(shifts_a: dict[str, float], shifts_b: dict[str, float]) -> tuple
 
 
 def shifts_for(
-    arm: str, seeds: tuple[int, ...], cells: int, scale: float, mu: float, steps: int
+    arm: str, seeds: tuple[int, ...], cells: int, scale: float, steps: int
 ) -> dict[str, float]:
     """One arm's allocation shift between the two dose levels, per seed."""
     shifts: dict[str, float] = {}
     for seed in seeds:
-        balanced = run_arm(arm, RATIOS[0], seed, cells, scale, mu, steps)
-        dosed = run_arm(arm, DOSE_RATIO, seed, cells, scale, mu, steps)
+        balanced = run_arm(arm, RATIOS[0], seed, cells, scale, steps)
+        dosed = run_arm(arm, DOSE_RATIO, seed, cells, scale, steps)
         shifts[str(seed)] = DEFAULT_READOUT.reading(balanced, dosed)
     return shifts
 
@@ -171,8 +165,8 @@ def sweep_lever_one(seeds: tuple[int, ...], steps: int) -> dict[str, Any]:
     for cells in CELL_COUNTS:
         sets = cells * (cells - 1) // 2
         for scale in CONTRIBUTION_SCALES:
-            value = shifts_for(PERSISTENCE_VALUE, seeds, cells, scale, 0.0, steps)
-            other = shifts_for(PERSISTENCE_SHUFFLED, seeds, cells, scale, 0.0, steps)
+            value = shifts_for(PERSISTENCE_VALUE, seeds, cells, scale, steps)
+            other = shifts_for(PERSISTENCE_SHUFFLED, seeds, cells, scale, steps)
             dz, pairs = contrast_dz(value, other)
             grid[f"cells{cells}-scale{scale}"] = {
                 "cells": cells,
@@ -191,35 +185,11 @@ def sweep_lever_one(seeds: tuple[int, ...], steps: int) -> dict[str, Any]:
     return grid
 
 
-def sweep_lever_two(seeds: tuple[int, ...], steps: int) -> dict[str, Any]:
-    """The price on the self-model, at the recorded configuration."""
-    print("\n== lever 2: a self-prediction that costs something ==")
-    print(f"  {'mu':>6}{'value':>9}{'shuffled':>10}{'dz':>8}{'seeds':>8}")
-    prices: dict[str, Any] = {}
-    for mu in SELF_SCORE_MU:
-        value = shifts_for(PERSISTENCE_VALUE, seeds, len(DEFAULT_COMPETENCE), 1.0, mu, steps)
-        other = shifts_for(PERSISTENCE_SHUFFLED, seeds, len(DEFAULT_COMPETENCE), 1.0, mu, steps)
-        dz, pairs = contrast_dz(value, other)
-        prices[f"mu{mu}"] = {
-            "mu": mu,
-            "value": value,
-            "shuffled": other,
-            "dz": dz,
-            "paired_seeds_at_80": pairs,
-        }
-        print(
-            f"  {mu:>6.1f}{statistics.fmean(value.values()):>9.4f}"
-            f"{statistics.fmean(other.values()):>10.4f}{dz:>+8.3f}{pairs:>8}"
-        )
-    return prices
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=Path.home() / "tame-runs" / "60-self-model")
     parser.add_argument("--seeds", type=str, default=",".join(str(seed) for seed in SEEDS))
     parser.add_argument("--steps", type=int, default=STEPS)
-    parser.add_argument("--skip-grid", action="store_true")
     args = parser.parse_args()
     seeds = tuple(int(part) for part in args.seeds.split(","))
     code_sha, code_dirty = code_identity()
@@ -239,9 +209,7 @@ def main() -> None:
         "horizon": WEALTH_HORIZON,
         "reading_window": READING_WINDOW,
     }
-    if not args.skip_grid:
-        record["lever_one"] = sweep_lever_one(seeds, args.steps)
-    record["lever_two"] = sweep_lever_two(seeds, args.steps)
+    record["lever_one"] = sweep_lever_one(seeds, args.steps)
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "self_model.json").write_text(json.dumps(record, indent=2, default=str))
     print(f"\nrecord: {args.out / 'self_model.json'}")

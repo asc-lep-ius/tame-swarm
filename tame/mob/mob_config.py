@@ -309,12 +309,6 @@ class MoBConfig:
     # Whether gamma is a constant or rises with the tissue's own recent stress
     # (Levin 2019's selective coupling). A secondary arm, never the primary.
     stress_gate_mode: str = STRESS_GATE_FIXED
-    # #60's price on the self-model: what a cell is paid for the accuracy of its
-    # own prediction of the value it will realise, under a bounded strictly
-    # proper rule. Zero is every recorded arm, and reproduces it bitwise. The
-    # scored prediction is a separate output from the bid, so this never enters
-    # the auction's price and the constitution is untouched.
-    self_score_mu: float = 0.0
     confidence_calibration_weight: float = 0.15
     confidence_z_loss_weight: float = 0.0001
     loss_ema_decay: float = 0.92
@@ -328,8 +322,6 @@ class MoBConfig:
         return stress_from_config(self)
 
     def __post_init__(self) -> None:
-        if self.self_score_mu < 0.0:
-            raise ValueError(f"self_score_mu must be non-negative, got {self.self_score_mu}")
         if self.stress_coupling not in SUPPORTED_STRESS_COUPLINGS:
             raise ValueError(
                 f"unknown stress_coupling {self.stress_coupling!r}; "
