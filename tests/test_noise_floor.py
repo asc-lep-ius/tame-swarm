@@ -148,6 +148,21 @@ def test_code_drift_is_borrowable_when_the_operator_names_the_decision(tmp_path)
     # The drift is recorded rather than erased by allowing it: the borrowed
     # floor says the lender had no SHA, so the summary that quotes it does too.
     assert borrowed.as_dict()["code_sha"] is None
+    # And what was waived, in the reasons `code_drift` gave for refusing it.
+    # `compare_runs.assert_same_code` is explicit that a comparison made across
+    # drift is "made and never made silently"; a waiver that left no trace
+    # anywhere would make this escape the weaker half of the pair it mirrors.
+    assert borrowed.code_drift_allowed
+    assert any("no code SHA recorded" in reason for reason in borrowed.code_drift_allowed)
+    assert borrowed.as_dict()["code_drift_allowed"] == borrowed.code_drift_allowed
+
+
+def test_a_floor_borrowed_with_no_drift_says_so_by_carrying_none(tmp_path):
+    lender = write_summary(tmp_path / "clean", replace(IDENTIFIED, seed=0))
+
+    borrowed = borrow_floor(lender, {"1": replace(IDENTIFIED, seed=1).as_dict()})
+
+    assert borrowed.code_drift_allowed == []
 
 
 def test_a_summary_that_measured_no_floor_has_none_to_lend(tmp_path):

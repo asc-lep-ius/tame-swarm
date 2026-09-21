@@ -24,11 +24,14 @@ the parity check.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, fields
+import logging
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 
 from parity import ArmFingerprint, code_drift
+
+logger = logging.getLogger(__name__)
 
 # What a floor is a property of: the shape, the precision, the device and the
 # kernel set. Two runs that agree on all of these run the same kernels over the
@@ -166,6 +169,12 @@ class BorrowedFloor:
     knobs: dict[str, Any]
     code_sha: str | None = None
     code_dirty: bool | None = None
+    # What `--allow-code-drift` waived, empty when it waived nothing. Recorded
+    # for `compare_runs.assert_same_code`'s reason: a comparison made across
+    # drift is made, and never made silently. Without this the escape leaves no
+    # trace at all -- the printed line reads as unqualified agreement and the
+    # summary says only what SHA the lender had, not that it disagreed.
+    code_drift_allowed: list[str] = field(default_factory=list)
 
     @property
     def is_zero(self) -> bool:
@@ -187,6 +196,7 @@ class BorrowedFloor:
             # to ask what kernels measured it.
             "code_sha": self.code_sha,
             "code_dirty": self.code_dirty,
+            "code_drift_allowed": list(self.code_drift_allowed),
             "is_zero": self.is_zero,
         }
 
@@ -227,7 +237,9 @@ def borrow_floor(
     ``parity.code_drift``, run here on the lender against each borrower.
     ``allow_code_drift`` is the operator saying it anyway, and it mirrors
     ``compare_runs.py --allow-code-drift`` so the runs recorded before #31 stay
-    borrowable when somebody names the decision.
+    borrowable when somebody names the decision -- including that escape's other
+    half, which is that the waived reasons are logged and carried on the
+    borrowed floor. A waiver nothing records is the silence the check replaced.
     """
     summary_path = path / "seed_summary.json"
     if not summary_path.exists():
@@ -251,6 +263,7 @@ def borrow_floor(
             "measured at cannot be read (every summary recorded before #6)"
         )
     lender = next(iter(prints.values()))
+    waived: list[str] = []
     for seed, fingerprint in fingerprints.items():
         differing = differing_floor_knobs(lender, fingerprint)
         if differing:
@@ -269,6 +282,16 @@ def borrow_floor(
                 f"seed {seed} runs, and a floor is a property of the kernels the code selects "
                 "(#31). Pass --allow-code-drift to borrow it anyway:\n" + "\n".join(drift)
             )
+        for reason in drift:
+            if reason not in waived:
+                waived.append(reason)
+    if waived:
+        logger.warning(
+            "code drift allowed by --allow-code-drift; the floor borrowed from %s was not "
+            "measured by this sweep's code:\n%s",
+            path,
+            "\n".join(waived),
+        )
     return BorrowedFloor(
         path=str(path),
         arm=summary.get("arm", "unknown"),
@@ -277,4 +300,5 @@ def borrow_floor(
         knobs=floor_knobs(lender),
         code_sha=lender.get("code_sha"),
         code_dirty=lender.get("code_dirty"),
+        code_drift_allowed=waived,
     )

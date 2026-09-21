@@ -324,21 +324,33 @@ def plan_maximum(
     The fixed-n requirement is the wrong default, and reading it as one is how a
     perfectly powerable design gets sent back to the fixture. A Pocock boundary
     is higher than a single final test, so a sequence that stops at the fixed n
-    reaches less power than the fixed design does: 0.488 against 0.833 at
-    dz = 1.5, and 0.21 at #39's dz = 0.867. Raising the maximum is what moves
+    reaches less power than the fixed design does: 0.494 against 0.833 at
+    dz = 1.5, and 0.306 at #39's dz = 0.867. Raising the maximum is what moves
     that, and it is the first thing to try.
 
-    Binary-searched over the batch grid, on the assumption that the sequence's
-    power does not fall as the maximum rises. It does not fall in anything
-    measured here, but it is an assumption and not a theorem -- one more look
-    also raises the boundary -- so the plan printed afterwards always carries its
-    own simulated power and no reader is asked to take this search on trust.
+    Binary-searched over the batch grid, which needs the sequence's power not to
+    fall as the maximum rises. **That holds at ``batch >= 3`` and not below it**,
+    which is why the batch is refused below three rather than merely defaulted
+    there. Measured at 40000 draws, seed 0, alpha 0.05: at batch 3, zero drops
+    over three effect sizes and twenty grid points each, and the search returns
+    the true smallest every time, including the close call at dz 0.867
+    (36 reads 0.796, 39 reads 0.827). At batch 1 the same sweep has ten drops
+    and the search over-reads a 0.10 target by 4.3x; at batch 2, eight. The
+    reason is the first look: a batch of one has no degrees of freedom at all
+    and a batch of two has one, so the boundary swamps the early looks and the
+    sequence's power moves with which looks happen to land where.
 
     The search runs at the caller's ``draws`` rather than at a cheaper count, so
     it is the *same* simulation the plan is printed from. A search an order
     coarser settled on a maximum reading 0.80 that printed 0.792 beneath itself,
     which is a default that contradicts its own table.
     """
+    if batch < BATCH_SEEDS:
+        raise ValueError(
+            f"a plan's maximum cannot be searched at a batch of {batch}: the sequence's power "
+            f"is not monotone in the maximum below {BATCH_SEEDS} and the search would return a "
+            "maximum that is not the smallest"
+        )
     ceiling = max(cap, 2)
     grid = [count for count in range(batch, ceiling + 1, batch) if count >= 2]
     if not grid or grid[-1] != ceiling:
@@ -509,9 +521,10 @@ def format_plan(plan: Plan, budget: Budget, batch: int, alpha: float, power: flo
             f"and this plan stops at {plan.looks[-1]}. The readout or the substrate is what "
             "moves it only once the maximum is already there."
             if plan.looks[-1] < affordable
-            else f"  The maximum is already everything the ceiling affords ({affordable} paired "
-            "seeds a side), so a longer sweep is not the lever: the readout or the substrate "
-            "is what moves it (section 8, rules 3 and 5)."
+            else f"  The maximum is already at or past everything the ceiling affords "
+            f"({affordable} paired seeds a side, and this plan stops at {plan.looks[-1]}), so a "
+            "longer sweep is not the lever: the readout or the substrate is what moves it "
+            "(section 8, rules 3 and 5)."
         )
     return "\n".join(lines)
 
@@ -604,6 +617,11 @@ def _plan_block(dz: float, budget: Budget, args: argparse.Namespace) -> tuple[li
     implied, so gating on the requirement alone printed a 246 GPU-h schedule
     under a ceiling line reading "12.3 against 15 -- inside it".
     """
+    # Before the search, not after: the search is the expensive part of this
+    # function, and a fixed design already over the ceiling is refused whatever
+    # it would have found.
+    if args.over_ceiling is None and not budget.fits:
+        return [], {}
     maximum = args.max_seeds or plan_maximum(
         dz,
         args.batch,
@@ -617,10 +635,14 @@ def _plan_block(dz: float, budget: Budget, args: argparse.Namespace) -> tuple[li
     blocks: list[str] = []
     if planned.hours > budget.hours:
         blocks.append(format_ceiling(planned, args.over_ceiling, "the plan's maximum"))
-    if args.over_ceiling is None and not (budget.fits and planned.fits):
+    if args.over_ceiling is None and not planned.fits:
         return blocks, {}
     looks = batch_looks(maximum, args.batch)
     if not looks:
+        blocks.append(
+            f"no sequential plan: a maximum of {maximum} cannot be looked at, since a look "
+            "needs two paired seeds to have a spread at all"
+        )
         return blocks, {}
     plan = sequential_plan(dz, looks, args.alpha, args.draws, args.seed)
     blocks.append(format_plan(plan, budget, args.batch, args.alpha, args.power))
@@ -712,6 +734,17 @@ def main() -> None:
     args = parser.parse_args()
     if args.dz is None and args.shifts is None and args.null_calibrate is None:
         parser.error("nothing to compute: pass --dz, --shifts or --null-calibrate")
+    if args.plan and args.batch < BATCH_SEEDS:
+        # `--batch -3` printed "batches of -3 paired seeds ... over 1 looks" at a
+        # boundary of 2.443 against a single final test's 2.447: a fixed-n test
+        # wearing the label of a family-wise-controlled sequence. Three is the
+        # project's floor for a quoted number (#13) and the count below which
+        # the maximum search's own contract stops holding.
+        parser.error(
+            f"--batch {args.batch}: a plan's batches are at least {BATCH_SEEDS} paired seeds. "
+            "Below that the first look has no spread worth a t, the Pocock boundary swamps "
+            "the design, and the sequence's power stops rising with the maximum"
+        )
     record: dict[str, object] = {}
     blocks: list[str] = []
     dz = args.dz

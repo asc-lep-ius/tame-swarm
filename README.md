@@ -821,11 +821,15 @@ The code is the twenty-second thing a floor depends on and the one the list
 cannot hold, because a *missing* SHA has to count as drift and a field-equality
 check reads two absences as agreement. So it is decided by `parity.code_drift`,
 run on the lender against each borrower — which is why the three rows above are
-**not** borrowable from one another: `79c1b17` and `91558b6` are different code,
-and #25's pair recorded no SHA at all and ran under `warn`. Borrowing across
-them is `run_seeds.py --allow-code-drift`, the same escape `compare_runs.py`
-carries, and the SHA the floor was measured at travels into `seed_summary.json`
-beside it so a later reader can see what it was.
+**not** borrowable from one another. `79c1b17` and `91558b6` are different code,
+and borrowing across *those two* is `run_seeds.py --allow-code-drift`, the same
+escape `compare_runs.py` carries: the waived reasons are logged, printed under
+the replicate line and recorded in `seed_summary.json` beside the lender's SHA,
+so the borrow is made and never made silently. The third row has no escape at
+all — #25's pair ran under `warn`, and `strict_determinism` *is* a floor knob,
+so a strict sweep asking for it is refused by name whatever flags it passes.
+That is the right asymmetry: a different SHA is a claim somebody can make about
+their own runs, and a different attention-backward kernel is not.
 
 **Multi-seed harness.** `scripts/run_seeds.py` runs one configuration over
 several seeds and reports mean ± std for every headline metric:

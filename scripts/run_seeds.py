@@ -570,6 +570,14 @@ def main() -> None:
             f"arm {borrowed.arm}, measured on seed {borrowed.replicate_seed} at the same "
             f"{len(borrowed.knobs)} floor knobs"
             + (" and recorded as zero" if borrowed.is_zero else " and NOT zero")
+            # Never unqualified: this line is what is pasted into a measurement
+            # row, and a waived drift that reaches it as agreement is the
+            # silence `--allow-code-drift` is not allowed to buy.
+            + (
+                ", borrowed across allowed code drift:\n" + "\n".join(borrowed.code_drift_allowed)
+                if borrowed.code_drift_allowed
+                else ""
+            )
         )
     elif args.floor_recorded_at is not None:
         print(

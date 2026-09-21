@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "tame"))
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
 from power import (  # noqa: E402
+    BATCH_SEEDS,
     Budget,
     _look_statistics,
     _plan_block,
@@ -27,6 +28,7 @@ from power import (  # noqa: E402
     format_plan,
     format_requirement,
     load_shift,
+    main,
     normal_approximation,
     null_calibration,
     paired_effect,
@@ -250,7 +252,10 @@ def test_an_under_powered_plan_names_the_lever_that_is_still_free():
         power=0.80,
     )
     assert "Raise the maximum first" not in wall
-    assert "already everything the ceiling affords" in wall
+    assert "already at or past everything the ceiling affords" in wall
+    # The sentence names both numbers, because the maximum can sit *past* the
+    # affordance under --over-ceiling and "already everything" was false there.
+    assert "and this plan stops at 7" in wall
 
 
 def test_a_discrete_readout_with_no_spread_is_a_call_and_not_a_skipped_split():
@@ -273,3 +278,57 @@ def test_the_pair_ceiling_the_message_quotes_is_the_one_the_search_used():
     assert "under 500 reaches this power" in format_requirement(
         0.01, budget, power=0.80, alpha=0.05, maximum=500
     )
+
+
+def test_the_maximum_is_not_searched_where_the_search_would_be_wrong():
+    """The binary search needs the sequence's power to rise with the maximum.
+
+    It does at a batch of three -- zero drops over three effect sizes and twenty
+    grid points each -- and it does not at one or two, where the first look has
+    no degrees of freedom worth a t and the boundary swamps the design. A
+    reviewer measured a 4.3x over-recommendation of a preregistered maximum at
+    batch 1, from the tool whose job is refusing designs that cost too much. So
+    the batch is refused there rather than the contract quietly weakened.
+    """
+    for batch in (-3, 0, 1, 2):
+        with pytest.raises(ValueError, match="not monotone in the maximum"):
+            plan_maximum(1.0, batch, alpha=0.05, draws=2000, seed=0, power=0.80, cap=30)
+
+    assert plan_maximum(1.5, BATCH_SEEDS, 0.05, 8000, 0, 0.80, 48) > 0
+
+
+def test_a_nonsense_batch_is_a_usage_error_and_not_a_sequence_wearing_the_label(
+    monkeypatch, capsys
+):
+    """``--batch -3`` printed "batches of -3 paired seeds ... over 1 looks".
+
+    At a boundary of 2.443 against a single final test's 2.447: a fixed-n test
+    wearing the label of a family-wise-controlled sequence. argparse takes any
+    integer, so the refusal is ``main``'s, and it has to name the flag -- the
+    degenerate cases used to surface as `range() arg 3 must not be zero` or as
+    nothing at all.
+    """
+    monkeypatch.setattr(sys, "argv", ["power.py", "--dz", "1.5", "--plan", "--batch", "-3"])
+
+    with pytest.raises(SystemExit):
+        main()
+
+    assert "at least 3 paired seeds" in capsys.readouterr().err
+
+
+def test_a_maximum_too_small_to_look_at_says_so_rather_than_printing_nothing(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["power.py", "--dz", "1.5", "--plan", "--max-seeds", "1"])
+
+    main()
+
+    assert "a maximum of 1 cannot be looked at" in capsys.readouterr().out
+
+
+def test_a_design_already_over_the_ceiling_does_not_pay_for_a_search_it_cannot_use():
+    args = build_parser().parse_args(["--dz", "0.867", "--plan"])
+    over = Budget(13, args.runs_per_seed, args.arms, args.hours_per_run, args.ceiling)
+    assert not over.fits
+
+    blocks, record = _plan_block(0.867, over, args)
+
+    assert (blocks, record) == ([], {})
