@@ -49,7 +49,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tame"))
 
 from compare_runs import DEFAULT_RESAMPLES, bootstrap_mean  # noqa: E402
 from dose_slope import interval_label  # noqa: E402
-from estimator_study import fit_first_order_lag, imposed_lag_residual  # noqa: E402
+from estimator_study import (  # noqa: E402
+    fit_first_order_lag,
+    imposed_lag_residual,
+    within_control_excess,
+)
 from measure_stakes_dial import (  # noqa: E402
     GOAL_TYPES,
     READING_WINDOW,
@@ -65,6 +69,7 @@ from synthetic_economy import (  # noqa: E402
     shuffled,
 )
 
+from mob.ledger import PERSISTENCE_DECOUPLED  # noqa: E402
 from mob.stress import STRESS_ATTRIBUTED, STRESS_MIXED, STRESS_SHARED  # noqa: E402
 from parity import code_identity  # noqa: E402
 
@@ -101,6 +106,12 @@ class Calibration:
     mean_stress: float
     attributed_per_token: float
     equal_budget_lambda: float
+    # What `mean_stress` was divided by, and what the control has to divide by
+    # too: `last_stress_charge` is a per-step *total* over the layer's tokens,
+    # while `stress_override` is a per-token magnitude the layer expands to all
+    # of them. Replaying a total as a magnitude charged the control arm
+    # `tokens` times the drain it was supposed to match.
+    tokens: int = 1
 
     def as_dict(self) -> dict[str, float]:
         return {
@@ -109,6 +120,7 @@ class Calibration:
             "setpoint": self.setpoint,
             "mean_stress": self.mean_stress,
             "attributed_per_token": self.attributed_per_token,
+            "tokens": float(self.tokens),
             "equal_budget_lambda": self.equal_budget_lambda,
         }
 
@@ -197,6 +209,7 @@ def calibrate(seed: int, steps: int = SETTLE_STEPS) -> Calibration:
         mean_stress=charge / tokens,
         attributed_per_token=abs(attributed) / tokens,
         equal_budget_lambda=price,
+        tokens=tokens,
     )
 
 
@@ -263,7 +276,10 @@ def run_stepped(
     off_type_relief: list[float] = []
     for step in range(RECOVER_STEPS):
         if replay is not None:
-            economy.mob.stress_override = torch.tensor(replay[step % len(replay)])
+            # `SETTLE_STEPS +`, or the recovery wraps back onto the donor's
+            # settle phase and the arm never sees the donor's response to the
+            # step -- which is the only phase the primary is read on.
+            economy.mob.stress_override = torch.tensor(replay[(SETTLE_STEPS + step) % len(replay)])
         record = economy.step()
         reading = economy.goal_reading(stepped, record.selected_experts)
         residuals.append(abs(stepped.setpoint - reading) / calibration.resting_sigma)
@@ -308,6 +324,18 @@ def contrast(label: str, a: dict[str, float], b: dict[str, float], resamples: in
     )
 
 
+def _as_fits(runs: dict[str, dict[str, Any]]) -> dict[str, dict[str, float]]:
+    """One arm's fits under the key names `within_control_excess` reads them by."""
+    return {
+        seed: {
+            "signature1/step_asymptote": run["asymptote"],
+            "signature1/step_tau": run["tau"],
+            "signature1/step_residual": run["fit_residual"],
+        }
+        for seed, run in runs.items()
+    }
+
+
 def read_arms(
     seeds: tuple[int, ...], calibrations: dict[int, Calibration], resamples: int
 ) -> dict[str, Any]:
@@ -341,6 +369,14 @@ def read_arms(
             resamples,
         )
     )
+    # `imposed_lag_residual` refits only the amplitude over a strict subfamily of
+    # what `fit_first_order_lag` already minimised, so `imposed - own >= 0` for
+    # every curve and "excludes zero" on it is arithmetic rather than a reading.
+    # #57 found that on its own setpoint step and built the null this reuses:
+    # the same statistic on the control arm against its own neighbour, so the
+    # difference can come out either way. Without it this row read
+    # +0.0502 [+0.0143, +0.1002] "excludes zero" on twelve positive-by-
+    # -construction values, and a review read that as the discriminator firing.
     imposed = {
         seed: imposed_lag_residual(
             runs[STRESS_SHARED][seed]["residual_curve"],
@@ -349,13 +385,27 @@ def read_arms(
         )
         for seed in runs[STRESS_SHARED]
     }
+    excess = {seed: imposed[seed] - runs[STRESS_SHARED][seed]["fit_residual"] for seed in imposed}
+    null = within_control_excess(
+        {PERSISTENCE_DECOUPLED: _as_fits(runs[STRESS_ATTRIBUTED])},
+        {
+            PERSISTENCE_DECOUPLED: {
+                seed: run["residual_curve"] for seed, run in runs[STRESS_ATTRIBUTED].items()
+            }
+        },
+    )
     print(
         contrast(
-            "residual under attributed's lag, minus its own",
-            column(STRESS_SHARED, "fit_residual"),
-            imposed,
+            "residual under a foreign lag, over what attributed does to itself",
+            {seed: 0.0 for seed in excess},
+            {seed: excess[seed] - null[seed] for seed in excess},
             resamples,
         )
+    )
+    print(
+        f"    treatment excess / control excess  "
+        f"{statistics.fmean(excess.values()):+.4f} / {statistics.fmean(null.values()):+.4f}"
+        "   both positive by construction, so the row above is the reading"
     )
 
     print("\n== guardrails (must not move) and the secondaries ==")
@@ -401,8 +451,13 @@ def read_control(
     for index, seed in enumerate(seeds):
         donor = seeds[(index + 1) % len(seeds)]
         recorded = run_stepped(donor, STRESS_SHARED, calibrations[donor])["charges"]
-        price = calibrations[seed].equal_budget_lambda
-        charges = [charge / price if price > 0 else 0.0 for charge in recorded]
+        # The donor's charge is a per-step total over its tokens; the override
+        # is a per-token magnitude. Undo the donor's own price *and* its token
+        # count, so what is replayed is the donor's stress trajectory and what
+        # prices it is the recipient's own budget.
+        donated = calibrations[donor]
+        scale = donated.equal_budget_lambda * donated.tokens
+        charges = [charge / scale if scale > 0 else 0.0 for charge in recorded]
         shared[str(seed)] = run_stepped(seed, STRESS_SHARED, calibrations[seed])["residual_stress"]
         replayed[str(seed)] = run_stepped(seed, STRESS_SHARED, calibrations[seed], replay=charges)[
             "residual_stress"
@@ -428,11 +483,18 @@ def sweep_window(
                 )
                 for seed in seeds
             }
-            row = {
-                key: statistics.fmean(float(run[key]) for run in runs.values())
-                for key in ("residual_stress", "tail_loss", "floor_occupancy", "on_type_share")
+            keys = ("residual_stress", "tail_loss", "floor_occupancy", "on_type_share")
+            row = {key: statistics.fmean(float(run[key]) for run in runs.values()) for key in keys}
+            # The per-seed values beside the mean, because a window cell read as
+            # a null needs the paired deltas `scripts/power.py` prices -- and
+            # storing only the mean is how three nulls in this sweep came to be
+            # stated as findings with no interval and nothing left to price them
+            # with.
+            window[f"lambda{multiple}-gamma{gamma}"] = row | {
+                "per_seed": {
+                    seed: {key: float(run[key]) for key in keys} for seed, run in runs.items()
+                }
             }
-            window[f"lambda{multiple}-gamma{gamma}"] = row
             print(
                 f"  {multiple:>8.2f}{gamma:>7.2f}{row['residual_stress']:>10.4f}"
                 f"{row['tail_loss']:>11.4f}{row['floor_occupancy']:>8.2f}"
@@ -448,6 +510,14 @@ def main() -> None:
     parser.add_argument("--seeds", type=str, default=",".join(str(seed) for seed in SEEDS))
     parser.add_argument("--resamples", type=int, default=DEFAULT_RESAMPLES)
     parser.add_argument("--skip-window", action="store_true")
+    # The control is the only stage whose numbers the #59 review moved, and the
+    # arms it is read against are unaffected, so re-deriving it should not cost
+    # the whole sweep again.
+    parser.add_argument(
+        "--only-control",
+        action="store_true",
+        help="Calibrate, then run the replayed-stress control alone and write it beside the rest",
+    )
     args = parser.parse_args()
     seeds = tuple(int(part) for part in args.seeds.split(","))
     code_sha, code_dirty = code_identity()
@@ -469,9 +539,10 @@ def main() -> None:
         "seeds": list(seeds),
         "calibration": {str(seed): value.as_dict() for seed, value in calibrations.items()},
     }
-    record["arms"] = read_arms(seeds, calibrations, args.resamples)
+    if not args.only_control:
+        record["arms"] = read_arms(seeds, calibrations, args.resamples)
     record["control"] = read_control(seeds, calibrations, args.resamples)
-    if not args.skip_window:
+    if not (args.skip_window or args.only_control):
         record["window"] = sweep_window(seeds, calibrations, args.resamples)
 
     args.out.mkdir(parents=True, exist_ok=True)

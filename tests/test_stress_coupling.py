@@ -24,7 +24,7 @@ from synthetic_economy import (  # noqa: E402
     shuffled,
 )
 
-from mob.ledger import Settlement, WealthUpdater  # noqa: E402
+from mob.ledger import LEDGER_SETPOINT, Settlement, WealthUpdater  # noqa: E402
 from mob.stress import (  # noqa: E402
     STRESS_ATTRIBUTED,
     STRESS_GATE_STATE,
@@ -181,22 +181,46 @@ def test_invariant_3_the_setpoint_and_the_resting_spread_are_read_only_after_cal
 
 
 def test_invariant_6_the_charge_lands_in_the_one_settlement_and_nowhere_else():
-    """The ledger reconstructs from what was recorded, with the charge in it.
+    """The ledger reconstructs from the recorded inflow with the charge in it.
 
     #40 exists so that every wealth path settles once; a charge that moved
-    wealth anywhere else would be the fourth path that issue removed.
+    wealth anywhere else would be the fourth path that issue removed. The
+    reconstruction is `measure_ledger_stability.py`'s -- `decay^T w_0 + the
+    relaxation toward the setpoint + the discounted inflow` -- and it is the
+    only form of this check that can fail for the reason the invariant names.
+    An earlier version asserted `charge > 0` and that some cell had lost
+    wealth, which is true whenever any cell lost any wealth to anything.
     """
     coupled = economy(stress_coupling=STRESS_SHARED, stress_lambda=0.01, stress_gamma=0.5)
+    # The same two constants `measure_ledger_stability._replay` reads: the
+    # relaxation is toward `initial_wealth` under `setpoint` mode and toward
+    # zero under `decay`, which is what the fixture runs.
+    decay = coupled.config.wealth_decay
+    setpoint = (
+        coupled.config.initial_wealth if coupled.config.ledger_mode == LEDGER_SETPOINT else 0.0
+    )
     coupled.step()
 
-    before = coupled.mob.expert_wealth.clone()
-    coupled.step()
-    charge = coupled.mob.last_stress_charge
+    start = coupled.mob.expert_wealth.clone().double()
+    inflow: list[torch.Tensor] = []
+    for _ in range(6):
+        before = coupled.mob.expert_wealth.clone().double()
+        coupled.step()
+        after = coupled.mob.expert_wealth.double()
+        # What the settlement put in, backed out of the relaxation: the charge
+        # is part of it, so a charge applied anywhere else shows up as a gap.
+        inflow.append(after - (before * decay + setpoint * (1.0 - decay)))
 
-    # Everything else held fixed, the charge is exactly what the ledger lost
-    # beyond the settlement it would have made at lambda zero.
-    assert charge > 0.0
-    assert float((before - coupled.mob.expert_wealth).max()) >= 0.0
+    steps = len(inflow)
+    weights = torch.tensor([decay**j for j in range(steps)], dtype=torch.float64)
+    reconstructed = (
+        start * decay**steps
+        + setpoint * (1.0 - decay) * float(weights.sum())
+        + (torch.stack(inflow) * weights.flip(0).unsqueeze(-1)).sum(dim=0)
+    )
+
+    assert coupled.mob.last_stress_charge > 0.0
+    assert torch.allclose(reconstructed, coupled.mob.expert_wealth.double(), atol=1e-5)
 
 
 def test_a_coupling_whose_name_and_price_disagree_is_refused():
@@ -238,6 +262,36 @@ def test_a_replayed_stress_is_a_charge_this_tissue_cannot_lower():
     assert coupled.mob.last_stress_charge == pytest.approx(
         0.01 * 7.0 * coupled.batch_size * coupled.seq_len
     )
+
+
+def test_a_replayed_charge_is_the_size_of_the_charge_it_replaces():
+    """The control's whole job is to hold the drain fixed and vary its lowerability.
+
+    `last_stress_charge` is a per-step *total* over the layer's tokens;
+    `stress_override` is a per-token magnitude the layer expands to all of them.
+    Replaying the total as the magnitude charged the control arm `tokens` times
+    the drain it was matching -- 32x on this fixture -- which drove it to the
+    wealth floor and made the contrast a comparison against an erased ledger.
+
+    The existing seam test pins `lambda * override * tokens`, which is true
+    whatever scale the caller picks, so only this one fails on that bug.
+    """
+    donor = economy(seed=0, stress_coupling=STRESS_SHARED, stress_lambda=0.01, stress_gamma=0.5)
+    for _ in range(8):
+        donor.step()
+    recorded = donor.mob.last_stress_charge
+    tokens = donor.batch_size * donor.seq_len
+
+    replaying = economy(seed=1, stress_coupling=STRESS_SHARED, stress_lambda=0.01, stress_gamma=0.5)
+    replaying.mob.stress_override = torch.tensor(recorded / (0.01 * tokens))
+    replaying.step()
+
+    assert replaying.mob.last_stress_charge == pytest.approx(recorded, rel=1e-6)
+    # And the bug's own signature: replaying the total unscaled costs `tokens`
+    # times as much, which is the arm being erased rather than stressed.
+    replaying.mob.stress_override = torch.tensor(recorded / 0.01)
+    replaying.step()
+    assert replaying.mob.last_stress_charge == pytest.approx(recorded * tokens, rel=1e-6)
 
 
 def test_the_setpoint_step_does_not_silently_switch_the_charge_off():
