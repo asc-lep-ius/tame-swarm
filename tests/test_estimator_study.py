@@ -41,7 +41,10 @@ def test_a_curve_imposed_on_its_own_fit_leaves_exactly_its_own_residual():
     asymptote, tau, residual = fit_first_order_lag(CURVE)
 
     assert imposed_lag_residual(CURVE, asymptote, tau) == pytest.approx(residual, abs=1e-12)
-    for other_tau in (tau * 2, tau / 2):
+    # Both on `TAU_GRID`, because the subfamily argument covers only the taus
+    # the grid search itself ranged over -- off it the inequality holds, but
+    # empirically rather than by the identity this test is about.
+    for other_tau in (tau * 2, tau + 5):
         assert imposed_lag_residual(CURVE, asymptote, other_tau) >= residual
     assert imposed_lag_residual(CURVE, asymptote + 0.1, tau) >= residual
 
