@@ -60,10 +60,12 @@ from measure_stakes_dial import (  # noqa: E402
     type_wins,
 )
 from power import pairs_for_power  # noqa: E402
+from sweep_wealth_bounds import CEILING_TOLERANCE, FLOOR_TOLERANCE  # noqa: E402
 from synthetic_economy import (  # noqa: E402
     BASE_CONFIG,
     DEFAULT_COMPETENCE,
     DifferentiatedEconomy,
+    pearson,
     shuffled,
 )
 
@@ -105,10 +107,21 @@ def run_arm(
     scale: float = 1.0,
     steps: int = STEPS,
 ) -> dict[str, float]:
-    """One arm at one dose, at a cell count and a contribution scale."""
+    """One arm at one dose, at a cell count and a contribution scale.
+
+    The guardrail columns are read over the same tail the shares are, and they
+    are the columns #60's grid was published without. The scale multiplies value,
+    reward and price but not the wealth band, so the thing to watch is the band:
+    occupancy at each bound says whether an arm is still an economy or a clamp,
+    and ``r(wealth, competence)`` says whether the ledger still tracks who is
+    good. At four times the recorded correction every ledger sits on the ceiling
+    and that correlation is not a number -- which is the reading the grid needed
+    and did not have.
+    """
     config = replace(BASE_CONFIG, num_experts=cells, persistence_coupling=arm)
+    competence = shuffled(competence_for(cells), seed)
     economy = DifferentiatedEconomy(
-        shuffled(competence_for(cells), seed),
+        competence,
         seed=seed,
         config=config,
         contribution_scale=scale,
@@ -119,6 +132,14 @@ def run_arm(
     by_type = {expert_type: torch.zeros(cells) for expert_type in GOAL_TYPES}
     losses: list[float] = []
     on_type: list[float] = []
+    # The two bounds take the two tolerances #16 measured, and that is not a
+    # fudge: the ceiling is an attractor a clamped cell sits exactly on, while
+    # the floor is escaped by a hair on every exploration win and decays back, so
+    # one tolerance for both undercounts the floor badly.
+    ceiling = BASE_CONFIG.max_wealth * (1 - CEILING_TOLERANCE)
+    floor = BASE_CONFIG.min_wealth * (1 + FLOOR_TOLERANCE)
+    at_ceiling = 0
+    at_floor = 0
     for step in range(steps):
         record = economy.step()
         if step < steps - TAIL:
@@ -128,9 +149,19 @@ def run_arm(
             by_type[expert_type] += counts
         losses.append(record.loss)
         on_type.append(economy.on_type_share(record.selected_experts))
+        wealth = economy.mob.expert_wealth
+        at_ceiling += int((wealth >= ceiling).sum())
+        at_floor += int((wealth <= floor).sum())
     metrics = share_columns(wins, "routing/win_share_e")
     metrics["eval/loss"] = statistics.fmean(losses)
     metrics["routing/on_type_share"] = statistics.fmean(on_type)
+    cell_steps = cells * TAIL
+    metrics["guardrail/ceiling_occupancy"] = at_ceiling / cell_steps
+    metrics["guardrail/floor_occupancy"] = at_floor / cell_steps
+    metrics["guardrail/interior_occupancy"] = 1.0 - (at_ceiling + at_floor) / cell_steps
+    # NaN when every ledger is on the same bound, and left as NaN: a clamped arm
+    # has no correlation to report and a zero there would read as one that does.
+    metrics["guardrail/wealth_vs_competence"] = pearson(economy.mob.expert_wealth, competence)
     return metrics
 
 
@@ -147,28 +178,60 @@ def contrast_dz(shifts_a: dict[str, float], shifts_b: dict[str, float]) -> tuple
     return dz, pairs_for_power(dz)
 
 
+GUARDRAIL_COLUMNS = (
+    "guardrail/ceiling_occupancy",
+    "guardrail/floor_occupancy",
+    "guardrail/interior_occupancy",
+    "guardrail/wealth_vs_competence",
+)
+
+
 def shifts_for(
     arm: str, seeds: tuple[int, ...], cells: int, scale: float, steps: int
-) -> dict[str, float]:
-    """One arm's allocation shift between the two dose levels, per seed."""
+) -> tuple[dict[str, float], dict[str, float]]:
+    """One arm's allocation shift between the two dose levels, per seed, and its guardrails.
+
+    The guardrails come back from the same runs rather than from a second pass:
+    reading the band costs nothing on top of a run that has already happened, and
+    a guardrail measured on a different run is a guardrail for a different run.
+    """
     shifts: dict[str, float] = {}
+    readings: list[dict[str, float]] = []
     for seed in seeds:
         balanced = run_arm(arm, RATIOS[0], seed, cells, scale, steps)
         dosed = run_arm(arm, DOSE_RATIO, seed, cells, scale, steps)
         shifts[str(seed)] = DEFAULT_READOUT.reading(balanced, dosed)
-    return shifts
+        readings.extend((balanced, dosed))
+    guardrails = {
+        column: statistics.fmean(reading[column] for reading in readings)
+        for column in GUARDRAIL_COLUMNS
+    }
+    return shifts, guardrails
+
+
+def band_columns(arm: str, bands: dict[str, float]) -> str:
+    """One arm's guardrail block, under the headings ``sweep_lever_one`` prints."""
+    return (
+        f"{arm:>10}"
+        f"{100 * bands['guardrail/ceiling_occupancy']:>7.1f}%"
+        f"{100 * bands['guardrail/floor_occupancy']:>7.1f}%"
+        f"{bands['guardrail/wealth_vs_competence']:>+9.3f}"
+    )
 
 
 def sweep_lever_one(seeds: tuple[int, ...], steps: int) -> dict[str, Any]:
     """The grid: cells per slot against the cells' share of the output."""
     print("\n== lever 1: the two ratios, value minus shuffled at the recorded readout ==")
-    print(f"  {'cells':>6}{'sets':>7}{'scale':>7}{'value':>9}{'shuffled':>10}{'dz':>8}{'seeds':>8}")
+    print(
+        f"  {'cells':>6}{'sets':>7}{'scale':>7}{'value':>9}{'shuffled':>10}{'dz':>8}{'seeds':>8}"
+        f"{'arm':>10}{'ceil%':>8}{'floor%':>8}{'r(w,c)':>9}"
+    )
     grid: dict[str, Any] = {}
     for cells in CELL_COUNTS:
         sets = cells * (cells - 1) // 2
         for scale in CONTRIBUTION_SCALES:
-            value = shifts_for(PERSISTENCE_VALUE, seeds, cells, scale, steps)
-            other = shifts_for(PERSISTENCE_SHUFFLED, seeds, cells, scale, steps)
+            value, value_bands = shifts_for(PERSISTENCE_VALUE, seeds, cells, scale, steps)
+            other, other_bands = shifts_for(PERSISTENCE_SHUFFLED, seeds, cells, scale, steps)
             dz, pairs = contrast_dz(value, other)
             grid[f"cells{cells}-scale{scale}"] = {
                 "cells": cells,
@@ -178,6 +241,10 @@ def sweep_lever_one(seeds: tuple[int, ...], steps: int) -> dict[str, Any]:
                 "shuffled": other,
                 "dz": dz,
                 "paired_seeds_at_80": pairs,
+                # Per arm, because the confound that withdrew this grid was the
+                # two arms clamping at *different* bounds: a mean over both would
+                # have hidden exactly the asymmetry that produced the contrast.
+                "guardrails": {PERSISTENCE_VALUE: value_bands, PERSISTENCE_SHUFFLED: other_bands},
                 # Recorded per grid cell rather than per run: the two ratios are
                 # what this grid varies, and a cell whose fingerprint says it ran
                 # at the recorded fixture is a cell no later comparison can
@@ -203,7 +270,12 @@ def sweep_lever_one(seeds: tuple[int, ...], steps: int) -> dict[str, Any]:
                 f"  {cells:>6}{sets:>7}{scale:>7.1f}"
                 f"{statistics.fmean(value.values()):>9.4f}"
                 f"{statistics.fmean(other.values()):>10.4f}{dz:>+8.3f}{pairs:>8}"
+                f"{band_columns(PERSISTENCE_VALUE, value_bands)}"
             )
+            # The second arm's bands on their own line under the same headings:
+            # the contrast is one row, and the thing that withdrew it is that the
+            # two arms were clamping at different bounds inside it.
+            print(f"  {'':>55}{band_columns(PERSISTENCE_SHUFFLED, other_bands)}")
     return grid
 
 
