@@ -350,6 +350,14 @@ def imposed_lag_residual(curve: list[float], asymptote: float, tau: float) -> fl
     The second half of the discriminator: if the treatment's response is only
     the control's lag at another amplitude, this is as small as its own fit's
     residual, and the step measured a transient rather than nesting.
+
+    **This is never smaller than the curve's own fit**, and that is arithmetic
+    rather than a result: fixing the intercept and tau and refitting only the
+    amplitude searches a strict subfamily of the ``(intercept, slope, tau)``
+    family ``fit_first_order_lag`` already minimised, over the same
+    ``TAU_GRID``. So ``imposed - own >= 0`` for every curve there has ever been,
+    and "excludes zero" on it would be a statement about the estimator rather
+    than about the arms. :func:`within_control_excess` is what gives it a null.
     """
     basis = [math.exp(-t / tau) for t in range(len(curve))]
     centred = [value - asymptote for value in curve]
@@ -410,6 +418,43 @@ def stage_setpoint(
     }
 
 
+def within_control_excess(
+    runs: dict[str, dict[str, dict[str, float]]],
+    curves: dict[str, dict[str, list[float]]],
+) -> dict[str, float]:
+    """The same statistic where there is no treatment: a control seed under another's lag.
+
+    The control arm against itself, paired by rotation the way #59's replayed
+    charge is, so there are as many null readings as treatment ones and the two
+    can be differenced seed by seed. What the excess can say is not that it is
+    positive -- it always is -- but whether the treatment's is larger than the
+    control arm produces against its own neighbour, and that contrast can come
+    out either way.
+    """
+    seeds = sorted(runs[PERSISTENCE_DECOUPLED], key=str)
+    if len(seeds) < 2:
+        # With one seed the rotation lands on itself, and imposing a curve's own
+        # fit returns its own residual exactly -- so the null would be 0.0 and
+        # the contrast would revert, silently, to the non-negative raw excess
+        # this function exists to give a null.
+        raise ValueError(
+            f"a control arm of {len(seeds)} seed(s) has no neighbour to be read against, so "
+            "the excess has no null; the setpoint stage needs at least two control seeds"
+        )
+    excess: dict[str, float] = {}
+    for index, seed in enumerate(seeds):
+        other = seeds[(index + 1) % len(seeds)]
+        excess[seed] = (
+            imposed_lag_residual(
+                curves[PERSISTENCE_DECOUPLED][seed],
+                runs[PERSISTENCE_DECOUPLED][other]["signature1/step_asymptote"],
+                runs[PERSISTENCE_DECOUPLED][other]["signature1/step_tau"],
+            )
+            - runs[PERSISTENCE_DECOUPLED][seed]["signature1/step_residual"]
+        )
+    return excess
+
+
 def step_discriminator(
     runs: dict[str, dict[str, dict[str, float]]],
     curves: dict[str, dict[str, list[float]]],
@@ -432,14 +477,25 @@ def step_discriminator(
         for seed in seeds
     }
     excess = {seed: imposed[seed] - own[seed] for seed in seeds}
+    # Against the control arm's own excess rather than against zero: the excess
+    # is non-negative by construction (see `imposed_lag_residual`), so zero is a
+    # null nothing could fail. Paired by seed, both sides being the same
+    # statistic over the same fits.
+    null = within_control_excess(runs, curves)
+    against_null = {seed: excess[seed] - null[seed] for seed in seeds}
     lines = []
     for label, values in (
         ("asymptote, value - decoupled", asymptote_gap),
-        ("residual under the control's lag, minus its own", excess),
+        ("residual under a foreign lag, over what the control does to itself", against_null),
     ):
         centre, low, high = bootstrap_mean(list(values.values()), resamples, 0)
         verdict = "excludes zero" if low > 0 or high < 0 else "includes zero"
         lines.append(f"{label:<48}{centre:>+9.4f}  [{low:+.4f}, {high:+.4f}]  {verdict}")
+    lines.append(
+        f"{'  treatment excess / control excess':<48}"
+        f"{statistics.fmean(excess.values()):>+9.4f} / {statistics.fmean(null.values()):+.4f}"
+        "   both positive by construction, so the row above is the reading"
+    )
     lines.append(
         f"{'tau, value / decoupled (steps)':<48}"
         + "  ".join(
@@ -453,6 +509,8 @@ def step_discriminator(
         "own_residual": own,
         "imposed_residual": imposed,
         "excess_residual": excess,
+        "control_excess": null,
+        "excess_against_control": against_null,
         "lines": lines,
     }
 
@@ -685,7 +743,10 @@ def main() -> None:
     parser.add_argument(
         "--chosen",
         type=str,
-        default="token-conditioned",
+        # The readout the recorded validation actually confirmed, so the module
+        # docstring's `--stage all` reproduces `validate.log` rather than a run
+        # nothing on disk records.
+        default="setpoint-step",
         choices=sorted(READOUTS),
         help="Which readout the validation stage confirms",
     )
