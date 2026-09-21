@@ -27,6 +27,12 @@ from noise_floor import (  # noqa: E402
 from .arm_fingerprints import BASE  # noqa: E402
 
 ZERO_FLOOR = {"eval/loss": 0.0, "routing/win_share_e0": 0.0}
+SHA = "79c1b1755f3a1e0c9d2b4a6e8f0c1d3e5a7b9c11"
+# A borrow is between two real sweeps, and a real sweep records its code
+# identity (#31). ``BASE`` leaves it unset, which is the legacy case and a
+# refusal in its own right, so the fixtures that are *about* something else say
+# what code they ran under.
+IDENTIFIED = replace(BASE, code_sha=SHA, code_dirty=False)
 
 
 def write_summary(path: Path, fingerprint, floor=ZERO_FLOOR, **overrides) -> Path:
@@ -81,8 +87,8 @@ def test_a_sequence_knob_survives_the_json_round_trip(tmp_path):
 
 
 def test_borrowing_records_the_lender_the_floor_and_the_knobs_it_was_measured_at(tmp_path):
-    lender = write_summary(tmp_path / "value", replace(BASE, seed=0))
-    borrower = replace(BASE, seed=1, persistence_coupling="shuffled")
+    lender = write_summary(tmp_path / "value", replace(IDENTIFIED, seed=0))
+    borrower = replace(IDENTIFIED, seed=1, persistence_coupling="shuffled")
 
     borrowed = borrow_floor(lender, {"1": borrower.as_dict()})
 
@@ -91,14 +97,57 @@ def test_borrowing_records_the_lender_the_floor_and_the_knobs_it_was_measured_at
     assert borrowed.replicate_seed == 0
     assert set(borrowed.knobs) == set(FLOOR_KNOBS)
     assert borrowed.as_dict()["knobs"]["requested_layers"] == list(BASE.requested_layers)
+    # Outside the knobs, and recorded anyway: a reader of a borrowed floor can
+    # ask what code measured it without going back to the lender's directory.
+    assert borrowed.as_dict()["code_sha"] == SHA
+    assert borrowed.as_dict()["code_dirty"] is False
 
 
 def test_a_floor_measured_at_another_configuration_is_refused_by_name(tmp_path):
-    lender = write_summary(tmp_path / "rank32", replace(BASE, adapter_rank=32))
-    borrower = replace(BASE, adapter_rank=8)
+    lender = write_summary(tmp_path / "rank32", replace(IDENTIFIED, adapter_rank=32))
+    borrower = replace(IDENTIFIED, adapter_rank=8)
 
     with pytest.raises(BorrowedFloorError, match="adapter_rank 32 vs 8"):
         borrow_floor(lender, {"0": borrower.as_dict()})
+
+
+def test_a_floor_measured_by_other_code_is_refused_at_identical_knobs(tmp_path):
+    """#31's finding is that the floor is a property of the kernels the code selects.
+
+    So the check that matters here cannot be a floor knob: ``code_sha`` is
+    excluded from ``FLOOR_KNOBS`` precisely because a *missing* SHA has to count
+    as drift and field equality would read two absences as agreement. Three
+    shapes, each its own refusal, and each of them accepted silently before.
+    """
+    other_sha = replace(IDENTIFIED, code_sha="0" * 40)
+    dirty = replace(IDENTIFIED, code_dirty=True)
+    legacy = replace(IDENTIFIED, code_sha=None, code_dirty=None)
+
+    lender = write_summary(tmp_path / "clean", IDENTIFIED)
+    with pytest.raises(BorrowedFloorError, match="different code"):
+        borrow_floor(lender, {"0": other_sha.as_dict()})
+    with pytest.raises(BorrowedFloorError, match="dirty tree"):
+        borrow_floor(lender, {"0": dirty.as_dict()})
+    with pytest.raises(BorrowedFloorError, match="no code SHA recorded"):
+        borrow_floor(lender, {"0": legacy.as_dict()})
+
+    # And the same three from the other side: a lender with no SHA is every
+    # summary written before #31, and it may not lend to a sweep that has one.
+    before_31 = write_summary(tmp_path / "legacy", legacy)
+    with pytest.raises(BorrowedFloorError, match="no code SHA recorded"):
+        borrow_floor(before_31, {"0": IDENTIFIED.as_dict()})
+
+
+def test_code_drift_is_borrowable_when_the_operator_names_the_decision(tmp_path):
+    """``--allow-code-drift``, the escape ``compare_runs.py`` already carries."""
+    lender = write_summary(tmp_path / "legacy", replace(IDENTIFIED, code_sha=None, code_dirty=None))
+
+    borrowed = borrow_floor(lender, {"0": IDENTIFIED.as_dict()}, allow_code_drift=True)
+
+    assert borrowed.is_zero
+    # The drift is recorded rather than erased by allowing it: the borrowed
+    # floor says the lender had no SHA, so the summary that quotes it does too.
+    assert borrowed.as_dict()["code_sha"] is None
 
 
 def test_a_summary_that_measured_no_floor_has_none_to_lend(tmp_path):

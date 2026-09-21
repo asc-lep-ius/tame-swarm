@@ -817,6 +817,16 @@ not in which kernels run, so a floor travels between them; a run at another
 never lent onwards. `compare_runs.py` quotes a borrowed floor in the `repl_std`
 column and says under the table whose runs it is.
 
+The code is the twenty-second thing a floor depends on and the one the list
+cannot hold, because a *missing* SHA has to count as drift and a field-equality
+check reads two absences as agreement. So it is decided by `parity.code_drift`,
+run on the lender against each borrower — which is why the three rows above are
+**not** borrowable from one another: `79c1b17` and `91558b6` are different code,
+and #25's pair recorded no SHA at all and ran under `warn`. Borrowing across
+them is `run_seeds.py --allow-code-drift`, the same escape `compare_runs.py`
+carries, and the SHA the floor was measured at travels into `seed_summary.json`
+beside it so a later reader can see what it was.
+
 **Multi-seed harness.** `scripts/run_seeds.py` runs one configuration over
 several seeds and reports mean ± std for every headline metric:
 
@@ -906,7 +916,13 @@ arm that means and the GPU-hours that implies; reads that effect size off two
 pairing rests on, printed beside it; plans a sequential design in batches with a
 family-wise boundary over its looks (AdaStop's shape); and measures what a
 readout calls a difference when there is none, by splitting one arm's runs in
-two (Colas et al. 2018). Its first three answers about this project's own
+two (Colas et al. 2018). The plan's **maximum is searched, not inherited from
+the fixed-n requirement**: a Pocock boundary is higher than a single final test,
+so a sequence that stops at the fixed n reaches less power than the fixed design
+does — 0.49 against 0.83 at dz 1.5 — and a default that quietly under-powers
+sends a workable design back to the fixture. Both the plan and the fixed
+requirement are read against the ceiling separately, because `--max-seeds` names
+a maximum the requirement never implied. Its first three answers about this project's own
 numbers are worth stating here: [#39](#stakes-dial-cell)'s primary needs 13
 paired seeds and 27 GPU-hours, its self-reference contrast needs 348 and about
 700, and at three paired seeds the percentile range excludes zero a quarter of

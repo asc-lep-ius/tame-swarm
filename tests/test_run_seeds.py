@@ -8,6 +8,7 @@ uses across seeds, at n = 2, so ``compare_runs.py`` can pool the two.
 import json
 import math
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -29,6 +30,8 @@ from run_seeds import (  # noqa: E402
 from goal_field import parse_goal_doses  # noqa: E402
 from parity import arm_label  # noqa: E402
 from train import TrainingConfig  # noqa: E402
+
+from .arm_fingerprints import BASE  # noqa: E402
 
 
 def test_the_floor_is_the_sample_std_of_one_seed_run_twice():
@@ -176,3 +179,146 @@ def test_borrowing_a_floor_and_measuring_one_are_not_asked_for_together(capsys):
         parse_sweep_args(["--floor_recorded_at", "runs/value", "--replicate"])
 
     assert "--no-replicate" in capsys.readouterr().err
+
+
+def sweep_for(tmp_path, monkeypatch, fingerprint, argv):
+    """Run ``main()`` over two fake seeds, and give back what it wrote and printed.
+
+    The borrow glue -- the ``borrow_floor`` call on real fingerprints, the
+    ``replication_error`` overwrite, the printed line and the summary field --
+    lives only in ``main``, and needs completed training runs to reach. Two
+    monkeypatches buy it without a GPU: the fixture builder and the trainer.
+    """
+    monkeypatch.setattr(run_seeds, "build_smoke_fixture", lambda workspace: ("tiny", "ds"))
+    monkeypatch.setattr(
+        run_seeds,
+        "run_seed",
+        lambda seed, config, replicate=False: (
+            {"eval/loss": 2.79 + 0.01 * seed},
+            replace(fingerprint, seed=seed).as_dict(),
+        ),
+    )
+    workspace = tmp_path / "sweep"
+    monkeypatch.setattr(
+        sys, "argv", ["run_seeds.py", "--output_dir", str(workspace), "--steps", "1", *argv]
+    )
+
+    run_seeds.main()
+
+    return json.loads((workspace / "seed_summary.json").read_text())
+
+
+def write_lender(path: Path, fingerprint) -> Path:
+    """A ``seed_summary.json`` with a measured floor, as a sweep before this one wrote it."""
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "seed_summary.json").write_text(
+        json.dumps(
+            {
+                "arm": fingerprint.arm,
+                "replicate_seed": fingerprint.seed,
+                "replication_std": {"eval/loss": 0.0},
+                "replication_error": None,
+                "floor_recorded_at": None,
+                "fingerprints": {str(fingerprint.seed): fingerprint.as_dict()},
+            }
+        )
+    )
+    return path
+
+
+def test_the_sweep_borrows_a_floor_and_records_the_code_that_measured_it(
+    tmp_path, monkeypatch, capsys
+):
+    """#56's borrow, end to end through ``main`` rather than through its parts."""
+    identified = replace(BASE, code_sha="c" * 40, code_dirty=False)
+    lender = write_lender(tmp_path / "lender", replace(identified, seed=0))
+
+    summary = sweep_for(
+        tmp_path,
+        monkeypatch,
+        identified,
+        ["--seeds", "1,2", "--no-replicate", "--floor_recorded_at", str(lender)],
+    )
+
+    assert summary["replication_std"] is None
+    assert summary["floor_recorded_at"]["path"] == str(lender)
+    assert summary["floor_recorded_at"]["is_zero"] is True
+    assert summary["floor_recorded_at"]["code_sha"] == "c" * 40
+    assert "the floor is borrowed from" in summary["replication_error"]
+    assert "the floor is borrowed from" in capsys.readouterr().out
+
+
+def test_a_refused_borrow_does_not_print_as_an_ordinary_no_replicate(tmp_path, monkeypatch, capsys):
+    """The printed table is what is pasted into a measurement row.
+
+    A refusal that reached only stderr left that row reading "the run-to-run
+    floor is not measured", which is what a sweep that never asked for one
+    prints -- a deliberate choice, rather than a floor this sweep was refused.
+    """
+    lender = write_lender(
+        tmp_path / "lender", replace(BASE, seed=0, adapter_rank=8, code_sha="d" * 40)
+    )
+
+    summary = sweep_for(
+        tmp_path,
+        monkeypatch,
+        replace(BASE, adapter_rank=32, code_sha="d" * 40, code_dirty=False),
+        ["--seeds", "1,2", "--no-replicate", "--floor_recorded_at", str(lender)],
+    )
+
+    assert summary["floor_recorded_at"] is None
+    assert summary["replication_std"] is None
+    assert "adapter_rank 8 vs 32" in summary["replication_error"]
+    printed = capsys.readouterr().out
+    assert "REFUSED" in printed
+    assert "the run-to-run floor is not measured" not in printed
+
+
+def test_a_floor_from_other_code_is_refused_by_the_sweep_and_allowed_when_named(
+    tmp_path, monkeypatch, capsys
+):
+    legacy = write_lender(tmp_path / "legacy", replace(BASE, seed=0))
+    borrower = replace(BASE, code_sha="e" * 40, code_dirty=False)
+    flags = ["--seeds", "1,2", "--no-replicate", "--floor_recorded_at", str(legacy)]
+
+    refused = sweep_for(tmp_path, monkeypatch, borrower, flags)
+    assert refused["floor_recorded_at"] is None
+    assert "no code SHA recorded" in refused["replication_error"]
+    assert "REFUSED" in capsys.readouterr().out
+
+    allowed = sweep_for(tmp_path, monkeypatch, borrower, [*flags, "--allow-code-drift"])
+    assert allowed["floor_recorded_at"]["is_zero"] is True
+    assert allowed["floor_recorded_at"]["code_sha"] is None
+
+
+def test_a_lender_that_never_measured_a_floor_stops_the_sweep_before_the_runs(
+    tmp_path, monkeypatch
+):
+    """A usage error printed as one, rather than a BorrowedFloorError traceback.
+
+    And *before* the runs: the pre-flight read is the whole point of checking the
+    lender twice, so a sweep that cannot borrow finds out for the price of a
+    file read rather than after the GPU-hours.
+    """
+    empty = tmp_path / "nothing"
+    empty.mkdir()
+
+    def never(*args, **kwargs):
+        raise AssertionError("the sweep ran a seed after the lender was refused")
+
+    monkeypatch.setattr(run_seeds, "run_seed", never)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["run_seeds.py", "--seeds", "1,2", "--no-replicate", "--floor_recorded_at", str(empty)],
+    )
+
+    with pytest.raises(SystemExit, match="no seed_summary.json"):
+        run_seeds.main()
+
+
+def test_allowing_code_drift_means_nothing_without_a_floor_to_borrow(capsys):
+    with pytest.raises(SystemExit):
+        parse_sweep_args(["--allow-code-drift"])
+
+    assert "--floor_recorded_at" in capsys.readouterr().err

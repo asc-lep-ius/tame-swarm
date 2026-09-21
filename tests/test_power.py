@@ -20,14 +20,19 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 from power import (  # noqa: E402
     Budget,
     _look_statistics,
+    _plan_block,
     batch_looks,
+    build_parser,
     format_ceiling,
+    format_plan,
+    format_requirement,
     load_shift,
     normal_approximation,
     null_calibration,
     paired_effect,
     paired_t_power,
     pairs_for_power,
+    plan_maximum,
     sequential_boundary,
     sequential_plan,
 )
@@ -173,3 +178,98 @@ def test_the_power_of_a_pair_count_no_one_can_reach_is_not_a_nan():
     """scipy's non-central t returns NaN far from any solution; the walk must not stop there."""
     assert not math.isnan(paired_t_power(0.15, 60_000))
     assert paired_t_power(0.15, 60_000) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_a_maximum_named_past_the_ceiling_is_refused_even_when_the_fixed_design_fits():
+    """The refusal reads the plan's own cost, not the fixed design's.
+
+    ``--max-seeds`` names a maximum the fixed-n requirement never implied, so a
+    gate on the requirement alone printed a 40-look schedule rising to 246
+    GPU-hours directly beneath a ceiling line reading "12.3 against 15 -- inside
+    it". Found by a reviewer running it; the acceptance criterion is that the
+    helper refuses to plan past the ceiling without a preregistration row.
+    """
+    args = build_parser().parse_args(["--dz", "1.5", "--plan", "--max-seeds", "120"])
+    budget = Budget(6, args.runs_per_seed, args.arms, args.hours_per_run, args.ceiling)
+    assert budget.fits  # the fixed design is inside the ceiling; the plan is not
+
+    blocks, record = _plan_block(1.5, budget, args)
+
+    assert record == {}
+    assert "REFUSED" in "\n".join(blocks)
+    assert "look" not in "\n".join(blocks)
+    assert "246.0 GPU-h against 15" in "\n".join(blocks)
+
+    named = build_parser().parse_args(
+        ["--dz", "1.5", "--plan", "--max-seeds", "120", "--over-ceiling", "row 9, dated"]
+    )
+    allowed, plan_record = _plan_block(1.5, budget, named)
+    assert plan_record["looks"][-1] == 120
+    assert "row 9, dated" in "\n".join(allowed)
+
+
+def test_the_plan_maximum_is_what_the_sequence_needs_and_not_what_a_fixed_design_needs():
+    """A Pocock boundary is higher than a single final test, so the fixed n under-powers.
+
+    At dz 1.5 the fixed requirement is 6 paired seeds for 0.833, and a sequence
+    that stops at 6 reaches 0.49. Defaulting the maximum to the fixed n is what
+    made ``--plan`` report an under-powered design at every dz, and the message
+    beneath it then named the readout as the lever when the maximum was the one
+    still free to move.
+    """
+    fixed = pairs_for_power(1.5)
+    assert fixed == 6
+    assert sequential_plan(1.5, batch_looks(fixed, 3), 0.05, 8000, 0).power < 0.6
+
+    chosen = plan_maximum(1.5, batch=3, alpha=0.05, draws=8000, seed=0, power=0.80, cap=48)
+
+    assert chosen > fixed
+    assert sequential_plan(1.5, batch_looks(chosen, 3), 0.05, 8000, 0).power >= 0.80
+    # The smallest such maximum, not merely one that works: a batch below it
+    # does not reach the target.
+    assert sequential_plan(1.5, batch_looks(chosen - 3, 3), 0.05, 8000, 0).power < 0.80
+
+
+def test_an_under_powered_plan_names_the_lever_that_is_still_free():
+    short = Budget(6, runs_per_seed=2, arms=3, hours_per_run=8.2 / 24, ceiling=100.0)
+    at_the_wall = Budget(6, runs_per_seed=2, arms=3, hours_per_run=8.2 / 24, ceiling=15.0)
+    plan = sequential_plan(0.867, batch_looks(6, 3), alpha=0.05, draws=8000, seed=0)
+    assert plan.power < 0.80
+
+    room = format_plan(plan, short, batch=3, alpha=0.05, power=0.80)
+    assert "Raise the maximum first" in room
+    assert f"affords {short.seeds_affordable}" in room
+
+    # And once the maximum is everything the ceiling affords, it is not: there
+    # the substrate is the only thing left, which is section 8's rule 3.
+    wall = format_plan(
+        sequential_plan(0.867, batch_looks(7, 3), alpha=0.05, draws=8000, seed=0),
+        at_the_wall,
+        batch=3,
+        alpha=0.05,
+        power=0.80,
+    )
+    assert "Raise the maximum first" not in wall
+    assert "already everything the ceiling affords" in wall
+
+
+def test_a_discrete_readout_with_no_spread_is_a_call_and_not_a_skipped_split():
+    """A zero-spread split with a nonzero mean is an infinite t, so it is a rejection.
+
+    Dropping it from the numerator while keeping it in the denominator is what
+    understates the rate this function exists to measure -- on exactly the
+    readouts that produce ties, which is every count-valued one.
+    """
+    tied = [1.0, 1.0, 1.0, 0.0, 0.0, 0.0]
+
+    calibration = null_calibration(tied, pairs=3, splits=200, alpha=0.05, seed=0, resamples=200)
+
+    assert calibration["paired_t_false_positive_rate"] > 0.0
+
+
+def test_the_pair_ceiling_the_message_quotes_is_the_one_the_search_used():
+    budget = Budget(500, runs_per_seed=2, arms=3, hours_per_run=8.2 / 24, ceiling=15.0)
+
+    assert "under 500 reaches this power" in format_requirement(
+        0.01, budget, power=0.80, alpha=0.05, maximum=500
+    )
