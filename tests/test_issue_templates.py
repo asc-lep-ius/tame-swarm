@@ -277,6 +277,9 @@ def test_the_calibration_row_stands_beside_power():
     with_power = [fields for fields in field_names(MEASUREMENT) if "Power" in fields]
     assert with_power, f"{MEASUREMENT.name} renders no table with a Power row"
     fields = with_power[0]
+    assert fields.index("Power") + 1 < len(fields), (
+        f"{MEASUREMENT.name}: Power is the last row, so nothing stands beside it"
+    )
     after_power = fields[fields.index("Power") + 1]
     assert after_power == "Calibration", (
         f"{MEASUREMENT.name}: the row after Power renders as {after_power!r}, not Calibration"
@@ -293,7 +296,14 @@ def test_what_it_records_carries_the_placement():
     section = re.search(r"<h2>What it records</h2>(.*?)<h2>", html, re.S)
     assert section, f"{MEASUREMENT.name} renders no 'What it records' section"
     items = [text_of(li) for li in re.findall(r"<li>.*?</li>", section.group(1), re.S)]
-    placement = [item for item in items if item.startswith("[ ] The placement under the ladder")]
+    # GitLab renders a task-list item as a checkbox and drops the literal `[ ] `;
+    # markdown-it's gfm-like preset has no task-list plugin and keeps it. Strip
+    # it so the assertion holds on either renderer (#68's review, checked on the forge).
+    placement = [
+        item
+        for item in items
+        if item.removeprefix("[ ] ").startswith("The placement under the ladder")
+    ]
     assert len(placement) == 1, f"{MEASUREMENT.name}: one placement item expected, got {placement}"
     assert "preregistration section 9" in placement[0]
     assert "two numbers, never one" in placement[0]

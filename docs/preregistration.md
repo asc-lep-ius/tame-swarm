@@ -288,7 +288,8 @@ CPU-minute, and was not asked. The tooling is #56's; the readout is #57's.
    columns and its 2× and 4× rows are withdrawn (README
    [`#self-model`](../README.md#self-model),
    `~/tame-runs/60-self-model/WITHDRAWN.md`): at 2× most of the `value` arm's
-   cell-steps sat on the ceiling, at 4× every ledger was exactly 750 while
+   cell-steps sat on the ceiling, at 4× effectively every ledger sat there
+   (99.7% of cell-steps under the shipped guardrail's re-derivation) while
    `shuffled` piled at the floor, and the contrast that "opened" was one arm
    frozen against another churning. The columns are the guardrail
    `scripts/measure_self_model.py` now carries; a grid without them is
@@ -321,7 +322,7 @@ its row and does not move it.
 | Rung | Intervention | Dose | Window | Reliably moved when | Trials |
 |---|---|---|---|---|---|
 | 1. **Physical blockade** (#63) | The dominant cell at a layer is blocked: (i) its output zeroed, bids and ledger untouched; (ii) its wealth pinned to the floor, output intact; (iii) a third, structurally different block, written into #63 as a prediction after (i) and (ii) are read and the setpoint stated in one sentence (Op 2 step 5) | Total — the cell is removed, not attenuated, so the block is a step and its size is not a variable | `W`: one quarter of the time the fixture's on-type loss takes to re-converge under (i) held indefinitely, measured on one seed and written into #63 before the arms run. Substitution inside `W` is the auction's; after `W` it is training's, which is Op 5's rate condition | The fraction of the blocked cell's pre-block on-type share the remaining cells take up inside `W`, on `value`, outside the null floor under a paired t, at **both** (i) and (ii) toward the same restored state — one substitution may be a pre-existing pathway; two independent ones is error correction — and the pre-block allocation returning on release | 6 seeds exploratory, 24 confirmatory, the planted effect recovered first (rule 7) |
-| 2. **Setpoint step** (#59's readout, #57's protocol) | The swept field's setpoint is stepped inside one run; the held field's setpoint does not move | One resting spread of the unpaid tissue's reading — the body's own calibration (README [`#stress-coupling`](../README.md#stress-coupling)); #57's confirmation used two, and a step is labelled with its size | One wealth memory horizon to settle, one to recover | The residual stress after the step, `shared` minus `attributed` (#59) — or the allocation shift across the step (#57) — outside the null floor under a paired t, with the single-lag discriminator's asymptote half beside it; its residual half is non-negative by construction and reads nothing (README [`#signature-1-estimator`](../README.md#signature-1-estimator)) | #67's 49 paired seeds a side at 2×, priced by `scripts/power.py`; the 1× read at 12 seeds ran at power 0.256 and places nothing |
+| 2. **Setpoint step** (#59's readout, #57's protocol) | The swept field's setpoint is stepped inside one run; the held field's setpoint does not move | One resting spread of the unpaid tissue's reading — the body's own calibration (README [`#stress-coupling`](../README.md#stress-coupling)); #57's confirmation used two, and a step is labelled with its size | One wealth memory horizon to settle, one to recover | The residual stress after the step, `shared` minus `attributed` (#59) — or the allocation shift across the step (#57) — outside the null floor under a paired t, with the single-lag discriminator's asymptote half beside it; its residual half is non-negative by construction and reads nothing (README [`#signature-1-estimator`](../README.md#signature-1-estimator)) | #67's 49 paired seeds a side at 2×, priced by `scripts/power.py`, or the count the dz measured at the derived rate prices if #67's Power row records that instead — never twelve: the 1× read at 12 seeds ran at power 0.256 and places nothing |
 | 3. **Payment change** (#39's dial) | The relative dose of the two goal fields differs between groups, `β₁/β₂ ∈ {1, 4}`; the cells are paid for closing the tissue's goal error and nothing pushes the stream | One unit of goal error priced at the injection's held-out cost, 0.017 nats (rule 5); the fixture's dose is unpriced and labelled so | End of training — the last logged shares at 2000 steps on the body, 600 on the fixture | Section 3's primary: the paired total-variation shift of the allocation between the dose groups, `value` minus `decoupled`, outside #35's interval and in the direction section 2 names | 3 paired seeds a side as recorded (exploratory under rule 1); 13 for the recorded dz of 0.87 |
 
 ### The rules that bind a rung
@@ -336,7 +337,9 @@ its row and does not move it.
    and the rungs are never read in sequence inside one run.
 2. **Reliability, not success** (Op 1 step 3). A rung has moved the collective
    when its criterion holds across at least three independent seeds *and* at a
-   count the power row says can resolve it; one seed's excursion is an
+   count the power row says can resolve it, and at a lower cost per unit of
+   trajectory change than the rung below it — a genuine class boundary is a
+   drop in that cost, not a smooth decline; one seed's excursion is an
    anecdote, and a contrast at six seeds is a draw from the range rule 7
    measures. The rung below the placement failing reproducibly is the more
    informative half and is recorded with the same care.
@@ -350,7 +353,10 @@ its row and does not move it.
 4. **Trajectory change, not output** (ladder inflation). Language output is
    behaviour, never testimony (section 6), and a cell's *report* moving is not a
    rung passed: the criterion at every rung is the allocation, the stress or
-   the loss, quantities the collective cannot pass by presenting.
+   the loss, quantities the collective cannot pass by presenting. Op 1's
+   fourth class, the giving of reasons, has no rung here for the same reason:
+   a channel read only through language output is one section 6 does not
+   read.
 5. **A composite has no placement** (Op 1 anti-pattern). A grid with a clamped
    cell is two economies, and a placement read across them averages two
    placements and predicts nothing; rule 8 of section 8 is what keeps a rung's

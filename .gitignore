@@ -72,3 +72,7 @@ mlruns/
 # `parity.code_identity()` reads: every fingerprint recorded from this checkout
 # would say the SHA identifies no code (#46).
 .claude/perspectives.md
+# Agent worktrees a session creates under the repo (`Agent isolation: worktree`).
+# Untracked they dirty `git status --porcelain` — which is what
+# `parity.code_identity()` reads — and `ruff check .` walks their half-written code.
+.claude/worktrees/
