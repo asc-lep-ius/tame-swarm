@@ -31,6 +31,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing
+import os
 import statistics
 import sys
 from concurrent.futures import ProcessPoolExecutor
@@ -38,7 +40,13 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
-import torch
+# A CPU fixture on a box with a GPU: the workers are spawned, never forked,
+# because a forked child of a CUDA-initialised parent dies in Adam's stream
+# check -- and the parent never initialises CUDA to begin with, so a body run
+# on the same box is not disturbed by a fixture that has no use for the card.
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+
+import torch  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tame"))
@@ -344,7 +352,10 @@ def _single_thread() -> None:
 
 
 def run_jobs(jobs: list[Job], workers: int) -> list[dict[str, Any]]:
-    with ProcessPoolExecutor(max_workers=workers, initializer=_single_thread) as pool:
+    spawn = multiprocessing.get_context("spawn")
+    with ProcessPoolExecutor(
+        max_workers=workers, initializer=_single_thread, mp_context=spawn
+    ) as pool:
         return list(pool.map(read, jobs))
 
 
