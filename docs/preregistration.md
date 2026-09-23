@@ -255,3 +255,118 @@ CPU-minute, and was not asked. The tooling is #56's; the readout is #57's.
    one and names the other as the secondary it is, with the reason;
    `run_seeds.py --primary` carries one field and a second is not bolted on
    beside it.
+7. **A readout earns its arm contrast on a planted effect first.** Written
+   2026-09-23 by #68, after #57 measured why: on a planted effect of known
+   sign, six seeds give a stable count — 3 to 4 paired seeds a side for the
+   recorded readout — and on an arm contrast the same six seeds give a number
+   spanning 12 to 8099 (README
+   [`#signature-1-estimator`](../README.md#signature-1-estimator)). No readout
+   is pointed at an arm contrast until it has (a) recovered a planted effect of
+   known sign at six seeds under a paired t, on the substrate it will read and
+   on a shift it was not developed on, and (b) been null-calibrated on split
+   same-arm runs (`scripts/power.py --null-calibrate`), so its false-positive
+   rate at the count it is used at is a measured number beside the nominal 5%
+   rather than an assumption — the percentile bootstrap this project decided
+   with reads 13–23% there. The calibration lives in the README beside the
+   readout's block, and the measurement template's Calibration row cites it: a
+   Power row whose Calibration row is empty prices a readout nobody has
+   checked, and the run it prices is exploratory whatever its issue says. #57
+   did this once (`scripts/estimator_study.py`'s planted stage) and it is the
+   reason its "no" is trusted; this makes it the preamble to every readout
+   rather than a study. Forward only, as rule 2: nothing recorded is re-read
+   under it.
+8. **A clamped cell is not read.** Any fixture grid — any sweep over a knob
+   that moves what a cell is paid, `contribution_scale` first — reports three
+   columns in every cell of the grid: occupancy at `max_wealth`, read at 1e-4
+   because the ceiling is an attractor; occupancy at `min_wealth`, read at 10%
+   because the floor is escaped by a hair on every exploration win
+   ([#16](../README.md#wealth-bounds-16)); and `r(wealth, competence)` where
+   competence is planted. A cell whose ledgers sit on a bound is a different
+   economy from its neighbours, not a louder one, and a contrast that crosses
+   into it is a contrast between economies: its row is reported with the
+   occupancy beside it and decides nothing. #60's grid was read without these
+   columns and its 2× and 4× rows are withdrawn (README
+   [`#self-model`](../README.md#self-model),
+   `~/tame-runs/60-self-model/WITHDRAWN.md`): at 2× most of the `value` arm's
+   cell-steps sat on the ceiling, at 4× every ledger was exactly 750 while
+   `shuffled` piled at the floor, and the contrast that "opened" was one arm
+   frozen against another churning. The columns are the guardrail
+   `scripts/measure_self_model.py` now carries; a grid without them is
+   exploratory whatever its issue says, and no 2× row is read before #73 has
+   derived the exchange rate that keeps the winners' fixed point inside the
+   band.
+
+## 9. Placement: which rung moves the collective
+
+Written 2026-09-23 by #68, before #63's first run and binding every stakes
+readout after it. Topological Process Realism's Thesis IV defines a system's
+degree of agency operationally — the least invasive class of intervention that
+reliably and efficiently alters its trajectory — and the Operative Corollary's
+Op 1 turns that into an assay with a ladder preregistered before the first
+trial. **"Is there a self at the cell scale" is retired as a question.** What a
+stakes readout records instead is a *placement*: **two numbers**, the lowest
+rung that reliably moved the collective and the highest rung that failed to. If
+the two are not adjacent, the gap is the uncertainty band and it is the honest
+output; a single number is the answer to a question this document no longer
+asks.
+
+### The ladder
+
+Three rungs at the cell scale, ascending in the agency a response indicates
+and descending in how invasive the intervention is. Each fixes, before its
+first trial, the intervention, the dose, the observation window, the success
+criterion and the trial count (Op 1 step 1); an issue that runs a rung copies
+its row and does not move it.
+
+| Rung | Intervention | Dose | Window | Reliably moved when | Trials |
+|---|---|---|---|---|---|
+| 1. **Physical blockade** (#63) | The dominant cell at a layer is blocked: (i) its output zeroed, bids and ledger untouched; (ii) its wealth pinned to the floor, output intact; (iii) a third, structurally different block, written into #63 as a prediction after (i) and (ii) are read and the setpoint stated in one sentence (Op 2 step 5) | Total — the cell is removed, not attenuated, so the block is a step and its size is not a variable | `W`: one quarter of the time the fixture's on-type loss takes to re-converge under (i) held indefinitely, measured on one seed and written into #63 before the arms run. Substitution inside `W` is the auction's; after `W` it is training's, which is Op 5's rate condition | The fraction of the blocked cell's pre-block on-type share the remaining cells take up inside `W`, on `value`, outside the null floor under a paired t, at **both** (i) and (ii) toward the same restored state — one substitution may be a pre-existing pathway; two independent ones is error correction — and the pre-block allocation returning on release | 6 seeds exploratory, 24 confirmatory, the planted effect recovered first (rule 7) |
+| 2. **Setpoint step** (#59's readout, #57's protocol) | The swept field's setpoint is stepped inside one run; the held field's setpoint does not move | One resting spread of the unpaid tissue's reading — the body's own calibration (README [`#stress-coupling`](../README.md#stress-coupling)); #57's confirmation used two, and a step is labelled with its size | One wealth memory horizon to settle, one to recover | The residual stress after the step, `shared` minus `attributed` (#59) — or the allocation shift across the step (#57) — outside the null floor under a paired t, with the single-lag discriminator's asymptote half beside it; its residual half is non-negative by construction and reads nothing (README [`#signature-1-estimator`](../README.md#signature-1-estimator)) | #67's 49 paired seeds a side at 2×, priced by `scripts/power.py`; the 1× read at 12 seeds ran at power 0.256 and places nothing |
+| 3. **Payment change** (#39's dial) | The relative dose of the two goal fields differs between groups, `β₁/β₂ ∈ {1, 4}`; the cells are paid for closing the tissue's goal error and nothing pushes the stream | One unit of goal error priced at the injection's held-out cost, 0.017 nats (rule 5); the fixture's dose is unpriced and labelled so | End of training — the last logged shares at 2000 steps on the body, 600 on the fixture | Section 3's primary: the paired total-variation shift of the allocation between the dose groups, `value` minus `decoupled`, outside #35's interval and in the direction section 2 names | 3 paired seeds a side as recorded (exploratory under rule 1); 13 for the recorded dz of 0.87 |
+
+### The rules that bind a rung
+
+1. **Each rung is read on its own runs.** Op 1 tests downward because a target
+   moved by a lower rung does not respond normally to a higher one afterward.
+   On this substrate every arm is a fresh run from a seed, so that contamination
+   is absent by construction — and the residual form of it is not: a collective
+   whose ledger a dose step or a payment change has already moved is not the
+   one a blockade is read on. A blockade read runs on fresh seeds, or on a
+   checkpoint taken before any setpoint step or payment change in that run,
+   and the rungs are never read in sequence inside one run.
+2. **Reliability, not success** (Op 1 step 3). A rung has moved the collective
+   when its criterion holds across at least three independent seeds *and* at a
+   count the power row says can resolve it; one seed's excursion is an
+   anecdote, and a contrast at six seeds is a draw from the range rule 7
+   measures. The rung below the placement failing reproducibly is the more
+   informative half and is recorded with the same care.
+3. **The null arm is already built** (Op 1 best practice: an intervention
+   matched for cost, duration and salience with no content). `shuffled` and
+   `decoupled` are that arm at every rung — the same auction, the same
+   throughput, the signal without the content — and each rung's criterion is
+   read against them, never against an unperturbed run alone. Some collectives
+   move under any sufficiently expensive intervention, and without the null arm
+   that movement is scored as a placement.
+4. **Trajectory change, not output** (ladder inflation). Language output is
+   behaviour, never testimony (section 6), and a cell's *report* moving is not a
+   rung passed: the criterion at every rung is the allocation, the stress or
+   the loss, quantities the collective cannot pass by presenting.
+5. **A composite has no placement** (Op 1 anti-pattern). A grid with a clamped
+   cell is two economies, and a placement read across them averages two
+   placements and predicts nothing; rule 8 of section 8 is what keeps a rung's
+   trials inside one economy. A placement that drifts between seeds or between
+   1× and 2× is the same signal — stop and individuate (#63) before placing.
+
+### What is placed today
+
+Nothing. Every stakes readout so far sits on rung 3 (#39, fixture and body,
+`value` minus `decoupled` with the sign against the position) or rung 2 (#59
+at 1×, power 0.256, decides nothing), and no rung 1 read exists. So the record
+this section opens with is: **lowest rung that reliably moved the collective —
+none; highest rung that failed — 3, twice.** The two are not adjacent because
+one of them is empty, and that is the honest output at this date. #63 supplies
+the first rung 1 read, #67 the first rung 2 read at a count that can resolve
+it, and #69 asks whether whatever placement the fixture returns survives on the
+body. Every issue that runs a rung records its placement under "What it
+records" in the measurement template and extends this section's record; a
+readout that returns one number has not finished.
