@@ -114,6 +114,9 @@ class StepRecord:
     mean_report: float
     mean_price: float
     mean_surplus: float
+    # ``(batch, seq)``, detached: the loss per token, so a reader can restrict it
+    # to the tokens of one type -- #63's on-type loss under a blockade.
+    per_token_loss: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -200,6 +203,61 @@ class SyntheticEconomy:
         )
         self.generator = torch.Generator().manual_seed(seed)
         self.last_sign: torch.Tensor | None = None
+        # #63's two blockades. The output block keeps the planted adapter it
+        # zeroed, so a release restores the cell bitwise; the ledger pin is
+        # re-applied around every settlement, so the pinned cell bids at the
+        # floor on every token however the economy tries to pay it.
+        self._blocked_adapters: dict[int, torch.Tensor] = {}
+        self._pinned_wealth: dict[int, float] = {}
+
+    def block_output(self, expert: int) -> None:
+        """Blockade (i): the cell's contribution is exactly zero; its bids and ledger are untouched.
+
+        The same operation ``economy_damage.senesce`` applies, kept reversible:
+        the down adapter is what carries the planted correction, and with it
+        zeroed the expert's output *is* the base's, so its contribution is zero
+        to the bit rather than small. Nothing here touches the confidence head
+        or the wealth -- the economy finds out the way a tissue would.
+        """
+        self._check_expert(expert)
+        if expert in self._blocked_adapters:
+            return
+        weight = cast(LightweightExpert, self.mob.experts[expert]).down_adapter_B.weight
+        self._blocked_adapters[expert] = weight.detach().clone()
+        with torch.no_grad():
+            weight.zero_()
+
+    def release_output(self, expert: int) -> None:
+        with torch.no_grad():
+            cast(LightweightExpert, self.mob.experts[expert]).down_adapter_B.weight.copy_(
+                self._blocked_adapters.pop(expert)
+            )
+
+    def pin_wealth(self, expert: int, level: float | None = None) -> None:
+        """Blockade (ii): the cell's ledger is held at ``level`` (the floor); its output is intact.
+
+        Applied now and again around every settlement, so the pin holds against
+        the reward the cell keeps earning. Under ``decoupled`` the gate reads a
+        pinned snapshot rather than this ledger, so the blockade reaches the
+        allocation by construction not at all -- which is a reading, not a bug.
+        """
+        self._check_expert(expert)
+        self._pinned_wealth[expert] = self.config.min_wealth if level is None else level
+        self._apply_pins()
+
+    def release_wealth(self, expert: int) -> None:
+        self._pinned_wealth.pop(expert)
+
+    def _check_expert(self, expert: int) -> None:
+        if not 0 <= expert < self.config.num_experts:
+            raise ValueError(f"expert must lie in [0, {self.config.num_experts}), got {expert}")
+
+    def _apply_pins(self) -> None:
+        if not self._pinned_wealth:
+            return
+        with torch.no_grad():
+            for expert, level in self._pinned_wealth.items():
+                self.mob.expert_wealth[expert] = level
 
     def _plant(self, competence: torch.Tensor) -> None:
         config = self.config
@@ -280,6 +338,7 @@ class SyntheticEconomy:
         return torch.zeros(selected.shape, dtype=torch.float32)
 
     def step(self, with_exact_values: bool = False) -> StepRecord:
+        self._apply_pins()
         x, target = self._draw()
         output = self.mob(x)
         per_token = ((output - target) ** 2).sum(-1)
@@ -289,6 +348,7 @@ class SyntheticEconomy:
         self.mob.update_wealth_from_loss(
             per_token.detach(), loss_gradient_scale=float(per_token.numel())
         )
+        self._apply_pins()
         auxiliary = self.mob.get_confidence_calibration_loss() + self.mob.get_router_z_loss()
         auxiliary.backward()
         self.optimizer.step()
@@ -311,6 +371,7 @@ class SyntheticEconomy:
             mean_report=summary.mean_report.item(),
             mean_price=summary.mean_price.item(),
             mean_surplus=summary.mean_surplus.item(),
+            per_token_loss=per_token.detach(),
         )
 
     def run(self, steps: int, window: int = 50) -> RunSummary:
