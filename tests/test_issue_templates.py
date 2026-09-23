@@ -248,3 +248,52 @@ def test_no_comment_is_left_open(path: Path):
         f"{path.name}:{open_at[0]} leaves a comment open to the end of the file, so everything "
         f"below it is swallowed:\n{open_at[1][:120]}"
     )
+
+
+MEASUREMENT = next(path for path in TEMPLATES if path.name == "measurement.md")
+
+
+def text_of(html: str) -> str:
+    """A rendered fragment with its tags stripped, whitespace collapsed."""
+    return normalised(re.sub(r"<[^>]+>", "", html))
+
+
+def field_names(path: Path) -> list[list[str]]:
+    """Each rendered table's first-cell texts, in row order: what a reader sees as the field."""
+    names: list[list[str]] = []
+    for rows in emitted_tables(path):
+        cells = [re.search(r"<td>(.*?)</td>", row, re.S) for row in rows]
+        names.append([text_of(cell.group(1)) for cell in cells if cell])
+    return names
+
+
+def test_the_calibration_row_stands_beside_power():
+    """#68: a Power row without a Calibration row prices a readout nobody has checked.
+
+    Read off the rendered table rather than the source, so a row that exists in
+    the file and is swallowed before it renders fails here as well as above.
+    Adjacent, not merely present: the rule is that the two are read together.
+    """
+    with_power = [fields for fields in field_names(MEASUREMENT) if "Power" in fields]
+    assert with_power, f"{MEASUREMENT.name} renders no table with a Power row"
+    fields = with_power[0]
+    after_power = fields[fields.index("Power") + 1]
+    assert after_power == "Calibration", (
+        f"{MEASUREMENT.name}: the row after Power renders as {after_power!r}, not Calibration"
+    )
+
+
+def test_what_it_records_carries_the_placement():
+    """#68: every stakes readout records two numbers, and the template asks for them.
+
+    Matched in the rendered list under the heading that owns it, so moving the
+    line into another section is a failure and not a relocation.
+    """
+    html = RENDERER.render(MEASUREMENT.read_text())
+    section = re.search(r"<h2>What it records</h2>(.*?)<h2>", html, re.S)
+    assert section, f"{MEASUREMENT.name} renders no 'What it records' section"
+    items = [text_of(li) for li in re.findall(r"<li>.*?</li>", section.group(1), re.S)]
+    placement = [item for item in items if item.startswith("[ ] The placement under the ladder")]
+    assert len(placement) == 1, f"{MEASUREMENT.name}: one placement item expected, got {placement}"
+    assert "preregistration section 9" in placement[0]
+    assert "two numbers, never one" in placement[0]
