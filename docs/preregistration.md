@@ -381,16 +381,17 @@ readout that returns one number has not finished.
 The first rung 1 read, on both fixtures, 24 paired seeds, three blockades.
 Against the rung's own row, on `value`: the freed slots are taken up inside `W`
 under the ledger pin and the gate block (uptake 0.66–1.00, half-life one step;
-the null arms read the same, except `decoupled` under the pin, which reaches
-nothing by construction); under the output block the quality fixture reads
+the null arms read the same, except differentiated `shuffled` under the pin,
++0.086 at p 0.07, and `decoupled` under the pin, which reaches nothing by
+construction); under the output block the quality fixture reads
 +0.003 — outside the null floor under the paired t (p 2e-7) but negligible and
 uncalibrated, the ledger ranking the silent cell into its slots through all of
-`W` — and the differentiated fixture +0.73 with a share half-life of 195 steps
+`W` — and the differentiated fixture +0.73 with a share half-life of 192 steps
 against a `W` of 667 taken from the cap, so that uptake is training's and does
 not count as inside `W`. The on-type loss inside `W` is worse than the
 control's under every blockade on every arm. The pre-block allocation returns
-in full after the output block, in 2 of 24 (quality) and 13 of 24
-(differentiated) seeds after the ledger pin, in 15 and 22 of 24 after the gate
+in 24 of 24 and 23 of 24 seeds after the output block, in 2 of 24 (quality)
+and 13 of 24 (differentiated) after the ledger pin, in 15 and 22 of 24 after the gate
 block. **The row fails on its return clause under (ii)**, whichever way the
 issue's criterion is read; that failure rests on releasing the pin at the
 floor, where the ledger has no re-entry (#40), which the row did not
