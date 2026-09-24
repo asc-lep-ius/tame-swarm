@@ -208,7 +208,10 @@ SURFACE_PATHS=""
 # identical table and row counts, and identical behaviour on the three things
 # the checks turn on — an unterminated comment inside a cell is escaped rather
 # than swallowing rows, a terminated one is passed through rather than stripped,
-# and a surplus cell is dropped silently. Not wired as a gate because the forge
+# and a surplus cell is dropped silently. One divergence is known and worked
+# around rather than pinned: the forge renders a `- [ ]` task-list item as a
+# checkbox with no literal `[ ] `, markdown-it keeps the brackets (#68's
+# review, 2026-09-23), so no check may anchor on them. Not wired as a gate because the forge
 # is Tailscale-only, and a gate that needs the forge is a gate that fails
 # offline.
 PARITY_CMD=""
