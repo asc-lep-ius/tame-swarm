@@ -40,10 +40,11 @@ import sys
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 
 import torch
 import torch.nn.functional as F
+from torch.utils.hooks import RemovableHandle
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tame"))
 
@@ -114,6 +115,9 @@ class StepRecord:
     mean_report: float
     mean_price: float
     mean_surplus: float
+    # ``(batch, seq)``, detached: the loss per token, so a reader can restrict it
+    # to the tokens of one type -- #63's on-type loss under a blockade.
+    per_token_loss: torch.Tensor | None = None
 
 
 @dataclass(frozen=True)
@@ -200,6 +204,98 @@ class SyntheticEconomy:
         )
         self.generator = torch.Generator().manual_seed(seed)
         self.last_sign: torch.Tensor | None = None
+        # #63's two blockades. The output block keeps the planted adapter it
+        # zeroed, so a release restores the cell bitwise; the ledger pin is
+        # re-applied around every settlement, so the pinned cell bids at the
+        # floor on every token however the economy tries to pay it.
+        self._blocked_adapters: dict[int, torch.Tensor] = {}
+        self._pinned_wealth: dict[int, float] = {}
+        self._silenced: dict[int, RemovableHandle] = {}
+
+    def block_output(self, expert: int) -> None:
+        """Blockade (i): the cell's contribution is exactly zero; its bids and ledger are untouched.
+
+        The same operation ``economy_damage.senesce`` applies, kept reversible:
+        the down adapter is what carries the planted correction, and with it
+        zeroed the expert's output *is* the base's, so its contribution is zero
+        to the bit rather than small. Nothing here touches the confidence head
+        or the wealth -- the economy finds out the way a tissue would.
+        """
+        self._check_expert(expert)
+        if expert in self._blocked_adapters:
+            return
+        weight = cast(LightweightExpert, self.mob.experts[expert]).down_adapter_B.weight
+        self._blocked_adapters[expert] = weight.detach().clone()
+        with torch.no_grad():
+            weight.zero_()
+
+    def release_output(self, expert: int) -> None:
+        with torch.no_grad():
+            cast(LightweightExpert, self.mob.experts[expert]).down_adapter_B.weight.copy_(
+                self._blocked_adapters.pop(expert)
+            )
+
+    def pin_wealth(self, expert: int, level: float | None = None) -> None:
+        """Blockade (ii): the cell's ledger is held at ``level`` (the floor); its output is intact.
+
+        Applied now and again around every settlement, so the pin holds against
+        the reward the cell keeps earning. Under ``decoupled`` the gate reads a
+        pinned snapshot rather than this ledger, so the blockade reaches the
+        allocation by construction not at all -- which is a reading, not a bug.
+        """
+        self._check_expert(expert)
+        self._pinned_wealth[expert] = self.config.min_wealth if level is None else level
+        self._apply_pins()
+
+    def release_wealth(self, expert: int) -> None:
+        self._pinned_wealth.pop(expert)
+
+    def block_bids(self, expert: int, token_type: int | None = None) -> None:
+        """Blockade (iii): the cell is not heard at the auction on one class of tokens.
+
+        Its report on those tokens reaches the gate as zero, so it bids nothing
+        there and wins them only by the exploration gift; the head that made the
+        report, the ledger and the output are all intact -- the auction is the
+        one thing between the cell and the token, and this closes it. With
+        ``token_type`` None every token is of the class, which is the quality
+        fixture's one type; on the differentiated fixture the cell keeps bidding
+        on the other types' tokens. Under ``decoupled`` the gate still reads the
+        bid, so unlike the ledger pin this blockade reaches the allocation there.
+        """
+        self._check_expert(expert)
+        if token_type is not None and not hasattr(self, "last_types"):
+            raise ValueError("a token class needs a fixture whose tokens have types")
+        if expert in self._silenced:
+            raise ValueError(f"expert {expert} is already silenced; release it first")
+
+        def silence(_gate: torch.nn.Module, args: tuple[Any, ...]) -> tuple[Any, ...]:
+            confidences = args[0].clone()
+            mask = self._token_class(token_type, confidences.shape[:-1])
+            confidences[..., expert] = confidences[..., expert].masked_fill(mask, 0.0)
+            return (confidences, *args[1:])
+
+        self._silenced[expert] = self.mob.gate.register_forward_pre_hook(silence)
+
+    def release_bids(self, expert: int) -> None:
+        self._silenced.pop(expert).remove()
+
+    def _token_class(self, token_type: int | None, shape: torch.Size) -> torch.Tensor:
+        if token_type is None:
+            return torch.ones(shape, dtype=torch.bool)
+        types = getattr(self, "last_types", None)
+        assert types is not None, "the draw records the token types before the gate reads them"
+        return types == token_type
+
+    def _check_expert(self, expert: int) -> None:
+        if not 0 <= expert < self.config.num_experts:
+            raise ValueError(f"expert must lie in [0, {self.config.num_experts}), got {expert}")
+
+    def _apply_pins(self) -> None:
+        if not self._pinned_wealth:
+            return
+        with torch.no_grad():
+            for expert, level in self._pinned_wealth.items():
+                self.mob.expert_wealth[expert] = level
 
     def _plant(self, competence: torch.Tensor) -> None:
         config = self.config
@@ -280,6 +376,7 @@ class SyntheticEconomy:
         return torch.zeros(selected.shape, dtype=torch.float32)
 
     def step(self, with_exact_values: bool = False) -> StepRecord:
+        self._apply_pins()
         x, target = self._draw()
         output = self.mob(x)
         per_token = ((output - target) ** 2).sum(-1)
@@ -289,6 +386,7 @@ class SyntheticEconomy:
         self.mob.update_wealth_from_loss(
             per_token.detach(), loss_gradient_scale=float(per_token.numel())
         )
+        self._apply_pins()
         auxiliary = self.mob.get_confidence_calibration_loss() + self.mob.get_router_z_loss()
         auxiliary.backward()
         self.optimizer.step()
@@ -311,6 +409,7 @@ class SyntheticEconomy:
             mean_report=summary.mean_report.item(),
             mean_price=summary.mean_price.item(),
             mean_surplus=summary.mean_surplus.item(),
+            per_token_loss=per_token.detach(),
         )
 
     def run(self, steps: int, window: int = 50) -> RunSummary:
@@ -395,6 +494,7 @@ class DifferentiatedEconomy(SyntheticEconomy):
         head_learning_rate: float = 1e-2,
         num_types: int = DEFAULT_NUM_TYPES,
         type_signal: float = DEFAULT_TYPE_SIGNAL,
+        contribution_scale: float = 1.0,
     ):
         if not 1 <= num_types <= competence.numel():
             raise ValueError(f"num_types must lie in [1, {competence.numel()}], got {num_types}")
@@ -405,6 +505,12 @@ class DifferentiatedEconomy(SyntheticEconomy):
             )
         self.num_types = num_types
         self.type_signal = type_signal
+        # #60's lever 1, second ratio: how much of the output the cells own. The
+        # planted corrections are orthonormal, so one is the recorded fixture and
+        # a larger scale is a body whose experts carry more of what the token
+        # wants -- the fixture's analogue of raising the adapter rank, which on
+        # the real body is 3.7% of the residual norm.
+        self.contribution_scale = contribution_scale
         # Assigned before the base class plants, since ``_plant`` reads them. The
         # expert types cycle through the type set and are then shuffled with a
         # generator of their own, so the assignment is fixed by the seed alone.
@@ -431,7 +537,7 @@ class DifferentiatedEconomy(SyntheticEconomy):
         # a percent (``CORRECTION_STD x sqrt(hidden_dim / rank)``), so prices and
         # rewards here are on the same scale the constants were derived on.
         basis = torch.linalg.qr(torch.randn(config.hidden_dim, self.num_types * rank))[0]
-        self.type_corrections = torch.stack(
+        self.type_corrections = self.contribution_scale * torch.stack(
             [basis[:, t * rank : (t + 1) * rank] for t in range(self.num_types)]
         )
         # The input direction that announces each type, orthonormal so the types
@@ -470,16 +576,73 @@ class DifferentiatedEconomy(SyntheticEconomy):
         self.last_types = types
         return x, target
 
-    def add_goal_field(self, expert_type: int, setpoint: float, dose: float) -> TypeGoalField:
-        """Attach a goal field on one type's correction (#33, #39); see ``TypeGoalField``."""
+    def add_goal_field(
+        self,
+        expert_type: int,
+        setpoint: float,
+        dose: float,
+        resting_sigma: float | None = None,
+    ) -> TypeGoalField:
+        """Attach a goal field on one type's correction (#33, #39); see ``TypeGoalField``.
+
+        ``resting_sigma`` makes the field a stress source as well as a payment
+        (#59): the layer charges every cell for the magnitude of this field's
+        error in units of that spread. It is measured on a run of this fixture
+        at no charge, the way the body's is measured on the pristine model
+        before conversion -- ``scripts/measure_stress_coupling.py`` does the
+        measuring, because a spread the mechanism measured on itself while the
+        mechanism was running is not a resting spread.
+        """
         if not 0 <= expert_type < self.num_types:
             raise ValueError(f"expert_type must lie in [0, {self.num_types}), got {expert_type}")
         field = TypeGoalField(self, expert_type, setpoint, dose)
-        self.mob.attach_goal_field(field)
+        self.mob.attach_goal_field(field, resting_sigma=resting_sigma)
         return field
 
     def goal_fields(self) -> Sequence[TypeGoalField]:
         return [field for field in self.mob.goal_fields if isinstance(field, TypeGoalField)]
+
+    def step_goal_setpoint(self, expert_type: int, delta: float) -> TypeGoalField:
+        """Move one attached field's setpoint by ``delta``: the experimenter's step (#57).
+
+        A thermostat is tested by moving the target, not the electricity price,
+        and the error that follows is in the tissue's own variable and the cells'
+        own units. The step is the experimenter's and never the cell's: nothing
+        in the economy can reach this, and the fields stay frozen -- the list is
+        rebuilt in place rather than edited, because a field that can be written
+        after attachment is a field the run's record no longer describes.
+        """
+        fields = list(self.mob.goal_fields)
+        # Carried across the rebuild rather than defaulted away: a field that
+        # came back without its resting spread would stop being a stress source
+        # (#59) at exactly the step the perturbation is applied, and the charge
+        # would go quiet in the phase the primary is read on -- which is how
+        # this was found.
+        sigmas = list(self.mob._resting_sigmas)
+        stepped = None
+        for index, field in enumerate(fields):
+            if isinstance(field, TypeGoalField) and field.expert_type == expert_type:
+                stepped = replace(field, setpoint=field.setpoint + delta)
+                fields[index] = stepped
+        if stepped is None:
+            raise ValueError(f"no goal field is attached on type {expert_type}")
+        self.mob.detach_goal_fields()
+        for field, sigma in zip(fields, sigmas, strict=True):
+            self.mob.attach_goal_field(field, resting_sigma=sigma)
+        return stepped
+
+    def goal_reading(self, field: TypeGoalField, selected: torch.Tensor) -> float:
+        """What the tissue is holding along one field's direction, averaged over tokens.
+
+        The same quantity ``closed_form_goal_terms`` prices the goal error
+        against: the on-type competence the winners delivered at their share.
+        Read here so an experiment can watch the regulated variable itself rather
+        than infer it from what the cells were paid.
+        """
+        k = self.config.top_k
+        delivered = self.competence[selected] / k
+        on_field = self.expert_types[selected] == field.expert_type
+        return float((delivered * on_field).sum(dim=-1).mean())
 
     def closed_form_goal_terms(self, selected: torch.Tensor) -> torch.Tensor:
         """What the goal fields pay every winner slot, per unit share, from the planted numbers.

@@ -16,6 +16,17 @@ from .ledger import (
     SUPPORTED_PERSISTENCE_COUPLINGS,
 )
 from .softmax_router import ROUTER_AUCTION, SUPPORTED_ROUTERS
+from .stress import (
+    DEFAULT_GAMMA,
+    DEFAULT_GATE_SIGMA,
+    DEFAULT_LAMBDA,
+    STRESS_ATTRIBUTED,
+    STRESS_GATE_FIXED,
+    SUPPORTED_GATE_MODES,
+    SUPPORTED_STRESS_COUPLINGS,
+    StressConfig,
+    stress_from_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -279,6 +290,25 @@ class MoBConfig:
     # mechanism is being compared against, so every economy path checks
     # has_economy rather than assuming there is one.
     router: str = ROUTER_AUCTION
+    # The coupling channel (#59): what a cell's continuation is charged for.
+    # "attributed" is #33's goal term and every recorded arm -- a cell is paid
+    # the counterfactual reduction it caused in the tissue's goal error.
+    # "shared" charges every cell at the layer the same unattributed stress
+    # magnitude, winner or not, so the only way to lower it is to act; "mixed"
+    # runs both at half budget. The three are at parity on everything else,
+    # which is what the equal-budget lambda below is for. stress_lambda = 0 is
+    # the economy as recorded and is asserted to reproduce it bitwise.
+    stress_coupling: str = STRESS_ATTRIBUTED
+    stress_lambda: float = DEFAULT_LAMBDA
+    # How much of the charge is the neighbourhood's error rather than this
+    # layer's, and where the gate opens, in resting spreads. Gamma is the term
+    # that makes it a tissue: at 0 a cell pays only for the error at its own
+    # layer, which is a cell with a private alarm rather than a shared one.
+    stress_gamma: float = DEFAULT_GAMMA
+    stress_gate_sigma: float = DEFAULT_GATE_SIGMA
+    # Whether gamma is a constant or rises with the tissue's own recent stress
+    # (Levin 2019's selective coupling). A secondary arm, never the primary.
+    stress_gate_mode: str = STRESS_GATE_FIXED
     confidence_calibration_weight: float = 0.15
     confidence_z_loss_weight: float = 0.0001
     loss_ema_decay: float = 0.92
@@ -286,7 +316,25 @@ class MoBConfig:
     inference_exploration_bonus: float = 0.03
     inference_wealth_compression: float = 0.4
 
+    @property
+    def stress(self) -> StressConfig:
+        """The coupling this configuration selects, validated on construction."""
+        return stress_from_config(self)
+
     def __post_init__(self) -> None:
+        if self.stress_coupling not in SUPPORTED_STRESS_COUPLINGS:
+            raise ValueError(
+                f"unknown stress_coupling {self.stress_coupling!r}; "
+                f"expected one of {sorted(SUPPORTED_STRESS_COUPLINGS)}"
+            )
+        if self.stress_gate_mode not in SUPPORTED_GATE_MODES:
+            raise ValueError(
+                f"unknown stress_gate_mode {self.stress_gate_mode!r}; "
+                f"expected one of {sorted(SUPPORTED_GATE_MODES)}"
+            )
+        # Constructed once so an out-of-range lambda, gamma or gate refuses here
+        # rather than on the first token of a multi-hour run.
+        _ = self.stress
         # The auction divides each winner's externality by its own wealth to price
         # it in the winner's own units. A non-positive wealth makes that division
         # meaningless, and the clamp guarding it would turn a valid numerator into

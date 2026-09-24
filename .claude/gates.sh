@@ -195,9 +195,25 @@ SURFACE_PATHS=""
 # Empty, and not the same word as tame/parity.py — which is about arm
 # fingerprints and refuses a comparison whose arms differ in anything but the
 # gate. This key is about a test double drifting from the server it stands in
-# for, and there is no double here: tests/test_api.py drives the real app
+# for, and there is no server double here: tests/test_api.py drives the real app
 # factory through FastAPI's TestClient. Nothing to pin, rather than something
 # unpinned.
+#
+# There is now one double of another kind, and it is left deliberately manual
+# rather than left unsaid. tests/test_issue_templates.py renders the issue
+# templates with markdown-it-py, which stands in for GitLab's own cmark-gfm, and
+# a stand-in that accepted markup the real renderer mangles would keep this
+# green on a broken template. Its parity evidence is #56's sixth review, which
+# rendered all four templates through gitlab.hephaestus POST /api/v4/markdown:
+# identical table and row counts, and identical behaviour on the three things
+# the checks turn on — an unterminated comment inside a cell is escaped rather
+# than swallowing rows, a terminated one is passed through rather than stripped,
+# and a surplus cell is dropped silently. One divergence is known and worked
+# around rather than pinned: the forge renders a `- [ ]` task-list item as a
+# checkbox with no literal `[ ] `, markdown-it keeps the brackets (#68's
+# review, 2026-09-23), so no check may anchor on them. Not wired as a gate because the forge
+# is Tailscale-only, and a gate that needs the forge is a gate that fails
+# offline.
 PARITY_CMD=""
 PARITY_PATHS=""
 

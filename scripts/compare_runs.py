@@ -197,8 +197,26 @@ def _values(group: dict[str, Any], metric: str) -> list[float]:
     return [result[metric] for result in group["per_seed"].values() if metric in result]
 
 
+def group_floor(group: dict[str, Any]) -> dict[str, float]:
+    """The run-to-run floor a group carries: the one it measured, or the one it borrowed.
+
+    #56 lets a sweep at a configuration whose floor is already recorded spend its
+    replicate budget on seeds and name the floor it borrows instead
+    (``run_seeds.py --no-replicate --floor_recorded_at``, section 8 rule 4). The
+    borrow is refused at write time unless the lender's floor knobs match, so by
+    the time it is here it is this configuration's floor -- but it is another
+    sweep's runs, which is why ``replication_note`` says so under every table
+    that quotes one.
+    """
+    measured = group.get("replication_std") or {}
+    if measured:
+        return measured
+    borrowed = group.get("floor_recorded_at") or {}
+    return borrowed.get("replication_std") or {}
+
+
 def pooled_replication_std(group_a: dict[str, Any], group_b: dict[str, Any], metric: str) -> float:
-    """The run-to-run floor on ``metric``, pooled over the groups that measured it.
+    """The run-to-run floor on ``metric``, pooled over the groups that carry it.
 
     Each group's ``replication_std`` is the sample std of one seed run twice (one
     degree of freedom), so pooling is the root mean square of whichever groups
@@ -206,9 +224,7 @@ def pooled_replication_std(group_a: dict[str, Any], group_b: dict[str, Any], met
     as a floor of zero.
     """
     floors = [
-        group["replication_std"][metric]
-        for group in (group_a, group_b)
-        if metric in (group.get("replication_std") or {})
+        group_floor(group)[metric] for group in (group_a, group_b) if metric in group_floor(group)
     ]
     if not floors:
         return float("nan")
@@ -222,16 +238,31 @@ def replication_note(group_a: dict[str, Any], group_b: dict[str, Any]) -> str:
         for group in (group_a, group_b)
         if group.get("replication_std")
     ]
+    borrowed = [
+        f"{group['floor_recorded_at']['path']} (arm {group['floor_recorded_at']['arm']})"
+        for group in (group_a, group_b)
+        if not group.get("replication_std") and group.get("floor_recorded_at")
+    ]
+    if not measured and borrowed:
+        return (
+            "repl_std: the run-to-run floor, BORROWED by both groups and measured by neither "
+            f"-- {', '.join(borrowed)}. The borrow is refused at write time unless the "
+            "lender ran the same floor knobs (#56, section 8 rule 4), so it is this "
+            "configuration's floor; it is not these runs'."
+        )
     if not measured:
         return (
             "repl_std: the run-to-run floor, NOT measured for either group -- "
             "run_seeds.py --replicate runs one seed twice and records it"
         )
-    return (
+    note = (
         f"repl_std: the run-to-run floor -- one seed run twice ({', '.join(measured)}), the "
         f"sample std of the pair, pooled over the {len(measured)} group(s) that measured it. "
         "A delta inside it is inside what re-running one seed already produces."
     )
+    if borrowed:
+        note += f" The other group borrowed its floor at the same knobs: {', '.join(borrowed)}."
+    return note
 
 
 def compare(group_a: dict[str, Any], group_b: dict[str, Any]) -> dict[str, dict[str, float]]:
