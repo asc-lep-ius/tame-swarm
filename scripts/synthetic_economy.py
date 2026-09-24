@@ -266,7 +266,7 @@ class SyntheticEconomy:
         if token_type is not None and not hasattr(self, "last_types"):
             raise ValueError("a token class needs a fixture whose tokens have types")
         if expert in self._silenced:
-            return
+            raise ValueError(f"expert {expert} is already silenced; release it first")
 
         def silence(_gate: torch.nn.Module, args: tuple[Any, ...]) -> tuple[Any, ...]:
             confidences = args[0].clone()

@@ -136,10 +136,15 @@ def returned(pre_shares: torch.Tensor, post_shares: torch.Tensor, blocked: int) 
 
 
 def half_life(shares_per_step: list[float], before: float, final: float) -> int | None:
-    """The first step inside the window at which the blocked cell has lost half its eventual loss.
+    """The step at which the blocked cell's *running mean* share has dropped half the window's loss.
 
-    ``None`` when the cell lost nothing over the window. A per-step share is
-    noisy, so the step is read on the running mean rather than on the raw step.
+    ``final`` is the cell's mean share over the window, so ``before - final`` is
+    the loss the window as a whole recorded, and the step is the one at which
+    the running mean from the block has fallen half of that. A per-step share
+    is noisy, which is why the running mean is read and not the raw step; the
+    cost is that a gradual decline reads later than its half-way point, so this
+    is a lower bound on how fast the auction moved, not the instant. ``None``
+    when the cell lost nothing over the window.
     """
     drop = before - final
     if drop <= 0:

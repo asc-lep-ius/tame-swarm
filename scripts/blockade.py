@@ -98,6 +98,8 @@ TAIL = 100
 # How long after release the return is watched: one re-convergence time, since
 # W is a quarter of one. The return is read over the last W of it.
 RELEASE_MULTIPLE = 4
+# A blocked-minus-control return within this of zero is a cell that came back.
+RETURN_TOLERANCE = 0.05
 # The trailing mean the re-convergence is read on, and the cap past which the
 # blocked loss is called not re-converging and W is taken from the cap.
 TRAILING = 50
@@ -535,7 +537,12 @@ def load_stage(stage: Path) -> dict[tuple[str, str], dict[str, dict[str, Any]]]:
 def summarise_stage(stage: Path) -> dict[str, Any]:
     """Every contrast in one stage, against the control and between arms, with dz and its seeds."""
     loaded = load_stage(stage)
-    summary: dict[str, Any] = {"stage": str(stage), "against_control": {}, "between_arms": {}}
+    summary: dict[str, Any] = {
+        "stage": str(stage),
+        "against_control": {},
+        "between_arms": {},
+        **identity(),
+    }
     against: dict[str, dict[str, dict[str, dict[str, float]]]] = {}
     for blockade in READ_BLOCKADES:
         if not all((arm, blockade) in loaded for arm in ARMS):
@@ -551,6 +558,9 @@ def summarise_stage(stage: Path) -> dict[str, Any]:
                     "pairs_at_80": pairs_for_power(test.dz) if test.sd > 0 else None,
                     "per_seed": deltas,
                     "guardrail": guardrail_columns(rows),
+                    # How many seeds sit within RETURN_TOLERANCE of the control:
+                    # the "returned in full" count the README quotes for (c).
+                    "within_tolerance": sum(abs(d) <= RETURN_TOLERANCE for d in deltas.values()),
                 }
         for field in ("uptake", "inside_on_type_loss"):
             for other in (PERSISTENCE_SHUFFLED, PERSISTENCE_DECOUPLED):
@@ -581,7 +591,7 @@ def guardrail_columns(rows: dict[str, dict[str, Any]]) -> dict[str, float]:
 
 
 def stage_summarise(args: argparse.Namespace) -> None:
-    for stage in sorted(args.out.glob("arms_*")):
+    for stage in sorted(path for path in args.out.glob("arms_*") if path.is_dir()):
         summary = summarise_stage(stage)
         write_json(stage / "SUMMARY.json", summary)
         print(f"\n== {stage.name} ==")

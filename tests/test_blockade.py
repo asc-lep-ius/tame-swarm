@@ -176,6 +176,8 @@ def test_gate_block_silences_the_cell_on_its_type_and_touches_nothing_else():
     planted = expert.down_adapter_B.weight.detach().clone()
 
     eco.block_bids(cell, cell_type)
+    with pytest.raises(ValueError):
+        eco.block_bids(cell, (cell_type + 1) % eco.num_types)
     assert all(torch.equal(a, b) for a, b in zip(heads, head_state(eco), strict=True))
     assert torch.equal(wealth, eco.mob.expert_wealth)
     assert torch.equal(expert.down_adapter_B.weight.detach(), planted)
@@ -255,7 +257,8 @@ def test_planted_statistic_reads_positive_when_the_share_went_by_competence():
     scattered = gains(PRE, torch.tensor([0.1, 0.48, 0.09, 0.085, 0.085, 0.08, 0.08, 0.0]))
     wrong = gains(PRE, torch.tensor([0.1, 0.48, 0.01, 0.005, 0.005, 0.0, 0.0, 0.4]))
     assert planted_statistic(right, ON_TYPE, PRE, 0, 2, 2) == pytest.approx(0.4)
-    assert abs(planted_statistic(scattered, ON_TYPE, PRE, 0, 2, 2) or 1.0) < 0.02
+    scattered_statistic = planted_statistic(scattered, ON_TYPE, PRE, 0, 2, 2)
+    assert scattered_statistic is not None and abs(scattered_statistic) < 0.02
     assert planted_statistic(wrong, ON_TYPE, PRE, 0, 2, 2) < 0
     two = torch.tensor([True, True, True, False, False, False, False, False])
     assert planted_statistic(right, two, PRE, 0, 2, 2) is None
