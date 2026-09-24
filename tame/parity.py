@@ -357,6 +357,20 @@ class ArmFingerprint:
     # this one said "84-86%" against a table that said 21.2%. A legacy
     # fingerprint reads as 1.0, which is what every run before #60 was.
     contribution_scale: float = 1.0
+    # #73's exchange rate: what a unit of realised value is worth in wealth, and
+    # whether it was derived from the settlement or set by hand. Every run
+    # before #73 ran at the hand-set 2.0, so a legacy fingerprint reads as one.
+    # Both asserted equal rather than varying: reward and charge share this one
+    # coefficient, so two arms at different rates have different fixed points
+    # and different ruin thresholds -- two economies, like two scales -- and an
+    # arm at a rate derived for its scale is not comparable with one at the
+    # hand-set rate even where the two numbers coincide, because the hand-set
+    # grid is the pairing the derivation is read against, never its twin. At
+    # the recorded scale the derivation returns the recorded constant and a
+    # run there records itself as hand-set, so nothing recorded before #73 is
+    # refused by a 1x run after it.
+    reward_scale: float = 2.0
+    reward_scale_derived: bool = False
     # #46's readiness register: one field per autonomy the tissue may be granted,
     # named exactly as the flag in ``readiness.ReadinessConfig``. Off in every run
     # there has been, so a legacy fingerprint reads as a run that granted none.

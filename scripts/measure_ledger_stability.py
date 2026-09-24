@@ -1,4 +1,4 @@
-"""The ledger's fixed point, solved from a run's own inflow and price (#40).
+"""The ledger's fixed point, solved from a run's own inflow and price (#40, #73).
 
 README ``#ledger-stability`` derives one map for both ledger modes::
 
@@ -6,7 +6,7 @@ README ``#ledger-stability`` derives one map for both ledger modes::
 
 and reads two roots off it: the wealth a cell settles at, and the ruin threshold
 below which the map pushes it further down. This script measures ``R`` and
-``kappa`` on the planted-competence quality fixture and solves the quadratic, so
+``kappa`` on the planted-competence fixtures and solves the quadratic, so
 every number in that section is reproducible and #43 can re-derive its own
 constants rather than tune them.
 
@@ -16,30 +16,50 @@ carries exactly one power of ``1/w`` and ``kappa`` is what is left. Both are rea
 over a tail, because the quadratic describes a ledger whose inflow is stationary
 over its own memory (``1 / rho`` = 333 steps) and says nothing about a transient.
 
+**The exchange rate (#73).** ``R`` and ``kappa`` are both priced in realised-value
+units and share one coefficient, ``reward_scale``, so a configuration whose
+cells own more of the output (#60's ``contribution_scale``) moves both together
+and its winners' fixed point into the ceiling: at twice the recorded correction
+most of the ``value`` arm's cell-steps sit on the ceiling and at four times every
+ledger is exactly ``max_wealth``, so the bid ``confidence x wealth`` carries no
+wealth at all. ``derive_reward_scale`` sets the rate per configuration from the
+settled economy's own ``R`` and ``kappa`` so that the winners' fixed point is the
+recorded configuration's -- one settlement across arms, #40's closed forms kept,
+and at the recorded scale the recorded constant to the bit.
+
     uv run python scripts/measure_ledger_stability.py
     uv run python scripts/measure_ledger_stability.py --mode setpoint --seeds 0
+    uv run python scripts/measure_ledger_stability.py --derive-reward-scale \\
+        --fixture differentiated-fixture --contribution-scale 2
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import math
+import statistics
 import sys
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
+from typing import Any
 
 import torch
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tame"))
 
+from sweep_wealth_bounds import CEILING_TOLERANCE, FLOOR_TOLERANCE  # noqa: E402
 from synthetic_economy import (  # noqa: E402
     BASE_CONFIG,
-    DEFAULT_COMPETENCE,
+    DifferentiatedEconomy,
     SyntheticEconomy,
+    competence_for,
     pearson,
     shuffled,
 )
 
+from mob import MoBConfig  # noqa: E402
 from mob.ledger import (  # noqa: E402
     LEDGER_DECAY,
     LEDGER_SETPOINT,
@@ -49,6 +69,7 @@ from mob.ledger import (  # noqa: E402
     RewardSignal,
     Settlement,
 )
+from parity import code_identity  # noqa: E402
 
 # Eight memory horizons at the shipped decay, which is the budget #16's sweep
 # settled on: shorter and the ledger is still reading its own transient, which is
@@ -58,6 +79,26 @@ DEFAULT_TAIL = 333
 # Above this share of the slots a cell is holding a market rather than the
 # exploration gift; the column #16 reports as ``win>1%``.
 MARKET_SHARE = 0.01
+
+QUALITY = "quality-fixture"
+DIFFERENTIATED = "differentiated-fixture"
+FIXTURES = (QUALITY, DIFFERENTIATED)
+DEFAULT_SEEDS = (0, 1, 2)
+# A cell *rests* on a bound when it sits there for more than this fraction of
+# the tail -- as against ``CellReading.clamped``, which is whether a bound held
+# it at any step. The two answer different questions: the closed form is not
+# about a cell a bound touched, and a ledger is not readable when more cells
+# rest on the ceiling than there are slots.
+RESTING = 0.5
+# The derivation's own budget: passes at successive trial rates before it
+# refuses, and how close two successive rates have to be to call it settled.
+MAX_PASSES = 6
+CONVERGENCE = 0.01
+DEFAULT_DERIVATION_OUT = Path.home() / "tame-runs" / "73-exchange-rate"
+
+
+class ClampedLedgerError(RuntimeError):
+    """A rate cannot be read off a ledger the band is holding; #73's refusal."""
 
 
 @dataclass
@@ -107,6 +148,11 @@ class CellReading:
     # rather than of part of it. Meaningless for a clamped cell, whose ledger was
     # held by a bound the recursion knows nothing about.
     reconstruction_error: float
+    # The fraction of the tail this cell spent on each bound, at the tolerance
+    # that bound needs (#16: the ceiling is an attractor and is read at 1e-4, the
+    # floor is escaped by a hair on every exploration win and is read at 10%).
+    tail_at_ceiling: float = 0.0
+    tail_at_floor: float = 0.0
 
     @property
     def relative_error(self) -> float:
@@ -117,6 +163,14 @@ class CellReading:
     def flat_inflow_error(self) -> float:
         """How far the bare ``S + n / rho`` is from it -- the inflow's own drift."""
         return abs(self.from_flat_inflow - self.wealth) / self.wealth
+
+    @property
+    def rests_on_ceiling(self) -> bool:
+        return self.tail_at_ceiling > RESTING
+
+    @property
+    def rests_on_floor(self) -> bool:
+        return self.tail_at_floor > RESTING
 
 
 @dataclass(frozen=True)
@@ -131,6 +185,60 @@ class LedgerReading:
     least_share: float
     wealth_vs_competence: float
     tail_loss: float
+    fixture: str = QUALITY
+    contribution_scale: float = 1.0
+    reward_scale: float = BASE_CONFIG.reward_scale
+
+    @property
+    def ceiling_occupancy(self) -> float:
+        """Cell-steps at the ceiling over the tail, as a fraction of all of them."""
+        return statistics.fmean(cell.tail_at_ceiling for cell in self.cells)
+
+    @property
+    def floor_occupancy(self) -> float:
+        return statistics.fmean(cell.tail_at_floor for cell in self.cells)
+
+    @property
+    def cells_on_ceiling(self) -> int:
+        return sum(cell.rests_on_ceiling for cell in self.cells)
+
+    def saturated(self, top_k: int) -> bool:
+        """More cells rest on the ceiling than there are slots: the ledger cannot rank.
+
+        At the recorded configuration exactly ``top_k`` cells rest there with
+        their fixed points above it (README #ledger-stability), and that is a
+        ledger the auction still reads -- the winners are ranked against the
+        floor cells by wealth. Once a third cell joins them the bids of the
+        clamped cells carry no wealth and the allocation among them is the
+        reports' alone, which is the regime #60's 2x and 4x rows were read in.
+        """
+        return self.cells_on_ceiling > top_k
+
+    def winners(self) -> list[CellReading]:
+        """Market holders by share, largest first."""
+        holders = [cell for cell in self.cells if cell.share > MARKET_SHARE]
+        return sorted(holders, key=lambda cell: cell.share, reverse=True)
+
+
+def build_economy(
+    fixture: str,
+    seed: int,
+    config: MoBConfig,
+    contribution_scale: float = 1.0,
+    cells: int = BASE_CONFIG.num_experts,
+) -> SyntheticEconomy:
+    """The fixture at ``seed``, at a cell count and a contribution scale."""
+    competence = shuffled(competence_for(cells), seed)
+    config = replace(config, num_experts=cells)
+    if fixture == QUALITY:
+        return SyntheticEconomy(
+            competence, seed=seed, config=config, contribution_scale=contribution_scale
+        )
+    if fixture == DIFFERENTIATED:
+        return DifferentiatedEconomy(
+            competence, seed=seed, config=config, contribution_scale=contribution_scale
+        )
+    raise ValueError(f"unknown fixture {fixture!r}; one of {FIXTURES}")
 
 
 def measure(
@@ -139,20 +247,33 @@ def measure(
     steps: int = DEFAULT_STEPS,
     tail: int = DEFAULT_TAIL,
     coupling: str = PERSISTENCE_VALUE,
+    fixture: str = QUALITY,
+    contribution_scale: float = 1.0,
+    reward_scale: float = BASE_CONFIG.reward_scale,
+    cells: int = BASE_CONFIG.num_experts,
+    config: MoBConfig = BASE_CONFIG,
 ) -> LedgerReading:
-    """Run the quality fixture under ``mode`` and solve each cell's quadratic.
+    """Run the fixture under ``mode`` and solve each cell's quadratic.
 
     ``coupling`` is #39's stakes dial. Under ``decoupled`` every price is computed
     from the pinned wealth, so the inflow carries no wealth at all and the bare
     ``S + n / rho`` is the exact fixed point of the map -- which makes that arm
     the one place the *stationarity* of the inflow is the only thing left between
     the formula and the ledger.
+
+    ``contribution_scale`` and ``reward_scale`` are #73's pair: the first is what
+    the cells own of the output, the second what a unit of it is worth in wealth.
+    ``config`` is the base every other field is written onto; a test hands one
+    over with a narrower band, and nothing else does.
     """
     if tail > steps:
         raise ValueError(f"tail must fit inside the run, got {tail} of {steps} steps")
 
-    config = replace(BASE_CONFIG, ledger_mode=mode, persistence_coupling=coupling)
-    economy = SyntheticEconomy(shuffled(DEFAULT_COMPETENCE, seed), seed=seed, config=config)
+    config = replace(
+        config, ledger_mode=mode, persistence_coupling=coupling, reward_scale=reward_scale
+    )
+    economy = build_economy(fixture, seed, config, contribution_scale, cells)
+    config = economy.config
     layer = economy.mob
     recorded = _Recorded(layer.wealth_updater.reward)
     layer.wealth_updater = replace(layer.wealth_updater, reward=recorded)
@@ -175,6 +296,10 @@ def measure(
     # took an exploration gift on the final step is still a clamped cell, and the
     # closed form is not about it.
     clamped = torch.zeros(config.num_experts, dtype=torch.bool)
+    at_ceiling = torch.zeros(config.num_experts)
+    at_floor = torch.zeros(config.num_experts)
+    ceiling = config.max_wealth * (1 - CEILING_TOLERANCE)
+    floor = config.min_wealth * (1 + FLOOR_TOLERANCE)
     for step in range(steps):
         record = economy.step()
         if step >= steps - tail:
@@ -185,6 +310,8 @@ def measure(
             clamped |= (layer.expert_wealth <= config.min_wealth) | (
                 layer.expert_wealth >= config.max_wealth
             )
+            at_ceiling += (layer.expert_wealth >= ceiling).float()
+            at_floor += (layer.expert_wealth <= floor).float()
 
     share = wins / wins.sum()
     rho = 1.0 - config.wealth_decay
@@ -200,10 +327,10 @@ def measure(
     price_coefficient = (charged * torch.stack(recorded.against)[-tail:]).mean(dim=0)
     flat_inflow = (torch.stack(recorded.paid) - torch.stack(charges))[-tail:].mean(dim=0)
 
-    cells = []
+    cells_read = []
     for index in range(config.num_experts):
         wealth = float(layer.expert_wealth[index])
-        cells.append(
+        cells_read.append(
             CellReading(
                 competence=float(economy.competence[index]),
                 wealth=wealth,
@@ -213,6 +340,8 @@ def measure(
                 clamped=bool(clamped[index]),
                 reconstruction_error=abs(float(reconstructed[index]) - wealth) / wealth,
                 from_flat_inflow=layer.wealth_updater.equilibrium(float(flat_inflow[index])),
+                tail_at_ceiling=float(at_ceiling[index]) / tail,
+                tail_at_floor=float(at_floor[index]) / tail,
                 **_roots(rho, setpoint, float(reward[index]), float(price_coefficient[index])),
             )
         )
@@ -221,11 +350,14 @@ def measure(
         mode=mode,
         coupling=coupling,
         seed=seed,
-        cells=tuple(cells),
+        cells=tuple(cells_read),
         market_holders=int((share > MARKET_SHARE).sum()),
         least_share=float(share.min()),
         wealth_vs_competence=pearson(layer.expert_wealth, economy.competence),
         tail_loss=sum(losses) / len(losses),
+        fixture=fixture,
+        contribution_scale=contribution_scale,
+        reward_scale=reward_scale,
     )
 
 
@@ -264,13 +396,290 @@ def _roots(
     }
 
 
+# --- #73: the exchange rate, derived from the settlement ---------------------------------
+
+
+def rate_placing(
+    target: float, reward: float, price_coefficient: float, rate: float, rho: float, setpoint: float
+) -> float:
+    """The ``reward_scale`` that puts a cell's upper root at ``target``.
+
+    ``reward`` and ``price_coefficient`` were read at ``rate``, and both are
+    proportional to it -- reward and charge share the one coefficient -- so the
+    raw inflow and charge are ``R / rate`` and ``kappa / rate``, and the quadratic
+    ``rho w^2 - (rho S + s r) w + s k = 0`` at ``w = target`` solves for ``s``::
+
+        s = rho x target x (target - S) / (r x target - k)
+
+    Read against a cell's own root this is the identity, which is what makes the
+    recorded scale return the recorded rate exactly. ``nan`` when no positive
+    rate places the cell there: the raw inflow at that wealth does not cover the
+    raw charge, so scaling both cannot help.
+    """
+    raw_reward, raw_charge = reward / rate, price_coefficient / rate
+    denominator = raw_reward * target - raw_charge
+    if not math.isfinite(target) or denominator <= 0.0:
+        return math.nan
+    return rho * target * (target - setpoint) / denominator
+
+
+@dataclass(frozen=True)
+class DerivationPass:
+    """One trial rate: the readings it produced and the rate they derive."""
+
+    rate: float
+    # Per seed: the winners' fixed points at this rate, by share rank, beside the
+    # per-cell rate that would place them at the reference's; the seed's own
+    # derived rate is the mean over its winners.
+    fixed_points: dict[int, tuple[float, ...]]
+    per_cell: dict[int, tuple[float, ...]]
+    derived: dict[int, float]
+    cells_on_ceiling: dict[int, int]
+    ceiling_occupancy: dict[int, float]
+    floor_occupancy: dict[int, float]
+    wealth_vs_competence: dict[int, float]
+    saturated: bool
+    next_rate: float
+    # How the next trial was chosen: from the derivation, or by halving because
+    # the derivation gave no finite positive rate on a saturated ledger.
+    next_rate_from: str
+
+
+@dataclass(frozen=True)
+class Derivation:
+    """The exchange rate for one configuration, and every pass that led to it."""
+
+    fixture: str
+    contribution_scale: float
+    cells: int
+    seeds: tuple[int, ...]
+    steps: int
+    tail: int
+    recorded_rate: float
+    # Per seed, the recorded configuration's winners' fixed points by share
+    # rank: what the derivation matches.
+    reference: dict[int, tuple[float, ...]]
+    reference_ceiling_occupancy: dict[int, float]
+    reference_floor_occupancy: dict[int, float]
+    passes: tuple[DerivationPass, ...]
+    derived: float
+    seed_spread: float
+    code_sha: str | None
+    code_dirty: bool | None
+
+    @property
+    def final(self) -> DerivationPass:
+        return self.passes[-1]
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def _winner_targets(reading: LedgerReading) -> tuple[float, ...]:
+    """The reference's winners' upper roots by share rank; cells with no real root are skipped."""
+    return tuple(cell.settles_at for cell in reading.winners() if math.isfinite(cell.settles_at))
+
+
+def _derive_from(
+    reading: LedgerReading, targets: tuple[float, ...], rate: float, config: MoBConfig
+) -> tuple[tuple[float, ...], tuple[float, ...], float]:
+    """Pair this reading's winners with the reference's by share rank and solve each."""
+    rho = 1.0 - config.wealth_decay
+    setpoint = config.initial_wealth if reading.mode == LEDGER_SETPOINT else 0.0
+    winners = reading.winners()[: len(targets)]
+    fixed_points = tuple(cell.settles_at for cell in winners)
+    per_cell = tuple(
+        rate_placing(target, cell.reward, cell.price_coefficient, rate, rho, setpoint)
+        for cell, target in zip(winners, targets, strict=False)
+    )
+    finite = [value for value in per_cell if math.isfinite(value) and value > 0.0]
+    derived = statistics.fmean(finite) if len(finite) == len(targets) else math.nan
+    return fixed_points, per_cell, derived
+
+
+def derive_reward_scale(
+    fixture: str,
+    contribution_scale: float,
+    seeds: tuple[int, ...] = DEFAULT_SEEDS,
+    steps: int = DEFAULT_STEPS,
+    tail: int = DEFAULT_TAIL,
+    cells: int = BASE_CONFIG.num_experts,
+    config: MoBConfig = BASE_CONFIG,
+    max_passes: int = MAX_PASSES,
+    tolerance: float = CONVERGENCE,
+) -> Derivation:
+    """The rate at which ``contribution_scale`` saturates the band as the recorded scale does.
+
+    The recorded configuration -- the same fixture and cell count at scale one
+    and the recorded rate -- is run first, and its winners' upper roots are the
+    targets. Then the scaled configuration is run at the recorded rate, its
+    winners' ``R`` and ``kappa`` are read, and ``rate_placing`` says what rate
+    puts each of them at its target; the seeds' mean is the next trial rate,
+    and the passes repeat until two successive rates agree within
+    ``tolerance``. At scale one the first pass *is* the reference, every cell's
+    rate is the identity, and the derivation returns the recorded constant in
+    one pass with the economy untouched.
+
+    **A saturated pass is never read as a derivation.** Once more cells rest
+    on the ceiling than there are slots the auction is deciding among clamped
+    bids, and the ``R`` and ``kappa`` such a pass reads belong to that
+    allocation and not to the economy the rate is for; the pass only sets the
+    next trial, and the rate that is returned comes from a pass the band was
+    not holding. A configuration whose every pass is saturated -- or whose
+    reference is, since a target read off a clamp is a target for a clamp --
+    is refused with ``ClampedLedgerError`` rather than given a number.
+
+    The rate is derived once per configuration from the seed set, and the
+    spread across seeds is recorded beside it; a rate re-derived per seed
+    would be a confound between the seeds it was meant to pair.
+    """
+    if contribution_scale <= 0.0:
+        raise ValueError(f"contribution_scale must be positive, got {contribution_scale}")
+    if not seeds:
+        raise ValueError("the derivation needs at least one seed")
+    recorded = config.reward_scale
+
+    def run(seed: int, scale: float, rate: float) -> LedgerReading:
+        return measure(
+            LEDGER_DECAY,
+            seed,
+            steps=steps,
+            tail=tail,
+            fixture=fixture,
+            contribution_scale=scale,
+            reward_scale=rate,
+            cells=cells,
+            config=config,
+        )
+
+    reference = {seed: run(seed, 1.0, recorded) for seed in seeds}
+    clamped = [seed for seed, reading in reference.items() if reading.saturated(config.top_k)]
+    if clamped:
+        raise ClampedLedgerError(
+            f"the recorded configuration of {fixture} at {cells} cells rests more than "
+            f"{config.top_k} cells on the ceiling on seeds {clamped}; a target read off a "
+            "clamp is a target for a clamp"
+        )
+    targets = {seed: _winner_targets(reading) for seed, reading in reference.items()}
+    empty = [seed for seed, target in targets.items() if not target]
+    if empty:
+        raise ClampedLedgerError(
+            f"no winner of the recorded configuration has a real fixed point on seeds {empty}"
+        )
+
+    passes: list[DerivationPass] = []
+    rate = recorded
+    for _ in range(max_passes):
+        readings = (
+            reference
+            if contribution_scale == 1.0 and rate == recorded
+            else {seed: run(seed, contribution_scale, rate) for seed in seeds}
+        )
+        solved = {seed: _derive_from(readings[seed], targets[seed], rate, config) for seed in seeds}
+        derived = {seed: solved[seed][2] for seed in seeds}
+        saturated = any(readings[seed].saturated(config.top_k) for seed in seeds)
+        finite = [value for value in derived.values() if math.isfinite(value)]
+        if len(finite) == len(seeds):
+            next_rate, origin = statistics.fmean(finite), "derived"
+        elif saturated:
+            next_rate, origin = rate / 2.0, "halved"
+        else:
+            raise ClampedLedgerError(
+                f"at rate {rate:.6g} the winners of {fixture} x{contribution_scale:g} at {cells} "
+                f"cells cannot be placed at the reference by any positive rate on seeds "
+                f"{[seed for seed in seeds if not math.isfinite(derived[seed])]}: the raw "
+                "inflow at the target does not cover the raw charge"
+            )
+        passes.append(
+            DerivationPass(
+                rate=rate,
+                fixed_points={seed: solved[seed][0] for seed in seeds},
+                per_cell={seed: solved[seed][1] for seed in seeds},
+                derived=derived,
+                cells_on_ceiling={seed: readings[seed].cells_on_ceiling for seed in seeds},
+                ceiling_occupancy={seed: readings[seed].ceiling_occupancy for seed in seeds},
+                floor_occupancy={seed: readings[seed].floor_occupancy for seed in seeds},
+                wealth_vs_competence={seed: readings[seed].wealth_vs_competence for seed in seeds},
+                saturated=saturated,
+                next_rate=next_rate,
+                next_rate_from=origin,
+            )
+        )
+        if not saturated and abs(next_rate - rate) <= tolerance * rate:
+            code_sha, code_dirty = code_identity()
+            return Derivation(
+                fixture=fixture,
+                contribution_scale=contribution_scale,
+                cells=cells,
+                seeds=tuple(seeds),
+                steps=steps,
+                tail=tail,
+                recorded_rate=recorded,
+                reference=targets,
+                reference_ceiling_occupancy={
+                    seed: reference[seed].ceiling_occupancy for seed in seeds
+                },
+                reference_floor_occupancy={seed: reference[seed].floor_occupancy for seed in seeds},
+                passes=tuple(passes),
+                derived=next_rate,
+                seed_spread=statistics.stdev(finite) if len(finite) > 1 else 0.0,
+                code_sha=code_sha,
+                code_dirty=code_dirty,
+            )
+        rate = next_rate
+
+    trail = ", ".join(
+        f"{p.rate:.4g} -> {p.next_rate:.4g}{' (saturated)' if p.saturated else ''}" for p in passes
+    )
+    raise ClampedLedgerError(
+        f"no unsaturated, settled rate for {fixture} x{contribution_scale:g} at {cells} cells "
+        f"within {max_passes} passes: {trail}"
+    )
+
+
+def _report_derivation(derivation: Derivation) -> None:
+    print(
+        f"\n=== exchange rate: {derivation.fixture} x{derivation.contribution_scale:g}, "
+        f"{derivation.cells} cells, seeds {list(derivation.seeds)}, "
+        f"{derivation.steps} steps / {derivation.tail} tail ==="
+    )
+    for seed in derivation.seeds:
+        roots = ", ".join(f"{w:.0f}" for w in derivation.reference[seed])
+        print(
+            f"  reference seed {seed}: winners settle at [{roots}], "
+            f"ceiling {derivation.reference_ceiling_occupancy[seed]:.3f} "
+            f"floor {derivation.reference_floor_occupancy[seed]:.3f}"
+        )
+    print(
+        f"  {'pass':>4} {'rate':>9} {'seed':>5} {'w+':>22} {'derived':>9} "
+        f"{'ceil':>6} {'floor':>6} {'r':>7}"
+    )
+    for index, p in enumerate(derivation.passes, 1):
+        for seed in derivation.seeds:
+            roots = ", ".join(f"{w:.0f}" for w in p.fixed_points[seed])
+            print(
+                f"  {index:>4} {p.rate:>9.5f} {seed:>5} {roots:>22} {p.derived[seed]:>9.5f} "
+                f"{p.ceiling_occupancy[seed]:>6.3f} {p.floor_occupancy[seed]:>6.3f} "
+                f"{p.wealth_vs_competence[seed]:>+7.3f}"
+                f"{'  saturated' if p.cells_on_ceiling[seed] > 0 and p.saturated else ''}"
+            )
+        print(f"       -> next {p.next_rate:.5f} ({p.next_rate_from})")
+    print(
+        f"  derived reward_scale {derivation.derived:.6f} (recorded {derivation.recorded_rate}), "
+        f"seed spread {derivation.seed_spread:.6f}, {len(derivation.passes)} pass(es)"
+    )
+
+
 def _report(reading: LedgerReading) -> None:
     print(
-        f"\n--- {reading.mode} ledger, {reading.coupling} arm, seed {reading.seed}: "
+        f"\n--- {reading.fixture} x{reading.contribution_scale:g} at reward_scale "
+        f"{reading.reward_scale:g}: {reading.mode} ledger, {reading.coupling} arm, "
+        f"seed {reading.seed}: "
         f"win>{MARKET_SHARE:.0%} {reading.market_holders} of {len(reading.cells)}, "
         f"least share {reading.least_share:.4f}, "
         f"r(wealth, competence) {reading.wealth_vs_competence:.3f}, "
-        f"tail loss {reading.tail_loss:.4f}"
+        f"tail loss {reading.tail_loss:.4f}, "
+        f"ceiling {reading.ceiling_occupancy:.3f} floor {reading.floor_occupancy:.3f}"
     )
     print(
         f"{'c':>5} {'wealth':>9} {'share':>7} {'R':>8} {'kappa':>9} "
@@ -286,10 +695,16 @@ def _report(reading: LedgerReading) -> None:
         )
 
 
+def derivation_path(out: Path, fixture: str, cells: int, contribution_scale: float) -> Path:
+    return out / f"derivation_{fixture}_cells{cells}_scale{contribution_scale:g}.json"
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--mode", default="both", choices=[*sorted(SUPPORTED_LEDGER_MODES), "both"])
-    parser.add_argument("--seeds", default="0,1,2", help="comma-separated fixture seeds")
+    parser.add_argument(
+        "--seeds", default=",".join(map(str, DEFAULT_SEEDS)), help="comma-separated"
+    )
     parser.add_argument("--steps", type=int, default=DEFAULT_STEPS)
     parser.add_argument("--tail", type=int, default=DEFAULT_TAIL)
     parser.add_argument(
@@ -298,12 +713,61 @@ def main() -> None:
         choices=sorted(SUPPORTED_PERSISTENCE_COUPLINGS),
         help="#39's stakes dial; decoupled is where the bare closed form is exact",
     )
+    parser.add_argument("--fixture", default=QUALITY, choices=FIXTURES)
+    parser.add_argument("--cells", type=int, default=BASE_CONFIG.num_experts)
+    parser.add_argument(
+        "--contribution-scale",
+        type=float,
+        default=1.0,
+        help="#60's knob; 1.0 is the recorded fixture",
+    )
+    parser.add_argument(
+        "--reward-scale",
+        type=float,
+        default=BASE_CONFIG.reward_scale,
+        help="a hand-set rate to read the ledger at; the derivation ignores it",
+    )
+    parser.add_argument(
+        "--derive-reward-scale",
+        action="store_true",
+        help="#73: derive the rate for --contribution-scale from the settlement and record it",
+    )
+    parser.add_argument("--out", type=Path, default=DEFAULT_DERIVATION_OUT)
     args = parser.parse_args()
+    seeds = tuple(int(seed) for seed in args.seeds.split(","))
+
+    if args.derive_reward_scale:
+        derivation = derive_reward_scale(
+            args.fixture,
+            args.contribution_scale,
+            seeds=seeds,
+            steps=args.steps,
+            tail=args.tail,
+            cells=args.cells,
+        )
+        _report_derivation(derivation)
+        path = derivation_path(args.out, args.fixture, args.cells, args.contribution_scale)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(derivation.as_dict(), indent=2, default=str))
+        print(f"  record: {path}")
+        return
 
     modes = [LEDGER_DECAY, LEDGER_SETPOINT] if args.mode == "both" else [args.mode]
     for mode in modes:
-        for seed in (int(seed) for seed in args.seeds.split(",")):
-            _report(measure(mode, seed, steps=args.steps, tail=args.tail, coupling=args.coupling))
+        for seed in seeds:
+            _report(
+                measure(
+                    mode,
+                    seed,
+                    steps=args.steps,
+                    tail=args.tail,
+                    coupling=args.coupling,
+                    fixture=args.fixture,
+                    contribution_scale=args.contribution_scale,
+                    reward_scale=args.reward_scale,
+                    cells=args.cells,
+                )
+            )
 
 
 if __name__ == "__main__":

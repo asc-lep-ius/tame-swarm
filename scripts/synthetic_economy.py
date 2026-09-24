@@ -71,6 +71,24 @@ BASE_CONFIG = MoBConfig(
 CORRECTION_STD = 0.35
 
 
+def competence_for(cells: int) -> torch.Tensor:
+    """A competence vector of ``cells`` entries over the recorded fixture's range (#60).
+
+    Eight is the recorded vector itself, unchanged, so that cell of the grid is
+    the fixture every other number in this project was measured on. Four takes
+    every other entry and sixteen repeats each one, which keeps the range and
+    the spacing rather than inventing a new distribution for each row -- a grid
+    whose cells differ in two things at once cannot say which one binds.
+    """
+    if cells == len(DEFAULT_COMPETENCE):
+        return DEFAULT_COMPETENCE
+    if cells == len(DEFAULT_COMPETENCE) // 2:
+        return DEFAULT_COMPETENCE[::2]
+    if cells == 2 * len(DEFAULT_COMPETENCE):
+        return DEFAULT_COMPETENCE.repeat_interleave(2)
+    raise ValueError(f"no competence vector defined for {cells} cells")
+
+
 def shuffled(competence: torch.Tensor, seed: int) -> torch.Tensor:
     """A permutation of ``competence`` that is not monotone in expert index.
 
@@ -187,6 +205,7 @@ class SyntheticEconomy:
         seq_len: int = 16,
         positive_fraction: float = 1.0,
         head_learning_rate: float = 1e-2,
+        contribution_scale: float = 1.0,
     ):
         torch.manual_seed(seed)
         self.competence = competence.float()
@@ -194,6 +213,16 @@ class SyntheticEconomy:
         self.batch_size = batch_size
         self.seq_len = seq_len
         self.positive_fraction = positive_fraction
+        # #60's knob, #73's argument: how much of the output the cells own, as a
+        # multiple of the recorded correction. Every realised value, reward and
+        # price scales with it while the wealth band does not, which is why a
+        # scale other than one runs at the exchange rate #73 derives
+        # (``measure_ledger_stability.derive_reward_scale``) and never at the
+        # recorded one. Multiplying by 1.0 is exact, so the recorded fixture is
+        # bitwise the one every earlier number was read on.
+        if contribution_scale <= 0.0:
+            raise ValueError(f"contribution_scale must be positive, got {contribution_scale}")
+        self.contribution_scale = contribution_scale
 
         self.mob = MixtureOfBidders(self.config)
         self.mob.train()
@@ -302,7 +331,12 @@ class SyntheticEconomy:
         rank = config.adapter_rank
         # Shared across experts so competence is the *only* thing that differs.
         shared_a = torch.randn(rank, config.intermediate_dim) / math.sqrt(config.intermediate_dim)
-        shared_m = torch.randn(config.hidden_dim, rank) * CORRECTION_STD / math.sqrt(rank)
+        shared_m = (
+            self.contribution_scale
+            * torch.randn(config.hidden_dim, rank)
+            * CORRECTION_STD
+            / math.sqrt(rank)
+        )
         with torch.no_grad():
             for expert_competence, module in zip(
                 competence.tolist(), self.mob.experts, strict=True
@@ -505,12 +539,6 @@ class DifferentiatedEconomy(SyntheticEconomy):
             )
         self.num_types = num_types
         self.type_signal = type_signal
-        # #60's lever 1, second ratio: how much of the output the cells own. The
-        # planted corrections are orthonormal, so one is the recorded fixture and
-        # a larger scale is a body whose experts carry more of what the token
-        # wants -- the fixture's analogue of raising the adapter rank, which on
-        # the real body is 3.7% of the residual norm.
-        self.contribution_scale = contribution_scale
         # Assigned before the base class plants, since ``_plant`` reads them. The
         # expert types cycle through the type set and are then shuffled with a
         # generator of their own, so the assignment is fixed by the seed alone.
@@ -526,6 +554,7 @@ class DifferentiatedEconomy(SyntheticEconomy):
             seq_len=seq_len,
             positive_fraction=positive_fraction,
             head_learning_rate=head_learning_rate,
+            contribution_scale=contribution_scale,
         )
 
     def _plant(self, competence: torch.Tensor) -> None:
@@ -535,7 +564,11 @@ class DifferentiatedEconomy(SyntheticEconomy):
         # One orthonormal block of ``rank`` columns per type. Orthonormal columns
         # have unit norm, which is the quality fixture's correction scale to within
         # a percent (``CORRECTION_STD x sqrt(hidden_dim / rank)``), so prices and
-        # rewards here are on the same scale the constants were derived on.
+        # rewards here are on the same scale the constants were derived on. #60's
+        # lever 1, second ratio, multiplies it: a larger scale is a body whose
+        # experts carry more of what the token wants -- the fixture's analogue of
+        # raising the adapter rank, which on the real body is 3.7% of the
+        # residual norm.
         basis = torch.linalg.qr(torch.randn(config.hidden_dim, self.num_types * rank))[0]
         self.type_corrections = self.contribution_scale * torch.stack(
             [basis[:, t * rank : (t + 1) * rank] for t in range(self.num_types)]

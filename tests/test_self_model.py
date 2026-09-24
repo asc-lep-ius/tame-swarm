@@ -20,11 +20,22 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent / "tame"))
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
+import measure_self_model  # noqa: E402
+from measure_ledger_stability import (  # noqa: E402
+    ClampedLedgerError,
+    Derivation,
+    DerivationPass,
+)
 from measure_self_model import (  # noqa: E402
     CLAMPED_COLUMN,
     CORRELATION_COLUMN,
+    DERIVED,
+    HAND_SET,
     READINGS_COLUMN,
+    RECORDED_RATE,
+    grid_row,
     pooled,
+    rates_for,
     run_arm,
 )
 from measure_stakes_dial import FIXTURE, RATIOS, TAIL, fixture_fingerprint  # noqa: E402
@@ -191,3 +202,101 @@ def test_one_clamped_seed_does_not_swallow_the_seeds_that_had_a_correlation():
 
     assert math.isnan(blind[CORRELATION_COLUMN])
     assert blind[CLAMPED_COLUMN] == 2
+
+
+# --- #73: the grid runs at the derived rate, with the hand-set pairing beside it ----------
+
+
+def _stub_derivation(rate: float) -> Derivation:
+    """A derivation record with the arithmetic already done, for the wiring tests."""
+    final = DerivationPass(
+        rate=rate,
+        fixed_points={0: (1500.0,)},
+        per_cell={0: (rate,)},
+        derived={0: rate},
+        cells_on_ceiling={0: 2},
+        ceiling_occupancy={0: 0.25},
+        floor_occupancy={0: 0.7},
+        wealth_vs_competence={0: 0.8},
+        saturated=False,
+        next_rate=rate,
+        next_rate_from="derived",
+    )
+    return Derivation(
+        fixture="differentiated-fixture",
+        contribution_scale=2.0,
+        cells=8,
+        seeds=(0,),
+        steps=10,
+        tail=5,
+        recorded_rate=RECORDED_RATE,
+        reference={0: (1500.0,)},
+        reference_ceiling_occupancy={0: 0.25},
+        reference_floor_occupancy={0: 0.7},
+        passes=(final,),
+        derived=rate,
+        seed_spread=0.0,
+        code_sha=None,
+        code_dirty=None,
+    )
+
+
+def test_a_scaled_cell_runs_at_its_derived_rate_with_the_hand_set_pairing_beside_it(monkeypatch):
+    """The withdrawn grid is reproduced as the pairing, never as the reading."""
+    monkeypatch.setattr(
+        measure_self_model, "derive_reward_scale", lambda *args, **kwargs: _stub_derivation(0.5)
+    )
+
+    rates, record = rates_for(8, 2.0, (0,), 10)
+
+    assert list(rates) == [DERIVED, HAND_SET]
+    assert rates[DERIVED] == (0.5, True)
+    assert rates[HAND_SET] == (RECORDED_RATE, False)
+    assert record["derived"]["derived"] == 0.5 and record["refused"] is None
+
+
+def test_the_recorded_scale_has_one_rate_and_derives_nothing(monkeypatch):
+    def never(*args, **kwargs):
+        raise AssertionError("1x must not run a derivation")
+
+    monkeypatch.setattr(measure_self_model, "derive_reward_scale", never)
+
+    rates, record = rates_for(8, 1.0, (0,), 10)
+
+    assert rates == {HAND_SET: (RECORDED_RATE, False)}
+    assert record == {"derived": None, "refused": None}
+
+
+def test_a_refused_derivation_leaves_the_pairing_and_the_refusal(monkeypatch):
+    """A cell read at the clamp is #60's grid; the record says so instead of running it as new."""
+
+    def refuse(*args, **kwargs):
+        raise ClampedLedgerError("every pass saturated")
+
+    monkeypatch.setattr(measure_self_model, "derive_reward_scale", refuse)
+
+    rates, record = rates_for(16, 4.0, (0,), 10)
+
+    assert rates == {HAND_SET: (RECORDED_RATE, False)}
+    assert record["derived"] is None
+    assert "saturated" in record["refused"]
+
+
+def test_a_grid_row_carries_the_rate_it_ran_at_in_every_fingerprint():
+    row = grid_row(4, 2.0, 0.5, True, (0,), 7)
+
+    assert row["reward_scale"] == 0.5 and row["reward_scale_derived"] is True
+    for arm in ("value", "shuffled"):
+        fingerprint = ArmFingerprint(**row["fingerprints"][arm]["0"])
+        assert fingerprint.reward_scale == 0.5
+        assert fingerprint.reward_scale_derived is True
+        assert fingerprint.contribution_scale == 2.0
+    with pytest.raises(ParityError, match="reward_scale"):
+        assert_parity(
+            [
+                ArmFingerprint(**row["fingerprints"]["value"]["0"]),
+                ArmFingerprint(
+                    **grid_row(4, 2.0, 2.0, False, (0,), 7)["fingerprints"]["shuffled"]["0"]
+                ),
+            ]
+        )

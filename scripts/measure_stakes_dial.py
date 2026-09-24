@@ -163,6 +163,8 @@ def fixture_fingerprint(
     cells: int = BASE_CONFIG.num_experts,
     contribution_scale: float = 1.0,
     readiness: ReadinessConfig = READINESS_OFF,
+    reward_scale: float = BASE_CONFIG.reward_scale,
+    reward_scale_derived: bool = False,
 ) -> ArmFingerprint:
     """A fingerprint for a fixture run: what the arms share, the dial, the doses, the code.
 
@@ -173,7 +175,9 @@ def fixture_fingerprint(
     ``cells`` and ``contribution_scale`` are #60's two ratios, taken as arguments
     for the same reason: a grid run at four cells or at twice the correction
     recorded itself as the recorded fixture while it was neither, so the
-    fingerprint said two incomparable runs were at parity.
+    fingerprint said two incomparable runs were at parity. ``reward_scale`` and
+    whether it was derived are #73's: a scale other than one runs at the rate
+    derived for it, and a run at the hand-set rate is the pairing, not a twin.
     """
     code_sha, code_dirty = code_identity()
     return ArmFingerprint(
@@ -218,6 +222,8 @@ def fixture_fingerprint(
         persistence_coupling=arm,
         goal_doses=doses,
         contribution_scale=contribution_scale,
+        reward_scale=reward_scale,
+        reward_scale_derived=reward_scale_derived,
         autonomy_plasticity=readiness.autonomy_plasticity,
         autonomy_exploration=readiness.autonomy_exploration,
         autonomy_setpoints=readiness.autonomy_setpoints,

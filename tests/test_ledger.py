@@ -11,6 +11,7 @@ What the class must *not* have changed is in
 which pins the recorded economy point by point.
 """
 
+import math
 import sys
 from dataclasses import dataclass, replace
 from dataclasses import field as dc_field
@@ -21,6 +22,13 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
+from measure_ledger_stability import (  # noqa: E402
+    DIFFERENTIATED,
+    QUALITY,
+    ClampedLedgerError,
+    derive_reward_scale,
+    rate_placing,
+)
 from synthetic_economy import (  # noqa: E402
     BASE_CONFIG,
     DEFAULT_COMPETENCE,
@@ -497,3 +505,151 @@ def test_the_closed_form_predicts_the_setpoint_arms_settled_ledger():
     assert reading.market_holders == 2
     assert reading.least_share < 0.01
     assert reading.wealth_vs_competence > 0.5
+
+
+# --- #73: the exchange rate, derived from the settlement ---------------------------------
+
+# Short enough to run in the gate and long enough for a market to form: what
+# these pin is the derivation's arithmetic and its refusal, not a settled
+# number, which the slow test at the bottom and README #ledger-stability carry.
+SHORT_STEPS, SHORT_TAIL = 120, 40
+
+
+def test_rate_placing_is_the_identity_on_a_cells_own_root():
+    """A cell read at rate ``s`` is placed at its own upper root by ``s`` exactly."""
+    rho, setpoint, rate = 0.003, 0.0, 2.0
+    reward, price_coefficient = 5.1023, 67.36
+    linear = rho * setpoint + reward
+    root = (linear + (linear**2 - 4 * rho * price_coefficient) ** 0.5) / (2 * rho)
+
+    assert rate_placing(root, reward, price_coefficient, rate, rho, setpoint) == pytest.approx(
+        rate, abs=1e-9
+    )
+    # Twice the target wants a little under twice the rate: the raw charge is a
+    # fixed offset against the raw inflow, and it matters less the higher the root.
+    doubled = rate_placing(2 * root, reward, price_coefficient, rate, rho, setpoint)
+    assert 1.9 * rate < doubled < 2 * rate
+    # No positive rate places a cell whose raw inflow at the target is under its raw charge.
+    assert math.isnan(rate_placing(1.0, reward, price_coefficient, rate, rho, setpoint))
+
+
+@pytest.mark.parametrize("fixture", [QUALITY, DIFFERENTIATED])
+def test_the_derivation_returns_the_recorded_rate_at_the_recorded_scale(fixture):
+    """1x is the recorded constant, in one pass, with the recorded economy untouched.
+
+    The reference run *is* the first pass, so every winner's rate is the identity
+    of ``rate_placing`` and the number that comes back is 2.0 to float rounding
+    rather than to a tolerance chosen to fit.
+    """
+    derivation = derive_reward_scale(fixture, 1.0, seeds=(0,), steps=SHORT_STEPS, tail=SHORT_TAIL)
+
+    assert derivation.derived == pytest.approx(BASE_CONFIG.reward_scale, abs=1e-6)
+    assert len(derivation.passes) == 1
+    assert not derivation.final.saturated
+    assert derivation.final.next_rate_from == "derived"
+    assert derivation.final.fixed_points[0] == derivation.reference[0]
+    assert derivation.seed_spread == 0.0
+
+
+def test_the_derivation_refuses_a_ledger_the_band_is_holding():
+    """A band one credit wide holds every winner on the ceiling; there is no rate to read."""
+    narrow = replace(BASE_CONFIG, max_wealth=BASE_CONFIG.initial_wealth + 1.0)
+
+    with pytest.raises(ClampedLedgerError, match="ceiling"):
+        derive_reward_scale(
+            QUALITY,
+            2.0,
+            seeds=(0,),
+            steps=SHORT_STEPS,
+            tail=SHORT_TAIL,
+            config=narrow,
+            max_passes=2,
+        )
+
+
+def test_the_derivation_refuses_a_scale_that_is_not_positive():
+    with pytest.raises(ValueError, match="positive"):
+        derive_reward_scale(QUALITY, 0.0, seeds=(0,), steps=SHORT_STEPS, tail=SHORT_TAIL)
+    with pytest.raises(ValueError, match="positive"):
+        SyntheticEconomy(DEFAULT_COMPETENCE, seed=0, contribution_scale=-1.0)
+
+
+def _quality_trajectory(steps: int = 30, **economy_overrides) -> tuple[torch.Tensor, list]:
+    config = replace(BASE_CONFIG, **economy_overrides.pop("config", {}))
+    economy = SyntheticEconomy(
+        shuffled(DEFAULT_COMPETENCE, 0), seed=0, config=config, **economy_overrides
+    )
+    routed = [economy.step().selected_experts.clone() for _ in range(steps)]
+    return economy.mob.expert_wealth.clone(), routed
+
+
+def test_the_recorded_quality_fixture_is_bitwise_the_one_at_scale_one():
+    """Multiplying the planted correction by 1.0 is exact; by 2.0 it is another fixture."""
+    recorded_wealth, recorded_routes = _quality_trajectory()
+    at_one_wealth, at_one_routes = _quality_trajectory(contribution_scale=1.0)
+    at_two_wealth, _ = _quality_trajectory(contribution_scale=2.0)
+
+    assert torch.equal(at_one_wealth, recorded_wealth)
+    assert all(torch.equal(a, b) for a, b in zip(at_one_routes, recorded_routes, strict=True))
+    assert not torch.equal(at_two_wealth, recorded_wealth)
+
+
+def test_the_rate_reads_exactly_zero_on_decoupled():
+    """Under the pinned arm the gate never reads the ledger the rate moves, so nothing moves.
+
+    The pairing on the live arm is what makes the zero a reading rather than a
+    fixture that ignores the rate everywhere.
+    """
+    decoupled = {"persistence_coupling": PERSISTENCE_DECOUPLED}
+    _, recorded = _quality_trajectory(config=decoupled)
+    _, halved = _quality_trajectory(config={**decoupled, "reward_scale": 0.5})
+    assert all(torch.equal(a, b) for a, b in zip(recorded, halved, strict=True))
+
+    _, live = _quality_trajectory()
+    _, live_halved = _quality_trajectory(config={"reward_scale": 0.5})
+    assert any(not torch.equal(a, b) for a, b in zip(live, live_halved, strict=True)), (
+        "the live economy ignored the rate too; the pairing proves nothing"
+    )
+
+
+def test_a_hand_set_rate_is_not_at_parity_with_a_derived_one():
+    """The withdrawn grid is the derivation's pairing, never its twin.
+
+    Two arms at one scale and two rates have two fixed points; and two at one
+    rate, one derived and one set by hand, are a measurement and its control
+    rather than a comparison -- which is why both fields are asserted equal.
+    """
+    derived = replace(BASE, contribution_scale=2.0, reward_scale=0.5, reward_scale_derived=True)
+    hand_set = replace(derived, persistence_coupling=PERSISTENCE_DECOUPLED, reward_scale=2.0)
+    coincident = replace(hand_set, reward_scale=0.5, reward_scale_derived=False)
+
+    assert_parity([derived, replace(derived, persistence_coupling=PERSISTENCE_DECOUPLED)])
+    with pytest.raises(ParityError, match="reward_scale"):
+        assert_parity([derived, hand_set])
+    with pytest.raises(ParityError, match="reward_scale_derived"):
+        assert_parity([derived, coincident])
+    # Every run before #73 ran at the hand-set constant, and a 1x run after it does too.
+    assert BASE.reward_scale == BASE_CONFIG.reward_scale
+    assert BASE.reward_scale_derived is False
+
+
+# The differentiated fixture at twice the recorded correction, seeds 0-2, 2667
+# steps: the configuration #60's grid was withdrawn on. What is pinned is the
+# guardrail #73 names as the number that would show the derivation failing --
+# ceiling occupancy at 2x outside the 1x spread -- with one cell of tolerance,
+# and that the recorded rate at 2x is the saturated pairing the grid measured.
+ONE_CELL = 1.0 / BASE_CONFIG.num_experts
+
+
+@pytest.mark.slow
+def test_a_2x_run_at_the_derived_rate_keeps_the_ceiling_inside_the_1x_spread():
+    derivation = derive_reward_scale(DIFFERENTIATED, 2.0)
+
+    assert derivation.passes[0].rate == BASE_CONFIG.reward_scale
+    assert derivation.passes[0].saturated, "the hand-set rate at 2x is no longer the clamp"
+    assert not derivation.final.saturated
+    assert 0.0 < derivation.derived < BASE_CONFIG.reward_scale
+    low = min(derivation.reference_ceiling_occupancy.values()) - ONE_CELL
+    high = max(derivation.reference_ceiling_occupancy.values()) + ONE_CELL
+    for seed, occupancy in derivation.final.ceiling_occupancy.items():
+        assert low <= occupancy <= high, (seed, occupancy, derivation.reference_ceiling_occupancy)

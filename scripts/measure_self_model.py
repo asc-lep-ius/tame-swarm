@@ -26,6 +26,15 @@ whether the *substrate* makes the contrast visible where the *estimator* could
 not, which is the question the gate asks and the fixture can answer for the
 price of CPU-seconds.
 
+**The grid runs at the derived exchange rate (#73).** The scale multiplies
+every realised value, reward and price against a wealth band that does not
+move, so at the hand-set `reward_scale` the 2x and 4x rows measured the clamp
+(README `#self-model`). Each scaled cell of the grid now derives its rate from
+its own settlement first (`measure_ledger_stability.derive_reward_scale`) and
+runs at it, with the hand-set rate run beside it as the pairing -- the
+withdrawn grid, reproduced so the two can be read against each other -- and a
+cell whose derivation is refused is recorded as refused rather than run.
+
     uv run python scripts/measure_self_model.py --out ~/tame-runs/60-self-model
 """
 
@@ -46,6 +55,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tame"))
 
 from allocation_shift import DEFAULT_READOUT  # noqa: E402
+from measure_ledger_stability import (  # noqa: E402
+    DEFAULT_STEPS as DERIVATION_STEPS,
+)
+from measure_ledger_stability import (
+    DIFFERENTIATED,
+    ClampedLedgerError,
+    Derivation,
+    derive_reward_scale,
+)
 from measure_stakes_dial import (  # noqa: E402
     FIXTURE,
     GOAL_TYPES,
@@ -65,6 +83,7 @@ from synthetic_economy import (  # noqa: E402
     BASE_CONFIG,
     DEFAULT_COMPETENCE,
     DifferentiatedEconomy,
+    competence_for,
     pearson,
     shuffled,
 )
@@ -73,30 +92,16 @@ from mob import PERSISTENCE_SHUFFLED, PERSISTENCE_VALUE  # noqa: E402
 from parity import code_identity  # noqa: E402
 
 SEEDS = (0, 1, 2)
+RECORDED_RATE = BASE_CONFIG.reward_scale
+# The two rates a scaled cell runs at: the one derived for it, and the hand-set
+# constant as the pairing. The recorded scale has one rate, the recorded one.
+DERIVED, HAND_SET = "derived", "hand-set"
 # Lever 1's grid. `top_k` stays at 2, so the cell counts are 6, 28 and 120
 # possible winner sets per token; the scales are multiples of the recorded
 # fixture's orthonormal correction, which is what the cells own of the output.
 CELL_COUNTS = (4, 8, 16)
 CONTRIBUTION_SCALES = (1.0, 2.0, 4.0)
 DOSE_RATIO = RATIOS[-1]
-
-
-def competence_for(cells: int) -> torch.Tensor:
-    """A competence vector of ``cells`` entries over the recorded fixture's range.
-
-    Eight is the recorded vector itself, unchanged, so that cell of the grid is
-    the fixture every other number in this project was measured on. Four takes
-    every other entry and sixteen repeats each one, which keeps the range and
-    the spacing rather than inventing a new distribution for each row -- a grid
-    whose cells differ in two things at once cannot say which one binds.
-    """
-    if cells == len(DEFAULT_COMPETENCE):
-        return DEFAULT_COMPETENCE
-    if cells == len(DEFAULT_COMPETENCE) // 2:
-        return DEFAULT_COMPETENCE[::2]
-    if cells == 2 * len(DEFAULT_COMPETENCE):
-        return DEFAULT_COMPETENCE.repeat_interleave(2)
-    raise ValueError(f"no competence vector defined for {cells} cells")
 
 
 def run_arm(
@@ -106,8 +111,9 @@ def run_arm(
     cells: int = len(DEFAULT_COMPETENCE),
     scale: float = 1.0,
     steps: int = STEPS,
+    reward_scale: float = RECORDED_RATE,
 ) -> dict[str, float]:
-    """One arm at one dose, at a cell count and a contribution scale.
+    """One arm at one dose, at a cell count, a contribution scale and an exchange rate.
 
     The guardrail columns are the ones #60's grid was published without:
     occupancy over the same tail the shares are read on, and the correlation on
@@ -119,7 +125,9 @@ def run_arm(
     and that correlation is not a number -- which is the reading the grid needed
     and did not have.
     """
-    config = replace(BASE_CONFIG, num_experts=cells, persistence_coupling=arm)
+    config = replace(
+        BASE_CONFIG, num_experts=cells, persistence_coupling=arm, reward_scale=reward_scale
+    )
     competence = shuffled(competence_for(cells), seed)
     economy = DifferentiatedEconomy(
         competence,
@@ -252,7 +260,12 @@ def pooled(readings: list[dict[str, float]]) -> dict[str, float]:
 
 
 def shifts_for(
-    arm: str, seeds: tuple[int, ...], cells: int, scale: float, steps: int
+    arm: str,
+    seeds: tuple[int, ...],
+    cells: int,
+    scale: float,
+    steps: int,
+    reward_scale: float = RECORDED_RATE,
 ) -> tuple[dict[str, float], dict[str, dict[str, float]]]:
     """One arm's allocation shift between the two dose levels, per seed, and its guardrails.
 
@@ -266,8 +279,8 @@ def shifts_for(
     shifts: dict[str, float] = {}
     readings: dict[str, list[dict[str, float]]] = {DOSE_BALANCED: [], DOSE_DOSED: []}
     for seed in seeds:
-        balanced = run_arm(arm, RATIOS[0], seed, cells, scale, steps)
-        dosed = run_arm(arm, DOSE_RATIO, seed, cells, scale, steps)
+        balanced = run_arm(arm, RATIOS[0], seed, cells, scale, steps, reward_scale)
+        dosed = run_arm(arm, DOSE_RATIO, seed, cells, scale, steps, reward_scale)
         shifts[str(seed)] = DEFAULT_READOUT.reading(balanced, dosed)
         readings[DOSE_BALANCED].append(balanced)
         readings[DOSE_DOSED].append(dosed)
@@ -275,7 +288,12 @@ def shifts_for(
 
 
 def cell_fingerprints(
-    cells: int, scale: float, seeds: tuple[int, ...], steps: int
+    cells: int,
+    scale: float,
+    seeds: tuple[int, ...],
+    steps: int,
+    reward_scale: float = RECORDED_RATE,
+    reward_scale_derived: bool = False,
 ) -> dict[str, Any]:
     """One fingerprint per arm per seed, recorded per grid cell rather than per run.
 
@@ -294,6 +312,8 @@ def cell_fingerprints(
                 steps,
                 cells=cells,
                 contribution_scale=scale,
+                reward_scale=reward_scale,
+                reward_scale_derived=reward_scale_derived,
             ).as_dict()
             for seed in seeds
         }
@@ -313,54 +333,124 @@ def band_columns(arm: str, dose: str, bands: dict[str, float]) -> str:
     )
 
 
-def sweep_lever_one(seeds: tuple[int, ...], steps: int) -> dict[str, Any]:
-    """The grid: cells per slot against the cells' share of the output."""
+def rates_for(
+    cells: int, scale: float, derivation_seeds: tuple[int, ...], derivation_steps: int
+) -> tuple[dict[str, tuple[float, bool]], dict[str, Any]]:
+    """The rates one grid cell runs at, and the derivation record that chose them.
+
+    At the recorded scale the rate is the recorded constant and nothing is
+    derived. Elsewhere the derived rate comes first and the hand-set constant
+    is the pairing; a refused derivation leaves only the pairing, with the
+    refusal in the record, because a cell read at the clamp is #60's grid and
+    not a reading of the derivation.
+    """
+    if scale == 1.0:
+        return {HAND_SET: (RECORDED_RATE, False)}, {"derived": None, "refused": None}
+    rates: dict[str, tuple[float, bool]] = {}
+    record: dict[str, Any]
+    try:
+        derivation: Derivation = derive_reward_scale(
+            DIFFERENTIATED, scale, seeds=derivation_seeds, steps=derivation_steps, cells=cells
+        )
+    except ClampedLedgerError as refused:
+        record = {"derived": None, "refused": str(refused)}
+        print(f"  cells {cells} scale {scale:g}: derivation refused -- {refused}")
+    else:
+        rates[DERIVED] = (derivation.derived, True)
+        record = {"derived": derivation.as_dict(), "refused": None}
+        print(
+            f"  cells {cells} scale {scale:g}: derived reward_scale {derivation.derived:.5f} "
+            f"(seed spread {derivation.seed_spread:.5f}, {len(derivation.passes)} passes; "
+            f"ceiling at the derived rate "
+            f"{statistics.fmean(derivation.final.ceiling_occupancy.values()):.3f} against "
+            f"{statistics.fmean(derivation.reference_ceiling_occupancy.values()):.3f} at 1x)"
+        )
+    rates[HAND_SET] = (RECORDED_RATE, False)
+    return rates, record
+
+
+def grid_row(
+    cells: int,
+    scale: float,
+    reward_scale: float,
+    derived: bool,
+    seeds: tuple[int, ...],
+    steps: int,
+) -> dict[str, Any]:
+    """One (cells, scale) cell of the grid at one exchange rate: the contrast and its guardrails."""
+    value, value_bands = shifts_for(PERSISTENCE_VALUE, seeds, cells, scale, steps, reward_scale)
+    other, other_bands = shifts_for(PERSISTENCE_SHUFFLED, seeds, cells, scale, steps, reward_scale)
+    dz, pairs = contrast_dz(value, other)
+    return {
+        "cells": cells,
+        "winner_sets": cells * (cells - 1) // 2,
+        "scale": scale,
+        "reward_scale": reward_scale,
+        "reward_scale_derived": derived,
+        "value": value,
+        "shuffled": other,
+        "dz": dz,
+        "paired_seeds_at_80": pairs,
+        # Per arm, because the confound that withdrew this grid was the
+        # two arms clamping at *different* bounds: a mean over both would
+        # have hidden exactly the asymmetry that produced the contrast.
+        "guardrails": {PERSISTENCE_VALUE: value_bands, PERSISTENCE_SHUFFLED: other_bands},
+        "fingerprints": cell_fingerprints(cells, scale, seeds, steps, reward_scale, derived),
+    }
+
+
+def print_row(row: dict[str, Any], rate: str) -> None:
+    """Every side of the contrast on a line of its own rather than a mean over it.
+
+    What withdrew this grid is that the two arms clamped at different bounds,
+    and at different doses, inside what printed as one row.
+    """
+    value, other = row["value"], row["shuffled"]
+    blocks = [
+        band_columns(arm, dose, row["guardrails"][arm][dose])
+        for arm in (PERSISTENCE_VALUE, PERSISTENCE_SHUFFLED)
+        for dose in (DOSE_BALANCED, DOSE_DOSED)
+    ]
+    contrast = (
+        f"  {row['cells']:>6}{row['winner_sets']:>7}{row['scale']:>7.1f}"
+        f"{rate:>9}{row['reward_scale']:>9.4f}"
+        f"{statistics.fmean(value.values()):>9.4f}"
+        f"{statistics.fmean(other.values()):>10.4f}{row['dz']:>+8.3f}{row['paired_seeds_at_80']:>8}"
+    )
+    print(contrast + blocks[0])
+    for block in blocks[1:]:
+        print(f"  {'':>73}{block}")
+
+
+def sweep_lever_one(
+    seeds: tuple[int, ...],
+    steps: int,
+    derivation_seeds: tuple[int, ...] = SEEDS,
+    derivation_steps: int = DERIVATION_STEPS,
+) -> dict[str, Any]:
+    """The grid: cells per slot against the cells' share of the output, at the derived rate."""
     print("\n== lever 1: the two ratios, value minus shuffled at the recorded readout ==")
     print(
-        f"  {'cells':>6}{'sets':>7}{'scale':>7}{'value':>9}{'shuffled':>10}{'dz':>8}{'seeds':>8}"
+        f"  {'cells':>6}{'sets':>7}{'scale':>7}{'rate':>9}{'reward':>9}{'value':>9}"
+        f"{'shuffled':>10}{'dz':>8}{'seeds':>8}"
         f"{'arm':>10}{'dose':>10}{'ceil%':>8}{'floor%':>8}{'r(w,c)':>9}"
     )
     grid: dict[str, Any] = {}
     for cells in CELL_COUNTS:
-        sets = cells * (cells - 1) // 2
         for scale in CONTRIBUTION_SCALES:
-            value, value_bands = shifts_for(PERSISTENCE_VALUE, seeds, cells, scale, steps)
-            other, other_bands = shifts_for(PERSISTENCE_SHUFFLED, seeds, cells, scale, steps)
-            dz, pairs = contrast_dz(value, other)
+            rates, derivation = rates_for(cells, scale, derivation_seeds, derivation_steps)
+            rows = {
+                rate: grid_row(cells, scale, reward_scale, derived, seeds, steps)
+                for rate, (reward_scale, derived) in rates.items()
+            }
+            for rate, row in rows.items():
+                print_row(row, rate)
             grid[f"cells{cells}-scale{scale}"] = {
                 "cells": cells,
-                "winner_sets": sets,
                 "scale": scale,
-                "value": value,
-                "shuffled": other,
-                "dz": dz,
-                "paired_seeds_at_80": pairs,
-                # Per arm, because the confound that withdrew this grid was the
-                # two arms clamping at *different* bounds: a mean over both would
-                # have hidden exactly the asymmetry that produced the contrast.
-                "guardrails": {PERSISTENCE_VALUE: value_bands, PERSISTENCE_SHUFFLED: other_bands},
-                "fingerprints": cell_fingerprints(cells, scale, seeds, steps),
+                "derivation": derivation,
+                "rates": rows,
             }
-            # Every side of the contrast on a line of its own rather than a
-            # mean over the thing being contrasted: what withdrew this grid is
-            # that the two arms clamped at different bounds, and at different
-            # doses, inside what printed as one row.
-            blocks = [
-                band_columns(arm, dose, bands[dose])
-                for arm, bands in (
-                    (PERSISTENCE_VALUE, value_bands),
-                    (PERSISTENCE_SHUFFLED, other_bands),
-                )
-                for dose in (DOSE_BALANCED, DOSE_DOSED)
-            ]
-            contrast = (
-                f"  {cells:>6}{sets:>7}{scale:>7.1f}"
-                f"{statistics.fmean(value.values()):>9.4f}"
-                f"{statistics.fmean(other.values()):>10.4f}{dz:>+8.3f}{pairs:>8}"
-            )
-            print(contrast + blocks[0])
-            for block in blocks[1:]:
-                print(f"  {'':>55}{block}")
     return grid
 
 
@@ -369,6 +459,12 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=Path.home() / "tame-runs" / "60-self-model")
     parser.add_argument("--seeds", type=str, default=",".join(str(seed) for seed in SEEDS))
     parser.add_argument("--steps", type=int, default=STEPS)
+    parser.add_argument(
+        "--derivation-steps",
+        type=int,
+        default=DERIVATION_STEPS,
+        help="the settle each scaled cell's exchange rate is derived on (#73)",
+    )
     args = parser.parse_args()
     seeds = tuple(int(part) for part in args.seeds.split(","))
     code_sha, code_dirty = code_identity()
@@ -387,8 +483,10 @@ def main() -> None:
         "steps": args.steps,
         "horizon": WEALTH_HORIZON,
         "reading_window": READING_WINDOW,
+        "derivation_steps": args.derivation_steps,
+        "recorded_reward_scale": RECORDED_RATE,
     }
-    record["lever_one"] = sweep_lever_one(seeds, args.steps)
+    record["lever_one"] = sweep_lever_one(seeds, args.steps, seeds, args.derivation_steps)
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "self_model.json").write_text(json.dumps(record, indent=2, default=str))
     print(f"\nrecord: {args.out / 'self_model.json'}")
