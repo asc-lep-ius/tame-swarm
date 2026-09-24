@@ -326,6 +326,11 @@ def test_read_pairs_its_control_and_refuses_an_unpaired_one(monkeypatch):
     control = driver.read(driver.Job(driver.QUALITY, "value", 0, driver.NONE, WINDOW))
     assert blocked["pre_shares"] == control["pre_shares"]
     assert blocked["blocked_cell"] == control["blocked_cell"]
+    # The wealthiest cell outside the pre-block winner set, never the blocked cell.
+    seated = set(winners(torch.tensor(blocked["pre_shares"]), 2)) | {blocked["blocked_cell"]}
+    assert blocked["next_by_wealth"] not in seated
+    assert blocked["wealth_hit"] == (blocked["largest_gainer"] == blocked["next_by_wealth"])
+    assert len(blocked["wealth_at_settle"]) == 8
     # The pinned cell bids at the floor from the first blocked step, so it loses
     # nearly everything inside the window: the ledger blockade substitutes at once.
     assert blocked["uptake"] > 0.9
@@ -392,6 +397,8 @@ def test_summarise_reads_the_targets_when_they_exist_and_says_so(tmp_path):
             "pre_shares": [0.5, 0.5, 0.0],
             "blocked_cell": blocked,
             "uptake": uptake,
+            "wealth_hit": True,
+            "predicted_hit": False,
             "inside_on_type_loss": loss,
             "returned": 1.0,
             "guardrail/ceiling_occupancy": 0.25,
@@ -421,4 +428,6 @@ def test_summarise_reads_the_targets_when_they_exist_and_says_so(tmp_path):
     row = summary["against_control"]["ledger/value/inside_on_type_loss"]
     # 0.012 and 0.013 against 1.1 x 0.0115 = 0.01265: one seed reaches the target.
     assert row["against_target"]["reached_target"] == 1
-    assert "against_target" not in summary["against_control"]["ledger/value/uptake"]
+    taken = summary["against_control"]["ledger/value/uptake"]
+    assert "against_target" not in taken
+    assert taken["substitute"] == {"predicted_hits": 0, "next_by_wealth_hits": 2}

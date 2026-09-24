@@ -83,6 +83,7 @@ from individuation import (  # noqa: E402
     returned,
     type_shares,
     uptake,
+    winners,
 )
 from mob import PERSISTENCE_DECOUPLED, PERSISTENCE_SHUFFLED, PERSISTENCE_VALUE  # noqa: E402
 from parity import code_identity  # noqa: E402
@@ -286,6 +287,7 @@ def read(job: Job) -> dict[str, Any]:
     predicted = predicted_substitute(competence, on_type, pre_shares, blocked, top_k)
     others = cell_gains.clone()
     others[blocked] = -torch.inf
+    by_wealth = next_by_wealth(wealth_at_settle, pre_shares, blocked, top_k)
     code_sha, code_dirty = code_identity()
     reading: dict[str, Any] = {
         **asdict(job),
@@ -302,6 +304,11 @@ def read(job: Job) -> dict[str, Any]:
         "post_on_type_loss": post.on_type_loss(cell_type),
         "largest_gainer": int(others.argmax()),
         "predicted_substitute": predicted,
+        # Stage 5's other candidate: the wealthiest cell outside the pre-block
+        # winner set, which is where the setpoint sentence says the slot goes.
+        "next_by_wealth": by_wealth,
+        "wealth_hit": int(others.argmax()) == by_wealth,
+        "wealth_at_settle": wealth_at_settle.tolist(),
         "half_life": half_life(
             inside.blocked_share, float(pre_shares[blocked]), float(inside_shares[blocked])
         ),
@@ -323,6 +330,13 @@ def read(job: Job) -> dict[str, Any]:
         )
         reading["predicted_hit"] = int(others.argmax()) == predicted
     return reading
+
+
+def next_by_wealth(wealth: torch.Tensor, pre_shares: torch.Tensor, blocked: int, top_k: int) -> int:
+    """The wealthiest cell not already holding a slot, the blocked cell aside."""
+    excluded = set(winners(pre_shares, top_k)) | {blocked}
+    candidates = [index for index in range(wealth.numel()) if index not in excluded]
+    return max(candidates, key=lambda index: float(wealth[index]))
 
 
 def measure_window(fixture: str, seed: int, scale: float) -> dict[str, Any]:
@@ -523,10 +537,12 @@ def _planted(args: argparse.Namespace, fixture: str) -> None:
         statistic = {seed: row["planted_statistic"] for seed, row in rows.items()}
         test = paired_t(list(statistic.values()))
         hits = sum(int(row["predicted_hit"]) for row in rows.values())
+        wealth_hits = sum(int(row["wealth_hit"]) for row in rows.values())
         record["blockades"][blockade] = {
             "planted_statistic": statistic,
             "paired_t": test.as_dict(),
             "predicted_hits": hits,
+            "next_by_wealth_hits": wealth_hits,
             "uptake": paired_against_control(
                 rows, grouped[(fixture, PERSISTENCE_VALUE, NONE)], "uptake"
             ),
@@ -536,7 +552,8 @@ def _planted(args: argparse.Namespace, fixture: str) -> None:
         print(
             f"planted, {fixture}, {blockade}: statistic mean {test.mean:+.4f} dz {test.dz:+.3f} "
             f"t {test.t:+.2f} "
-            f"p {test.p:.4f}; predicted substitute the largest gainer in {hits}/{len(rows)} seeds"
+            f"p {test.p:.4f}; predicted substitute the largest gainer in {hits}/{len(rows)} "
+            f"seeds, the next cell by wealth in {wealth_hits}/{len(rows)}"
         )
     write_json(args.out / f"planted_{fixture}.json", record)
 
@@ -710,6 +727,15 @@ def summarise_stage(
                     )
                 if field == "inside_on_type_loss" and targets is not None:
                     row["against_target"] = against_target(rows, targets[arm])
+                if field == "uptake":
+                    # Who took the freed slot: the cell competence predicts, or
+                    # the next cell by wealth. Counted over the seeds of one arm.
+                    row["substitute"] = {
+                        "predicted_hits": sum(
+                            int(r.get("predicted_hit", False)) for r in rows.values()
+                        ),
+                        "next_by_wealth_hits": sum(int(r["wealth_hit"]) for r in rows.values()),
+                    }
                 summary["against_control"][f"{blockade}/{arm}/{field}"] = row
         for field in ("uptake", "inside_on_type_loss"):
             for other in (PERSISTENCE_SHUFFLED, PERSISTENCE_DECOUPLED):
