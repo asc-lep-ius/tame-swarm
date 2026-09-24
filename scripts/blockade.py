@@ -177,6 +177,11 @@ class Window:
     blocked_share: list[float]
     at_ceiling: int = 0
     at_floor: int = 0
+    # Each cell's report, summed over the tokens of the stretch: what the gate
+    # multiplied by the ledger to rank it. Stage 5 reads who took a freed slot
+    # against it.
+    report_sum: torch.Tensor | None = None
+    tokens: int = 0
 
     def on_type_loss(self, cell_type: int) -> float:
         return statistics.fmean(self.loss_by_type[cell_type])
@@ -187,6 +192,11 @@ class Window:
     def own_type_wins(self, types: torch.Tensor) -> torch.Tensor:
         """Slots each cell held on tokens of its own type."""
         return self.wins_by_type[types, torch.arange(types.numel())]
+
+    def mean_report(self) -> torch.Tensor:
+        """Each cell's mean report over the stretch's tokens."""
+        assert self.report_sum is not None and self.tokens > 0
+        return self.report_sum / self.tokens
 
 
 def observe(economy: SyntheticEconomy, steps: int, watch: tuple[int, int] | None = None) -> Window:
@@ -209,6 +219,15 @@ def observe(economy: SyntheticEconomy, steps: int, watch: tuple[int, int] | None
                 selected[mask].flatten(), minlength=cells
             ).float()
             window.loss_by_type[cell_type].append(float(record.per_token_loss[mask].mean()))
+        stats = economy.mob.last_stats
+        assert stats is not None
+        reports = stats.confidences.detach().reshape(-1, cells)
+        window.report_sum = (
+            reports.sum(dim=0)
+            if window.report_sum is None
+            else window.report_sum + reports.sum(dim=0)
+        )
+        window.tokens += reports.size(0)
         if watch is not None:
             cell, cell_type = watch
             held = selected[types == cell_type]
@@ -288,6 +307,8 @@ def read(job: Job) -> dict[str, Any]:
     others = cell_gains.clone()
     others[blocked] = -torch.inf
     by_wealth = next_by_wealth(wealth_at_settle, pre_shares, blocked, top_k)
+    pre_bids = pre.mean_report() * wealth_at_settle
+    by_bid = next_by_wealth(pre_bids, pre_shares, blocked, top_k)
     code_sha, code_dirty = code_identity()
     reading: dict[str, Any] = {
         **asdict(job),
@@ -309,6 +330,12 @@ def read(job: Job) -> dict[str, Any]:
         "next_by_wealth": by_wealth,
         "wealth_hit": int(others.argmax()) == by_wealth,
         "wealth_at_settle": wealth_at_settle.tolist(),
+        # And the third candidate: the largest pre-block *bid* outside the
+        # winner set -- the mean report over the tail times the ledger at the
+        # settle, which is the quantity the gate actually ranks.
+        "next_by_bid": by_bid,
+        "bid_hit": int(others.argmax()) == by_bid,
+        "pre_mean_report": pre.mean_report().tolist(),
         "half_life": half_life(
             inside.blocked_share, float(pre_shares[blocked]), float(inside_shares[blocked])
         ),
@@ -333,7 +360,11 @@ def read(job: Job) -> dict[str, Any]:
 
 
 def next_by_wealth(wealth: torch.Tensor, pre_shares: torch.Tensor, blocked: int, top_k: int) -> int:
-    """The wealthiest cell not already holding a slot, the blocked cell aside."""
+    """The cell not already holding a slot, the blocked cell aside, ranking highest on ``wealth``.
+
+    Called on the ledger for the next cell by wealth and on the mean bid for the
+    next cell by bid; the exclusion is the same either way.
+    """
     excluded = set(winners(pre_shares, top_k)) | {blocked}
     candidates = [index for index in range(wealth.numel()) if index not in excluded]
     return max(candidates, key=lambda index: float(wealth[index]))
@@ -538,11 +569,13 @@ def _planted(args: argparse.Namespace, fixture: str) -> None:
         test = paired_t(list(statistic.values()))
         hits = sum(int(row["predicted_hit"]) for row in rows.values())
         wealth_hits = sum(int(row["wealth_hit"]) for row in rows.values())
+        bid_hits = sum(int(row["bid_hit"]) for row in rows.values())
         record["blockades"][blockade] = {
             "planted_statistic": statistic,
             "paired_t": test.as_dict(),
             "predicted_hits": hits,
             "next_by_wealth_hits": wealth_hits,
+            "next_by_bid_hits": bid_hits,
             "uptake": paired_against_control(
                 rows, grouped[(fixture, PERSISTENCE_VALUE, NONE)], "uptake"
             ),
@@ -553,7 +586,8 @@ def _planted(args: argparse.Namespace, fixture: str) -> None:
             f"planted, {fixture}, {blockade}: statistic mean {test.mean:+.4f} dz {test.dz:+.3f} "
             f"t {test.t:+.2f} "
             f"p {test.p:.4f}; predicted substitute the largest gainer in {hits}/{len(rows)} "
-            f"seeds, the next cell by wealth in {wealth_hits}/{len(rows)}"
+            f"seeds, the next cell by wealth in {wealth_hits}/{len(rows)}, "
+            f"the next cell by bid in {bid_hits}/{len(rows)}"
         )
     write_json(args.out / f"planted_{fixture}.json", record)
 
@@ -735,6 +769,7 @@ def summarise_stage(
                             int(r.get("predicted_hit", False)) for r in rows.values()
                         ),
                         "next_by_wealth_hits": sum(int(r["wealth_hit"]) for r in rows.values()),
+                        "next_by_bid_hits": sum(int(r["bid_hit"]) for r in rows.values()),
                     }
                 summary["against_control"][f"{blockade}/{arm}/{field}"] = row
         for field in ("uptake", "inside_on_type_loss"):

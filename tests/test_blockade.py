@@ -331,6 +331,9 @@ def test_read_pairs_its_control_and_refuses_an_unpaired_one(monkeypatch):
     assert blocked["next_by_wealth"] not in seated
     assert blocked["wealth_hit"] == (blocked["largest_gainer"] == blocked["next_by_wealth"])
     assert len(blocked["wealth_at_settle"]) == 8
+    assert blocked["next_by_bid"] not in seated
+    assert blocked["bid_hit"] == (blocked["largest_gainer"] == blocked["next_by_bid"])
+    assert len(blocked["pre_mean_report"]) == 8 and min(blocked["pre_mean_report"]) >= 0.0
     # The pinned cell bids at the floor from the first blocked step, so it loses
     # nearly everything inside the window: the ledger blockade substitutes at once.
     assert blocked["uptake"] > 0.9
@@ -398,6 +401,7 @@ def test_summarise_reads_the_targets_when_they_exist_and_says_so(tmp_path):
             "blocked_cell": blocked,
             "uptake": uptake,
             "wealth_hit": True,
+            "bid_hit": False,
             "predicted_hit": False,
             "inside_on_type_loss": loss,
             "returned": 1.0,
@@ -430,4 +434,8 @@ def test_summarise_reads_the_targets_when_they_exist_and_says_so(tmp_path):
     assert row["against_target"]["reached_target"] == 1
     taken = summary["against_control"]["ledger/value/uptake"]
     assert "against_target" not in taken
-    assert taken["substitute"] == {"predicted_hits": 0, "next_by_wealth_hits": 2}
+    assert taken["substitute"] == {
+        "predicted_hits": 0,
+        "next_by_wealth_hits": 2,
+        "next_by_bid_hits": 0,
+    }
