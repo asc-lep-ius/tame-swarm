@@ -10,6 +10,8 @@ a different run. The readouts are then checked on hand-built shares where the
 answer is arithmetic.
 """
 
+import os
+import subprocess
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -56,6 +58,28 @@ def economy(seed: int = 0, arm: str = "value") -> SyntheticEconomy:
 
 def head_state(economy: SyntheticEconomy) -> list[torch.Tensor]:
     return [p.detach().clone() for p in economy.mob.confidence_heads.parameters()]
+
+
+def test_importing_the_driver_leaves_the_cuda_device_list_alone():
+    """pytest imports every test module at collection.
+
+    An import that hid the card hid it from the GPU suite in the same process
+    (pipelines 546 and 549); hiding it is what running the script does.
+    """
+    probe = (
+        "import os, sys; "
+        f"sys.path.insert(0, {str(Path(__file__).parent.parent / 'scripts')!r}); "
+        f"sys.path.insert(0, {str(Path(__file__).parent.parent / 'tame')!r}); "
+        "import blockade; print(repr(os.environ.get('CUDA_VISIBLE_DEVICES'))); "
+        "blockade.hide_the_card(); print(repr(os.environ.get('CUDA_VISIBLE_DEVICES')))"
+    )
+    # In a subprocess, never in this one: hiding the card here would hide it
+    # from every later test this worker runs, which is the bug being pinned.
+    env = {k: v for k, v in os.environ.items() if k != "CUDA_VISIBLE_DEVICES"}
+    out = subprocess.run(
+        [sys.executable, "-c", probe], check=True, capture_output=True, text=True, env=env
+    )
+    assert out.stdout.split() == ["None", "''"], out.stdout
 
 
 def test_output_block_zeroes_the_contribution_exactly_and_touches_nothing_else():
