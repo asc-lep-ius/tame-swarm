@@ -43,13 +43,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 
-# A CPU fixture on a box with a GPU: the workers are spawned, never forked,
-# because a forked child of a CUDA-initialised parent dies in Adam's stream
-# check -- and the parent never initialises CUDA to begin with, so a body run
-# on the same box is not disturbed by a fixture that has no use for the card.
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
-
-import torch  # noqa: E402
+import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tame"))
@@ -367,6 +361,10 @@ def _single_thread() -> None:
 
 
 def run_jobs(jobs: list[Job], workers: int) -> list[dict[str, Any]]:
+    # Spawned, never forked: a forked child of a CUDA-initialised parent dies
+    # in Adam's stream check, and the parent hides the card (``hide_the_card``)
+    # so a body run on the same box is not disturbed by a fixture that has no
+    # use for it.
     spawn = multiprocessing.get_context("spawn")
     with ProcessPoolExecutor(
         max_workers=workers, initializer=_single_thread, mp_context=spawn
@@ -662,7 +660,21 @@ STAGES = {
 }
 
 
+def hide_the_card() -> None:
+    """A CPU fixture on a box with a GPU never touches the card.
+
+    Set here, when the script runs, and never at import: pytest imports every
+    test module at collection, so an import-time ``CUDA_VISIBLE_DEVICES=""``
+    hid the card from the GPU suite in the same process (pipelines 546 and
+    549). CUDA initialises lazily, so setting it before the first CUDA call is
+    enough, and the spawned workers inherit it. ``setdefault`` keeps an
+    operator's explicit choice.
+    """
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+
+
 def main() -> None:
+    hide_the_card()
     args = build_parser().parse_args()
     if args.seeds is None:
         args.seeds = DEFAULT_SEEDS[args.stage]
