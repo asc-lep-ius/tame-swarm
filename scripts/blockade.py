@@ -9,10 +9,13 @@ when the dominant cell at the layer is blocked, do the remaining cells take up
 its work *inside the window*, through the auction, toward the same restored
 state under two structurally different blockades?
 
-Two blockades, both on the fixture's own hooks: **output** (the cell's
-contribution zeroed, bids and ledger untouched -- the economy has to find out)
-and **ledger** (its wealth pinned to the floor, output intact -- the cell is
-still worth what it was, and only the record of it is gone). The **window**
+Three blockades, all on the fixture's own hooks: **output** (the cell's
+contribution zeroed, bids and ledger untouched -- the economy has to find out),
+**ledger** (its wealth pinned to the floor, output intact -- the cell is still
+worth what it was, and only the record of it is gone) and **gate** (the cell's
+bid on its own type's tokens reaches the auction as zero, head, ledger and
+output intact -- the third, written into the prereg file as a prediction after
+the first two were read, Op 2 step 5). The **window**
 ``W`` is a quarter of the time the on-type loss takes to re-converge under the
 output blockade held indefinitely, measured first on one seed (``--stage
 window``) and written into ``docs/prereg/63-individuation.md`` before any arm
@@ -83,8 +86,9 @@ QUALITY = "quality-fixture"
 DIFFERENTIATED = "differentiated-fixture"
 FIXTURES = (QUALITY, DIFFERENTIATED)
 ARMS = (PERSISTENCE_VALUE, PERSISTENCE_SHUFFLED, PERSISTENCE_DECOUPLED)
-NONE, OUTPUT, LEDGER = "none", "output", "ledger"
-BLOCKADES = (NONE, OUTPUT, LEDGER)
+NONE, OUTPUT, LEDGER, GATE = "none", "output", "ledger", "gate"
+BLOCKADES = (NONE, OUTPUT, LEDGER, GATE)
+READ_BLOCKADES = (OUTPUT, LEDGER, GATE)
 # Eight wealth memory horizons at the decay, #16's convention for a settled
 # ledger; the issue's budget.
 SETTLE_STEPS = 2667
@@ -213,6 +217,13 @@ def apply_blockade(economy: SyntheticEconomy, blockade: str, cell: int) -> None:
         economy.block_output(cell)
     elif blockade == LEDGER:
         economy.pin_wealth(cell)
+    elif blockade == GATE:
+        # The class is the cell's own type; the quality fixture has one type, so
+        # there the class is every token.
+        own_type = (
+            int(expert_types(economy)[cell]) if isinstance(economy, DifferentiatedEconomy) else None
+        )
+        economy.block_bids(cell, own_type)
     elif blockade != NONE:
         raise ValueError(f"unknown blockade {blockade!r}")
 
@@ -222,6 +233,8 @@ def release_blockade(economy: SyntheticEconomy, blockade: str, cell: int) -> Non
         economy.release_output(cell)
     elif blockade == LEDGER:
         economy.release_wealth(cell)
+    elif blockade == GATE:
+        economy.release_bids(cell)
 
 
 @dataclass(frozen=True)
@@ -343,7 +356,7 @@ def measure_window(fixture: str, seed: int, scale: float) -> dict[str, Any]:
             statistics.fmean(blocked_run.blocked_share[i : i + 50])
             for i in range(0, len(losses), 50)
         ],
-        "code_sha": code_identity()[0],
+        **identity(),
     }
 
 
@@ -391,6 +404,12 @@ def paired_against_control(
     return deltas
 
 
+def identity() -> dict[str, Any]:
+    """The code every record was read at; a dirty tree is recorded as one."""
+    code_sha, code_dirty = code_identity()
+    return {"code_sha": code_sha, "code_dirty": code_dirty}
+
+
 def write_json(path: Path, record: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(record, indent=2, default=str))
@@ -421,8 +440,13 @@ def stage_planted(args: argparse.Namespace) -> None:
     ]
     readings = run_jobs(jobs, args.workers)
     grouped = group(readings)
-    record: dict[str, Any] = {"window": window, "seeds": list(args.seeds), "blockades": {}}
-    for blockade in (OUTPUT, LEDGER):
+    record: dict[str, Any] = {
+        "window": window,
+        "seeds": list(args.seeds),
+        "blockades": {},
+        **identity(),
+    }
+    for blockade in READ_BLOCKADES:
         rows = grouped[(QUALITY, PERSISTENCE_VALUE, blockade)]
         statistic = {seed: row["planted_statistic"] for seed, row in rows.items()}
         test = paired_t(list(statistic.values()))
@@ -459,7 +483,12 @@ def stage_null(args: argparse.Namespace) -> None:
             grouped[(fixture, PERSISTENCE_VALUE, OUTPUT)],
             grouped[(fixture, PERSISTENCE_VALUE, NONE)],
         )
-        record: dict[str, Any] = {"fixture": fixture, "window": window, "seeds": list(args.seeds)}
+        record: dict[str, Any] = {
+            "fixture": fixture,
+            "window": window,
+            "seeds": list(args.seeds),
+            **identity(),
+        }
         for field in ("uptake", "inside_on_type_loss", "returned"):
             values = paired_against_control(blocked, control, field)
             calibration = null_calibration(
@@ -482,7 +511,7 @@ def stage_arms(args: argparse.Namespace) -> None:
             Job(fixture, arm, seed, blockade, window, args.scale)
             for arm in ARMS
             for seed in args.seeds
-            for blockade in BLOCKADES
+            for blockade in args.blockades
         ]
         readings = run_jobs(jobs, args.workers)
         stage = args.out / f"arms_{fixture}_{len(args.seeds)}seeds"
@@ -507,7 +536,9 @@ def summarise_stage(stage: Path) -> dict[str, Any]:
     loaded = load_stage(stage)
     summary: dict[str, Any] = {"stage": str(stage), "against_control": {}, "between_arms": {}}
     against: dict[str, dict[str, dict[str, dict[str, float]]]] = {}
-    for blockade in (OUTPUT, LEDGER):
+    for blockade in READ_BLOCKADES:
+        if not all((arm, blockade) in loaded for arm in ARMS):
+            continue
         for arm in ARMS:
             rows, control = loaded[(arm, blockade)], loaded[(arm, NONE)]
             for field in ("uptake", "inside_on_type_loss", "returned"):
@@ -586,6 +617,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--scale", type=float, default=1.0, help="contribution_scale; 1.0 is the recorded fixture"
     )
+    parser.add_argument(
+        "--blockades",
+        nargs="+",
+        choices=BLOCKADES,
+        default=list(BLOCKADES),
+        help="the arm stage's conditions; the control is always run",
+    )
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--splits", type=int, default=2000)
     parser.add_argument("--resamples", type=int, default=2000)
@@ -617,6 +655,8 @@ def main() -> None:
         raise SystemExit(
             "every 2x row waits on #73's exchange rate; this script runs the 1x rows only"
         )
+    if NONE not in args.blockades:
+        args.blockades = [NONE, *args.blockades]
     STAGES[args.stage](args)
 
 

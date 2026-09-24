@@ -115,3 +115,52 @@ seeds 0–23, read only after 3 is written down. Contrasts: each blockade's
 `value` − `decoupled` on (a) and (b), paired by seed, with the paired t, dz
 and the paired seeds at 80% power (`power.pairs_for_power`) — the power row
 #69 needs, labelled 1×.
+
+## After (i) and (ii): the setpoint in one sentence, and the third blockade
+
+Written 2026-09-24 after the six-seed stage was recorded
+(`~/tame-runs/individuation/arms_*_6seeds/SUMMARY.json`, code `51e82a1`) and
+before the gate stage runs; git history dates it. What the six seeds said, in
+the two sentences the prediction needs: under (ii) the freed slots are taken up
+inside W on both fixtures (`value` uptake +0.64 quality, +0.99 differentiated)
+and under (i) on the differentiated fixture (+0.75), while the on-type loss
+inside W is *worse* than the control's on every arm under both blockades
+(+0.02 to +0.31), and on release the ledger-pinned cell does not return
+(−1.00 quality, −0.49 differentiated) where the output-blocked one does
+(≈ 0.00). The planted substitute was recovered under (ii) (p 0.011, 4/6) and
+not under (i) (p 0.97, 1/6).
+
+**The setpoint.** What the collective restores is a full allocation ranked by
+the ledger — every slot sold, to the wealthiest bidders — and not the on-type
+loss: it re-sells a silenced cell's slots at once and leaves the work undone.
+
+**(iii) Gate.** The dominant cell's bid on its own type's tokens reaches the
+auction as zero (`SyntheticEconomy.block_bids`); its head, ledger and output are
+intact, so it is the third channel — the auction itself — after the output and
+the ledger. On the quality fixture the class is every token. Predictions, from
+the setpoint above, for `value` at 1×, blocked minus control, paired by seed:
+
+1. **Uptake inside W ≈ 1** on both fixtures, as under (ii): the slots are
+   re-sold on the first blocked token because the ranking of the remaining
+   cells is untouched.
+2. **On-type loss inside W worse than the control's** by about (ii)'s amount
+   (+0.02 to +0.03 quality, +0.2 to +0.3 differentiated): the substitute is the
+   next bidder by the ledger, not a cell that restores the work.
+3. **Full return on release, ≈ 0.00**, where (ii) reads −1.00: the cell's
+   wealth was never touched, so it wins its slots back on the first unblocked
+   token. This is the prediction that separates the three channels — (ii) fails
+   to return because the ledger has no re-entry (#40), not because the tissue
+   re-formed without the cell.
+4. **The planted substitute is recovered**, as under (ii), because the same
+   ranking hands the freed slot to the same cell.
+5. **Under `decoupled` the blockade reaches the allocation** (uptake ≈ 1),
+   unlike (ii), because the pinned snapshot still multiplies a zero bid.
+
+If 1–3 hold, (ii) and (iii) substitute toward the same *allocation* and neither
+toward the same *loss*, and what the six seeds already say is confirmed by a
+third channel: the substitution is of slots by wealth rank, not of means toward
+the end. If 3 fails — the cell does not return under (iii) either — the
+non-return under (ii) was not the ledger's and the setpoint sentence is wrong.
+The gate rows run at six seeds first and enter the 24-seed stage beside the
+other two; the same seeds under the same code, so the six-seed rows of every
+blockade must reproduce bitwise inside the 24-seed record.
