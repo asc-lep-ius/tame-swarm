@@ -185,7 +185,8 @@ criterion, calibrated before it is pointed at an arm.
     counterfactual targets, in the skill form, after #70's fix. Neither runs
     before #73 has derived the exchange rate: `reward_scale` per configuration
     from the settled economy's own inflow and charge, static and fingerprinted,
-    returning the recorded 2.0 bitwise at 1× (the fork taken over a running
+    returning the recorded 2.0 within 1e-6 at 1× with the economy bitwise the
+    one recorded (the fork taken over a running
     normaliser on realised value, for the reasons #73 carries).
 14. **#42 is re-gated on #63.** The core is built on a cell scale that has
     passed individuation — two structurally different blockades toward the same
