@@ -553,15 +553,19 @@ def summarise_stage(stage: Path) -> dict[str, Any]:
                 deltas = paired_against_control(rows, control, field)
                 test = paired_t(list(deltas.values()))
                 against.setdefault(blockade, {}).setdefault(field, {})[arm] = deltas
-                summary["against_control"][f"{blockade}/{arm}/{field}"] = {
+                row: dict[str, Any] = {
                     **test.as_dict(),
                     "pairs_at_80": pairs_for_power(test.dz) if test.sd > 0 else None,
                     "per_seed": deltas,
                     "guardrail": guardrail_columns(rows),
-                    # How many seeds sit within RETURN_TOLERANCE of the control:
-                    # the "returned in full" count the README quotes for (c).
-                    "within_tolerance": sum(abs(d) <= RETURN_TOLERANCE for d in deltas.values()),
                 }
+                if field == "returned":
+                    # How many seeds came back within RETURN_TOLERANCE of the
+                    # control: the "returned in full" count the README quotes.
+                    row["within_tolerance"] = sum(
+                        abs(d) <= RETURN_TOLERANCE for d in deltas.values()
+                    )
+                summary["against_control"][f"{blockade}/{arm}/{field}"] = row
         for field in ("uptake", "inside_on_type_loss"):
             for other in (PERSISTENCE_SHUFFLED, PERSISTENCE_DECOUPLED):
                 value, control_arm = (
