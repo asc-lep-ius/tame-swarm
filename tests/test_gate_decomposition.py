@@ -18,6 +18,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent / "tame"))
 sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
 
+import gate_decomposition  # noqa: E402
 from gate_decomposition import (  # noqa: E402
     DIFFERENTIATED,
     QUALITY,
@@ -178,27 +179,45 @@ def test_the_line_is_the_one_the_issue_fixed_before_the_read():
     assert SENIORITY_LINE == 0.90
 
 
-def test_the_read_uses_the_ledger_the_auction_bid_with_not_the_one_it_left():
-    """With no exploration, the pre-step ledger reproduces the winner set on every step.
+def test_the_read_uses_the_ledger_the_auction_bid_with_not_the_one_it_left(monkeypatch):
+    """``read_run`` hands ``decompose`` the pre-step ledger, and the post-step one would differ.
 
     The identity check cannot catch a read that passes the post-step ledger --
-    it rebuilds the bid from whatever wealth it is handed -- so this pins the
-    order ``read_run`` relies on: ``allocation_wealth()`` is cloned *before* the
-    step, and on at least one step the ledger the step leaves behind would name
-    a different winner set.
+    it rebuilds the bid from whatever wealth it is handed -- so this spies on
+    the wealth ``read_run`` actually passes: with no exploration, its top-k of
+    confidence x wealth must reproduce the winner set on every step. The second
+    half is the teeth: on the same economy the ledger a step leaves behind names
+    a different winner set on at least one step, so a clone taken after the
+    step fails the first half.
     """
-    config = replace(BASE_CONFIG, persistence_coupling=PERSISTENCE_VALUE, exploration_rate=0.0)
-    economy = SyntheticEconomy(shuffled(DEFAULT_COMPETENCE, 0), 0, config=config)
-    mob = economy.mob
+    monkeypatch.setattr(
+        gate_decomposition, "BASE_CONFIG", replace(BASE_CONFIG, exploration_rate=0.0)
+    )
+    handed: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    real_decompose = gate_decomposition.decompose
+
+    def spy(confidences, wealth, selected, top_k, mask=None):
+        handed.append((confidences.clone(), wealth.clone(), selected.clone()))
+        return real_decompose(confidences, wealth, selected, top_k, mask)
+
+    monkeypatch.setattr(gate_decomposition, "decompose", spy)
+    read_run(QUALITY, PERSISTENCE_VALUE, 0, steps=80, tail=80, horizon=10)
+    assert len(handed) == 80
+    for confidences, wealth, selected in handed:
+        assert torch.equal(
+            gate_of(confidences, wealth).sort(dim=-1).values, selected.sort(dim=-1).values
+        )
+
+    economy = SyntheticEconomy(
+        shuffled(DEFAULT_COMPETENCE, 0), 0, config=gate_decomposition.BASE_CONFIG
+    )
     post_step_disagreements = 0
     for _ in range(80):
-        before = mob.allocation_wealth().detach().clone()
         economy.step()
-        stats = mob.last_stats
+        stats = economy.mob.last_stats
         assert stats is not None
-        after = mob.allocation_wealth().detach().clone()
+        after = economy.mob.allocation_wealth().detach().clone()
         winners = stats.selected_experts.sort(dim=-1).values
-        assert torch.equal(gate_of(stats.confidences, before).sort(dim=-1).values, winners)
         post = gate_of(stats.confidences, after).sort(dim=-1).values
         post_step_disagreements += int((post != winners).any(dim=-1).sum())
     assert post_step_disagreements > 0, "the test has no teeth if the ledger never reorders a bid"
