@@ -9,6 +9,7 @@ pinned ledger is what says the wealth term reads constant where it should.
 
 import math
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -23,8 +24,14 @@ from gate_decomposition import (  # noqa: E402
     SENIORITY_LINE,
     floor_between,
     read_run,
+    script_identity,
 )
-from synthetic_economy import BASE_CONFIG  # noqa: E402
+from synthetic_economy import (  # noqa: E402
+    BASE_CONFIG,
+    DEFAULT_COMPETENCE,
+    SyntheticEconomy,
+    shuffled,
+)
 
 from mob import PERSISTENCE_DECOUPLED, PERSISTENCE_VALUE  # noqa: E402
 from mob.gate_decomposition import decompose, merge, wealth_top_k  # noqa: E402
@@ -169,3 +176,37 @@ def test_the_fixture_is_its_own_replicate_so_the_floor_is_zero():
 
 def test_the_line_is_the_one_the_issue_fixed_before_the_read():
     assert SENIORITY_LINE == 0.90
+
+
+def test_the_read_uses_the_ledger_the_auction_bid_with_not_the_one_it_left():
+    """With no exploration, the pre-step ledger reproduces the winner set on every step.
+
+    The identity check cannot catch a read that passes the post-step ledger --
+    it rebuilds the bid from whatever wealth it is handed -- so this pins the
+    order ``read_run`` relies on: ``allocation_wealth()`` is cloned *before* the
+    step, and on at least one step the ledger the step leaves behind would name
+    a different winner set.
+    """
+    config = replace(BASE_CONFIG, persistence_coupling=PERSISTENCE_VALUE, exploration_rate=0.0)
+    economy = SyntheticEconomy(shuffled(DEFAULT_COMPETENCE, 0), 0, config=config)
+    mob = economy.mob
+    post_step_disagreements = 0
+    for _ in range(80):
+        before = mob.allocation_wealth().detach().clone()
+        economy.step()
+        stats = mob.last_stats
+        assert stats is not None
+        after = mob.allocation_wealth().detach().clone()
+        winners = stats.selected_experts.sort(dim=-1).values
+        assert torch.equal(gate_of(stats.confidences, before).sort(dim=-1).values, winners)
+        post = gate_of(stats.confidences, after).sort(dim=-1).values
+        post_step_disagreements += int((post != winners).any(dim=-1).sum())
+    assert post_step_disagreements > 0, "the test has no teeth if the ledger never reorders a bid"
+
+
+def test_each_script_records_its_own_digest():
+    scripts = Path(__file__).parent.parent / "scripts"
+    fixture = script_identity(scripts / "gate_decomposition.py")
+    body = script_identity(scripts / "gate_decomposition_body.py")
+    assert fixture["script_sha1"] != body["script_sha1"]
+    assert fixture["code_sha"] == body["code_sha"]

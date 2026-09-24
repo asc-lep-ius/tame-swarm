@@ -65,9 +65,9 @@ def read_checkpoint(
     """
     from train import TAMETrainer, TrainingConfig, restore_checkpoint  # noqa: PLC0415
 
-    os.environ.setdefault(
-        "MLFLOW_TRACKING_URI", f"file:{Path(tempfile.gettempdir()) / 'tame-gate-mlruns'}"
-    )
+    # Set, not defaulted: a read must never log into whatever store the shell
+    # happens to point at.
+    os.environ["MLFLOW_TRACKING_URI"] = f"file:{Path(tempfile.gettempdir()) / 'tame-gate-mlruns'}"
     state = torch.load(checkpoint / "training_state.pt", map_location="cpu", weights_only=False)
     recorded = dict(state["config"])
     run_dir = checkpoint.parent
@@ -206,7 +206,7 @@ def read_one(checkpoint: Path, args: argparse.Namespace) -> dict[str, Any]:
         probe_batches=len(batches),
         gpu_seconds=time.monotonic() - loaded,
         wall_seconds=time.monotonic() - started,
-        **script_identity(),
+        **script_identity(Path(__file__)),
     )
     del model
     if device.type == "cuda":
@@ -244,7 +244,7 @@ def run_body(args: argparse.Namespace) -> None:
     checkpoints = sorted(args.body_root.glob("r*/*/runs/seed*/checkpoint-*"))
     if not checkpoints:
         raise SystemExit(f"no checkpoints under {args.body_root}")
-    identity = script_identity()
+    identity = script_identity(Path(__file__))
     print(
         f"code {identity['code_sha']} dirty={identity['code_dirty']} "
         f"script {identity['script_sha1']}"

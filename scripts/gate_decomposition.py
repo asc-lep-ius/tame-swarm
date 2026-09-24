@@ -90,10 +90,14 @@ READ_FIELDS = (
 )
 
 
-def script_identity() -> dict[str, Any]:
-    """The code SHA beside a digest of this file, so a reading names the script that read it."""
+def script_identity(script: Path) -> dict[str, Any]:
+    """The code SHA beside a digest of ``script``, so a reading names the script that read it.
+
+    The caller passes its own ``__file__``: the body script once imported this
+    and every body record carried the fixture script's digest.
+    """
     code_sha, code_dirty = code_identity()
-    digest = hashlib.sha1(Path(__file__).read_bytes()).hexdigest()[:12]
+    digest = hashlib.sha1(script.read_bytes()).hexdigest()[:12]
     return {"code_sha": code_sha, "code_dirty": code_dirty, "script_sha1": digest}
 
 
@@ -184,7 +188,7 @@ def read_run(
         "fingerprint": fixture_fingerprint(
             FIXTURE_IDS[fixture], seed, arm, doses_for(fixture), steps
         ).as_dict(),
-        **script_identity(),
+        **script_identity(Path(__file__)),
     }
 
 
@@ -246,7 +250,7 @@ def main() -> None:
     fixtures = FIXTURES if args.fixture == "both" else (args.fixture,)
     arms = tuple(args.arms.split(","))
     seeds = tuple(int(part) for part in args.seeds.split(","))
-    identity = script_identity()
+    identity = script_identity(Path(__file__))
     print(
         f"code {identity['code_sha']} dirty={identity['code_dirty']} "
         f"script {identity['script_sha1']}"
