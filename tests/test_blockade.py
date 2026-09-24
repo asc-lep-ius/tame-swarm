@@ -284,6 +284,13 @@ def test_type_shares_and_paired_t():
     assert flat.sd == 0.0 and flat.p == 0.0
 
 
+def test_load_stage_reads_the_arm_files_and_not_its_own_summary(tmp_path):
+    """A second summarise pass finds the SUMMARY.json the first one wrote, and must skip it."""
+    (tmp_path / "value_none.json").write_text('{"readings": {"0": {"uptake": 0.0}}}')
+    (tmp_path / "SUMMARY.json").write_text('{"stage": "earlier"}')
+    assert driver.load_stage(tmp_path) == {("value", "none"): {"0": {"uptake": 0.0}}}
+
+
 def test_read_pairs_its_control_and_refuses_an_unpaired_one(monkeypatch):
     monkeypatch.setattr(driver, "SETTLE_STEPS", 120)
     blocked = driver.read(driver.Job(driver.QUALITY, "value", 0, driver.LEDGER, WINDOW))

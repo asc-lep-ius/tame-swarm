@@ -525,7 +525,8 @@ def stage_arms(args: argparse.Namespace) -> None:
 
 def load_stage(stage: Path) -> dict[tuple[str, str], dict[str, dict[str, Any]]]:
     loaded: dict[tuple[str, str], dict[str, dict[str, Any]]] = {}
-    for path in sorted(stage.glob("*.json")):
+    # ``<arm>_<blockade>.json`` only: the stage's own SUMMARY.json sits beside them.
+    for path in sorted(stage.glob("*_*.json")):
         arm, blockade = path.stem.rsplit("_", 1)
         loaded[(arm, blockade)] = json.loads(path.read_text())["readings"]
     return loaded
