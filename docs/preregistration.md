@@ -379,20 +379,28 @@ readout that returns one number has not finished.
 
 **2026-09-24, #63 at 1× (README [`#individuation-blockade`](../README.md#individuation-blockade)).**
 The first rung 1 read, on both fixtures, 24 paired seeds, three blockades.
-Against the rung's own row: the freed slots are taken up inside `W` under the
-ledger pin and the gate block on every arm (uptake 0.66–1.00, at once), under
-the output block only on the differentiated fixture (0.73) and not on the
-quality fixture (0.003, where the ledger ranks the silent cell into its slots
-through all of `W`); the on-type loss inside `W` is worse than the control's
-under every blockade on every arm, so no substitution is toward the same
-restored state; the pre-block allocation returns in full after the output block,
-in 2 of 24 seeds after the ledger pin, in 15 and 22 of 24 after the gate block.
-The conjunction the row asks for fails on both fixtures. **Record: lowest rung
-that reliably moved the collective — none; highest rung that failed — 3, twice,
-and now rung 1 at 1× on both fixtures.** The gap is unchanged because the
-lower entry is still empty. What rung 1 did show is written down as a
-description, not a placement: the collective substitutes slots by the ledger's
-ranking on the first blocked token and does not substitute means. The 2× rows
-of the same read run after #73 and re-enter this record; whether the issue's
-criterion reads its uptake clause alone or together with "toward the same
-restored state" is an open fork for the operator, named in the README block.
+Against the rung's own row, on `value`: the freed slots are taken up inside `W`
+under the ledger pin and the gate block (uptake 0.66–1.00, half-life one step;
+the null arms read the same, except `decoupled` under the pin, which reaches
+nothing by construction); under the output block the quality fixture reads
++0.003 — outside the null floor under the paired t (p 2e-7) but negligible and
+uncalibrated, the ledger ranking the silent cell into its slots through all of
+`W` — and the differentiated fixture +0.73 with a share half-life of 195 steps
+against a `W` of 667 taken from the cap, so that uptake is training's and does
+not count as inside `W`. The on-type loss inside `W` is worse than the
+control's under every blockade on every arm. The pre-block allocation returns
+in full after the output block, in 2 of 24 (quality) and 13 of 24
+(differentiated) seeds after the ledger pin, in 15 and 22 of 24 after the gate
+block. **The row fails on its return clause under (ii)**, whichever way the
+issue's criterion is read; that failure rests on releasing the pin at the
+floor, where the ledger has no re-entry (#40), which the row did not
+anticipate and the 2× rows should specify. Whether the substitution clause
+fails too — it does if "the same restored state" is the on-type loss, and does
+not if it is the allocation — is the open fork for the operator named in the
+README block. **Record: lowest rung that reliably moved the collective — none;
+highest rung that failed — 3, twice, and rung 1 at 1× on both fixtures, on the
+return clause.** The gap is unchanged because the lower entry is still empty.
+What rung 1 did show is written down as a description, not a placement: the
+collective re-sells a blocked cell's slots by the ledger's ranking on the first
+blocked token, and inside `W` nothing restores the work. The 2× rows of the
+same read run after #73 and re-enter this record.

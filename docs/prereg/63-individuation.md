@@ -164,3 +164,19 @@ non-return under (ii) was not the ledger's and the setpoint sentence is wrong.
 The gate rows run at six seeds first and enter the 24-seed stage beside the
 other two; the same seeds under the same code, so the six-seed rows of every
 blockade must reproduce bitwise inside the 24-seed record.
+
+## After the arm stages (2026-09-24): W exceeds adaptation on the differentiated fixture
+
+Recorded after the 24-seed stage, and not a change to anything above. The
+rule fixed before the measurement took W from the cap's quarter when the
+on-type loss never re-converged, which gave 667 on the differentiated
+fixture. The blocked cell's own-type share under (i) falls with a half-life
+of 195 steps there (median over 24 seeds, 26–269), and the window measurement
+had already shown the slots gone within about 300 steps. So on this fixture W
+is longer than the collective's adaptation to blockade (i), which is the trap
+the issue names, and the differentiated (i) uptake (+0.73) is a read of
+retraining: it is reported in the README table with that label and section 9
+does not count it as substitution inside W. The (ii) and (iii) rows are
+unaffected — their half-life is one step on both fixtures. For the 2× rows,
+when the loss does not re-converge, W should be taken from the share's own
+half-life under (i) rather than from the cap.
