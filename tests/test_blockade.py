@@ -10,6 +10,7 @@ a different run. The readouts are then checked on hand-built shares where the
 answer is arithmetic.
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -26,6 +27,7 @@ import blockade as driver  # noqa: E402
 from synthetic_economy import (  # noqa: E402
     BASE_CONFIG,
     DEFAULT_COMPETENCE,
+    REDUNDANT_COMPETENCE,
     DifferentiatedEconomy,
     SyntheticEconomy,
     shuffled,
@@ -332,3 +334,91 @@ def test_read_pairs_its_control_and_refuses_an_unpaired_one(monkeypatch):
     other = driver.read(driver.Job(driver.QUALITY, "value", 1, driver.NONE, WINDOW))
     with pytest.raises(AssertionError):
         driver.paired_against_control({"0": blocked}, {"0": other}, "uptake")
+
+
+# --- stage 5: the redundancy fixture and the born-without target ----------------------------
+
+
+def test_the_redundancy_fixture_is_the_quality_fixture_with_a_second_top_cell():
+    """Two cells of equal top competence, and otherwise the recorded vector."""
+    twins = (REDUNDANT_COMPETENCE.max() == REDUNDANT_COMPETENCE).nonzero().flatten().tolist()
+    assert len(twins) == 2
+    differs = (REDUNDANT_COMPETENCE != DEFAULT_COMPETENCE).nonzero().flatten().tolist()
+    assert len(differs) == 1
+    assert float(DEFAULT_COMPETENCE[differs[0]]) == pytest.approx(0.3)
+
+    built = driver.build(driver.REDUNDANCY, "value", 0, 1.0)
+    assert isinstance(built, SyntheticEconomy) and not isinstance(built, DifferentiatedEconomy)
+    assert torch.equal(built.competence, shuffled(REDUNDANT_COMPETENCE, 0))
+    assert torch.equal(driver.expert_types(built), torch.zeros(8, dtype=torch.long))
+    with pytest.raises(ValueError, match="differentiated"):
+        driver.build(driver.REDUNDANCY, "value", 0, 2.0)
+
+
+def test_the_predicted_substitute_on_the_redundancy_fixture_is_the_shut_out_twin():
+    """With one twin seated beside the 0.7, the best cell not already winning is the other twin."""
+    competence = REDUNDANT_COMPETENCE
+    seated, other = 0, 6
+    assert float(competence[seated]) == float(competence[other]) == pytest.approx(0.9)
+    pre = torch.zeros(8)
+    pre[seated], pre[1] = 0.5, 0.5
+    on_type = torch.ones(8, dtype=torch.bool)
+
+    assert predicted_substitute(competence, on_type, pre, seated, 2) == other
+
+
+def test_the_target_is_the_arms_own_and_a_row_blocking_another_cell_is_refused():
+    rows = {
+        "0": {"blocked_cell": 1, "inside_on_type_loss": 0.011},
+        "1": {"blocked_cell": 2, "inside_on_type_loss": 0.030},
+    }
+    targets = {
+        "0": {"blocked_cell": 1, "born_without_on_type_loss": 0.010},
+        "1": {"blocked_cell": 2, "born_without_on_type_loss": 0.020},
+    }
+
+    read = driver.against_target(rows, targets)
+
+    assert read["reached_target"] == 1
+    assert read["gap_to_target"] == {"0": pytest.approx(0.001), "1": pytest.approx(0.010)}
+    assert read["mean_gap"] == pytest.approx(0.0055)
+    with pytest.raises(AssertionError, match="blocked cell"):
+        driver.against_target(rows, {**targets, "1": {**targets["1"], "blocked_cell": 3}})
+
+
+def test_summarise_reads_the_targets_when_they_exist_and_says_so(tmp_path):
+    def reading(blocked: int, loss: float, uptake: float) -> dict:
+        return {
+            "pre_shares": [0.5, 0.5, 0.0],
+            "blocked_cell": blocked,
+            "uptake": uptake,
+            "inside_on_type_loss": loss,
+            "returned": 1.0,
+            "guardrail/ceiling_occupancy": 0.25,
+            "guardrail/floor_occupancy": 0.75,
+            "guardrail/r_wealth_competence": 0.8,
+        }
+
+    stage = tmp_path / "arms_redundancy-fixture_2seeds"
+    stage.mkdir()
+    for arm in driver.ARMS:
+        for blockade, loss in ((driver.NONE, 0.010), (driver.LEDGER, 0.012)):
+            rows = {"0": reading(1, loss, 0.0 if blockade == driver.NONE else 0.9)}
+            rows["1"] = reading(1, loss + 0.001, rows["0"]["uptake"])
+            (stage / f"{arm}_{blockade}.json").write_text(json.dumps({"readings": rows}))
+    targets = {
+        arm: {seed: {"blocked_cell": 1, "born_without_on_type_loss": 0.0115} for seed in ("0", "1")}
+        for arm in driver.ARMS
+    }
+
+    assert driver.stage_fixture(stage) == driver.REDUNDANCY
+    without = driver.summarise_stage(stage)
+    assert without["targets_read"] is False
+    assert "against_target" not in without["against_control"]["ledger/value/inside_on_type_loss"]
+
+    summary = driver.summarise_stage(stage, targets)
+    assert summary["targets_read"] is True
+    row = summary["against_control"]["ledger/value/inside_on_type_loss"]
+    # 0.012 and 0.013 against 1.1 x 0.0115 = 0.01265: one seed reaches the target.
+    assert row["against_target"]["reached_target"] == 1
+    assert "against_target" not in summary["against_control"]["ledger/value/uptake"]

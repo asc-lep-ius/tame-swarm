@@ -54,6 +54,15 @@ from mob import LightweightExpert, MixtureOfBidders, MoBConfig  # noqa: E402
 # project has used, so numbers here are comparable with the sweep and the
 # stationarity run.
 DEFAULT_COMPETENCE = torch.tensor([0.9, 0.7, 0.55, 0.5, 0.45, 0.4, 0.3, 0.1])
+# #63 stage 5: the recorded vector with its 0.3 replaced by a second 0.9 -- two
+# cells of equal top competence, so a substitute exists that can do the blocked
+# cell's work. Measured on seeds 0-5 before any stage ran (2026-09-25): under
+# the live ledger the seniority the quality fixture runs on (#62) seats one twin
+# beside the 0.7 and shuts the other out on every seed, at the floor, where a
+# blockade of the seated twin can ask whether the auction hands the freed slot
+# to the cell that can do the work or to the next cell by wealth. Replacing the
+# 0.7 instead seats both twins on half the seeds and asks nothing.
+REDUNDANT_COMPETENCE = torch.tensor([0.9, 0.7, 0.55, 0.5, 0.45, 0.4, 0.9, 0.1])
 
 BASE_CONFIG = MoBConfig(
     num_experts=8,

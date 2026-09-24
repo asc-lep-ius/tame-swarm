@@ -28,6 +28,16 @@ quality fixture, where the substitute is predicted to be the next most competent
 cell) and the null calibration (``--stage null``) come before any arm contrast
 (``--stage arms``, then ``--stage summarise``). Rule 8 puts ceiling and floor
 occupancy and ``r(wealth, competence)`` beside every reading.
+
+**Stage 5, the redundancy fixture** (``--fixtures redundancy-fixture``): the
+quality fixture with a second cell at the top competence, which the seniority
+the live ledger runs on (#62) seats beside the 0.7 on no seed -- so a cell that
+can do the blocked cell's work sits at the floor, and the question the recorded
+fixtures cannot ask is whether the auction hands the freed slot to it. The
+criterion the operator fixed for it is the *born-without target*: the on-type
+loss a collective born without the blocked cell settles at, which ``--stage
+targets`` measures per arm and seed and ``--stage summarise`` reads every
+blocked window against.
 """
 
 from __future__ import annotations
@@ -55,6 +65,7 @@ from sweep_wealth_bounds import CEILING_TOLERANCE, FLOOR_TOLERANCE  # noqa: E402
 from synthetic_economy import (  # noqa: E402
     BASE_CONFIG,
     DEFAULT_COMPETENCE,
+    REDUNDANT_COMPETENCE,
     DifferentiatedEconomy,
     SyntheticEconomy,
     pearson,
@@ -78,7 +89,15 @@ from parity import code_identity  # noqa: E402
 
 QUALITY = "quality-fixture"
 DIFFERENTIATED = "differentiated-fixture"
-FIXTURES = (QUALITY, DIFFERENTIATED)
+REDUNDANCY = "redundancy-fixture"
+FIXTURES = (QUALITY, DIFFERENTIATED, REDUNDANCY)
+# The two fixtures the 1x stages were recorded on, which is what a stage runs
+# on when none is named; stage 5's fixture is named explicitly.
+RECORDED_FIXTURES = (QUALITY, DIFFERENTIATED)
+# Where a planted substitute is predicted: one type, so the best cell not
+# already winning is defined; the differentiated fixture has two cells a type
+# and nothing to predict.
+PLANTED_FIXTURES = (QUALITY, REDUNDANCY)
 ARMS = (PERSISTENCE_VALUE, PERSISTENCE_SHUFFLED, PERSISTENCE_DECOUPLED)
 NONE, OUTPUT, LEDGER, GATE = "none", "output", "ledger", "gate"
 BLOCKADES = (NONE, OUTPUT, LEDGER, GATE)
@@ -114,11 +133,12 @@ def build(
     ``economy_damage.floor_without`` reads re-formation against.
     """
     config = replace(BASE_CONFIG, persistence_coupling=arm)
-    competence = shuffled(DEFAULT_COMPETENCE, seed)
+    planted = REDUNDANT_COMPETENCE if fixture == REDUNDANCY else DEFAULT_COMPETENCE
+    competence = shuffled(planted, seed)
     if without is not None:
         competence = competence.clone()
         competence[without] = 0.0
-    if fixture == QUALITY:
+    if fixture in PLANTED_FIXTURES:
         if scale != 1.0:
             raise ValueError("contribution_scale is the differentiated fixture's knob")
         return SyntheticEconomy(competence, seed=seed, config=config)
@@ -356,11 +376,47 @@ def measure_window(fixture: str, seed: int, scale: float) -> dict[str, Any]:
     }
 
 
+@dataclass(frozen=True)
+class TargetJob:
+    fixture: str
+    arm: str
+    seed: int
+    scale: float = 1.0
+
+
+def measure_target(job: TargetJob) -> dict[str, Any]:
+    """The born-without target for one arm and seed: what the remaining means allow.
+
+    The dominant cell is read off the arm's own settled state -- under a
+    pinned ledger the winner set can differ from the live arm's -- and the
+    collective born without it is the same seed with that cell's competence
+    zero (``build``'s ``without``), settled the same way. Its on-type loss is
+    the state the operator fixed as "the same restored state" (#63, 2026-09-24):
+    substitution counts when the loss inside W reaches what the means allow.
+    """
+    economy, pre = settle(job.fixture, job.arm, job.seed, job.scale)
+    types = expert_types(economy)
+    blocked = dominant_cell(pre.own_type_wins(types), economy.competence)
+    cell_type = int(types[blocked])
+    born_without = build(job.fixture, job.arm, job.seed, job.scale, without=blocked)
+    observe(born_without, SETTLE_STEPS - TAIL)
+    tail = observe(born_without, TAIL)
+    return {
+        **asdict(job),
+        "blocked_cell": blocked,
+        "blocked_type": cell_type,
+        "pre_on_type_loss": pre.on_type_loss(cell_type),
+        "born_without_on_type_loss": tail.on_type_loss(cell_type),
+        "born_without_shares": tail.shares(cell_type).tolist(),
+        **identity(),
+    }
+
+
 def _single_thread() -> None:
     torch.set_num_threads(1)
 
 
-def run_jobs(jobs: list[Job], workers: int) -> list[dict[str, Any]]:
+def run_jobs(jobs: list[Job] | list[TargetJob], workers: int) -> list[dict[str, Any]]:
     # Spawned, never forked: a forked child of a CUDA-initialised parent dies
     # in Adam's stream check, and the parent hides the card (``hide_the_card``)
     # so a body run on the same box is not disturbed by a fixture that has no
@@ -369,6 +425,8 @@ def run_jobs(jobs: list[Job], workers: int) -> list[dict[str, Any]]:
     with ProcessPoolExecutor(
         max_workers=workers, initializer=_single_thread, mp_context=spawn
     ) as pool:
+        if jobs and isinstance(jobs[0], TargetJob):
+            return list(pool.map(measure_target, jobs))
         return list(pool.map(read, jobs))
 
 
@@ -433,21 +491,35 @@ def load_window(out: Path, fixture: str) -> int:
 
 
 def stage_planted(args: argparse.Namespace) -> None:
-    """Rule 7's first half: the predicted substitute takes the freed share, six seeds, paired t."""
-    window = load_window(args.out, QUALITY)
+    """Rule 7's first half: the predicted substitute takes the freed share, six seeds, paired t.
+
+    One record per planted fixture, ``planted_<fixture>.json``; the quality
+    fixture's 1x record was written before the name carried the fixture and
+    stays at ``planted.json`` in ``~/tame-runs/individuation/``.
+    """
+    for fixture in args.fixtures:
+        if fixture not in PLANTED_FIXTURES:
+            print(f"{fixture}: no planted substitute to predict; skipped")
+            continue
+        _planted(args, fixture)
+
+
+def _planted(args: argparse.Namespace, fixture: str) -> None:
+    window = load_window(args.out, fixture)
     jobs = [
-        Job(QUALITY, PERSISTENCE_VALUE, seed, b, window) for seed in args.seeds for b in BLOCKADES
+        Job(fixture, PERSISTENCE_VALUE, seed, b, window) for seed in args.seeds for b in BLOCKADES
     ]
     readings = run_jobs(jobs, args.workers)
     grouped = group(readings)
     record: dict[str, Any] = {
+        "fixture": fixture,
         "window": window,
         "seeds": list(args.seeds),
         "blockades": {},
         **identity(),
     }
     for blockade in READ_BLOCKADES:
-        rows = grouped[(QUALITY, PERSISTENCE_VALUE, blockade)]
+        rows = grouped[(fixture, PERSISTENCE_VALUE, blockade)]
         statistic = {seed: row["planted_statistic"] for seed, row in rows.items()}
         test = paired_t(list(statistic.values()))
         hits = sum(int(row["predicted_hit"]) for row in rows.values())
@@ -456,17 +528,50 @@ def stage_planted(args: argparse.Namespace) -> None:
             "paired_t": test.as_dict(),
             "predicted_hits": hits,
             "uptake": paired_against_control(
-                rows, grouped[(QUALITY, PERSISTENCE_VALUE, NONE)], "uptake"
+                rows, grouped[(fixture, PERSISTENCE_VALUE, NONE)], "uptake"
             ),
             "recovered": test.p < 0.05 and test.mean > 0,
             "readings": rows,
         }
         print(
-            f"planted, {blockade}: statistic mean {test.mean:+.4f} dz {test.dz:+.3f} "
+            f"planted, {fixture}, {blockade}: statistic mean {test.mean:+.4f} dz {test.dz:+.3f} "
             f"t {test.t:+.2f} "
             f"p {test.p:.4f}; predicted substitute the largest gainer in {hits}/{len(rows)} seeds"
         )
-    write_json(args.out / "planted.json", record)
+    write_json(args.out / f"planted_{fixture}.json", record)
+
+
+def stage_targets(args: argparse.Namespace) -> None:
+    """The born-without target per arm and seed, read by ``summarise`` against every window."""
+    for fixture in args.fixtures:
+        jobs = [TargetJob(fixture, arm, seed, args.scale) for arm in ARMS for seed in args.seeds]
+        readings = run_jobs(jobs, args.workers)
+        record: dict[str, Any] = {
+            "fixture": fixture,
+            "seeds": list(args.seeds),
+            "targets": {arm: {} for arm in ARMS},
+            **identity(),
+        }
+        for reading in readings:
+            record["targets"][reading["arm"]][str(reading["seed"])] = reading
+        write_json(args.out / f"targets_{fixture}.json", record)
+        for arm in ARMS:
+            rows = record["targets"][arm]
+            gap = [
+                row["born_without_on_type_loss"] - row["pre_on_type_loss"] for row in rows.values()
+            ]
+            print(
+                f"targets, {fixture}, {arm}: born-without minus pre-block on-type loss "
+                f"{statistics.fmean(gap):+.4f} (min {min(gap):+.4f}, max {max(gap):+.4f}) "
+                f"over {len(rows)} seeds"
+            )
+
+
+def load_targets(out: Path, fixture: str) -> dict[str, dict[str, dict[str, Any]]] | None:
+    path = out / f"targets_{fixture}.json"
+    if not path.exists():
+        return None
+    return json.loads(path.read_text())["targets"]
 
 
 def stage_null(args: argparse.Namespace) -> None:
@@ -532,13 +637,53 @@ def load_stage(stage: Path) -> dict[tuple[str, str], dict[str, dict[str, Any]]]:
     return loaded
 
 
-def summarise_stage(stage: Path) -> dict[str, Any]:
+def stage_fixture(stage: Path) -> str:
+    """``arms_<fixture>_<n>seeds`` names the fixture its readings came from."""
+    return stage.name[len("arms_") :].rsplit("_", 1)[0]
+
+
+def against_target(
+    rows: dict[str, dict[str, Any]], targets: dict[str, dict[str, Any]]
+) -> dict[str, Any]:
+    """The loss inside W against what the means allow, per seed: the operator's criterion.
+
+    A window whose on-type loss is within ``RE_FORMATION_FACTOR`` of the
+    born-without target has substituted to what the remaining means allow --
+    the same factor the window stage reads re-convergence with. The target is
+    the arm's own, since a pinned ledger can seat a different winner set, and a
+    row whose blocked cell is not the target's is refused rather than compared.
+    """
+    gaps: dict[str, float] = {}
+    reached = 0
+    for seed, row in rows.items():
+        target = targets[seed]
+        if target["blocked_cell"] != row["blocked_cell"]:
+            raise AssertionError(
+                f"seed {seed}: the target was read without cell {target['blocked_cell']} and "
+                f"the window blocked cell {row['blocked_cell']}"
+            )
+        gaps[seed] = row["inside_on_type_loss"] - target["born_without_on_type_loss"]
+        reached += (
+            row["inside_on_type_loss"] <= RE_FORMATION_FACTOR * target["born_without_on_type_loss"]
+        )
+    return {
+        "gap_to_target": gaps,
+        "mean_gap": statistics.fmean(gaps.values()),
+        "reached_target": reached,
+        "factor": RE_FORMATION_FACTOR,
+    }
+
+
+def summarise_stage(
+    stage: Path, targets: dict[str, dict[str, dict[str, Any]]] | None = None
+) -> dict[str, Any]:
     """Every contrast in one stage, against the control and between arms, with dz and its seeds."""
     loaded = load_stage(stage)
     summary: dict[str, Any] = {
         "stage": str(stage),
         "against_control": {},
         "between_arms": {},
+        "targets_read": targets is not None,
         **identity(),
     }
     against: dict[str, dict[str, dict[str, dict[str, float]]]] = {}
@@ -563,6 +708,8 @@ def summarise_stage(stage: Path) -> dict[str, Any]:
                     row["within_tolerance"] = sum(
                         abs(d) <= RETURN_TOLERANCE for d in deltas.values()
                     )
+                if field == "inside_on_type_loss" and targets is not None:
+                    row["against_target"] = against_target(rows, targets[arm])
                 summary["against_control"][f"{blockade}/{arm}/{field}"] = row
         for field in ("uptake", "inside_on_type_loss"):
             for other in (PERSISTENCE_SHUFFLED, PERSISTENCE_DECOUPLED):
@@ -594,15 +741,25 @@ def guardrail_columns(rows: dict[str, dict[str, Any]]) -> dict[str, float]:
 
 def stage_summarise(args: argparse.Namespace) -> None:
     for stage in sorted(path for path in args.out.glob("arms_*") if path.is_dir()):
-        summary = summarise_stage(stage)
+        fixture = stage_fixture(stage)
+        if fixture not in args.fixtures:
+            continue
+        summary = summarise_stage(stage, load_targets(args.out, fixture))
         write_json(stage / "SUMMARY.json", summary)
-        print(f"\n== {stage.name} ==")
+        print(f"\n== {stage.name} (targets {'read' if summary['targets_read'] else 'absent'}) ==")
         for name, row in summary["against_control"].items():
+            target = row.get("against_target")
+            reached = ""
+            if target:
+                reached = (
+                    f"  to target {target['mean_gap']:+.4f}, "
+                    f"reached {target['reached_target']}/{row['n']:.0f}"
+                )
             print(
                 f"  {name:<40} mean {row['mean']:+.4f}  dz {row['dz']:+.3f}  p {row['p']:.4f}"
                 f"  ceiling {row['guardrail']['guardrail/ceiling_occupancy']:.3f}"
                 f"  floor {row['guardrail']['guardrail/floor_occupancy']:.3f}"
-                f"  r {row['guardrail']['guardrail/r_wealth_competence']:+.3f}"
+                f"  r {row['guardrail']['guardrail/r_wealth_competence']:+.3f}{reached}"
             )
         for name, row in summary["between_arms"].items():
             print(
@@ -623,9 +780,11 @@ def build_parser() -> argparse.ArgumentParser:
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument(
-        "--stage", choices=("window", "planted", "null", "arms", "summarise"), required=True
+        "--stage",
+        choices=("window", "planted", "null", "targets", "arms", "summarise"),
+        required=True,
     )
-    parser.add_argument("--fixtures", nargs="+", choices=FIXTURES, default=list(FIXTURES))
+    parser.add_argument("--fixtures", nargs="+", choices=FIXTURES, default=list(RECORDED_FIXTURES))
     parser.add_argument("--seeds", type=parse_seeds, default=None, help="`0-5` or `0,1,2`")
     parser.add_argument(
         "--scale", type=float, default=1.0, help="contribution_scale; 1.0 is the recorded fixture"
@@ -648,6 +807,7 @@ DEFAULT_SEEDS = {
     "window": (0,),
     "planted": EXPLORATORY_SEEDS,
     "null": NULL_SEEDS,
+    "targets": CONFIRMATORY_SEEDS,
     "arms": EXPLORATORY_SEEDS,
     "summarise": (),
 }
@@ -655,6 +815,7 @@ STAGES = {
     "window": stage_window,
     "planted": stage_planted,
     "null": stage_null,
+    "targets": stage_targets,
     "arms": stage_arms,
     "summarise": stage_summarise,
 }

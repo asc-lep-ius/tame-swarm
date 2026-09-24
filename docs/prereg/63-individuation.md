@@ -181,3 +181,75 @@ unaffected — their half-life is one step on both fixtures. A proposal for the
 2× rows, which changes a rule fixed before the run and so waits on the
 operator: when the loss does not re-converge, take W from the share's own
 half-life under (i) rather than from the cap.
+
+## Stage 5 (2026-09-25, before it ran): the redundancy fixture
+
+Added by the operator on 2026-09-24 with the criterion fixed for the 2× rows:
+*the same restored state* is the **born-without target**, the on-type loss a
+collective born without the blocked cell settles at. The two recorded fixtures
+cannot ask whether the auction hands a freed slot to a cell that can do the
+work, because on the quality fixture no such cell exists and on the
+differentiated one the freed slots go to wrong-type cells. This fixture is the
+quality fixture with its 0.3 replaced by a second 0.9
+(`synthetic_economy.REDUNDANT_COMPETENCE`, `--fixtures redundancy-fixture`):
+two cells of equal top competence, one type, 1× only, the same three blockades
+and the same stages, plus a `targets` stage that measures the born-without
+target per arm and seed so that `summarise` reads every blocked window
+against it (`against_target`: the gap, and how many seeds reach the target
+within the 1.1× the window stage already uses).
+
+**Measured before any stage ran, seeds 0–5, settled 2667 steps, and recorded
+here so it cannot be read as a result.** Under `value` the seniority the quality
+fixture runs on (#62) seats one twin beside the 0.7 on every seed and shuts the
+other out, at the floor (wealth 15–20, share 0.002); the alternative — replacing
+the 0.7 — seats both twins on three seeds of six and asks nothing, which is why
+the 0.3 was replaced. Under `shuffled` one twin is seated with the 0.7 on four
+seeds, with the 0.5 on one, and seed 5 churns three cells; under `decoupled`,
+where the gate reads a pinned equal wealth and the reports alone decide, a twin
+is seated on four seeds and **both twins are shut out on seeds 1 and 2** (the
+0.7 and 0.55 win). So on every arm and every seed at least one 0.9 sits outside
+the winner set: a substitute that can do the work exists, and the dominant
+cell — the seated twin under `value` — is the cell whose blockade asks whether
+the auction finds it.
+
+**Predictions, `value` at 1×, blocked minus control, paired by seed**, from the
+setpoint sentence above ("a full allocation ranked by the ledger") and one
+addition it did not need before: at the floor the ledger cannot rank, since
+every shut-out cell sits within a few credits of 15, so *among the shut-out
+cells the report decides*, and the shut-out twin's head has trained on its gift
+tokens where it realised 0.9-level value.
+
+1. **Under (ii) and (iii), uptake ≈ 1** at once, half-life one step, as on the
+   quality fixture. Under (i) ≈ 0 inside W: seniority holds the silent twin in
+   its slots.
+2. **The freed slot goes to the shut-out twin** under (ii) and (iii): the
+   planted statistic (`predicted_substitute` names the twin) is recovered at
+   six seeds, paired t positive at p < 0.05, the twin the largest gainer in at
+   least four seeds of six.
+3. **The on-type loss inside W reaches the born-without target** under (ii)
+   and (iii) — on this fixture the collective born without one twin seats the
+   other beside the 0.7, so the target is close to the pre-block loss, and
+   reaching it is a substitution *of means*, the first in this record if it
+   holds. Under (i) the loss inside W does not reach it (the silent twin keeps
+   its slots).
+4. **Between arms, a predicted sign.** `shuffled` heads regress onto another
+   cell's realised values, so the shut-out twin's report there is not its own
+   competence: the twin is recovered less often and the gap to the target is
+   larger than under `value` — `value` − `shuffled` on the planted statistic
+   and on the gap to the target read positive for the twin and negative for the
+   gap. `decoupled` chooses by report at pinned equal wealth, so it recovers
+   the twin as `value` does, against its own target (its pre-block winner set
+   differs, and on seeds 1 and 2 the blocked "dominant cell" is not a twin).
+5. **Return on release** as before: full after (i), absent after (ii) (the
+   floor has no re-entry, #40), mixed after (iii).
+
+If 2 and 3 hold and 4 does not — the twin is recovered on `shuffled` too — the
+substitution is the auction reading *any* report at a flat ledger, and stakes
+add nothing to it at 1× on this fixture either. If 2 fails — the slot goes by
+wealth rank to a cell that cannot do the work while a twin sits at the floor —
+the setpoint sentence holds unqualified and the tissue restores the ledger's
+ranking even where a competent substitute exists, which is the strongest form
+of "no entity at the cell scale at 1×" this fixture can return. W is measured
+on seed 0 first and written here before the arms run; the stages run in rule
+7's order: window, planted, null, targets, arms at six seeds, summarise, arms
+at twenty-four, summarise.
