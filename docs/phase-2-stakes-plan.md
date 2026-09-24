@@ -150,3 +150,63 @@ then:     #47, #45 (with #60)
 last:     #44, re-declared under #57 and section 8, on a bound tissue
 reserve:  #48, on #58's line and #57's reading
 ```
+
+## Amended 2026-09-23, third: signal before stakes
+
+Every null Phase 2 has read so far was an arm contrast on an aggregate at 1×
+contribution scale, and #57 measured that such a number at six seeds is one
+draw from a range spanning three orders of magnitude. #59's coupling run
+resolved nothing at power 0.256 (three of its four positive claims withdrawn);
+#60's grid measured the wealth band rather than the cells' share of the output
+and both its readings are withdrawn (README `#self-model`,
+`~/tame-runs/60-self-model/WITHDRAWN.md`). The operator's priorities stand —
+the vision over the schedule, GPU-hours the binding constraint — so a
+milestone was inserted before any stake is re-tested: **Phase 2.5, Signal
+Before Stakes** (milestone 5, label `phase-2.5`, #62–#69 filed 2026-09-21 and
+#73 the same evening). Its job is a readout with the shape of the entity
+criterion, calibrated before it is pointed at an arm.
+
+12. **A placement, not a verdict, is what a stakes readout returns.** #68
+    writes the ladder into `docs/preregistration.md` section 9 — physical
+    blockade (#63), setpoint step (#59's readout), payment change (#39's dial),
+    each with its intervention, dose, window, criterion and trial count fixed
+    before the first trial — and every stakes readout after it records two
+    numbers: the lowest rung that reliably moved the collective and the highest
+    that failed. Section 8 gains two rules beside it: a readout recovers a
+    planted effect of known sign at six seeds and is null-calibrated on split
+    same-arm runs before it reads an arm contrast (rule 7), and a cell whose
+    ledger sits on a bound is a different economy and is not read (rule 8).
+    "Is there a self at the cell scale" is retired as a question.
+13. **#59's and #60's 1× readings stand as measurements; their decisions are
+    taken at 2×.** #59's calibrated primary (power 0.256), its saturated-regime
+    reading and its four secondaries are carried to #67 as predictions and
+    re-read at 49 paired seeds a side. #60's 1× null at 4, 8 and 16 cells
+    stands; its scored self-prediction is rebuilt under #66 on dense
+    counterfactual targets, in the skill form, after #70's fix. Neither runs
+    before #73 has derived the exchange rate: `reward_scale` per configuration
+    from the settled economy's own inflow and charge, static and fingerprinted,
+    returning the recorded 2.0 within 1e-6 at 1× with the economy bitwise the
+    one recorded (the fork taken over a running
+    normaliser on realised value, for the reasons #73 carries).
+14. **#42 is re-gated on #63.** The core is built on a cell scale that has
+    passed individuation — two structurally different blockades toward the same
+    restored state, inside a window shorter than adaptation — or on the record
+    that it has not, which is #48's hand-off. #42 follows #63 and #67, not #59
+    alone.
+15. **#44's power row comes from #69.** The body pair #69 runs (a memory smoke,
+    one exploratory pair, a priced confirmation only if it fits the 15 GPU-hour
+    ceiling) is where the fixture-to-body discount section 8 rule 3 calls an
+    assumption is measured for the ladder's readouts; #44 sources its Power
+    and Calibration rows from it and does not run before it.
+
+### Order of work, amended a third time
+
+```
+now:      #68 (the ladder and the rules, docs)  ->  #62 | #63 at 1× (CPU, parallel)
+then:     #73 (the exchange rate)  ->  #64  ->  #65 if #62/#64 gate it in
+then:     #66 | #67 at 2× (after #73, and #70's fix for #66)
+then:     #69 (one priced body pair; on hold until #64 reads "one lever")
+then:     #42 (gated on #63)  ->  #43  ->  #47, #45
+last:     #44, on a bound tissue, with #69's power and calibration rows
+reserve:  #48, on #58's line and #63's "no" at 2×
+```
