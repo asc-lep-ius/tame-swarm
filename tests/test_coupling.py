@@ -226,11 +226,19 @@ def test_detach_restores_the_uncoupled_forward_after_the_receptor_has_trained():
 
 
 def test_norm_cap_binds_where_the_raw_delta_exceeds_it():
-    """Construct a delta larger than the cap and check the cap is what comes out."""
+    """Construct a delta larger than the cap and check the cap is what comes out.
+
+    Seeded, because the draw below is the fixture's own precondition rather than
+    the thing under test: `h0` is centred on 3 but unbounded, so an unseeded draw
+    lands under the cap on about 0.07% of runs (3 in 4000 measured) and fails on
+    the assertion that the fixture is a fixture. At this seed the smallest raw
+    fraction is 165x the cap.
+    """
     cap = 0.05
     direction = torch.eye(HIDDEN)[0]
     gain = 20.0
-    hidden = torch.randn(2, 4, HIDDEN)
+    generator = torch.Generator().manual_seed(10)
+    hidden = torch.randn(2, 4, HIDDEN, generator=generator)
     hidden[..., 0] += 3.0  # a strong goal component: raw fraction = gain * |h0| / |h|
     hidden[0, 0].zero_()
     hidden_norm = hidden.norm(dim=-1)

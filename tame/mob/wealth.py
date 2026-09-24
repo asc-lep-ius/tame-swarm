@@ -109,6 +109,9 @@ class WealthUpdateMixin:
     _cached_explored: torch.Tensor | None
     _cached_values: torch.Tensor | None
     _cached_goal_terms: torch.Tensor | None
+    _cached_stress: torch.Tensor | None
+    # What #59's charge took from every cell at the last settlement.
+    last_stress_charge: float
     _loss_feedback_pending: bool
     _cached_calibration_loss: torch.Tensor | None
     last_value_summary: ValueSummary | None
@@ -324,12 +327,24 @@ class WealthUpdateMixin:
 
         self._cached_calibration_loss = objective * weight
 
+    def _stress_for(self, seq_len: int) -> torch.Tensor | None:
+        """This step's transmitted stress, trimmed to the tokens the loss reached (#59).
+
+        The forward caches it over the whole sequence and the loss can arrive
+        shorter, exactly as the values and goal terms can; trimmed the same way
+        and for the same reason.
+        """
+        if self._cached_stress is None:
+            return None
+        return self._cached_stress[:, :seq_len]
+
     def _discard_loss_feedback(self) -> None:
         self._loss_feedback_pending = False
         self._live_confidences = None
         self._cached_calibration_loss = None
         self._cached_values = None
         self._cached_goal_terms = None
+        self._cached_stress = None
 
     def update_wealth_from_loss(
         self,
@@ -423,7 +438,7 @@ class WealthUpdateMixin:
 
             valid_mask = self._valid_token_mask(token_mask, batch_size, seq_len)
 
-            self.wealth_updater.settle(
+            self.last_stress_charge = self.wealth_updater.settle(
                 self.expert_wealth,
                 Settlement(
                     selected_experts=selected_experts,
@@ -435,6 +450,7 @@ class WealthUpdateMixin:
                     valid_mask=valid_mask,
                     values=values,
                     usage_count=self.expert_usage_count,
+                    stress=self._stress_for(seq_len),
                 ),
                 self._vcg_charges,
             )
@@ -448,6 +464,7 @@ class WealthUpdateMixin:
             self._loss_feedback_pending = False
             self._cached_values = None
             self._cached_goal_terms = None
+            self._cached_stress = None
 
         self._compute_and_cache_calibration_loss(values, selected_experts, valid_mask)
 
@@ -568,7 +585,7 @@ class WealthUpdateMixin:
         """
         with torch.no_grad():
             batch_size, seq_len, _ = confidences.shape
-            self.wealth_updater.settle(
+            self.last_stress_charge = self.wealth_updater.settle(
                 self.expert_wealth,
                 Settlement(
                     selected_experts=selected_experts,

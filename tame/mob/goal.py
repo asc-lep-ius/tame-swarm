@@ -92,6 +92,34 @@ def error_relieved(reading: torch.Tensor, push: torch.Tensor, setpoint: float) -
     return error_without - error_with
 
 
+def goal_reading(
+    contributions: torch.Tensor,
+    routing_weights: torch.Tensor,
+    direction: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """What the tissue holds along a direction on each token, and each slot's push.
+
+    The reading is the sum over winner slots of share times coordinate -- what
+    the experts *added* at this layer, projected. Factored out of
+    :func:`goal_error_reduction` rather than written twice because #59 charges a
+    cell for the magnitude of the same reading's error, and two copies of a
+    projection are two things to get wrong.
+    """
+    d = direction.to(torch.float32)
+    if d.dim() == 1:
+        d = d.view(1, 1, -1)
+    norm_sq = (d * d).sum(dim=-1, keepdim=True)
+    dots = (contributions.float() * d.unsqueeze(-2)).sum(dim=-1)
+    # A zero direction on a token is no field on that token, not an infinity.
+    coordinates = torch.where(
+        norm_sq > 0,
+        dots / norm_sq.clamp_min(torch.finfo(torch.float32).tiny),
+        torch.zeros_like(dots),
+    )
+    pushes = routing_weights.float() * coordinates
+    return pushes.sum(dim=-1), pushes
+
+
 def goal_error_reduction(
     contributions: torch.Tensor,
     routing_weights: torch.Tensor,
@@ -107,20 +135,8 @@ def goal_error_reduction(
     is against the tissue without that cell, the other winners left in place.
     Accumulated in float32 for the reason ``realised_values`` is.
     """
-    d = direction.to(torch.float32)
-    if d.dim() == 1:
-        d = d.view(1, 1, -1)
-    norm_sq = (d * d).sum(dim=-1, keepdim=True)
-    dots = (contributions.float() * d.unsqueeze(-2)).sum(dim=-1)
-    # A zero direction on a token is no field on that token, not an infinity.
-    coordinates = torch.where(
-        norm_sq > 0,
-        dots / norm_sq.clamp_min(torch.finfo(torch.float32).tiny),
-        torch.zeros_like(dots),
-    )
-    pushes = routing_weights.float() * coordinates
-    reading = pushes.sum(dim=-1, keepdim=True)
-    return error_relieved(reading, pushes, setpoint)
+    reading, pushes = goal_reading(contributions, routing_weights, direction)
+    return error_relieved(reading.unsqueeze(-1), pushes, setpoint)
 
 
 def goal_terms(
