@@ -1,5 +1,6 @@
 """The fixture port of #58's counterfactual-route read reads what it claims (#64)."""
 
+import math
 import sys
 from pathlib import Path
 
@@ -158,7 +159,5 @@ def test_the_swing_to_contrast_correlation_recovers_a_planted_line():
     assert read["fisher_interval"][1] < -0.9
     assert read["permutation_p"] <= 0.01
     # Too few cells to correlate at all comes back as nan rather than a number.
-    assert (
-        port.swing_contrast_correlation(dict(list(grouped.items())[:2]), contrasts)["r"]
-        != read["r"]
-    )
+    few = port.swing_contrast_correlation(dict(list(grouped.items())[:2]), contrasts)
+    assert math.isnan(few["r"])
