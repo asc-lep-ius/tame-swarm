@@ -42,6 +42,7 @@ relative to the executed loss of the token it was read on.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import multiprocessing
@@ -69,6 +70,7 @@ from measure_ledger_stability import (  # noqa: E402
     DEFAULT_SEEDS as DERIVATION_SEEDS,
 )
 from measure_ledger_stability import (
+    DIFFERENTIATED,
     FIXTURES,
     QUALITY,
     ClampedLedgerError,
@@ -274,6 +276,12 @@ def alternatives_read(
     moved_total = moved_better = moved_swing = 0.0
     confident = executed.losses <= float(executed.losses.quantile(CONFIDENT_QUANTILE))
     confident_better = 0.0
+    # The body's rate counted every draw-token pair, and on the body an
+    # unmoved token was still beaten about half the time by the stream
+    # upstream of it; on the fixture an unmoved token ties exactly, so the
+    # same rate is diluted by the pairs no draw moved. The conditional pair
+    # -- moved and confident -- is the one that compares with the body.
+    confident_moved = confident_moved_better = 0.0
     for _ in range(alternatives):
         wrapper = GumbelTopKRoute(gate, generator, noise_scale, subset=None)
         with routed_by(economy, wrapper):
@@ -281,13 +289,18 @@ def alternatives_read(
         if alternative.tokens != executed.tokens:
             raise ValueError("an alternative route read a different number of tokens")
         moved = (alternative.routes != executed.routes).any(dim=-1)
-        improved = alternative.losses < executed.losses
+        # A token no draw moved reads the executed loss up to the order the
+        # same cells' outputs were summed in, so "better" is only ever read on
+        # a moved token: a rounding flip on an unmoved one is not a route.
+        improved = (alternative.losses < executed.losses) & moved
         best = torch.minimum(best, alternative.losses)
         better += improved.float()
         moved_total += float(moved.sum())
         moved_better += float((improved & moved).sum())
         moved_swing += float((alternative.losses - executed.losses).abs()[moved].sum())
         confident_better += float((improved & confident).sum())
+        confident_moved += float((moved & confident).sum())
+        confident_moved_better += float((improved & moved & confident).sum())
     gap = executed.losses - best
     return {
         "gap": gap,
@@ -297,6 +310,10 @@ def alternatives_read(
         "moved_swing": moved_swing / moved_total if moved_total else math.nan,
         "confident_better": confident_better / (alternatives * float(confident.sum())),
         "confident_tokens": int(confident.sum()),
+        "confident_moved_fraction": confident_moved / (alternatives * float(confident.sum())),
+        "confident_moved_better": (
+            confident_moved_better / confident_moved if confident_moved else math.nan
+        ),
     }
 
 
@@ -311,9 +328,12 @@ def floor_of(gap_a: torch.Tensor, gap_b: torch.Tensor) -> dict[str, float]:
 
 
 def probe_hash(probe: list[tuple[torch.Tensor, torch.Tensor]]) -> str:
-    """A hash of the probe's inputs, so two arms of one seed can be shown to share the tokens."""
-    stacked = torch.cat([x.flatten() for x, _ in probe])
-    return str(int(torch.round(stacked.double().sum() * 1e6)))
+    """A hash of the probe's inputs and targets, in order, to show two arms of one seed share it."""
+    digest = hashlib.sha256()
+    for x, target in probe:
+        digest.update(x.contiguous().numpy().tobytes())
+        digest.update(target.contiguous().numpy().tobytes())
+    return digest.hexdigest()[:16]
 
 
 def read_one(job: Job, settle_steps: int = SETTLE_STEPS) -> dict[str, Any]:
@@ -354,6 +374,9 @@ def read_one(job: Job, settle_steps: int = SETTLE_STEPS) -> dict[str, Any]:
         "counterfactual/confident_better": first["confident_better"],
         "counterfactual/confident_better_pair": second["confident_better"],
         "counterfactual/confident_tokens": first["confident_tokens"],
+        "counterfactual/confident_moved_fraction": first["confident_moved_fraction"],
+        "counterfactual/confident_moved_better": first["confident_moved_better"],
+        "counterfactual/confident_moved_better_pair": second["confident_moved_better"],
         **floor,
         "counterfactual/fragile_fraction": float(fragile.float().mean()),
         "counterfactual/gap_on_fragile": float(gap[fragile].mean()) if bool(fragile.any()) else 0.0,
@@ -460,6 +483,8 @@ COLUMNS = (
     "counterfactual/gap_on_fragile_above_floor",
     "counterfactual/mean_relative_gap",
     "counterfactual/confident_better",
+    "counterfactual/confident_moved_fraction",
+    "counterfactual/confident_moved_better",
     "counterfactual/moved_better",
     "counterfactual/moved_fraction",
     "floor",
@@ -570,10 +595,31 @@ def swing_contrast_correlation(
         if sample.numel()
         else [math.nan, math.nan]
     )
+    # The seed bootstrap holds the cells fixed, so its interval is the seed
+    # noise *given* these five or six points and says nothing about how far
+    # a correlation over that few points is from zero. The Fisher z interval
+    # and a permutation p over the cells carry that half.
+    n = len(cells)
+    fisher = [math.nan, math.nan]
+    if n > 3 and not math.isnan(point):
+        z = math.atanh(max(-0.999999, min(0.999999, point)))
+        half = 1.96 / math.sqrt(n - 3)
+        fisher = [math.tanh(z - half), math.tanh(z + half)]
+    xs = torch.tensor(
+        [statistics.fmean(row[seed][PRIMARY] for seed in row) for row in rows], dtype=torch.float64
+    )
+    permuted = 0
+    for _ in range(resamples):
+        order = torch.randperm(n, generator=generator)
+        if abs(pearson(xs, ys[order])) >= abs(point):
+            permuted += 1
     return {
         "r": point,
         "cells": len(cells),
         "interval": interval,
+        "interval_is": "seed bootstrap, cells fixed",
+        "fisher_interval": fisher,
+        "permutation_p": permuted / resamples,
         "points": {
             f"cells{c}-scale{s:g}": {
                 "swing": statistics.fmean(row[seed][PRIMARY] for seed in row),
@@ -592,6 +638,8 @@ def _columns(cell: dict[str, Any]) -> str:
         f"{mean['counterfactual/relative_gap_on_fragile']:>9.4f}"
         f"{mean['counterfactual/gap_on_fragile_above_floor']:>9.4f}"
         f"{mean['counterfactual/confident_better']:>8.3f}"
+        f"{mean['counterfactual/confident_moved_fraction']:>8.3f}"
+        f"{mean['counterfactual/confident_moved_better']:>8.3f}"
         f"{mean['counterfactual/moved_better']:>8.3f}"
         f"{100 * mean['footprint/relative_adapter_footprint']:>7.1f}%"
         f"{mean['guardrail/ceiling_occupancy']:>7.3f}{mean['guardrail/floor_occupancy']:>7.3f}"
@@ -617,7 +665,8 @@ def stage_summarise(args: argparse.Namespace) -> None:
         print(f"\n== {fixture} ==")
         print(
             f"  {'arm':>10}{'cells':>6}{'scale':>6}{'rate':>8}{'fragile':>9}{'rel gap':>9}"
-            f"{'>floor':>9}{'conf<':>8}{'moved<':>8}{'foot%':>8}{'ceil':>7}{'floor':>7}{'r':>7}"
+            f"{'>floor':>9}{'conf<':>8}{'c.moved':>8}{'c.mv<':>8}{'moved<':>8}{'foot%':>8}"
+            f"{'ceil':>7}{'floor':>7}{'r':>7}"
         )
         for (arm, cells, scale), rows in sorted(grouped.items()):
             cell = pooled(rows)
@@ -628,7 +677,12 @@ def stage_summarise(args: argparse.Namespace) -> None:
         for arm in ARMS:
             for cells in CELL_COUNTS:
                 for scale in SCALES[1:]:
-                    for column in (PRIMARY, "counterfactual/confident_better"):
+                    for column in (
+                        PRIMARY,
+                        "counterfactual/confident_better",
+                        "counterfactual/confident_moved_better",
+                        "counterfactual/confident_moved_fraction",
+                    ):
                         contrast = scale_contrast(grouped, arm, cells, scale, column)
                         if contrast is not None:
                             summary["scale_contrasts"][
@@ -643,10 +697,14 @@ def stage_summarise(args: argparse.Namespace) -> None:
         if args.self_model is not None and args.self_model.exists():
             correlation = swing_contrast_correlation(grouped, self_model_contrasts(args.self_model))
             summary["correlation_with_self_model"] = correlation
+            low, high = correlation["interval"]
+            f_low, f_high = correlation["fisher_interval"]
+            against = "" if fixture == DIFFERENTIATED else " -- against the differentiated #60 grid"
             print(
                 f"  r(swing on fragile tokens, #60 contrast dz) over {correlation['cells']} grid "
-                f"cells: {correlation['r']:+.3f} [{correlation['interval'][0]:+.3f}, "
-                f"{correlation['interval'][1]:+.3f}]"
+                f"cells: {correlation['r']:+.3f}; seed bootstrap [{low:+.3f}, {high:+.3f}], "
+                f"Fisher z [{f_low:+.3f}, {f_high:+.3f}], "
+                f"permutation p {correlation['permutation_p']:.3f}{against}"
             )
         (args.out / fixture / "SUMMARY.json").write_text(json.dumps(summary, indent=2, default=str))
 

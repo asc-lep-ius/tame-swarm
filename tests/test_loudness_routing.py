@@ -9,6 +9,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
 import loudness_routing as port  # noqa: E402
+from counterfactual_routing import GumbelTopKRoute  # noqa: E402
 from measure_ledger_stability import QUALITY  # noqa: E402
 
 from mob import PERSISTENCE_DECOUPLED, PERSISTENCE_VALUE  # noqa: E402
@@ -55,19 +56,28 @@ def test_the_routes_compare_as_sets():
 
 
 def test_an_alternative_that_moves_no_token_reads_the_executed_loss():
-    """The fixture has no stream: an unmoved token's loss is the executed one exactly."""
+    """The fixture has no stream: a token whose route a draw left alone reads the executed loss."""
     economy, _ = port.settle(_job(), SHORT)
     probe = port.draw_probe(economy, 4)
     executed = port.read(economy, probe)
+    generator = torch.Generator().manual_seed(7)
+    wrapper = GumbelTopKRoute(economy.mob.gate, generator, 1.0, subset=None)
+    with port.routed_by(economy, wrapper):
+        alternative = port.read(economy, probe)
+    moved = (alternative.routes != executed.routes).any(dim=-1)
+
+    assert bool((~moved).any()) and bool(moved.any())
+    # Up to the order the same cells' outputs were summed in, never further.
+    assert torch.allclose(alternative.losses[~moved], executed.losses[~moved], rtol=1e-5, atol=1e-7)
+    assert not torch.allclose(alternative.losses[moved], executed.losses[moved], rtol=1e-3)
 
     read = port.alternatives_read(economy, probe, executed, 3, 1.0, 7)
-
     assert read["gap"].min() >= 0.0
     assert 0.0 <= read["moved_fraction"] <= 1.0
     assert read["confident_tokens"] == pytest.approx(0.25 * executed.tokens, abs=1)
-    # Every token the draws left alone contributes no gap, by construction.
-    unmoved_gap = read["gap"][read["alternatives_better"] == 0.0]
-    assert bool((unmoved_gap == 0.0).all()) if unmoved_gap.numel() else True
+    # The conditional rate counts only the confident pairs a draw moved, so
+    # the diluted rate is never above it.
+    assert read["confident_better"] <= read["confident_moved_better"] + 1e-9
 
 
 def test_the_floor_is_the_pair_of_gumbel_seeds():
@@ -78,10 +88,11 @@ def test_the_floor_is_the_pair_of_gumbel_seeds():
 
     assert floor["floor_max"] == pytest.approx(0.3)
     assert floor["floor_mean"] == pytest.approx(0.075)
-    assert 0.0 <= floor["floor"] <= 0.3
+    # torch's quantile interpolates: the 95th percentile of [0, 0, 0, 0.3] is 0.255.
+    assert floor["floor"] == pytest.approx(0.255)
 
 
-def test_read_one_records_the_reading_and_its_identity(monkeypatch):
+def test_read_one_records_the_reading_and_its_identity():
     reading = port.read_one(_job(), SHORT)
 
     assert reading["probe_tokens"] == 128
@@ -104,12 +115,12 @@ def test_two_arms_of_one_seed_read_the_same_probe_tokens():
 
 
 def test_the_scale_contrast_pairs_by_seed_and_refuses_a_different_probe():
-    def reading(seed: int, value: float, probe: str) -> dict:
+    def reading(value: float, probe: str) -> dict:
         return {port.PRIMARY: value, "probe_hash": probe}
 
     grouped = {
-        (PERSISTENCE_VALUE, 8, 1.0): {0: reading(0, 0.1, "a"), 1: reading(1, 0.2, "b")},
-        (PERSISTENCE_VALUE, 8, 2.0): {0: reading(0, 0.3, "a"), 1: reading(1, 0.5, "b")},
+        (PERSISTENCE_VALUE, 8, 1.0): {0: reading(0.1, "a"), 1: reading(0.2, "b")},
+        (PERSISTENCE_VALUE, 8, 2.0): {0: reading(0.3, "a"), 1: reading(0.5, "b")},
     }
 
     contrast = port.scale_contrast(grouped, PERSISTENCE_VALUE, 8, 2.0, port.PRIMARY)
@@ -120,3 +131,34 @@ def test_the_scale_contrast_pairs_by_seed_and_refuses_a_different_probe():
     grouped[(PERSISTENCE_VALUE, 8, 2.0)][1]["probe_hash"] = "c"
     with pytest.raises(AssertionError, match="probe tokens"):
         port.scale_contrast(grouped, PERSISTENCE_VALUE, 8, 2.0, port.PRIMARY)
+
+
+def test_the_swing_to_contrast_correlation_recovers_a_planted_line():
+    """Six cells whose swing is a line in the contrast: r = 1, both intervals at 1, p at 0."""
+    contrasts = {
+        (4, 1.0): -1.0,
+        (4, 2.0): -2.0,
+        (4, 4.0): -3.0,
+        (8, 1.0): -0.5,
+        (8, 2.0): -1.5,
+        (8, 4.0): -2.5,
+    }
+    grouped = {
+        (PERSISTENCE_VALUE, cells, scale): {
+            seed: {port.PRIMARY: -dz + 0.001 * seed} for seed in range(3)
+        }
+        for (cells, scale), dz in contrasts.items()
+    }
+
+    read = port.swing_contrast_correlation(grouped, contrasts, resamples=200)
+
+    assert read["cells"] == 6
+    assert read["r"] == pytest.approx(-1.0, abs=1e-3)
+    assert read["interval"][0] == pytest.approx(-1.0, abs=1e-2)
+    assert read["fisher_interval"][1] < -0.9
+    assert read["permutation_p"] <= 0.01
+    # Too few cells to correlate at all comes back as nan rather than a number.
+    assert (
+        port.swing_contrast_correlation(dict(list(grouped.items())[:2]), contrasts)["r"]
+        != read["r"]
+    )
