@@ -64,6 +64,7 @@ from mob import MoBConfig  # noqa: E402
 from mob.ledger import (  # noqa: E402
     LEDGER_DECAY,
     LEDGER_SETPOINT,
+    LOSS_REWARD_MULTIPLIER,
     PERSISTENCE_VALUE,
     SUPPORTED_LEDGER_MODES,
     SUPPORTED_PERSISTENCE_COUPLINGS,
@@ -113,6 +114,9 @@ class _Recorded:
     inner: RewardSignal
     paid: list[torch.Tensor] = field(default_factory=list)
     against: list[torch.Tensor] = field(default_factory=list)
+    # #65's gift, paid after the transfer; zeros when the signal pays none, so
+    # the inflow the replay reconstructs is the whole settlement either way.
+    gifted: list[torch.Tensor] = field(default_factory=list)
 
     @property
     def multiplier(self) -> float:
@@ -125,7 +129,9 @@ class _Recorded:
         return paid
 
     def gift(self, wealth: torch.Tensor, settlement: Settlement) -> torch.Tensor | None:
-        return self.inner.gift(wealth, settlement)
+        gift = self.inner.gift(wealth, settlement)
+        self.gifted.append(torch.zeros_like(wealth) if gift is None else gift.clone())
+        return gift
 
 
 @dataclass(frozen=True)
@@ -224,6 +230,10 @@ class LedgerReading:
         """Market holders by share, largest first."""
         holders = [cell for cell in self.cells if cell.share > MARKET_SHARE]
         return sorted(holders, key=lambda cell: cell.share, reverse=True)
+
+    def winner_competences(self) -> list[float]:
+        """Who holds the market, by competence, largest share first: the seats, not their count."""
+        return [cell.competence for cell in self.winners()]
 
 
 def build_economy(
@@ -331,17 +341,21 @@ def measure(
 
     share = wins / wins.sum()
     rho = 1.0 - config.wealth_decay
+    # The reward inflow is what the signal paid plus what it gifted (#65): both
+    # carry no wealth, and a gifted cell's R is its whole inflow or the map
+    # solves the wrong ledger.
+    inflow = torch.stack(recorded.paid) + torch.stack(recorded.gifted)
     reconstructed = _replay(
-        torch.stack(recorded.paid) - torch.stack(charges),
+        inflow - torch.stack(charges),
         start=start,
         decay=config.wealth_decay,
         setpoint=config.initial_wealth if mode == LEDGER_SETPOINT else 0.0,
     )
     setpoint = config.initial_wealth if mode == LEDGER_SETPOINT else 0.0
-    reward = torch.stack(recorded.paid)[-tail:].mean(dim=0)
+    reward = inflow[-tail:].mean(dim=0)
     charged = torch.stack(charges)[-tail:]
     price_coefficient = (charged * torch.stack(recorded.against)[-tail:]).mean(dim=0)
-    flat_inflow = (torch.stack(recorded.paid) - torch.stack(charges))[-tail:].mean(dim=0)
+    flat_inflow = (inflow - torch.stack(charges))[-tail:].mean(dim=0)
 
     cells_read = []
     for index in range(config.num_experts):
@@ -820,8 +834,16 @@ class ReEntryReading:
     fixture: str
     contribution_scale: float
     reward_scale: float
+    re_entry_gift: float
     floor_cells: tuple[int, ...]
     winner_cells: tuple[int, ...]
+    winner_competences: tuple[float, ...]
+    # The winners' charge and threshold as read at *this* settlement. A cell
+    # that takes a seat displaces a wealth-750 winner and pays that winner's
+    # bid, and a gift raises every loser's bid and with it the winners' kappa,
+    # so what is read at the shipped gift is a lower bound on the price a
+    # returning cell faces, not a fixed point; the gifted readings carry the
+    # kappa the gift moved it to.
     winner_price_coefficient: float
     winner_ruin_threshold: float
     threshold_inflow: float
@@ -836,17 +858,24 @@ class ReEntryReading:
     # tokens, and the ledger credits a slot at ``1 / num_tokens``, so the
     # per-slot amount is the per-step extra divided by that share.
     gift_per_explored_slot: dict[int, float]
-    # What a loser could gain by losing on purpose, in credits a step: the gift
-    # share times the per-slot amount -- the deviation bound #38 measured at
-    # ``rate x value`` grows by exactly this.
+    # What a loser could gain by losing on purpose, in credits a step: the
+    # whole lottery, ``exploration_rate x`` the per-slot amount, which is what
+    # the stalest loser collects under the staleness draw -- the deviation
+    # bound #38 measured at ``rate x value`` grows by this. The mean over
+    # equally stale losers is the exploration share of it.
     deviation_worth: dict[int, float]
     # The issue's own condition, which crossing the threshold does not meet: a
     # cell that has crossed ``w_-`` climbs only on a winner's inflow, ``R >=
     # 2 sqrt(rho kappa)`` at the winners' ``kappa``. The extra a floor cell
-    # would need to be paid a step to have that inflow, per slot, and what a
-    # deliberate loser would then collect a step.
+    # would need to be paid a step to have that inflow, per slot in credits,
+    # the same per slot in the units ``MoBConfig.re_entry_gift`` is set in
+    # (credits divided by ``reward_scale x LOSS_REWARD_MULTIPLIER``), and
+    # what a deliberate loser could collect a step: the whole lottery,
+    # ``exploration_rate x per slot``, since the staleness draw hands the
+    # stalest loser nearly every gift (``tests/constitution/test_reentry.py``).
     root_condition_extra: dict[int, float]
     root_condition_per_slot: dict[int, float]
+    root_condition_config_amount: dict[int, float]
     root_condition_worth: dict[int, float]
 
     def as_dict(self) -> dict[str, Any]:
@@ -882,13 +911,19 @@ def re_entry(reading: LedgerReading, config: MoBConfig = BASE_CONFIG) -> ReEntry
     extra = {i: max(0.0, needed[i] - floor_inflow[i]) for i in floor_cells}
     per_slot = {i: extra[i] / gift_share for i in floor_cells}
     root_extra = {i: max(0.0, threshold_inflow - floor_inflow[i]) for i in floor_cells}
+    # ``re_entry_gift`` is set in realised-value units and the ledger credits
+    # it through the exchange rate, so a per-slot figure in credits is that
+    # many times smaller in the config.
+    to_config = 1.0 / (config.reward_scale * LOSS_REWARD_MULTIPLIER)
     return ReEntryReading(
         seed=reading.seed,
         fixture=reading.fixture,
         contribution_scale=reading.contribution_scale,
         reward_scale=reading.reward_scale,
+        re_entry_gift=reading.re_entry_gift,
         floor_cells=tuple(floor_cells),
         winner_cells=tuple(winners),
+        winner_competences=tuple(reading.cells[i].competence for i in winners),
         winner_price_coefficient=kappa,
         winner_ruin_threshold=threshold,
         threshold_inflow=threshold_inflow,
@@ -913,17 +948,35 @@ def re_entry(reading: LedgerReading, config: MoBConfig = BASE_CONFIG) -> ReEntry
         inflow_to_cross=needed,
         extra_inflow_to_cross=extra,
         gift_per_explored_slot=per_slot,
-        deviation_worth={i: per_slot[i] * gift_share for i in floor_cells},
+        deviation_worth={i: per_slot[i] * config.exploration_rate for i in floor_cells},
         root_condition_extra=root_extra,
         root_condition_per_slot={i: root_extra[i] / gift_share for i in floor_cells},
-        root_condition_worth=root_extra,
+        root_condition_config_amount={
+            i: root_extra[i] / gift_share * to_config for i in floor_cells
+        },
+        root_condition_worth={
+            i: root_extra[i] / gift_share * config.exploration_rate for i in floor_cells
+        },
     )
 
 
+def _finite(value: Any) -> Any:
+    """JSON has no infinity: an unbounded inflow is recorded as ``null`` rather than as a token."""
+    if isinstance(value, dict):
+        return {k: _finite(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_finite(v) for v in value]
+    if isinstance(value, float) and math.isinf(value):
+        return None
+    return value
+
+
 def _report_re_entry(read: ReEntryReading) -> None:
+    seats = ", ".join(f"{c:.2f}" for c in read.winner_competences)
     print(
         f"\n=== re-entry: {read.fixture} x{read.contribution_scale:g} at reward_scale "
-        f"{read.reward_scale:g}, seed {read.seed}: winners {list(read.winner_cells)} pay "
+        f"{read.reward_scale:g}, gift {read.re_entry_gift:g}, seed {read.seed}: winners "
+        f"{list(read.winner_cells)} (competence {seats}) pay "
         f"kappa {read.winner_price_coefficient:.2f}, "
         f"ruin threshold {read.winner_ruin_threshold:.2f}, "
         f"inflow to clear it {read.threshold_inflow:.3f} a step ==="
@@ -934,7 +987,7 @@ def _report_re_entry(read: ReEntryReading) -> None:
     print(
         f"  {'cell':>4} {'R now':>8} {'kappa':>7} {'shortfall':>10} {'crosses in':>11} "
         f"{'R to cross':>11} {'extra':>8} {'per slot':>9} {'worth/step':>11} "
-        f"{'root extra':>11} {'per slot':>9}"
+        f"{'root extra':>11} {'per slot':>9} {'config':>8}"
     )
     for cell in read.floor_cells:
         steps = read.steps_to_cross_shipped[cell]
@@ -944,7 +997,8 @@ def _report_re_entry(read: ReEntryReading) -> None:
             f"{read.shortfall[cell]:>9.1f}x {'never' if steps is None else steps:>11} "
             f"{read.inflow_to_cross[cell]:>11.4f} {read.extra_inflow_to_cross[cell]:>8.4f} "
             f"{read.gift_per_explored_slot[cell]:>9.1f} {read.deviation_worth[cell]:>11.4f} "
-            f"{read.root_condition_extra[cell]:>11.4f} {read.root_condition_per_slot[cell]:>9.1f}"
+            f"{read.root_condition_extra[cell]:>11.4f} {read.root_condition_per_slot[cell]:>9.1f} "
+            f"{read.root_condition_config_amount[cell]:>8.3f}"
         )
 
 
@@ -992,7 +1046,8 @@ def _report(reading: LedgerReading) -> None:
         f"least share {reading.least_share:.4f}, "
         f"r(wealth, competence) {reading.wealth_vs_competence:.3f}, "
         f"tail loss {reading.tail_loss:.4f}, "
-        f"ceiling {reading.ceiling_occupancy:.3f} floor {reading.floor_occupancy:.3f}"
+        f"ceiling {reading.ceiling_occupancy:.3f} floor {reading.floor_occupancy:.3f}, "
+        f"seats {[round(c, 2) for c in reading.winner_competences()]}"
     )
     print(
         f"{'c':>5} {'wealth':>9} {'share':>7} {'R':>8} {'kappa':>9} "
@@ -1054,7 +1109,8 @@ def main() -> None:
         "--re-entry-gift",
         type=float,
         default=0.0,
-        help="#65's candidate 1: credits per explored slot; 0 is the shipped economy",
+        help="#65's candidate 1, in realised-value units per explored slot (the ledger credits "
+        "it through reward_scale x the reward multiplier); 0 is the shipped economy",
     )
     parser.add_argument("--out", type=Path, default=DEFAULT_DERIVATION_OUT)
     args = parser.parse_args()
@@ -1094,9 +1150,9 @@ def main() -> None:
             )
             _report(reading)
             if args.re_entry:
-                read = re_entry(reading)
+                read = re_entry(reading, replace(BASE_CONFIG, num_experts=args.cells))
                 _report_re_entry(read)
-                records.append({"mode": mode, **read.as_dict()})
+                records.append({"mode": mode, **_finite(read.as_dict())})
     if args.re_entry:
         code_sha, code_dirty = code_identity()
         path = args.out / (

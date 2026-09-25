@@ -271,8 +271,11 @@ class MoBConfig:
     # report can move it, and its size is derived from the settlement
     # (``scripts/measure_ledger_stability.py --re-entry``) rather than set by
     # hand. It passes through ``reward_scale`` like the reward and the charge.
-    # What it costs is written into the deviation bound: a loser collects
-    # ``exploration_rate / (num_experts - top_k)`` of it a token by losing.
+    # What it costs is written into the deviation bound: under the staleness
+    # draw the stalest loser collects nearly every gift, so losing on purpose
+    # is worth up to ``exploration_rate x`` this a token, in credits at
+    # ``reward_scale x LOSS_REWARD_MULTIPLIER`` per unit; the mean over equally
+    # stale losers is the ``1 / (num_experts - top_k)`` share of that.
     re_entry_gift: float = 0.0
     # The stakes dial (#39): does a cell's continuation depend on its realised
     # value? "value" is today's economy. "decoupled" pins the wealth the gate
