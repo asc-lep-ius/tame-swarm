@@ -428,7 +428,7 @@ class DerivationPass:
     """One trial rate: the readings it produced and the rate they derive."""
 
     rate: float
-    # Per seed, keyed by cell: the reference winner's root at this rate, and
+    # Per seed, keyed by share rank: the scaled winner's root at this rate, and
     # the rate that would place that cell at its reference root. The seed's
     # own derived rate is the mean over its winners.
     fixed_points: dict[int, dict[int, float]]
@@ -467,7 +467,7 @@ class Derivation:
     steps: int
     tail: int
     recorded_rate: float
-    # Per seed, keyed by cell: the recorded configuration's winners' roots,
+    # Per seed, keyed by share rank: the recorded configuration's winners' roots,
     # which the derivation places the same cells at.
     reference: dict[int, dict[int, float]]
     reference_ceiling_occupancy: dict[int, float]
@@ -489,40 +489,50 @@ class Derivation:
 
 
 def _winner_targets(reading: LedgerReading) -> dict[int, float]:
-    """The reference's market holders with a real root, keyed by cell.
+    """The reference's winners' roots by share rank: rank 0 is the largest holder.
 
-    Keyed by cell rather than by rank: the seed fixes each cell's identity
-    across scales, so the scaled reading's cell ``i`` is paired with the
-    reference's cell ``i`` whatever its share rank became. A winner with no real
-    root has no fixed point to place and is left out.
+    By rank rather than by cell, because the derivation places *the scaled
+    economy's winners* where the recorded economy's winners sit, and a scaled
+    run may seat different cells (the quality fixture at twice the correction
+    and the recorded rate does). A winner with no real root keeps its rank and
+    carries ``nan``, so the ranks below it stay aligned with the scaled run's;
+    it is skipped when solving rather than compressed out of the ranking.
     """
-    return {
-        index: cell.settles_at
-        for index, cell in enumerate(reading.cells)
-        if cell.share > MARKET_SHARE and math.isfinite(cell.settles_at)
-    }
+    return {rank: cell.settles_at for rank, cell in enumerate(reading.winners())}
 
 
 def _solve(
     reading: LedgerReading, targets: dict[int, float], rate: float, config: MoBConfig
 ) -> tuple[dict[int, float], dict[int, float], float]:
-    """Each reference winner's root at this rate, the rate placing it, and the seed's mean."""
+    """Each winner's root at this rate, the rate placing it at its rank's target, and the mean.
+
+    The scaled reading's winners are paired with the reference's by share rank;
+    a rank whose reference root is ``nan`` is skipped, and a rank the scaled
+    reading has no winner for is ``nan`` here, which the caller reads as "the
+    winners could not be placed".
+    """
     rho = 1.0 - config.wealth_decay
     setpoint = config.initial_wealth if reading.mode == LEDGER_SETPOINT else 0.0
-    fixed_points = {cell: reading.cells[cell].settles_at for cell in targets}
+    winners = reading.winners()
+    placeable = {rank: t for rank, t in targets.items() if math.isfinite(t)}
+    fixed_points = {
+        rank: winners[rank].settles_at if rank < len(winners) else math.nan for rank in placeable
+    }
     per_cell = {
-        cell: rate_placing(
+        rank: rate_placing(
             target,
-            reading.cells[cell].reward,
-            reading.cells[cell].price_coefficient,
+            winners[rank].reward,
+            winners[rank].price_coefficient,
             rate,
             rho,
             setpoint,
         )
-        for cell, target in targets.items()
+        if rank < len(winners)
+        else math.nan
+        for rank, target in placeable.items()
     }
     finite = [value for value in per_cell.values() if math.isfinite(value) and value > 0.0]
-    derived = statistics.fmean(finite) if len(finite) == len(targets) else math.nan
+    derived = statistics.fmean(finite) if finite and len(finite) == len(placeable) else math.nan
     return fixed_points, per_cell, derived
 
 
@@ -545,9 +555,9 @@ def _run_pass(
     else:
         unplaced = [seed for seed in seeds if not math.isfinite(derived[seed])]
         raise ClampedLedgerError(
-            f"at rate {rate:.6g} no positive rate places the reference winners of seeds "
-            f"{unplaced} at their roots: the raw inflow at the target does not cover the "
-            "raw charge"
+            f"at rate {rate:.6g} the winners of seeds {unplaced} cannot be placed at the "
+            "reference's roots: fewer winners than the reference has, or the raw inflow "
+            "at the target does not cover the raw charge"
         )
     return DerivationPass(
         rate=rate,
@@ -576,7 +586,11 @@ def _reference_targets(
             "clamp is a target for a clamp"
         )
     targets = {seed: _winner_targets(reading) for seed, reading in reference.items()}
-    empty = [seed for seed, target in targets.items() if not target]
+    empty = [
+        seed
+        for seed, target in targets.items()
+        if not any(math.isfinite(root) for root in target.values())
+    ]
     if empty:
         raise ClampedLedgerError(
             f"no winner of the recorded configuration has a real fixed point on seeds {empty}"
@@ -599,8 +613,8 @@ def derive_reward_scale(
 
     The recorded configuration -- the same fixture and cell count at scale one
     and the recorded rate -- is run first, and its winners' upper roots are the
-    targets, keyed by cell. Then the scaled configuration is run at the
-    recorded rate, the same cells' ``R`` and ``kappa`` are read, and
+    targets, keyed by share rank. Then the scaled configuration is run at the
+    recorded rate, its winners' ``R`` and ``kappa`` are read by rank, and
     ``rate_placing`` says what rate puts each of them at its target; the seeds'
     mean is the next trial rate, and the passes repeat until a pass would derive
     a rate within ``tolerance`` of the one it ran at. **The rate returned is the
@@ -711,7 +725,7 @@ def _report_derivation(derivation: Derivation) -> None:
         f"{derivation.steps} steps / {derivation.tail} tail ==="
     )
     for seed in derivation.seeds:
-        roots = ", ".join(f"{cell}:{w:.0f}" for cell, w in derivation.reference[seed].items())
+        roots = ", ".join(f"{w:.0f}" for w in derivation.reference[seed].values())
         print(
             f"  reference seed {seed}: winners settle at [{roots}], "
             f"ceiling {derivation.reference_ceiling_occupancy[seed]:.3f} "
