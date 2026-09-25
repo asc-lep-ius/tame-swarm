@@ -428,26 +428,37 @@ class DerivationPass:
     """One trial rate: the readings it produced and the rate they derive."""
 
     rate: float
-    # Per seed: the winners' fixed points at this rate, by share rank, beside the
-    # per-cell rate that would place them at the reference's; the seed's own
-    # derived rate is the mean over its winners.
-    fixed_points: dict[int, tuple[float, ...]]
-    per_cell: dict[int, tuple[float, ...]]
+    # Per seed, keyed by cell: the reference winner's root at this rate, and
+    # the rate that would place that cell at its reference root. The seed's
+    # own derived rate is the mean over its winners.
+    fixed_points: dict[int, dict[int, float]]
+    per_cell: dict[int, dict[int, float]]
     derived: dict[int, float]
     cells_on_ceiling: dict[int, int]
     ceiling_occupancy: dict[int, float]
     floor_occupancy: dict[int, float]
     wealth_vs_competence: dict[int, float]
-    saturated: bool
+    saturated_seeds: tuple[int, ...]
     next_rate: float
     # How the next trial was chosen: from the derivation, or by halving because
     # the derivation gave no finite positive rate on a saturated ledger.
     next_rate_from: str
 
+    @property
+    def saturated(self) -> bool:
+        return bool(self.saturated_seeds)
+
 
 @dataclass(frozen=True)
 class Derivation:
-    """The exchange rate for one configuration, and every pass that led to it."""
+    """The exchange rate for one configuration, and every pass that led to it.
+
+    ``derived`` is the rate the final pass *ran at*: every occupancy, root and
+    correlation the final pass records was read at that rate, and it is within
+    ``tolerance`` of the rate that pass would derive next. At the recorded
+    scale the final pass is the reference run, so ``derived`` is the recorded
+    constant exactly.
+    """
 
     fixture: str
     contribution_scale: float
@@ -456,13 +467,15 @@ class Derivation:
     steps: int
     tail: int
     recorded_rate: float
-    # Per seed, the recorded configuration's winners' fixed points by share
-    # rank: what the derivation matches.
-    reference: dict[int, tuple[float, ...]]
+    # Per seed, keyed by cell: the recorded configuration's winners' roots,
+    # which the derivation places the same cells at.
+    reference: dict[int, dict[int, float]]
     reference_ceiling_occupancy: dict[int, float]
     reference_floor_occupancy: dict[int, float]
+    reference_wealth_vs_competence: dict[int, float]
     passes: tuple[DerivationPass, ...]
     derived: float
+    # The spread across seeds of the final pass's per-seed derivation.
     seed_spread: float
     code_sha: str | None
     code_dirty: bool | None
@@ -475,26 +488,100 @@ class Derivation:
         return asdict(self)
 
 
-def _winner_targets(reading: LedgerReading) -> tuple[float, ...]:
-    """The reference's winners' upper roots by share rank; cells with no real root are skipped."""
-    return tuple(cell.settles_at for cell in reading.winners() if math.isfinite(cell.settles_at))
+def _winner_targets(reading: LedgerReading) -> dict[int, float]:
+    """The reference's market holders with a real root, keyed by cell.
+
+    Keyed by cell rather than by rank: the seed fixes each cell's identity
+    across scales, so the scaled reading's cell ``i`` is paired with the
+    reference's cell ``i`` whatever its share rank became. A winner with no real
+    root has no fixed point to place and is left out.
+    """
+    return {
+        index: cell.settles_at
+        for index, cell in enumerate(reading.cells)
+        if cell.share > MARKET_SHARE and math.isfinite(cell.settles_at)
+    }
 
 
-def _derive_from(
-    reading: LedgerReading, targets: tuple[float, ...], rate: float, config: MoBConfig
-) -> tuple[tuple[float, ...], tuple[float, ...], float]:
-    """Pair this reading's winners with the reference's by share rank and solve each."""
+def _solve(
+    reading: LedgerReading, targets: dict[int, float], rate: float, config: MoBConfig
+) -> tuple[dict[int, float], dict[int, float], float]:
+    """Each reference winner's root at this rate, the rate placing it, and the seed's mean."""
     rho = 1.0 - config.wealth_decay
     setpoint = config.initial_wealth if reading.mode == LEDGER_SETPOINT else 0.0
-    winners = reading.winners()[: len(targets)]
-    fixed_points = tuple(cell.settles_at for cell in winners)
-    per_cell = tuple(
-        rate_placing(target, cell.reward, cell.price_coefficient, rate, rho, setpoint)
-        for cell, target in zip(winners, targets, strict=False)
-    )
-    finite = [value for value in per_cell if math.isfinite(value) and value > 0.0]
+    fixed_points = {cell: reading.cells[cell].settles_at for cell in targets}
+    per_cell = {
+        cell: rate_placing(
+            target,
+            reading.cells[cell].reward,
+            reading.cells[cell].price_coefficient,
+            rate,
+            rho,
+            setpoint,
+        )
+        for cell, target in targets.items()
+    }
+    finite = [value for value in per_cell.values() if math.isfinite(value) and value > 0.0]
     derived = statistics.fmean(finite) if len(finite) == len(targets) else math.nan
     return fixed_points, per_cell, derived
+
+
+def _run_pass(
+    readings: dict[int, LedgerReading],
+    targets: dict[int, dict[int, float]],
+    rate: float,
+    config: MoBConfig,
+) -> DerivationPass:
+    """Solve one trial rate on every seed and choose the next."""
+    seeds = sorted(readings)
+    solved = {seed: _solve(readings[seed], targets[seed], rate, config) for seed in seeds}
+    derived = {seed: solved[seed][2] for seed in seeds}
+    saturated = tuple(seed for seed in seeds if readings[seed].saturated(config.top_k))
+    finite = [value for value in derived.values() if math.isfinite(value)]
+    if len(finite) == len(seeds):
+        next_rate, origin = statistics.fmean(finite), "derived"
+    elif saturated:
+        next_rate, origin = rate / 2.0, "halved"
+    else:
+        unplaced = [seed for seed in seeds if not math.isfinite(derived[seed])]
+        raise ClampedLedgerError(
+            f"at rate {rate:.6g} no positive rate places the reference winners of seeds "
+            f"{unplaced} at their roots: the raw inflow at the target does not cover the "
+            "raw charge"
+        )
+    return DerivationPass(
+        rate=rate,
+        fixed_points={seed: solved[seed][0] for seed in seeds},
+        per_cell={seed: solved[seed][1] for seed in seeds},
+        derived=derived,
+        cells_on_ceiling={seed: readings[seed].cells_on_ceiling for seed in seeds},
+        ceiling_occupancy={seed: readings[seed].ceiling_occupancy for seed in seeds},
+        floor_occupancy={seed: readings[seed].floor_occupancy for seed in seeds},
+        wealth_vs_competence={seed: readings[seed].wealth_vs_competence for seed in seeds},
+        saturated_seeds=saturated,
+        next_rate=next_rate,
+        next_rate_from=origin,
+    )
+
+
+def _reference_targets(
+    reference: dict[int, LedgerReading], config: MoBConfig, fixture: str, cells: int
+) -> dict[int, dict[int, float]]:
+    """The recorded configuration's winners' roots per seed, refused when read off a clamp."""
+    clamped = [seed for seed, reading in reference.items() if reading.saturated(config.top_k)]
+    if clamped:
+        raise ClampedLedgerError(
+            f"the recorded configuration of {fixture} at {cells} cells rests more than "
+            f"{config.top_k} cells on the ceiling on seeds {clamped}; a target read off a "
+            "clamp is a target for a clamp"
+        )
+    targets = {seed: _winner_targets(reading) for seed, reading in reference.items()}
+    empty = [seed for seed, target in targets.items() if not target]
+    if empty:
+        raise ClampedLedgerError(
+            f"no winner of the recorded configuration has a real fixed point on seeds {empty}"
+        )
+    return targets
 
 
 def derive_reward_scale(
@@ -512,22 +599,25 @@ def derive_reward_scale(
 
     The recorded configuration -- the same fixture and cell count at scale one
     and the recorded rate -- is run first, and its winners' upper roots are the
-    targets. Then the scaled configuration is run at the recorded rate, its
-    winners' ``R`` and ``kappa`` are read, and ``rate_placing`` says what rate
-    puts each of them at its target; the seeds' mean is the next trial rate,
-    and the passes repeat until two successive rates agree within
-    ``tolerance``. At scale one the first pass *is* the reference, every cell's
-    rate is the identity, and the derivation returns the recorded constant in
-    one pass with the economy untouched.
+    targets, keyed by cell. Then the scaled configuration is run at the
+    recorded rate, the same cells' ``R`` and ``kappa`` are read, and
+    ``rate_placing`` says what rate puts each of them at its target; the seeds'
+    mean is the next trial rate, and the passes repeat until a pass would derive
+    a rate within ``tolerance`` of the one it ran at. **The rate returned is the
+    one that pass ran at**, so every guardrail the record carries was read at
+    it. At scale one the first pass *is* the reference, every cell's rate is
+    the identity, and the derivation returns the recorded constant exactly with
+    the economy untouched.
 
     **A saturated pass is never read as a derivation.** Once more cells rest
     on the ceiling than there are slots the auction is deciding among clamped
     bids, and the ``R`` and ``kappa`` such a pass reads belong to that
     allocation and not to the economy the rate is for; the pass only sets the
-    next trial, and the rate that is returned comes from a pass the band was
-    not holding. A configuration whose every pass is saturated -- or whose
-    reference is, since a target read off a clamp is a target for a clamp --
-    is refused with ``ClampedLedgerError`` rather than given a number.
+    next trial (halving it when it cannot even solve), and the rate that is
+    returned comes from a pass the band was not holding. A configuration whose
+    every pass is saturated -- or whose reference is, since a target read off a
+    clamp is a target for a clamp -- is refused with ``ClampedLedgerError``
+    rather than given a number.
 
     The rate is derived once per configuration from the seed set, and the
     spread across seeds is recorded beside it; a rate re-derived per seed
@@ -553,20 +643,7 @@ def derive_reward_scale(
         )
 
     reference = {seed: run(seed, 1.0, recorded) for seed in seeds}
-    clamped = [seed for seed, reading in reference.items() if reading.saturated(config.top_k)]
-    if clamped:
-        raise ClampedLedgerError(
-            f"the recorded configuration of {fixture} at {cells} cells rests more than "
-            f"{config.top_k} cells on the ceiling on seeds {clamped}; a target read off a "
-            "clamp is a target for a clamp"
-        )
-    targets = {seed: _winner_targets(reading) for seed, reading in reference.items()}
-    empty = [seed for seed, target in targets.items() if not target]
-    if empty:
-        raise ClampedLedgerError(
-            f"no winner of the recorded configuration has a real fixed point on seeds {empty}"
-        )
-
+    targets = _reference_targets(reference, config, fixture, cells)
     passes: list[DerivationPass] = []
     rate = recorded
     for _ in range(max_passes):
@@ -575,65 +652,55 @@ def derive_reward_scale(
             if contribution_scale == 1.0 and rate == recorded
             else {seed: run(seed, contribution_scale, rate) for seed in seeds}
         )
-        solved = {seed: _derive_from(readings[seed], targets[seed], rate, config) for seed in seeds}
-        derived = {seed: solved[seed][2] for seed in seeds}
-        saturated = any(readings[seed].saturated(config.top_k) for seed in seeds)
-        finite = [value for value in derived.values() if math.isfinite(value)]
-        if len(finite) == len(seeds):
-            next_rate, origin = statistics.fmean(finite), "derived"
-        elif saturated:
-            next_rate, origin = rate / 2.0, "halved"
-        else:
-            raise ClampedLedgerError(
-                f"at rate {rate:.6g} the winners of {fixture} x{contribution_scale:g} at {cells} "
-                f"cells cannot be placed at the reference by any positive rate on seeds "
-                f"{[seed for seed in seeds if not math.isfinite(derived[seed])]}: the raw "
-                "inflow at the target does not cover the raw charge"
+        passes.append(_run_pass(readings, targets, rate, config))
+        final = passes[-1]
+        if not final.saturated and abs(final.next_rate - rate) <= tolerance * rate:
+            return _finish(
+                fixture, contribution_scale, cells, steps, tail, reference, targets, passes
             )
-        passes.append(
-            DerivationPass(
-                rate=rate,
-                fixed_points={seed: solved[seed][0] for seed in seeds},
-                per_cell={seed: solved[seed][1] for seed in seeds},
-                derived=derived,
-                cells_on_ceiling={seed: readings[seed].cells_on_ceiling for seed in seeds},
-                ceiling_occupancy={seed: readings[seed].ceiling_occupancy for seed in seeds},
-                floor_occupancy={seed: readings[seed].floor_occupancy for seed in seeds},
-                wealth_vs_competence={seed: readings[seed].wealth_vs_competence for seed in seeds},
-                saturated=saturated,
-                next_rate=next_rate,
-                next_rate_from=origin,
-            )
-        )
-        if not saturated and abs(next_rate - rate) <= tolerance * rate:
-            code_sha, code_dirty = code_identity()
-            return Derivation(
-                fixture=fixture,
-                contribution_scale=contribution_scale,
-                cells=cells,
-                seeds=tuple(seeds),
-                steps=steps,
-                tail=tail,
-                recorded_rate=recorded,
-                reference=targets,
-                reference_ceiling_occupancy={
-                    seed: reference[seed].ceiling_occupancy for seed in seeds
-                },
-                reference_floor_occupancy={seed: reference[seed].floor_occupancy for seed in seeds},
-                passes=tuple(passes),
-                derived=next_rate,
-                seed_spread=statistics.stdev(finite) if len(finite) > 1 else 0.0,
-                code_sha=code_sha,
-                code_dirty=code_dirty,
-            )
-        rate = next_rate
-
+        rate = final.next_rate
     trail = ", ".join(
         f"{p.rate:.4g} -> {p.next_rate:.4g}{' (saturated)' if p.saturated else ''}" for p in passes
     )
     raise ClampedLedgerError(
         f"no unsaturated, settled rate for {fixture} x{contribution_scale:g} at {cells} cells "
         f"within {max_passes} passes: {trail}"
+    )
+
+
+def _finish(
+    fixture: str,
+    contribution_scale: float,
+    cells: int,
+    steps: int,
+    tail: int,
+    reference: dict[int, LedgerReading],
+    targets: dict[int, dict[int, float]],
+    passes: list[DerivationPass],
+) -> Derivation:
+    final = passes[-1]
+    finite = [value for value in final.derived.values() if math.isfinite(value)]
+    code_sha, code_dirty = code_identity()
+    seeds = tuple(sorted(reference))
+    return Derivation(
+        fixture=fixture,
+        contribution_scale=contribution_scale,
+        cells=cells,
+        seeds=seeds,
+        steps=steps,
+        tail=tail,
+        recorded_rate=reference[seeds[0]].reward_scale,
+        reference=targets,
+        reference_ceiling_occupancy={seed: reference[seed].ceiling_occupancy for seed in seeds},
+        reference_floor_occupancy={seed: reference[seed].floor_occupancy for seed in seeds},
+        reference_wealth_vs_competence={
+            seed: reference[seed].wealth_vs_competence for seed in seeds
+        },
+        passes=tuple(passes),
+        derived=final.rate,
+        seed_spread=statistics.stdev(finite) if len(finite) > 1 else 0.0,
+        code_sha=code_sha,
+        code_dirty=code_dirty,
     )
 
 
@@ -644,11 +711,12 @@ def _report_derivation(derivation: Derivation) -> None:
         f"{derivation.steps} steps / {derivation.tail} tail ==="
     )
     for seed in derivation.seeds:
-        roots = ", ".join(f"{w:.0f}" for w in derivation.reference[seed])
+        roots = ", ".join(f"{cell}:{w:.0f}" for cell, w in derivation.reference[seed].items())
         print(
             f"  reference seed {seed}: winners settle at [{roots}], "
             f"ceiling {derivation.reference_ceiling_occupancy[seed]:.3f} "
-            f"floor {derivation.reference_floor_occupancy[seed]:.3f}"
+            f"floor {derivation.reference_floor_occupancy[seed]:.3f} "
+            f"r {derivation.reference_wealth_vs_competence[seed]:+.3f}"
         )
     print(
         f"  {'pass':>4} {'rate':>9} {'seed':>5} {'w+':>22} {'derived':>9} "
@@ -656,12 +724,12 @@ def _report_derivation(derivation: Derivation) -> None:
     )
     for index, p in enumerate(derivation.passes, 1):
         for seed in derivation.seeds:
-            roots = ", ".join(f"{w:.0f}" for w in p.fixed_points[seed])
+            roots = ", ".join(f"{w:.0f}" for w in p.fixed_points[seed].values())
             print(
                 f"  {index:>4} {p.rate:>9.5f} {seed:>5} {roots:>22} {p.derived[seed]:>9.5f} "
                 f"{p.ceiling_occupancy[seed]:>6.3f} {p.floor_occupancy[seed]:>6.3f} "
                 f"{p.wealth_vs_competence[seed]:>+7.3f}"
-                f"{'  saturated' if p.cells_on_ceiling[seed] > 0 and p.saturated else ''}"
+                f"{'  saturated' if seed in p.saturated_seeds else ''}"
             )
         print(f"       -> next {p.next_rate:.5f} ({p.next_rate_from})")
     print(

@@ -22,10 +22,13 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
+import measure_ledger_stability  # noqa: E402
 from measure_ledger_stability import (  # noqa: E402
     DIFFERENTIATED,
     QUALITY,
+    CellReading,
     ClampedLedgerError,
+    LedgerReading,
     derive_reward_scale,
     rate_placing,
 )
@@ -543,12 +546,113 @@ def test_the_derivation_returns_the_recorded_rate_at_the_recorded_scale(fixture)
     """
     derivation = derive_reward_scale(fixture, 1.0, seeds=(0,), steps=SHORT_STEPS, tail=SHORT_TAIL)
 
-    assert derivation.derived == pytest.approx(BASE_CONFIG.reward_scale, abs=1e-6)
+    assert derivation.derived == BASE_CONFIG.reward_scale
+    assert derivation.final.next_rate == pytest.approx(BASE_CONFIG.reward_scale, abs=1e-6)
     assert len(derivation.passes) == 1
     assert not derivation.final.saturated
     assert derivation.final.next_rate_from == "derived"
     assert derivation.final.fixed_points[0] == derivation.reference[0]
     assert derivation.seed_spread == 0.0
+    assert set(derivation.reference_wealth_vs_competence) == {0}
+
+
+# --- the refusal paths, on hand-built readings ------------------------------------------
+
+
+def _cell(share: float, reward: float, price_coefficient: float, on_ceiling: bool) -> CellReading:
+    """A cell whose root follows from its R and kappa at the shipped decay."""
+    rho = 1.0 - BASE_CONFIG.wealth_decay
+    discriminant = reward**2 - 4.0 * rho * price_coefficient
+    root = (reward + discriminant**0.5) / (2.0 * rho) if discriminant >= 0.0 else math.nan
+    return CellReading(
+        competence=0.5,
+        wealth=BASE_CONFIG.max_wealth if on_ceiling else 20.0,
+        share=share,
+        reward=reward,
+        price_coefficient=price_coefficient,
+        settles_at=root,
+        ruined_below=0.0,
+        from_flat_inflow=0.0,
+        clamped=on_ceiling,
+        reconstruction_error=0.0,
+        tail_at_ceiling=1.0 if on_ceiling else 0.0,
+        tail_at_floor=0.0,
+    )
+
+
+def _reading(
+    seed: int, scale: float, rate: float, winners: int, winner_reward: float = 5.0
+) -> LedgerReading:
+    """``winners`` cells resting on the ceiling with a market share, the rest shut out."""
+    cells = tuple(
+        _cell(0.45, winner_reward, 60.0, True)
+        if index < winners
+        else _cell(0.002, 0.01, -0.3, False)
+        for index in range(BASE_CONFIG.num_experts)
+    )
+    return LedgerReading(
+        mode=LEDGER_DECAY,
+        coupling=PERSISTENCE_VALUE,
+        seed=seed,
+        cells=cells,
+        market_holders=winners,
+        least_share=0.002,
+        wealth_vs_competence=0.8,
+        tail_loss=0.01,
+        contribution_scale=scale,
+        reward_scale=rate,
+    )
+
+
+def _stub_measure(monkeypatch, scaled):
+    """The reference is the recorded two-up-six-down lattice; ``scaled`` answers every other run."""
+
+    def fake(mode, seed, steps, tail, fixture, contribution_scale, reward_scale, cells, config):
+        if contribution_scale == 1.0 and reward_scale == BASE_CONFIG.reward_scale:
+            return _reading(seed, 1.0, reward_scale, winners=2)
+        return scaled(seed, contribution_scale, reward_scale)
+
+    monkeypatch.setattr(measure_ledger_stability, "measure", fake)
+
+
+def test_a_configuration_whose_every_pass_is_saturated_is_refused(monkeypatch):
+    """Finite R and kappa on a clamped ledger derive a number, and the number is never returned."""
+    _stub_measure(monkeypatch, lambda seed, scale, rate: _reading(seed, scale, rate, winners=5))
+
+    with pytest.raises(ClampedLedgerError, match="no unsaturated, settled rate"):
+        derive_reward_scale(QUALITY, 2.0, seeds=(0,), steps=10, tail=5, max_passes=3)
+
+
+def test_a_saturated_pass_that_cannot_solve_halves_the_trial_rate(monkeypatch):
+    """No positive rate places a winner whose raw inflow is under its raw charge: halve and go on."""
+
+    def scaled(seed, scale, rate):
+        if rate == BASE_CONFIG.reward_scale:
+            # Saturated, and the winners' R is too small for any rate to place them.
+            return _reading(seed, scale, rate, winners=5, winner_reward=0.001)
+        return _reading(seed, scale, rate, winners=2)
+
+    _stub_measure(monkeypatch, scaled)
+
+    derivation = derive_reward_scale(QUALITY, 2.0, seeds=(0,), steps=10, tail=5)
+
+    first = derivation.passes[0]
+    assert first.saturated and first.next_rate_from == "halved"
+    assert first.next_rate == BASE_CONFIG.reward_scale / 2.0
+    assert derivation.derived == first.next_rate, (
+        "the rate returned is the one the final pass ran at"
+    )
+    assert not derivation.final.saturated
+
+
+def test_an_unsaturated_pass_that_cannot_place_the_winners_is_refused_at_once(monkeypatch):
+    _stub_measure(
+        monkeypatch,
+        lambda seed, scale, rate: _reading(seed, scale, rate, winners=2, winner_reward=0.001),
+    )
+
+    with pytest.raises(ClampedLedgerError, match="does not cover the raw charge"):
+        derive_reward_scale(QUALITY, 2.0, seeds=(0,), steps=10, tail=5)
 
 
 def test_the_derivation_refuses_a_ledger_the_band_is_holding():
