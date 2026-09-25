@@ -188,6 +188,7 @@ class LedgerReading:
     fixture: str = QUALITY
     contribution_scale: float = 1.0
     reward_scale: float = BASE_CONFIG.reward_scale
+    re_entry_gift: float = 0.0
 
     @property
     def ceiling_occupancy(self) -> float:
@@ -252,6 +253,7 @@ def measure(
     reward_scale: float = BASE_CONFIG.reward_scale,
     cells: int = BASE_CONFIG.num_experts,
     config: MoBConfig = BASE_CONFIG,
+    re_entry_gift: float = 0.0,
 ) -> LedgerReading:
     """Run the fixture under ``mode`` and solve each cell's quadratic.
 
@@ -270,7 +272,11 @@ def measure(
         raise ValueError(f"tail must fit inside the run, got {tail} of {steps} steps")
 
     config = replace(
-        config, ledger_mode=mode, persistence_coupling=coupling, reward_scale=reward_scale
+        config,
+        ledger_mode=mode,
+        persistence_coupling=coupling,
+        reward_scale=reward_scale,
+        re_entry_gift=re_entry_gift,
     )
     economy = build_economy(fixture, seed, config, contribution_scale, cells)
     config = economy.config
@@ -358,6 +364,7 @@ def measure(
         fixture=fixture,
         contribution_scale=contribution_scale,
         reward_scale=reward_scale,
+        re_entry_gift=re_entry_gift,
     )
 
 
@@ -704,6 +711,216 @@ def _finish(
     )
 
 
+# --- #65: re-entry as a path, sized from the settlement ------------------------------------
+
+# One memory horizon at the shipped decay, the window the claim names: a cell
+# at the floor clears the ruin threshold within it or it does not.
+HORIZON = 333
+# How many horizons the shipped gift is given before the read says "never".
+NEVER_AFTER = 10
+
+
+def steps_to_cross(
+    start: float,
+    threshold: float,
+    inflow: float,
+    price_coefficient: float,
+    decay: float,
+    setpoint: float,
+    cap: int,
+) -> int | None:
+    """Steps for ``w <- decay w + rho S + R - kappa / w`` to carry ``start`` past ``threshold``.
+
+    The map with no clamp above and the floor below: a cell that would fall
+    under ``start`` is held there, as the band holds it, so what is counted is
+    climbing and nothing else. ``None`` when the cap passes first.
+    """
+    rho = 1.0 - decay
+    wealth = start
+    for step in range(1, cap + 1):
+        wealth = max(start, decay * wealth + rho * setpoint + inflow - price_coefficient / wealth)
+        if wealth >= threshold:
+            return step
+    return None
+
+
+def inflow_to_cross_within(
+    start: float,
+    threshold: float,
+    price_coefficient: float,
+    decay: float,
+    setpoint: float,
+    horizon: int = HORIZON,
+) -> float:
+    """The smallest per-step inflow that carries ``start`` past ``threshold`` inside ``horizon``.
+
+    Monotone in the inflow, so a bisection on it; the upper bracket doubles
+    until it crosses. Zero when the cell already sits past the threshold.
+    """
+    if start >= threshold:
+        return 0.0
+
+    def crosses(inflow: float) -> bool:
+        return (
+            steps_to_cross(start, threshold, inflow, price_coefficient, decay, setpoint, horizon)
+            is not None
+        )
+
+    low, high = 0.0, 1.0
+    while not crosses(high):
+        high *= 2.0
+        if high > 1e6:
+            return math.inf
+    for _ in range(60):
+        mid = (low + high) / 2.0
+        if crosses(mid):
+            high = mid
+        else:
+            low = mid
+    return high
+
+
+@dataclass(frozen=True)
+class ReEntryReading:
+    """What the settlement says about a shut-out cell's way back (#65).
+
+    Every number is derived from one ``LedgerReading``: the winners' price
+    coefficient is what a cell pays once it wins, so its ruin threshold is the
+    wealth a returning cell has to be carried past; the floor cells' own inflow
+    is what the shipped gift pays them; and the gift that would carry each of
+    them past the threshold inside one horizon is solved on the map, per cell,
+    beside what that gift is worth to a deliberate loser.
+    """
+
+    seed: int
+    fixture: str
+    contribution_scale: float
+    reward_scale: float
+    floor_cells: tuple[int, ...]
+    winner_cells: tuple[int, ...]
+    winner_price_coefficient: float
+    winner_ruin_threshold: float
+    threshold_inflow: float
+    floor_inflow: dict[int, float]
+    floor_price_coefficient: dict[int, float]
+    shortfall: dict[int, float]
+    steps_to_cross_shipped: dict[int, int | None]
+    inflow_to_cross: dict[int, float]
+    extra_inflow_to_cross: dict[int, float]
+    # The per-slot credit that pays ``extra_inflow_to_cross`` on average: an
+    # explored slot reaches each loser at ``exploration_rate / (n - k)`` of the
+    # tokens, and the ledger credits a slot at ``1 / num_tokens``, so the
+    # per-slot amount is the per-step extra divided by that share.
+    gift_per_explored_slot: dict[int, float]
+    # What a loser could gain by losing on purpose, in credits a step: the gift
+    # share times the per-slot amount -- the deviation bound #38 measured at
+    # ``rate x value`` grows by exactly this.
+    deviation_worth: dict[int, float]
+    # The issue's own condition, which crossing the threshold does not meet: a
+    # cell that has crossed ``w_-`` climbs only on a winner's inflow, ``R >=
+    # 2 sqrt(rho kappa)`` at the winners' ``kappa``. The extra a floor cell
+    # would need to be paid a step to have that inflow, per slot, and what a
+    # deliberate loser would then collect a step.
+    root_condition_extra: dict[int, float]
+    root_condition_per_slot: dict[int, float]
+    root_condition_worth: dict[int, float]
+
+    def as_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def re_entry(reading: LedgerReading, config: MoBConfig = BASE_CONFIG) -> ReEntryReading:
+    """#65's read on one settled ledger: the shortfall, and the gift that would close it."""
+    rho = 1.0 - config.wealth_decay
+    setpoint = config.initial_wealth if reading.mode == LEDGER_SETPOINT else 0.0
+    winners = [
+        index
+        for index, cell in enumerate(reading.cells)
+        if cell.share > MARKET_SHARE and math.isfinite(cell.ruined_below)
+    ]
+    floor_cells = [index for index, cell in enumerate(reading.cells) if cell.rests_on_floor]
+    if not winners or not floor_cells:
+        raise ValueError(
+            "the re-entry read needs at least one winner with a real root and one floor cell"
+        )
+    kappa = statistics.fmean(reading.cells[i].price_coefficient for i in winners)
+    threshold = statistics.fmean(reading.cells[i].ruined_below for i in winners)
+    threshold_inflow = 2.0 * math.sqrt(rho * kappa) if kappa > 0 else 0.0
+    gift_share = config.exploration_rate / (config.num_experts - config.top_k)
+    floor_inflow = {i: reading.cells[i].reward for i in floor_cells}
+    floor_kappa = {i: reading.cells[i].price_coefficient for i in floor_cells}
+    needed = {
+        i: inflow_to_cross_within(
+            config.min_wealth, threshold, floor_kappa[i], config.wealth_decay, setpoint
+        )
+        for i in floor_cells
+    }
+    extra = {i: max(0.0, needed[i] - floor_inflow[i]) for i in floor_cells}
+    per_slot = {i: extra[i] / gift_share for i in floor_cells}
+    root_extra = {i: max(0.0, threshold_inflow - floor_inflow[i]) for i in floor_cells}
+    return ReEntryReading(
+        seed=reading.seed,
+        fixture=reading.fixture,
+        contribution_scale=reading.contribution_scale,
+        reward_scale=reading.reward_scale,
+        floor_cells=tuple(floor_cells),
+        winner_cells=tuple(winners),
+        winner_price_coefficient=kappa,
+        winner_ruin_threshold=threshold,
+        threshold_inflow=threshold_inflow,
+        floor_inflow=floor_inflow,
+        floor_price_coefficient=floor_kappa,
+        shortfall={
+            i: threshold_inflow / floor_inflow[i] if floor_inflow[i] > 0 else math.inf
+            for i in floor_cells
+        },
+        steps_to_cross_shipped={
+            i: steps_to_cross(
+                config.min_wealth,
+                threshold,
+                floor_inflow[i],
+                floor_kappa[i],
+                config.wealth_decay,
+                setpoint,
+                NEVER_AFTER * HORIZON,
+            )
+            for i in floor_cells
+        },
+        inflow_to_cross=needed,
+        extra_inflow_to_cross=extra,
+        gift_per_explored_slot=per_slot,
+        deviation_worth={i: per_slot[i] * gift_share for i in floor_cells},
+        root_condition_extra=root_extra,
+        root_condition_per_slot={i: root_extra[i] / gift_share for i in floor_cells},
+        root_condition_worth=root_extra,
+    )
+
+
+def _report_re_entry(read: ReEntryReading) -> None:
+    print(
+        f"\n=== re-entry: {read.fixture} x{read.contribution_scale:g} at reward_scale "
+        f"{read.reward_scale:g}, seed {read.seed}: winners {list(read.winner_cells)} pay "
+        f"kappa {read.winner_price_coefficient:.2f}, "
+        f"ruin threshold {read.winner_ruin_threshold:.2f}, "
+        f"inflow to clear it {read.threshold_inflow:.3f} a step ==="
+    )
+    print(
+        f"  {'cell':>4} {'R now':>8} {'kappa':>7} {'shortfall':>10} {'crosses in':>11} "
+        f"{'R to cross':>11} {'extra':>8} {'per slot':>9} {'worth/step':>11} "
+        f"{'root extra':>11} {'per slot':>9}"
+    )
+    for cell in read.floor_cells:
+        steps = read.steps_to_cross_shipped[cell]
+        print(
+            f"  {cell:>4} {read.floor_inflow[cell]:>8.4f} "
+            f"{read.floor_price_coefficient[cell]:>7.2f} "
+            f"{read.shortfall[cell]:>9.1f}x {'never' if steps is None else steps:>11} "
+            f"{read.inflow_to_cross[cell]:>11.4f} {read.extra_inflow_to_cross[cell]:>8.4f} "
+            f"{read.gift_per_explored_slot[cell]:>9.1f} {read.deviation_worth[cell]:>11.4f} "
+            f"{read.root_condition_extra[cell]:>11.4f} {read.root_condition_per_slot[cell]:>9.1f}"
+        )
+
+
 def _report_derivation(derivation: Derivation) -> None:
     print(
         f"\n=== exchange rate: {derivation.fixture} x{derivation.contribution_scale:g}, "
@@ -741,7 +958,8 @@ def _report_derivation(derivation: Derivation) -> None:
 def _report(reading: LedgerReading) -> None:
     print(
         f"\n--- {reading.fixture} x{reading.contribution_scale:g} at reward_scale "
-        f"{reading.reward_scale:g}: {reading.mode} ledger, {reading.coupling} arm, "
+        f"{reading.reward_scale:g}, gift {reading.re_entry_gift:g}: "
+        f"{reading.mode} ledger, {reading.coupling} arm, "
         f"seed {reading.seed}: "
         f"win>{MARKET_SHARE:.0%} {reading.market_holders} of {len(reading.cells)}, "
         f"least share {reading.least_share:.4f}, "
@@ -800,6 +1018,17 @@ def main() -> None:
         action="store_true",
         help="#73: derive the rate for --contribution-scale from the settlement and record it",
     )
+    parser.add_argument(
+        "--re-entry",
+        action="store_true",
+        help="#65: the shortfall and the gift that would close it, from each seed's settlement",
+    )
+    parser.add_argument(
+        "--re-entry-gift",
+        type=float,
+        default=0.0,
+        help="#65's candidate 1: credits per explored slot; 0 is the shipped economy",
+    )
     parser.add_argument("--out", type=Path, default=DEFAULT_DERIVATION_OUT)
     args = parser.parse_args()
     seeds = tuple(int(seed) for seed in args.seeds.split(","))
@@ -821,21 +1050,41 @@ def main() -> None:
         return
 
     modes = [LEDGER_DECAY, LEDGER_SETPOINT] if args.mode == "both" else [args.mode]
+    records: list[dict[str, Any]] = []
     for mode in modes:
         for seed in seeds:
-            _report(
-                measure(
-                    mode,
-                    seed,
-                    steps=args.steps,
-                    tail=args.tail,
-                    coupling=args.coupling,
-                    fixture=args.fixture,
-                    contribution_scale=args.contribution_scale,
-                    reward_scale=args.reward_scale,
-                    cells=args.cells,
-                )
+            reading = measure(
+                mode,
+                seed,
+                steps=args.steps,
+                tail=args.tail,
+                coupling=args.coupling,
+                fixture=args.fixture,
+                contribution_scale=args.contribution_scale,
+                reward_scale=args.reward_scale,
+                cells=args.cells,
+                re_entry_gift=args.re_entry_gift,
             )
+            _report(reading)
+            if args.re_entry:
+                read = re_entry(reading)
+                _report_re_entry(read)
+                records.append({"mode": mode, **read.as_dict()})
+    if args.re_entry:
+        code_sha, code_dirty = code_identity()
+        path = args.out / (
+            f"re_entry_{args.fixture}_cells{args.cells}_scale{args.contribution_scale:g}"
+            f"_rate{args.reward_scale:g}_gift{args.re_entry_gift:g}.json"
+        )
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {"code_sha": code_sha, "code_dirty": code_dirty, "readings": records},
+                indent=2,
+                default=str,
+            )
+        )
+        print(f"  record: {path}")
 
 
 if __name__ == "__main__":

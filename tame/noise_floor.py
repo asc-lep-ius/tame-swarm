@@ -115,7 +115,10 @@ NOT_A_FLOOR_KNOB: dict[str, str] = {
         _OPTIMISER,
     ),
     **dict.fromkeys(("probe_tokens", "eval_split"), _MEASUREMENT),
-    **dict.fromkeys(("contribution_scale", "reward_scale", "reward_scale_derived"), _MAGNITUDE),
+    **dict.fromkeys(
+        ("contribution_scale", "reward_scale", "reward_scale_derived", "re_entry_gift"),
+        _MAGNITUDE,
+    ),
     **dict.fromkeys(("code_sha", "code_dirty"), _CODE),
     **dict.fromkeys(
         (

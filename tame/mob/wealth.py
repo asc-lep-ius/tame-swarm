@@ -451,6 +451,7 @@ class WealthUpdateMixin:
                     values=values,
                     usage_count=self.expert_usage_count,
                     stress=self._stress_for(seq_len),
+                    explored=explored,
                 ),
                 self._vcg_charges,
             )

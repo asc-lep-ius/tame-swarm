@@ -165,6 +165,7 @@ def fixture_fingerprint(
     readiness: ReadinessConfig = READINESS_OFF,
     reward_scale: float = BASE_CONFIG.reward_scale,
     reward_scale_derived: bool = False,
+    re_entry_gift: float = 0.0,
 ) -> ArmFingerprint:
     """A fingerprint for a fixture run: what the arms share, the dial, the doses, the code.
 
@@ -224,6 +225,7 @@ def fixture_fingerprint(
         contribution_scale=contribution_scale,
         reward_scale=reward_scale,
         reward_scale_derived=reward_scale_derived,
+        re_entry_gift=re_entry_gift,
         autonomy_plasticity=readiness.autonomy_plasticity,
         autonomy_exploration=readiness.autonomy_exploration,
         autonomy_setpoints=readiness.autonomy_setpoints,

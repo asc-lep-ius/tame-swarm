@@ -371,6 +371,11 @@ class ArmFingerprint:
     # refused by a 1x run after it.
     reward_scale: float = 2.0
     reward_scale_derived: bool = False
+    # #65's re-entry gift, credits per explored slot. Every run before #65 paid
+    # none, so a legacy fingerprint reads as 0.0; asserted equal, since an arm
+    # whose losers are paid to lose is a different economy from one whose
+    # losers are not.
+    re_entry_gift: float = 0.0
     # #46's readiness register: one field per autonomy the tissue may be granted,
     # named exactly as the flag in ``readiness.ReadinessConfig``. Off in every run
     # there has been, so a legacy fingerprint reads as a run that granted none.

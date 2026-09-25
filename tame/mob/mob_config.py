@@ -56,6 +56,7 @@ AUCTION_ONLY_FIELDS = (
     "use_differentiable_routing",
     "exploration_rate",
     "exploration_draw",
+    "re_entry_gift",
     "persistence_coupling",
     "ledger_mode",
     # Reached only below the has_economy early return in update_wealth_from_loss, so
@@ -264,6 +265,15 @@ class MoBConfig:
     # expert is re-sampled faster than a merely unlucky one -- the constitution's
     # re-entry property. "uniform" is what every arm before #38 ran under.
     exploration_draw: str = EXPLORATION_DRAW_STALENESS
+    # #65's candidate 1: a credit per explored slot, in realised-value units, paid
+    # to the loser the exploration draw handed the slot to. Zero is the shipped
+    # economy, bitwise: the gift is keyed on the draw and nothing else, so no
+    # report can move it, and its size is derived from the settlement
+    # (``scripts/measure_ledger_stability.py --re-entry``) rather than set by
+    # hand. It passes through ``reward_scale`` like the reward and the charge.
+    # What it costs is written into the deviation bound: a loser collects
+    # ``exploration_rate / (num_experts - top_k)`` of it a token by losing.
+    re_entry_gift: float = 0.0
     # The stakes dial (#39): does a cell's continuation depend on its realised
     # value? "value" is today's economy. "decoupled" pins the wealth the gate
     # reads at initial_wealth and draws re-entry uniformly, and the ledger

@@ -111,6 +111,11 @@ class Settlement:
     # How often each expert has held a token. A ledger-side count rather than a
     # step quantity, read only by the inference path's re-entry gift.
     usage_count: torch.Tensor | None = None
+    # Which slots the exploration draw handed to a loser this step (#38), or
+    # None on a path that explores nothing. Read only by #65's training-path
+    # gift: a quantity no report can move, which is what lets a credit keyed on
+    # it stay outside the auction's incentives.
+    explored: torch.Tensor | None = None
 
 
 class RewardSignal(Protocol):
@@ -336,7 +341,25 @@ class RealisedValueReward:
         return rewards
 
     def gift(self, wealth: torch.Tensor, settlement: Settlement) -> torch.Tensor | None:
-        return None
+        """#65's re-entry gift: a credit per explored slot to the loser that drew it.
+
+        Credited at ``1 / num_tokens`` a slot, the share a held slot's value is
+        credited at, so a loser's expected inflow from it is the exploration
+        share times the amount -- the number the deviation bound grows by. None
+        at the shipped amount of zero, where the settlement is the recorded one
+        to the bit.
+        """
+        explored = settlement.explored
+        if self.config.re_entry_gift <= 0.0 or explored is None:
+            return None
+        gifted = explored
+        if settlement.valid_mask is not None:
+            gifted = gifted & settlement.valid_mask.unsqueeze(-1)
+        gift = torch.zeros_like(wealth)
+        for expert_idx in range(self.config.num_experts):
+            slots = (gifted & (settlement.selected_experts == expert_idx)).sum()
+            gift[expert_idx] += slots.float() / settlement.num_tokens
+        return gift * self.config.re_entry_gift * self.config.reward_scale * self.multiplier
 
 
 @dataclass(frozen=True)
