@@ -328,10 +328,22 @@ def floor_of(gap_a: torch.Tensor, gap_b: torch.Tensor) -> dict[str, float]:
 
 
 def probe_hash(probe: list[tuple[torch.Tensor, torch.Tensor]]) -> str:
-    """A hash of the probe's inputs and targets, in order, to show two arms of one seed share it."""
+    """A hash of the probe's inputs, in order, to show two arms or scales of one seed share them.
+
+    Inputs only: the target is the base output plus the planted correction,
+    which the scale multiplies, so two scales of one seed read the same tokens
+    against targets that differ by construction. ``target_hash`` records the
+    targets beside it.
+    """
     digest = hashlib.sha256()
-    for x, target in probe:
+    for x, _ in probe:
         digest.update(x.contiguous().numpy().tobytes())
+    return digest.hexdigest()[:16]
+
+
+def target_hash(probe: list[tuple[torch.Tensor, torch.Tensor]]) -> str:
+    digest = hashlib.sha256()
+    for _, target in probe:
         digest.update(target.contiguous().numpy().tobytes())
     return digest.hexdigest()[:16]
 
@@ -362,6 +374,7 @@ def read_one(job: Job, settle_steps: int = SETTLE_STEPS) -> dict[str, Any]:
         **asdict(job),
         "probe_tokens": executed.tokens,
         "probe_hash": probe_hash(probe),
+        "target_hash": target_hash(probe),
         "probe_loss": float(executed.losses.mean()),
         "counterfactual/mean_gap": float(gap.mean()),
         "counterfactual/mean_relative_gap": float(relative.mean()),
