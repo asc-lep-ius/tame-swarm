@@ -18,7 +18,7 @@ from measure_ledger_stability import (  # noqa: E402
 )
 from synthetic_economy import BASE_CONFIG  # noqa: E402
 
-from mob.ledger import LEDGER_DECAY, PERSISTENCE_VALUE  # noqa: E402
+from mob.ledger import LEDGER_DECAY, LOSS_REWARD_MULTIPLIER, PERSISTENCE_VALUE  # noqa: E402
 
 DECAY = BASE_CONFIG.wealth_decay
 
@@ -65,9 +65,15 @@ def _cell(share: float, reward: float, kappa: float, on_floor: bool) -> CellRead
 
 
 def test_the_read_sizes_the_gift_from_the_winners_charge_and_the_floors_inflow():
-    """README #ledger-stability's own numbers: winners at kappa ~67, floor cells at ~0.01."""
+    """README #ledger-stability's shape: winners paying a charge whose ruin threshold sits above the floor.
+
+    At kappa 80 the winners' lower root is 16.1, above the floor of 15, so a
+    floor cell has a threshold to cross and the extra to cross it is not
+    trivially zero; the floor cells carry a positive kappa so their own map
+    does not cross on its inflow either.
+    """
     cells = tuple(
-        _cell(0.49, 5.0, 67.0, False) if index < 2 else _cell(0.002, 0.01, -0.3, True)
+        _cell(0.49, 5.0, 80.0, False) if index < 2 else _cell(0.002, 0.01, 0.2, True)
         for index in range(8)
     )
     reading = LedgerReading(
@@ -85,19 +91,32 @@ def test_the_read_sizes_the_gift_from_the_winners_charge_and_the_floors_inflow()
 
     rho = 1.0 - DECAY
     assert read.winner_cells == (0, 1) and read.floor_cells == tuple(range(2, 8))
-    assert read.threshold_inflow == pytest.approx(2.0 * math.sqrt(rho * 67.0))
+    assert read.threshold_inflow == pytest.approx(2.0 * math.sqrt(rho * 80.0))
+    assert read.winner_ruin_threshold > BASE_CONFIG.min_wealth
     assert read.shortfall[2] == pytest.approx(read.threshold_inflow / 0.01)
-    assert 80 < read.shortfall[2] < 100
+    assert 90 < read.shortfall[2] < 110
     gift_share = BASE_CONFIG.exploration_rate / (BASE_CONFIG.num_experts - BASE_CONFIG.top_k)
     for cell in read.floor_cells:
+        assert read.extra_inflow_to_cross[cell] > 0.0
         assert read.root_condition_extra[cell] == pytest.approx(read.threshold_inflow - 0.01)
         assert read.root_condition_per_slot[cell] == pytest.approx(
             read.root_condition_extra[cell] / gift_share
         )
-        assert read.deviation_worth[cell] == pytest.approx(read.extra_inflow_to_cross[cell])
         assert read.gift_per_explored_slot[cell] == pytest.approx(
             read.extra_inflow_to_cross[cell] / gift_share
         )
+        # The worth to a deliberate loser is the whole lottery, rate x the per-slot amount.
+        assert read.deviation_worth[cell] == pytest.approx(
+            read.gift_per_explored_slot[cell] * BASE_CONFIG.exploration_rate
+        )
+        assert read.root_condition_worth[cell] == pytest.approx(
+            read.root_condition_per_slot[cell] * BASE_CONFIG.exploration_rate
+        )
+        # And the config's units are credits over the exchange rate and the multiplier.
+        assert read.root_condition_config_amount[cell] == pytest.approx(
+            read.root_condition_per_slot[cell] / (BASE_CONFIG.reward_scale * LOSS_REWARD_MULTIPLIER)
+        )
+    assert 2.0 < read.root_condition_config_amount[2] < 3.5
 
 
 def test_a_ledger_with_no_floor_cell_reads_as_nothing_to_carry_back():

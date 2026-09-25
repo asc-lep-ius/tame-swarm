@@ -232,8 +232,19 @@ class LedgerReading:
         return sorted(holders, key=lambda cell: cell.share, reverse=True)
 
     def winner_competences(self) -> list[float]:
-        """Who holds the market, by competence, largest share first: the seats, not their count."""
+        """The seated cells' competences, largest share first: the seats, not their count."""
         return [cell.competence for cell in self.winners()]
+
+    def seats(self) -> list[str]:
+        """The seated cells by index and competence, so two cells of equal competence read apart."""
+        return [
+            f"{index}:{cell.competence:.2f}"
+            for index, cell in sorted(
+                ((i, c) for i, c in enumerate(self.cells) if c.share > MARKET_SHARE),
+                key=lambda pair: pair[1].share,
+                reverse=True,
+            )
+        ]
 
 
 def build_economy(
@@ -914,7 +925,7 @@ def re_entry(reading: LedgerReading, config: MoBConfig = BASE_CONFIG) -> ReEntry
     # ``re_entry_gift`` is set in realised-value units and the ledger credits
     # it through the exchange rate, so a per-slot figure in credits is that
     # many times smaller in the config.
-    to_config = 1.0 / (config.reward_scale * LOSS_REWARD_MULTIPLIER)
+    to_config = 1.0 / (reading.reward_scale * LOSS_REWARD_MULTIPLIER)
     return ReEntryReading(
         seed=reading.seed,
         fixture=reading.fixture,
@@ -972,11 +983,11 @@ def _finite(value: Any) -> Any:
 
 
 def _report_re_entry(read: ReEntryReading) -> None:
-    seats = ", ".join(f"{c:.2f}" for c in read.winner_competences)
+    seats = ", ".join(f"{i}:{c:.2f}" for i, c in zip(read.winner_cells, read.winner_competences))
     print(
         f"\n=== re-entry: {read.fixture} x{read.contribution_scale:g} at reward_scale "
-        f"{read.reward_scale:g}, gift {read.re_entry_gift:g}, seed {read.seed}: winners "
-        f"{list(read.winner_cells)} (competence {seats}) pay "
+        f"{read.reward_scale:g}, gift {read.re_entry_gift:g}, seed {read.seed}: seats "
+        f"[{seats}] pay "
         f"kappa {read.winner_price_coefficient:.2f}, "
         f"ruin threshold {read.winner_ruin_threshold:.2f}, "
         f"inflow to clear it {read.threshold_inflow:.3f} a step ==="
@@ -1047,7 +1058,7 @@ def _report(reading: LedgerReading) -> None:
         f"r(wealth, competence) {reading.wealth_vs_competence:.3f}, "
         f"tail loss {reading.tail_loss:.4f}, "
         f"ceiling {reading.ceiling_occupancy:.3f} floor {reading.floor_occupancy:.3f}, "
-        f"seats {[round(c, 2) for c in reading.winner_competences()]}"
+        f"seats {reading.seats()}"
     )
     print(
         f"{'c':>5} {'wealth':>9} {'share':>7} {'R':>8} {'kappa':>9} "
@@ -1150,7 +1161,10 @@ def main() -> None:
             )
             _report(reading)
             if args.re_entry:
-                read = re_entry(reading, replace(BASE_CONFIG, num_experts=args.cells))
+                read = re_entry(
+                    reading,
+                    replace(BASE_CONFIG, num_experts=args.cells, reward_scale=args.reward_scale),
+                )
                 _report_re_entry(read)
                 records.append({"mode": mode, **_finite(read.as_dict())})
     if args.re_entry:
