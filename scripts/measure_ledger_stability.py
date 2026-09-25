@@ -52,6 +52,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tame"))
 from sweep_wealth_bounds import CEILING_TOLERANCE, FLOOR_TOLERANCE  # noqa: E402
 from synthetic_economy import (  # noqa: E402
     BASE_CONFIG,
+    REDUNDANT_COMPETENCE,
     DifferentiatedEconomy,
     SyntheticEconomy,
     competence_for,
@@ -82,7 +83,11 @@ MARKET_SHARE = 0.01
 
 QUALITY = "quality-fixture"
 DIFFERENTIATED = "differentiated-fixture"
-FIXTURES = (QUALITY, DIFFERENTIATED)
+# #63 stage 5's fixture: the quality vector with a second cell at the top
+# competence, on which a shut-out cell that can do the work exists -- the one
+# place #65's re-entry can be read as a winner set changing under competence.
+REDUNDANCY = "redundancy-fixture"
+FIXTURES = (QUALITY, DIFFERENTIATED, REDUNDANCY)
 DEFAULT_SEEDS = (0, 1, 2)
 # A cell *rests* on a bound when it sits there for more than this fraction of
 # the tail -- as against ``CellReading.clamped``, which is whether a bound held
@@ -229,9 +234,14 @@ def build_economy(
     cells: int = BASE_CONFIG.num_experts,
 ) -> SyntheticEconomy:
     """The fixture at ``seed``, at a cell count and a contribution scale."""
-    competence = shuffled(competence_for(cells), seed)
+    if fixture == REDUNDANCY:
+        if cells != REDUNDANT_COMPETENCE.numel():
+            raise ValueError("the redundancy fixture is defined at eight cells")
+        competence = shuffled(REDUNDANT_COMPETENCE, seed)
+    else:
+        competence = shuffled(competence_for(cells), seed)
     config = replace(config, num_experts=cells)
-    if fixture == QUALITY:
+    if fixture in (QUALITY, REDUNDANCY):
         return SyntheticEconomy(
             competence, seed=seed, config=config, contribution_scale=contribution_scale
         )
