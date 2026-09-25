@@ -655,6 +655,42 @@ def test_an_unsaturated_pass_that_cannot_place_the_winners_is_refused_at_once(mo
         derive_reward_scale(QUALITY, 2.0, seeds=(0,), steps=10, tail=5)
 
 
+def test_winners_pair_by_rank_and_a_rootless_rank_keeps_the_others_aligned(monkeypatch):
+    """The scaled run may seat other cells; a rootless reference winner is skipped, not squeezed."""
+    reading = _reading(0, 1.0, BASE_CONFIG.reward_scale, winners=3)
+    cells = list(reading.cells)
+    # Rank 1's root is not real: kappa too large for its reward. The same share
+    # as its neighbours, so the stable sort keeps it at rank 1.
+    cells[1] = _cell(0.45, 0.01, 60.0, True)
+    rootless = replace(reading, cells=tuple(cells))
+    targets = measure_ledger_stability._winner_targets(rootless)
+
+    assert sorted(targets) == [0, 1, 2]
+    assert math.isfinite(targets[0]) and math.isnan(targets[1]) and math.isfinite(targets[2])
+    # The scaled reading's rank-2 winner is placed at the reference's rank-2 root,
+    # not shifted onto rank 1's missing one.
+    _, per_rank, derived = measure_ledger_stability._solve(
+        reading, targets, BASE_CONFIG.reward_scale, BASE_CONFIG
+    )
+    assert sorted(per_rank) == [0, 2]
+    assert per_rank[2] == pytest.approx(BASE_CONFIG.reward_scale, abs=1e-9)
+    assert derived == pytest.approx(BASE_CONFIG.reward_scale, abs=1e-9)
+
+
+def test_a_scaled_run_with_fewer_winners_than_the_reference_cannot_be_placed(monkeypatch):
+    _stub_measure(monkeypatch, lambda seed, scale, rate: _reading(seed, scale, rate, winners=1))
+    targets = measure_ledger_stability._winner_targets(
+        _reading(0, 1.0, BASE_CONFIG.reward_scale, winners=2)
+    )
+
+    _, _, derived = measure_ledger_stability._solve(
+        _reading(0, 2.0, 2.0, winners=1), targets, 2.0, BASE_CONFIG
+    )
+    assert math.isnan(derived)
+    with pytest.raises(ClampedLedgerError, match="fewer winners"):
+        derive_reward_scale(QUALITY, 2.0, seeds=(0,), steps=10, tail=5)
+
+
 def test_the_derivation_refuses_a_ledger_the_band_is_holding():
     """A band one credit wide holds every winner on the ceiling; there is no rate to read."""
     narrow = replace(BASE_CONFIG, max_wealth=BASE_CONFIG.initial_wealth + 1.0)
