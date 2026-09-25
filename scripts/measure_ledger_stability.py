@@ -863,10 +863,10 @@ def re_entry(reading: LedgerReading, config: MoBConfig = BASE_CONFIG) -> ReEntry
         if cell.share > MARKET_SHARE and math.isfinite(cell.ruined_below)
     ]
     floor_cells = [index for index, cell in enumerate(reading.cells) if cell.rests_on_floor]
-    if not winners or not floor_cells:
-        raise ValueError(
-            "the re-entry read needs at least one winner with a real root and one floor cell"
-        )
+    if not winners:
+        raise ValueError("the re-entry read needs at least one winner with a real root")
+    # No cell resting on the floor is itself a reading -- a gift that lifts
+    # every cell off it -- and comes back with every per-cell table empty.
     kappa = statistics.fmean(reading.cells[i].price_coefficient for i in winners)
     threshold = statistics.fmean(reading.cells[i].ruined_below for i in winners)
     threshold_inflow = 2.0 * math.sqrt(rho * kappa) if kappa > 0 else 0.0
@@ -928,6 +928,9 @@ def _report_re_entry(read: ReEntryReading) -> None:
         f"ruin threshold {read.winner_ruin_threshold:.2f}, "
         f"inflow to clear it {read.threshold_inflow:.3f} a step ==="
     )
+    if not read.floor_cells:
+        print("  no cell rests on the floor over the tail; nothing to carry back")
+        return
     print(
         f"  {'cell':>4} {'R now':>8} {'kappa':>7} {'shortfall':>10} {'crosses in':>11} "
         f"{'R to cross':>11} {'extra':>8} {'per slot':>9} {'worth/step':>11} "

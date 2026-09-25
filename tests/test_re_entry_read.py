@@ -100,7 +100,8 @@ def test_the_read_sizes_the_gift_from_the_winners_charge_and_the_floors_inflow()
         )
 
 
-def test_the_read_refuses_a_ledger_with_no_floor_cell():
+def test_a_ledger_with_no_floor_cell_reads_as_nothing_to_carry_back():
+    """A gift that lifts every cell off the floor is a reading, not an error."""
     cells = tuple(_cell(0.125, 1.0, 10.0, False) for _ in range(8))
     reading = LedgerReading(
         mode=LEDGER_DECAY,
@@ -112,5 +113,21 @@ def test_the_read_refuses_a_ledger_with_no_floor_cell():
         wealth_vs_competence=0.0,
         tail_loss=0.01,
     )
-    with pytest.raises(ValueError, match="floor cell"):
-        re_entry(reading)
+
+    read = re_entry(reading)
+
+    assert read.floor_cells == () and read.floor_inflow == {}
+    assert read.winner_cells == tuple(range(8))
+    with pytest.raises(ValueError, match="winner"):
+        re_entry(
+            LedgerReading(
+                mode=LEDGER_DECAY,
+                coupling=PERSISTENCE_VALUE,
+                seed=0,
+                cells=tuple(_cell(0.001, 0.01, -0.3, True) for _ in range(8)),
+                market_holders=0,
+                least_share=0.001,
+                wealth_vs_competence=0.0,
+                tail_loss=0.01,
+            )
+        )
