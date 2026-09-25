@@ -659,8 +659,12 @@ def test_winners_pair_by_rank_and_a_rootless_rank_keeps_the_others_aligned(monke
     """The scaled run may seat other cells; a rootless reference winner is skipped, not squeezed."""
     reading = _reading(0, 1.0, BASE_CONFIG.reward_scale, winners=3)
     cells = list(reading.cells)
+    # Rank 2 earns less than rank 0, so its root differs and a pairing that
+    # squeezed rank 2 onto rank 1's target could not return the identity.
+    cells[2] = _cell(0.44, 4.0, 60.0, True)
+    reading = replace(reading, cells=tuple(cells))
     # Rank 1's root is not real: kappa too large for its reward. The same share
-    # as its neighbours, so the stable sort keeps it at rank 1.
+    # as rank 0, so the stable sort keeps it at rank 1.
     cells[1] = _cell(0.45, 0.01, 60.0, True)
     rootless = replace(reading, cells=tuple(cells))
     targets = measure_ledger_stability._winner_targets(rootless)

@@ -692,6 +692,7 @@ def _finish(
     targets: dict[int, dict[int, float]],
     passes: list[DerivationPass],
 ) -> Derivation:
+    """The record: the reference, every pass, and the rate the final pass ran at."""
     final = passes[-1]
     finite = [value for value in final.derived.values() if math.isfinite(value)]
     code_sha, code_dirty = code_identity()
