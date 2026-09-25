@@ -983,7 +983,9 @@ def _finite(value: Any) -> Any:
 
 
 def _report_re_entry(read: ReEntryReading) -> None:
-    seats = ", ".join(f"{i}:{c:.2f}" for i, c in zip(read.winner_cells, read.winner_competences))
+    seats = ", ".join(
+        f"{i}:{c:.2f}" for i, c in zip(read.winner_cells, read.winner_competences, strict=True)
+    )
     print(
         f"\n=== re-entry: {read.fixture} x{read.contribution_scale:g} at reward_scale "
         f"{read.reward_scale:g}, gift {read.re_entry_gift:g}, seed {read.seed}: seats "

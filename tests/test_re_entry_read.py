@@ -65,7 +65,7 @@ def _cell(share: float, reward: float, kappa: float, on_floor: bool) -> CellRead
 
 
 def test_the_read_sizes_the_gift_from_the_winners_charge_and_the_floors_inflow():
-    """README #ledger-stability's shape: winners paying a charge whose ruin threshold sits above the floor.
+    """README #ledger-stability's shape: winners whose ruin threshold sits above the floor.
 
     At kappa 80 the winners' lower root is 16.1, above the floor of 15, so a
     floor cell has a threshold to cross and the extra to cross it is not
