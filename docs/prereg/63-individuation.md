@@ -257,10 +257,18 @@ at twenty-four, summarise.
 ## Stage 5 outcome (2026-09-25, after the 24-seed stage; code `2734062`)
 
 Recorded after the run and not a change to anything above. W came out as the
-cap's quarter, 667: under (i) the silent twin kept its 0.49 share for the whole
-2667 steps and the on-type loss never came down, so (i)'s rows are seniority's
-and W here is 3.6× the quality fixture's. The planted effect was **not
-recovered** under any blockade (the twin the largest gainer in 0 / 1 / 1 of 6
+cap's quarter, 667, and was not written into this file before the arms ran
+(mechanically the rule's answer; noted rather than glossed): under (i) the
+silent twin keeps its 0.49 share for about 600 steps, loses it over about 150,
+and the on-type loss falls from 0.11–0.12 to a plateau of 0.050 that it holds
+to step 2667 — four times the born-without target and never within 1.1× of it
+— so (i)'s rows are seniority's inside W and W here is 3.6× the quality
+fixture's. The next-by-wealth and next-by-bid candidates are **post hoc**
+(section 8 rule 2): added at `369ac9d` and `2734062` after the first pass at
+`33ed250` had read the twin taking the slot in one seed of six; the earlier
+passes are kept under `stage5-first-pass-33ed250/` and
+`stage5-second-pass-369ac9d/` and agree on every shared field. The planted
+effect was **not recovered** under any blockade (the twin the largest gainer in 0 / 1 / 1 of 6
 seeds; p 0.22 / 0.95 / 0.98), so every arm row is uncalibrated by rule 7. Of
 the five predictions: (1) held, with the pinned twin's share leaving at a
 half-life of 80 steps rather than one; (2) **failed** — the twin takes the
@@ -274,5 +282,8 @@ instead: `decoupled` hands the slot to the twin in 20 of 24 under (iii) and 22
 of 24 under (i) and reaches the target in 6 of 24; (5) return full after (i),
 absent after (ii) and, unlike the quality fixture, absent after (iii) as well
 (0 of 24). The clause written above for a failed (2) applies, corrected on one
-word: the slot goes not by wealth rank but by a per-token report race among
-the cells the ledger has shut out, and the ledger is what keeps the race there.
+word: the post hoc columns say the slot goes not by wealth rank either, and
+which floor cell takes it is unresolved by the pre-block record — a per-token
+report race among the cells the ledger has shut out is the hypothesis the
+next run should preregister, not a reading of this one. The `decoupled`
+contrast is reported with the caveat that its pre-block winner set differs.

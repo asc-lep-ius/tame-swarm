@@ -439,3 +439,44 @@ def test_summarise_reads_the_targets_when_they_exist_and_says_so(tmp_path):
         "next_by_wealth_hits": 2,
         "next_by_bid_hits": 0,
     }
+
+
+def test_summarise_gives_legacy_readings_no_substitute_block(tmp_path):
+    """The recorded 1x stages predate the candidate fields and must still summarise."""
+
+    def reading(loss: float, uptake: float) -> dict:
+        return {
+            "pre_shares": [0.5, 0.5, 0.0],
+            "blocked_cell": 1,
+            "uptake": uptake,
+            "inside_on_type_loss": loss,
+            "returned": 1.0,
+            "guardrail/ceiling_occupancy": 0.25,
+            "guardrail/floor_occupancy": 0.75,
+            "guardrail/r_wealth_competence": 0.8,
+        }
+
+    stage = tmp_path / "arms_quality-fixture_2seeds"
+    stage.mkdir()
+    for arm in driver.ARMS:
+        for blockade, loss in ((driver.NONE, 0.010), (driver.LEDGER, 0.012)):
+            rows = {seed: reading(loss, 0.0 if blockade == driver.NONE else 0.9) for seed in "01"}
+            (stage / f"{arm}_{blockade}.json").write_text(json.dumps({"readings": rows}))
+
+    summary = driver.summarise_stage(stage)
+
+    assert summary["targets_read"] is False
+    assert "substitute" not in summary["against_control"]["ledger/value/uptake"]
+
+
+def test_the_target_is_read_without_the_cell_the_window_stage_blocks(monkeypatch):
+    """The operator's criterion, measured: the same cell, the same born-without loss."""
+    monkeypatch.setattr(driver, "SETTLE_STEPS", 120)
+    monkeypatch.setattr(driver, "RECONVERGENCE_CAP", 20)
+
+    window = driver.measure_window(driver.QUALITY, 0, 1.0)
+    target = driver.measure_target(driver.TargetJob(driver.QUALITY, "value", 0))
+
+    assert target["blocked_cell"] == window["blocked_cell"]
+    assert target["born_without_on_type_loss"] == window["born_without_on_type_loss"]
+    assert target["pre_on_type_loss"] == window["pre_on_type_loss"]

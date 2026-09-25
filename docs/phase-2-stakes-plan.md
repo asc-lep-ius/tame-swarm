@@ -229,8 +229,8 @@ rate the same week (README `#ledger-stability`).
     1× records re-read under it are labelled post hoc (section 8 rule 2).
 17. **Stage 5 of #63 is the redundancy fixture**, at 1×, before any 2× row:
     the quality fixture with a second cell at the top competence
-    (`REDUNDANT_COMPETENCE`), which the live ledger's seniority seats beside
-    the 0.7 on no seed — so a cell that can do the work sits at the floor and
+    (`REDUNDANT_COMPETENCE`), of which the live ledger's seniority seats only
+    one beside the 0.7 — so a cell that can do the work sits at the floor and
     the question the recorded fixtures cannot ask is whether the auction hands
     the freed slot to it. Its predictions are in
     `docs/prereg/63-individuation.md` under "Stage 5", written before it ran.
@@ -239,14 +239,20 @@ rate the same week (README `#ledger-stability`).
     gate #62 was to provide; it runs after #73, whose derivation sizes the
     exchange rate and the exploration gift together.
 19. **Every 2× row runs at #73's derived rate** — quality ×2 at 0.503,
-    differentiated ×2 at 0.448 and ×4 at 0.103 on seeds 0–2 — and never at the
-    hand-set constant, which is the pairing every derived row is reported
-    beside. The floor guardrail is not met on the quality fixture at 2× (the
+    differentiated ×2 at 0.448 and ×4 at 0.103 on seeds 0–2
+    (`~/tame-runs/73-exchange-rate/derivation_*.json`; README
+    `#ledger-stability` once #73's branch lands) — and never at the hand-set
+    constant, which is the pairing every derived row is reported beside. The floor guardrail is not met on the quality fixture at 2× (the
     shut-out cells' rebate does not scale with the winners' flows, and their
     root rises two to four credits above the floor); the ceiling guardrail is,
     on both fixtures, and a 2× row reads that column before its contrast.
 
 ### Order of work, amended a fourth time
+
+The placement of #63's 2× rows after #66 and #67 below is the implementing
+session's proposal (the operator's instruction of 2026-09-25 named that order
+for the run), not a recorded operator decision on the milestone; the rows can
+run as soon as #73 lands and nothing here gates them.
 
 ```
 done:     #68, #62, #63 at 1× (both fixtures), #73, #63 stage 5

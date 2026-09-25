@@ -425,6 +425,9 @@ record is unchanged — lowest rung that reliably moved the collective, none;
 highest that failed, 3 twice, and rung 1 at 1× on three fixtures. What the
 stage adds as a description: the arm whose gate cannot read the ledger
 (`decoupled`) finds the competent substitute in 20 of 24 seeds where the live
-ledger finds it in 5, so at this scale the ledger is what keeps the freed slot
-among the cells it has already shut out. The 2× rows re-enter this record
-after they run at #73's derived rate.
+ledger finds it in 5 — consistent with the ledger being what keeps the freed
+slot among the cells it has already shut out, which this fixture cannot
+separate from the arms' different pre-block allocations (`decoupled` seats the
+0.7 on four seeds of 24 and shuts both twins out on four, its target is its
+own, and every row is uncalibrated). The 2× rows re-enter this record after
+they run at #73's derived rate.

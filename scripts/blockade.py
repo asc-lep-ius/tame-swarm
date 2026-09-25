@@ -30,8 +30,8 @@ cell) and the null calibration (``--stage null``) come before any arm contrast
 occupancy and ``r(wealth, competence)`` beside every reading.
 
 **Stage 5, the redundancy fixture** (``--fixtures redundancy-fixture``): the
-quality fixture with a second cell at the top competence, which the seniority
-the live ledger runs on (#62) seats beside the 0.7 on no seed -- so a cell that
+quality fixture with a second cell at the top competence, of which the seniority
+the live ledger runs on (#62) seats only one beside the 0.7 -- so a cell that
 can do the blocked cell's work sits at the floor, and the question the recorded
 fixtures cannot ask is whether the auction hands the freed slot to it. The
 criterion the operator fixed for it is the *born-without target*: the on-type
@@ -761,9 +761,13 @@ def summarise_stage(
                     )
                 if field == "inside_on_type_loss" and targets is not None:
                     row["against_target"] = against_target(rows, targets[arm])
-                if field == "uptake":
-                    # Who took the freed slot: the cell competence predicts, or
-                    # the next cell by wealth. Counted over the seeds of one arm.
+                if field == "uptake" and all(
+                    "wealth_hit" in r and "bid_hit" in r for r in rows.values()
+                ):
+                    # Who took the freed slot: the cell competence predicts, the
+                    # next cell by wealth, or the next by bid, counted over the
+                    # seeds of one arm. Readings recorded before 369ac9d carry
+                    # neither candidate and get no block rather than zeros.
                     row["substitute"] = {
                         "predicted_hits": sum(
                             int(r.get("predicted_hit", False)) for r in rows.values()
