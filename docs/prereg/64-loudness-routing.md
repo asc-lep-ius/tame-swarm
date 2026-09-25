@@ -97,3 +97,26 @@ seeds — the number that says whether #58 and #60 are one problem.
 counts × six seeds = 108 readings), then the differentiated fixture, then
 `--stage summarise --self-model <the #73 grid record>`. CPU only; each reading
 is one settle and 65 probe forwards.
+
+## Outcome (2026-09-25, after the grid; code `7e99155`, `~/tame-runs/loudness-routing/`)
+
+Recorded after the run and not a change to anything above. The guardrail
+written above as the port's own check — at 1× the confident-token rate reads
+about 0.5 on both fixtures — **did not reproduce**: 0.000 on the quality
+`value` arm at 4 and 8 cells, 0.18–0.19 on the differentiated `value` arm,
+0.02–0.29 on the other arms, against the body's 0.49. The port measures the
+same statistic the body read did; the fixture's router is not at chance
+because planted competence is what the bid ranking finds. So neither line is
+read: "one lever" needs the guardrail to leave 0.5, "the market needs its own
+fix" needs it to stay there. The 2× and 4× rows were read in the same
+summarise pass as the 1× rows, after the guardrail had failed, and are
+reported as descriptions (README `#loudness-routing`). What they describe:
+loudness lowers the confident-token rate and the relative fragile gap on the
+differentiated fixture on every arm alike, `value` and `decoupled` reading
+the same at 4 cells; on the quality fixture, which starts at zero, both rise
+at 4× and 4 cells. The correlation with #60's contrast at the derived rate is
++0.01 [−0.66, +0.68] (quality, five cells) and +0.10 [+0.02, +0.17]
+(differentiated, six). The quality fixture at 4× and 8 cells was refused by
+#73's derivation (no settled rate in six passes) and is absent from the grid.
+The port is a separate script rather than a flag on the body script, so the
+body path is untouched to the byte (deviation from the issue's Touches row).
