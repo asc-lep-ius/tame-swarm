@@ -120,3 +120,31 @@ at 4× and 4 cells. The correlation with #60's contrast at the derived rate is
 #73's derivation (no settled rate in six passes) and is absent from the grid.
 The port is a separate script rather than a flag on the body script, so the
 body path is untouched to the byte (deviation from the issue's Touches row).
+
+## Correction (2026-09-25, after the review of the first outcome; supersedes the outcome above where they differ)
+
+The outcome above read the confident-token rate as the body read it and
+called the fixture's router "not at chance" on that number. The review found
+the number is not the body's: the body's rate counted unmoved tokens the
+stream beat about half the time, and on the fixture an unmoved token ties, so
+the rate is diluted by the pairs no draw moved and its fall with loudness is
+the draw moving fewer routes. The grids were re-run at `66f25f0` and then
+`4e3ecd7` (the pairing hash had to cover the inputs only, since the targets
+scale with *c*) with the conditional pair recorded — the confident pairs a
+draw moved and the beaten-rate over them — and "better" read only on moved
+tokens. Read on the conditional rate the differentiated fixture's `value`
+arm sits at 0.36 (4 cells) and 0.25 (8 cells) at 1×, against the body's
+0.49; the quality fixture stays at 0.000. So the guardrail still does not
+reproduce and neither line is read, but "loudness makes the route more
+load-bearing on every arm alike" is withdrawn: the fraction of confident pairs
+a draw moves falls with loudness on every arm, the rate given a move rises at
+4 cells and falls at 8 cells on the live and pinned arms alike, and the
+relative fragile gap rises at 4 cells and falls at 8. The correlation with
+#60's contrast now carries a Fisher-z interval and a permutation p beside the
+seed bootstrap (r +0.01 and +0.10; Fisher [−0.88, +0.88] and [−0.78, +0.84];
+p 0.99 and 0.88), the quality fixture's read being against the differentiated
+#60 grid, the only one that ran. Two errors in the sections above are noted
+rather than edited: the "one lever" line subtracts a loss-unit floor from a
+relative gap (no column computes it; it was not read), and line 70's "dz −3.8
+at 8 cells, 2×" is the 16-cell figure (8 cells 2× reads −1.66). The rule 8
+guardrail is now reported per cell against the 1× seeds' range in the README.
