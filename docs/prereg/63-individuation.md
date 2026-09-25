@@ -259,9 +259,9 @@ at twenty-four, summarise.
 Recorded after the run and not a change to anything above. W came out as the
 cap's quarter, 667, and was not written into this file before the arms ran
 (mechanically the rule's answer; noted rather than glossed): under (i) the
-silent twin keeps its 0.49 share for about 600 steps, loses it over about 150,
-and the on-type loss falls from 0.11–0.12 to a plateau of 0.050 that it holds
-to step 2667 — four times the born-without target and never within 1.1× of it
+silent twin keeps its 0.49 share for about 600 steps, loses it over about 150
+(under 0.005 from step 800), and the on-type loss falls from 0.11–0.12 to a
+plateau of 0.050 that it holds from step 750 to 2667 — four times the born-without target and never within 1.1× of it
 — so (i)'s rows are seniority's inside W and W here is 3.6× the quality
 fixture's. The next-by-wealth and next-by-bid candidates are **post hoc**
 (section 8 rule 2): added at `369ac9d` and `2734062` after the first pass at
@@ -271,7 +271,7 @@ passes are kept under `stage5-first-pass-33ed250/` and
 effect was **not recovered** under any blockade (the twin the largest gainer in 0 / 1 / 1 of 6
 seeds; p 0.22 / 0.95 / 0.98), so every arm row is uncalibrated by rule 7. Of
 the five predictions: (1) held, with the pinned twin's share leaving at a
-half-life of 80 steps rather than one; (2) **failed** — the twin takes the
+median half-life of 80 steps over 24 seeds rather than one; (2) **failed** — the twin takes the
 slot in 4 and 5 of 24 seeds under (ii) and (iii), one other floor cell takes
 it nearly whole, and that cell is neither the next by wealth (3, 4 of 24) nor
 the largest pre-block bid (8, 10 of 24); (3) **failed** — the loss inside W
