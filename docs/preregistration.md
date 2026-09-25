@@ -405,3 +405,26 @@ What rung 1 did show is written down as a description, not a placement: the
 collective re-sells a blocked cell's slots by the ledger's ranking on the first
 blocked token, and inside `W` nothing restores the work. The 2× rows of the
 same read run after #73 and re-enter this record.
+
+**2026-09-25, #63 stage 5 at 1× on the redundancy fixture (README
+[`#individuation-blockade`](../README.md#individuation-blockade), "Stage 5").**
+The criterion is now the born-without target (the operator's decision of
+2026-09-24), and the fixture is the one on which a cell that can do the
+blocked cell's work exists at the floor. Against the rung's own row on
+`value`, 24 paired seeds: the freed slots are taken up inside `W` under the
+ledger pin and the gate block (0.90, 0.99) and not under the output block
+(0.03, seniority); the on-type loss inside `W` reaches what the remaining
+means allow in **2 of 24** seeds under either structural blockade (gap +0.023,
++0.025), and the competent twin takes the slot in 4 and 5 of 24; the pre-block
+allocation returns after the output block (24 of 24) and after **neither** of
+the other two (0 of 24, 0 of 24; `W` is 667 here and the substitute's
+seniority forms inside it). The planted effect was not recovered under any
+blockade (rule 7), so the rows are descriptions. **The row fails on the
+substitution clause under the criterion, and on the return clause**; the
+record is unchanged — lowest rung that reliably moved the collective, none;
+highest that failed, 3 twice, and rung 1 at 1× on three fixtures. What the
+stage adds as a description: the arm whose gate cannot read the ledger
+(`decoupled`) finds the competent substitute in 20 of 24 seeds where the live
+ledger finds it in 5, so at this scale the ledger is what keeps the freed slot
+among the cells it has already shut out. The 2× rows re-enter this record
+after they run at #73's derived rate.

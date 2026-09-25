@@ -253,3 +253,26 @@ of "no entity at the cell scale at 1×" this fixture can return. W is measured
 on seed 0 first and written here before the arms run; the stages run in rule
 7's order: window, planted, null, targets, arms at six seeds, summarise, arms
 at twenty-four, summarise.
+
+## Stage 5 outcome (2026-09-25, after the 24-seed stage; code `2734062`)
+
+Recorded after the run and not a change to anything above. W came out as the
+cap's quarter, 667: under (i) the silent twin kept its 0.49 share for the whole
+2667 steps and the on-type loss never came down, so (i)'s rows are seniority's
+and W here is 3.6× the quality fixture's. The planted effect was **not
+recovered** under any blockade (the twin the largest gainer in 0 / 1 / 1 of 6
+seeds; p 0.22 / 0.95 / 0.98), so every arm row is uncalibrated by rule 7. Of
+the five predictions: (1) held, with the pinned twin's share leaving at a
+half-life of 80 steps rather than one; (2) **failed** — the twin takes the
+slot in 4 and 5 of 24 seeds under (ii) and (iii), one other floor cell takes
+it nearly whole, and that cell is neither the next by wealth (3, 4 of 24) nor
+the largest pre-block bid (8, 10 of 24); (3) **failed** — the loss inside W
+reaches the born-without target in 2 of 24 under either blockade, gap +0.023
+and +0.025; (4) **failed as written** — `value` and `shuffled` are equal to
+four decimals, and the sign is between the live ledger and the pinned one
+instead: `decoupled` hands the slot to the twin in 20 of 24 under (iii) and 22
+of 24 under (i) and reaches the target in 6 of 24; (5) return full after (i),
+absent after (ii) and, unlike the quality fixture, absent after (iii) as well
+(0 of 24). The clause written above for a failed (2) applies, corrected on one
+word: the slot goes not by wealth rank but by a per-token report race among
+the cells the ledger has shut out, and the ledger is what keeps the race there.
