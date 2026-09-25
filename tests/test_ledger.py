@@ -624,7 +624,7 @@ def test_a_configuration_whose_every_pass_is_saturated_is_refused(monkeypatch):
 
 
 def test_a_saturated_pass_that_cannot_solve_halves_the_trial_rate(monkeypatch):
-    """No positive rate places a winner whose raw inflow is under its raw charge: halve and go on."""
+    """No positive rate places a winner whose inflow is under its charge: halve and go on."""
 
     def scaled(seed, scale, rate):
         if rate == BASE_CONFIG.reward_scale:
